@@ -451,12 +451,15 @@ fn all_labels(harness: &Harness<'static, ZenApp>) -> Vec<String> {
     // The predicate is the only place the label is readable (`query_all_by` hands the closure an
     // `AccessKitNode` and yields action-ready nodes); answering `false` collects nothing.
     let labels = std::cell::RefCell::new(Vec::new());
-    harness.query_all_by(|node: &AccessKitNode<'_>| {
-        if let Some(label) = node.label() {
-            labels.borrow_mut().push(label);
-        }
-        false
-    });
+    harness
+        .query_all_by(|node: &AccessKitNode<'_>| {
+            if let Some(label) = node.label() {
+                labels.borrow_mut().push(label);
+            }
+            false
+        })
+        // The predicate is the collection; the iterator itself is the point, so drain it.
+        .count();
     let mut labels = labels.into_inner();
     labels.sort();
     labels

@@ -330,7 +330,7 @@ fn path_chips(
         // last-allocated-wins rule of plan §9.2 step 8 cannot bite between two chips.
         response.widget_info(|| {
             let mut info = egui::WidgetInfo::new(egui::Role::Button);
-            info.label = Some(label.clone().into());
+            info.label = Some(label.clone());
             info
         });
         if response.clicked() && target != *path {
