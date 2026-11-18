@@ -703,7 +703,11 @@ impl DirService {
         let entry_path = listing
             .join(row.dirent.file_name())
             .unwrap_or_else(|_| listing.clone());
-        let stat = EntryStat::in_listing(entry_path, listing.clone(), row.dirent.clone(), info);
+        // `rel_base` is the row itself, so `rel_path` comes out empty: Go fills `rel_path` **only for a
+        // flat (recursive) listing** — `api/dir.go:141-149` sets it inside the `flat=true` branch and
+        // leaves it `""` otherwise, which is why `dir-root.json` has no `rel_path` key at all while
+        // `dir-flat-subdir.json` has `rel_path:"b"`. Step 9's flat walk passes the listing root here.
+        let stat = EntryStat::in_listing(entry_path.clone(), entry_path, row.dirent.clone(), info);
         let files_count = row
             .dirent
             .kind()
