@@ -729,8 +729,8 @@ impl AppModel {
     pub fn mark_stale(&mut self, path: &FsPath) -> usize {
         let hits: Vec<TabId> = self
             .panes
-            .iter()
-            .flat_map(|(_, pane)| pane.tabs.iter())
+            .values()
+            .flat_map(|pane| pane.tabs.iter())
             .filter(|tab| tab.path.starts_with(path))
             .map(|tab| tab.id)
             .collect();
