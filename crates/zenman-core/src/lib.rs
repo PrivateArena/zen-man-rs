@@ -40,6 +40,7 @@
 #![deny(clippy::wildcard_imports)]
 
 pub mod cursor;
+pub mod entry;
 pub mod error;
 pub mod limits;
 pub mod metrics;

@@ -20,51 +20,17 @@
 //! Everything here is `cfg`-neutral and takes or returns plain integers — [`mod_bits_to_finfo`],
 //! [`attributes_to_mode`], [`mode_to_attributes`] — so the Windows mapping is unit-testable from Linux and
 //! no `windows-sys` type reaches a public signature.
+//!
+//! [`EntryKind`] and [`EntryLike`] live in [`crate::entry`] (plan §5.2's `entry.rs` row): they describe an
+//! *entry*, and [`ModeKind::from_entry`] is the one place mode reading needs them. They are re-exported
+//! here because the mode and entry modules are read together.
 
 use std::fmt::{self, Write as _};
 
 use bitflags::bitflags;
 
+use crate::entry::EntryLike;
 use crate::error::CoreError;
-
-/// The kind of a directory entry, as far as mode rendering cares.
-///
-/// Plan §5.2's `entry.rs` row (a later pass) owns the full entry type and its `is_dir` rule; this is
-/// the minimal taxonomy [`ModeKind::from_entry`] switches on, declared here so `mode.rs` compiles and
-/// is unit-testable before that pass lands. `entry.rs` will re-export/alias it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum EntryKind {
-    /// A regular file.
-    File,
-    /// A directory.
-    Dir,
-    /// A symlink whose target is not a directory.
-    Symlink,
-    /// A symlink to a directory — `is_dir:true` on the wire, `L…` in the mode string.
-    SymlinkDir,
-}
-
-/// The read-only view [`ModeKind::from_entry`] needs from an entry.
-///
-/// Deliberately tiny and `cfg`-neutral: `unix_mode()` is `None` on a Windows build or when `stat`
-/// failed (Go's `entry.Info()` error → `"unknown"`, `docs/contracts.md` → *fileMode strings*), and
-/// `windows_attributes()` is `None` everywhere else.
-pub trait EntryLike {
-    /// The entry's name, without its parent.
-    fn file_name(&self) -> &str;
-    /// The entry's kind, link-to-directory distinguished.
-    fn kind(&self) -> EntryKind;
-    /// Byte size of the entry.
-    fn size(&self) -> i64;
-    /// Modification time in Unix seconds, `None` when the stat failed.
-    fn mtime_secs(&self) -> Option<i64>;
-    /// The raw `st_mode` when the platform produced one and the stat worked.
-    fn unix_mode(&self) -> Option<u32>;
-    /// Windows file attributes, when the platform produced them.
-    fn windows_attributes(&self) -> Option<u32> {
-        None
-    }
-}
 
 bitflags! {
     /// The permission and setuid/setgid/sticky bits of a Unix mode, as raw octal values (not Go's
@@ -563,6 +529,8 @@ impl fmt::Display for ArchiveMode {
 mod tests {
     use super::*;
 
+    use crate::entry::{DirEntryLike, EntryKind, InfoEntry};
+
     /// Every mode string in `docs/contracts.md` → *fileMode strings*, plus the special-bit cases the
     /// goldens could not contain. The expected values are **generated**: `go run` of a walker over the
     /// fixture tree (Go 1.x on this machine, `/media/jang/home/PortableApp/go`) printed
@@ -759,49 +727,28 @@ mod tests {
         );
     }
 
+    /// [`ModeKind::from_entry`] reads an [`EntryLike`]; the three cases that matter are a directory, a
+    /// link to one, and a stat that failed (`unknown`, plan F20). `EntryLike` is sealed in
+    /// [`crate::entry`], so this uses one of the four producers rather than a local stub.
     #[test]
     fn from_entry_uses_the_kind_and_the_stat_result() {
-        struct Stub {
-            kind: EntryKind,
-            st: Option<u32>,
-        }
-        impl EntryLike for Stub {
-            fn file_name(&self) -> &str {
-                "stub"
-            }
-            fn kind(&self) -> EntryKind {
-                self.kind
-            }
-            fn size(&self) -> i64 {
-                0
-            }
-            fn mtime_secs(&self) -> Option<i64> {
-                None
-            }
-            fn unix_mode(&self) -> Option<u32> {
-                self.st
-            }
-        }
+        let entry = |kind, st| InfoEntry::new("stub", kind, 0, None, st);
         assert_eq!(
-            ModeKind::from_entry(&Stub {
-                kind: EntryKind::Dir,
-                st: Some(0o040755)
-            }),
+            ModeKind::from_entry(&entry(EntryKind::Dir, Some(0o040_755))),
             ModeKind::Dir(ModeBits::from_bits_retain(0o755))
         );
         assert_eq!(
-            ModeKind::from_entry(&Stub {
-                kind: EntryKind::SymlinkDir,
-                st: Some(0o120777)
-            }),
+            ModeKind::from_entry(&entry(EntryKind::SymlinkDir, Some(0o120_777))),
             ModeKind::Symlink(ModeBits::from_bits_retain(0o777))
         );
         // The stat failed: `unknown`, which is the whole point of F20's degraded row.
         assert_eq!(
-            ModeKind::from_entry(&Stub {
-                kind: EntryKind::File,
-                st: None
-            }),
+            ModeKind::from_entry(&entry(EntryKind::File, None)),
+            ModeKind::Unknown
+        );
+        // A dirent that has never been statted answers the same way (`DirEntryLike` has no mode at all).
+        assert_eq!(
+            ModeKind::from_entry(&DirEntryLike::new("stub", EntryKind::Dir)),
             ModeKind::Unknown
         );
     }
