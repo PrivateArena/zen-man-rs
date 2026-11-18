@@ -1046,7 +1046,7 @@ use zenman_core::ops::chmod::{self, ChmodReq, Recursive};
 use zenman_core::ops::delete::{DeleteMode, DeleteOutcome, DeleteReport, DeleteReq};
 use zenman_core::ops::mkdir::{DEFAULT_DIR_MODE, MkdirReq};
 use zenman_core::ops::open::{self, OpenRoute};
-use zenman_core::ops::rename::{RenameOutcome, RenameReq, RenameTarget};
+use zenman_core::ops::rename::{self, RenameOutcome, RenameReq, RenameTarget};
 use zenman_core::platform::{
     CopyItem, CopyReport, DiskSpace, Env, ExecOutput, ExecRequest, LinkItem, MountTable, Os,
     PlatformCaps, PlatformFuture, Shortcut, ready,
@@ -1572,6 +1572,314 @@ fn a_permanent_delete_removes_a_tree_and_records_the_paths_that_went() {
             .any(|(p, o)| *o == Some(origin) && *p == fskey(&abs(&root))),
         "the directory that lost the tree is invalidated with the caller's origin: {:?}",
         dir_changed(&events)
+    );
+    let _ = remove_tree(&root);
+}
+
+// ── rename ─────────────────────────────────────────────────────────────────────────────────────
+
+/// The three policies, on a name that is taken — the same question [`ConflictPolicy`] answers for a
+/// paste, asked of a rename (plan §5.3's "one answer to 'the name is taken'").
+#[test]
+fn rename_answers_a_taken_name_by_policy() {
+    let root = temp_dir("rename-policy");
+    let mut session = open_session(&root);
+    let taken = write(&root.join("tree/new-name.txt"), b"occupant");
+    let _ = taken;
+
+    // SkipExisting: the occupant stays, the rename is refused *for that item*, and nothing is logged.
+    let src = write(&root.join("tree/old-name.txt"), b"payload");
+    let err = session
+        .rename(
+            &RenameReq::one(src.clone(), "new-name.txt"),
+            session.next_origin(),
+        )
+        .expect("the request itself is well formed");
+    assert!(
+        matches!(&err.outcomes[0], RenameOutcome::Failed { error, .. }
+            if error.kind() == "already_exists"),
+        "{:?}",
+        err.outcomes
+    );
+    assert!(
+        exists(&root.join("tree/old-name.txt")),
+        "the source did not move"
+    );
+    assert_eq!(
+        read(&root.join("tree/new-name.txt")),
+        b"occupant",
+        "and the occupant was not touched"
+    );
+    assert!(err.log_id.is_none(), "nothing renamed, nothing recorded");
+    assert!(err.renamed().is_empty());
+
+    // Overwrite: the occupant is replaced, and the record names the *source*, Go-style.
+    let mut req = RenameReq::one(src.clone(), "new-name.txt");
+    req.policy = ConflictPolicy::Overwrite;
+    let report = session
+        .rename(&req, session.next_origin())
+        .expect("overwrite renames");
+    let pairs = report.renamed();
+    assert_eq!(pairs.len(), 1, "{:?}", report.outcomes);
+    assert_eq!(
+        pairs[0].1.to_string_lossy(),
+        root.join("tree/new-name.txt").to_string_lossy()
+    );
+    assert_eq!(read(&root.join("tree/new-name.txt")), b"payload");
+    assert!(!exists(&root.join("tree/old-name.txt")));
+
+    // Rename: both survive, under `name (1).txt`.
+    let third = write(&root.join("tree/third.txt"), b"third");
+    let mut req = RenameReq::one(third.clone(), "new-name.txt");
+    req.policy = ConflictPolicy::Rename;
+    let report = session
+        .rename(&req, session.next_origin())
+        .expect("the rename policy invents a name");
+    let (_from, to) = report.renamed()[0];
+    assert_eq!(
+        to.file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .as_deref(),
+        Some("new-name (1).txt")
+    );
+    assert!(
+        exists(&root.join("tree/new-name.txt")),
+        "the previous winner stays"
+    );
+
+    // The single-rename record: `Append(ActionRename, [src], "", newName)` (`api/ops.go:414`), and the
+    // capture's roles for action byte 5 (`log.json` record 2).
+    let id = report.log_id.expect("a record was appended");
+    assert_record_roles(&session, &root, id, ActionType::RENAME);
+    let record = session.log_record(id).expect("it reads back");
+    assert_eq!(
+        record.sources,
+        vec![third.to_string_lossy()],
+        "sources are the *old* paths"
+    );
+    assert_eq!(record.dest, "", "Go logged no dest for a rename");
+    assert_eq!(record.name, "new-name (1).txt");
+    assert!(record.is_reversible(), "`rename` is one of the five");
+    let _ = remove_tree(&root);
+}
+
+/// The name is a *name*, not a path: `..`, `.`, `/` and a glob are all refused before anything is
+/// renamed, and `foo..bar` — the substring Go's `validateDest` refused (ledger #14) — is allowed.
+#[test]
+fn a_rename_name_is_one_component_and_nothing_else() {
+    assert!(
+        rename::validate_rename_name("foo..bar").is_ok(),
+        "the ledger-#14 false positive is gone"
+    );
+    assert!(rename::validate_rename_name("a b.txt").is_ok());
+    for bad in ["", ".", "..", "a/b", "x*", "?y"] {
+        let err = rename::validate_rename_name(bad).expect_err("`{bad}` is not one component");
+        assert_eq!(err.kind(), "invalid_path", "`{bad}`: {err}");
+    }
+
+    let root = temp_dir("rename-name");
+    let mut session = open_session(&root);
+    let file = write(&root.join("tree/keep.txt"), b"payload");
+    let escape = RenameReq::one(file.clone(), "../../etc/passwd");
+    let report = session
+        .rename(&escape, session.next_origin())
+        .expect("the request is a rename, refused per item");
+    assert_eq!(report.renamed().len(), 0, "{:?}", report.outcomes);
+    assert_eq!(
+        report.failed()[0].1.kind(),
+        "invalid_path",
+        "the escape attempt is a typed rejection"
+    );
+    assert!(
+        exists(&root.join("tree/keep.txt")),
+        "and the file is where it was"
+    );
+    assert_eq!(read(&root.join("tree/keep.txt")), b"payload");
+    let _ = remove_tree(&root);
+}
+
+/// Go's batch quirk, kept on purpose (`api/ops.go:466-474`): renaming a parent rewrites the paths of the
+/// sources that lived under it, or the batch renames children that are no longer where the request said
+/// they were. Plan §5.3's done-when row, and the record keeps Go's JSON-array `name`
+/// (`tests/golden/log.json` record 14).
+#[test]
+fn a_batch_rename_renames_a_parent_and_its_children_and_logs_the_name_array() {
+    let root = temp_dir("rename-batch");
+    let mut session = open_session(&root);
+    let parent = mkdir(&root.join("tree/parent"));
+    let child = write(&root.join("tree/parent/child.txt"), b"c");
+    let sibling = write(&root.join("tree/plain.txt"), b"s");
+
+    let report = session
+        .rename(
+            &RenameReq::batch(
+                vec![parent.clone(), child.clone(), sibling.clone()],
+                vec![
+                    "PARENT".to_string(),
+                    "kid.txt".to_string(),
+                    "plain-renamed.txt".to_string(),
+                ],
+            ),
+            session.next_origin(),
+        )
+        .expect("a batch rename is one call");
+    assert_eq!(report.renamed().len(), 3, "{:?}", report.outcomes);
+    assert!(
+        exists(&root.join("tree/PARENT/kid.txt")),
+        "the child followed its parent: {:?}",
+        report.outcomes
+    );
+    assert!(exists(&root.join("tree/plain-renamed.txt")));
+    assert!(!exists(&root.join("tree/parent")));
+
+    let id = report.log_id.expect("one record for the batch");
+    assert_record_roles(&session, &root, id, ActionType::RENAME);
+    let record = session.log_record(id).expect("it reads back");
+    let names: Vec<String> = serde_json::from_str(&record.name).expect("`name` is Go's JSON array");
+    assert_eq!(
+        names,
+        vec!["PARENT", "kid.txt", "plain-renamed.txt"],
+        "the array is the names that applied, in order — what `revertRename` parses back"
+    );
+    assert_eq!(
+        record.sources,
+        vec![
+            parent.to_string_lossy(),
+            // Go's `renamedSources` collects `src` *after* the rewrite loop has relaid the later entries
+            // (`api/ops.go:466-474`), so the child is recorded under its new parent — which is what makes
+            // `revertRename`'s reverse pass land it back inside `/tree/parent`.
+            abs(&root.join("tree/PARENT/child.txt")).to_string_lossy(),
+            sibling.to_string_lossy()
+        ],
+        "the sources are the paths as renamed, exactly as Go collected them"
+    );
+
+    // …which is exactly what the revert does, in reverse order (plan §7 row 9's "revert of each
+    // reversible action type passes", for `rename`).
+    let origin = session.next_origin();
+    let job = running(session.revert(id, origin));
+    let (done, _ev) = pump(&mut session, job, |p| p.revert().cloned());
+    let done = done.expect("the batch revert finished");
+    assert_eq!(done.restored.len(), 3, "{done:?}");
+    assert!(
+        exists(&root.join("tree/parent/child.txt")),
+        "back where they started"
+    );
+    assert!(exists(&root.join("tree/plain.txt")));
+    assert_eq!(
+        session.log_record(id).expect("the record").status,
+        LogStatus::REVERTED,
+        "the frame is patched in place — a revert appends nothing (the capture's 19-record log)"
+    );
+    let _ = remove_tree(&root);
+}
+
+// ── mkdir ──────────────────────────────────────────────────────────────────────────────────────
+
+/// Go's `handleMkdir` (`api/ops.go:488-521`): the row it returned, and the record it appended —
+/// `Append(ActionMkdir, [], dest, name)`, which is the *shape of golden record 1*, the one the capture
+/// itself reverted.
+#[test]
+fn mkdir_makes_the_dir_returns_the_row_and_collides_honestly() {
+    let root = temp_dir("mkdir");
+    let mut session = open_session(&root);
+    let tree = abs(&root.join("tree"));
+    fs::create_dir_all(root.join("tree")).expect("tree");
+    let intent = Arc::new(RecordingIntent::new());
+    session.set_intent(Arc::clone(&intent) as Arc<dyn IndexIntent>);
+
+    let origin = session.next_origin();
+    let entry = session
+        .mkdir(&MkdirReq::new(tree.clone(), "made-dir"), origin)
+        .expect("the directory is made");
+    assert_eq!(entry.name, "made-dir");
+    assert!(entry.is_dir, "Go's `isDir`");
+    let mode_text = entry.mode.clone();
+    assert!(
+        entry.mode.starts_with('d'),
+        "Go's FileMode.String(): {mode_text}"
+    );
+    let made = root.join("tree/made-dir");
+    #[cfg(unix)]
+    assert_eq!(
+        mode_of(&made) & 0o700,
+        0o700,
+        "0755 & ~umask — the umask applies here exactly as it did to Go's `os.Mkdir(_, 0755)`"
+    );
+    assert!(entry.size >= 0, "a size was reported: {}", entry.size);
+
+    let parent = abs(&root.join("tree"));
+    let _ = session.poll();
+    let changed = dir_changed(&session.dirs().flush_invalidations());
+    assert!(
+        changed
+            .iter()
+            .any(|(p, o)| *p == fskey(&parent) && *o == Some(origin)),
+        "the parent listing is stale now: {changed:?}"
+    );
+    assert!(
+        intent
+            .recorded()
+            .contains(&IndexOp::Created { path: abs(&made) })
+    );
+
+    let golden = golden_json("log.json");
+    let go = golden["records"]
+        .as_array()
+        .expect("records")
+        .iter()
+        .find(|r| r["action"].as_i64() == Some(i64::from(ActionType::MKDIR.0)))
+        .expect("the capture has a mkdir record");
+    let record = session
+        .log_recent(None)
+        .expect("the log")
+        .records
+        .into_iter()
+        .next()
+        .expect("one record");
+    assert_eq!(record.action, ActionType::MKDIR);
+    assert!(
+        record.sources.is_empty(),
+        "an mkdir logs no sources: {:?}",
+        record.sources
+    );
+    assert_eq!(
+        go["sources"].as_array().expect("sources").len(),
+        0,
+        "and the capture agrees (golden record 1: `[]`, not absent)"
+    );
+    assert_eq!(
+        record.dest,
+        tree.to_string_lossy(),
+        "`dest` is the parent, `name` the new directory (`api/ops.go:501`)"
+    );
+    assert_eq!(record.name, "made-dir");
+    assert_eq!(
+        record.is_reversible(),
+        go["reversible"].as_bool().expect("reversible"),
+        "and mkdir is one of the five reversible types"
+    );
+    assert!(record.is_reversible());
+
+    // The collision Go reported as a raw `file exists` 500 is a typed `AlreadyExists` here, and an
+    // illegal name never reaches the filesystem at all.
+    let again = session
+        .mkdir(
+            &MkdirReq::new(tree.clone(), "made-dir"),
+            session.next_origin(),
+        )
+        .expect_err("a taken name is a typed collision");
+    assert_eq!(again.kind(), "already_exists");
+    let escape = session
+        .mkdir(
+            &MkdirReq::new(tree.clone(), "../escape"),
+            session.next_origin(),
+        )
+        .expect_err("`..` is not a directory name");
+    assert_eq!(escape.kind(), "invalid_path");
+    assert!(
+        !root.join("escape").exists(),
+        "and nothing was created outside the tree"
     );
     let _ = remove_tree(&root);
 }
