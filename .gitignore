@@ -82,3 +82,4 @@ tests/fixtures/
 # Negation rules must come last: git uses last-match-wins.
 !tests/golden/
 !tests/golden/**
+.bash_history
