@@ -158,6 +158,15 @@ pub struct Tokens {
     pub tab_close_size: f32,
     /// Widest single breadcrumb segment.
     pub crumb_max_width: f32,
+    /// Horizontal padding inside a crumb chip (`toolbar.css:85`, `padding: 2px 6px`).
+    pub crumb_chip_padding: f32,
+    /// Gap on each side of a crumb separator (`toolbar.css:70`, `gap: 4px`).
+    pub crumb_separator_gap: f32,
+    /// How far a chip is inset from the top and bottom of its 50 px strip (the chip is the strip's
+    /// height minus twice this), so it reads as a chip and not as a block of the address bar.
+    pub crumb_chip_inset: f32,
+    /// Corner radius of a crumb chip (`toolbar.css:86`, `border-radius: 4px`).
+    pub crumb_corner_radius: u8,
     /// Fixed chrome the same estimate adds to a tab's text width (padding on both sides).
     pub tab_fixed_chrome: f32,
     /// Space the empty-pane placeholder leaves above its first line.
@@ -256,6 +265,10 @@ impl Tokens {
             tab_new_button: 22.0,
             tab_close_size: 14.0,
             crumb_max_width: 220.0,
+            crumb_chip_padding: 6.0,
+            crumb_separator_gap: 4.0,
+            crumb_chip_inset: 12.0,
+            crumb_corner_radius: 4,
             tab_fixed_chrome: 32.0,
             empty_pane_space: 24.0,
             drawer_section_gap: 4.0,

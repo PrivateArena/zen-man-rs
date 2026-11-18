@@ -21,11 +21,32 @@ use std::time::{Duration, SystemTime};
 use zenman_core::session::{Session, SessionPaths};
 use zenman_core::store::config::ZenConfig;
 
-/// A session in `zenman-ui-test-<pid>-<tag>`; two tests with different tags never collide.
+/// Where every fixture of this test binary lives: cargo's own per-integration-test scratch
+/// directory (`CARGO_TARGET_TMPDIR`, i.e. `<workspace>/target/tmp`) under `zenman-ui-fixtures`.
+///
+/// It is **deterministic**: no process id, so the *path painted into a snapshot baseline* — the
+/// breadcrumb of `02-file-list.png` / `03-file-grid.png` — is the same string on every run of the
+/// same checkout, which is what makes those PNGs byte-reproducible (plan §9.2 step-8c review 3).
+/// Collisions are impossible the other way: the directory is per *cargo test invocation* of one
+/// target, and every scene/test already passes its own unique tagged subdirectory, so two tests
+/// never share a tree. Only if the scratch directory cannot be created at all (a read-only or
+/// missing `target/`) does this fall back to the system temp directory — still pid-free.
+fn fixture_base() -> PathBuf {
+    let scratch = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("zenman-ui-fixtures");
+    if std::fs::create_dir_all(&scratch).is_ok() {
+        return scratch;
+    }
+    let fallback = std::env::temp_dir().join("zenman-ui-fixtures");
+    std::fs::create_dir_all(&fallback)
+        .expect("neither cargo's scratch directory nor the temp directory is creatable");
+    fallback
+}
+
+/// A session in `<scratch>/zenman-ui-fixtures/zenman-ui-test-<tag>`; two tags never collide.
 #[must_use]
 pub fn session(tag: &str) -> Session {
-    let dir = std::env::temp_dir().join(format!("zenman-ui-test-{}-{tag}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("the temp directory is creatable");
+    let dir = fixture_base().join(format!("zenman-ui-test-{tag}"));
+    std::fs::create_dir_all(&dir).expect("the fixture directory is creatable");
     let paths = SessionPaths::new(
         dir.join("config.json"),
         dir.join("action.log"),
@@ -61,7 +82,7 @@ const DAY: u64 = 86_400;
 /// The listing tree the file-pane and snapshot tests render.
 ///
 /// ```text
-/// <temp>/zenman-ui-fixture-<pid>-<tag>/listing/
+/// <scratch>/zenman-ui-fixtures/zenman-ui-fixture-<tag>/listing/
 ///   docs/                    (dir, three files inside)
 ///   reports/                 (dir, empty)
 ///   .hidden                  (a dot file: the backend never filters hidden rows)
@@ -78,7 +99,7 @@ const DAY: u64 = 86_400;
 /// Rebuilt on every call — idempotent, and cheap enough (hundreds of small files) that a test can
 /// not compare against a stale tree.
 pub fn listing_tree(tag: &str) -> PathBuf {
-    let root = std::env::temp_dir().join(format!("zenman-ui-fixture-{}-{tag}", std::process::id()));
+    let root = fixture_base().join(format!("zenman-ui-fixture-{tag}"));
     let listing = root.join("listing");
     std::fs::create_dir_all(listing.join("docs")).expect("fixture directory");
     std::fs::create_dir_all(listing.join("reports")).expect("fixture directory");
