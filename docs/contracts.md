@@ -264,9 +264,12 @@ The `unknown` path also leaves `size:0` and `mod_time:-62135596800` (Go's zero `
 Layout (`api/log.go:18-83`, cross-checked against `LOG-HEXDUMP.txt` and `LOG-RECORDS.json`):
 
 ```
-"ZMLG" | u64be latestID | i64be unixTime | u8 actionType | u8 status | u32be CRC32
+"ZMLG" | i64be id | i64be unix_nanoseconds | u8 actionType | u8 status | u32be recLen
 body: [u16be len][bytes] sources… | 0x0000 | [u16be len][bytes] dest | [u16be len][bytes] name
-record length = recLen (magic+header+body, CRC excluded); total_len = recLen + 4
+trailer: u32be CRC32/IEEE over everything before it
+recLen = magic+header+body (CRC excluded); total_len = recLen + 4
+
+*Corrected by step 5 against the bytes (this table previously labelled `recLen` as `CRC32` in the header row). Also measured there: no file header, no record count, **no end sentinel**; an empty log is a 0-byte file (`api/log.go:143`), not `[0xA5,0x5A]`; `/api/log` wraps as `{"count":N,"records":[…]}` (never `total`/`entries`, and `records` is `[]` when empty — `api/log.go:685-687`); a revert is an **in-place patch** of the status byte + re-sealed CRC (`api/log.go:355-386`), never a rewrite into a revert directory, and the file size does not change; the frame stores **nanoseconds** with no zone, so `log.json`’s `+07:00` is the capture host’s local zone and is not reproducible text; Go decodes *any* `actionType`/`status` byte (`api/log.go:486`, `""` for unknown action, `"done"` for any status but 1), so both are newtypes over `u8` rather than `#[repr(u8)]` enums if byte-identical re-encode is required. The golden `action.log` holds **19 records, 1 revert marker** (7 661 B, last frame ends at EOF).
 ```
 
 Big-endian throughout. `recLen` excludes the CRC field; `verifyCRC` (`:591-597`) covers every byte before it, **so the revert patch must recompute the CRC** — and demonstrably does: in the captured post-revert log, record 1 has `status:1` with `crc_ok:true`. The file is opened `O_RDWR|O_CREATE` **without `O_APPEND`**, appending via `Seek(0, io.SeekEnd)` (`:142`, `:245`). Path resolution: `$XDG_DATA_HOME|~/.local/share/zen-man/action.log`, falling back to `/tmp/zen-man` (`:122-131`). `isReversible = {PasteCopy, PasteMove, Rename, Mkdir, PasteLink}` (`:600-602`).
