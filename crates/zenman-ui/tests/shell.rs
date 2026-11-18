@@ -48,8 +48,13 @@ fn the_header_status_bar_and_pane_placeholder_are_in_the_tree() {
     harness.run();
     harness.get_by_label("Zen-Man");
     harness.get_by_label("test boot line");
-    harness.get_by_label_contains("pane(s)");
-    harness.get_by_label_contains("empty pane");
+    // Step 7's placeholder status line is gone: the bar is the real one (`panels/status_bar.rs`),
+    // so the assertions are its own words — the selection cell and the pane cell.
+    harness.get_by_label_contains("selected");
+    harness.get_by_label_contains("in the listing");
+    // And step 7's "empty pane" placeholder is now the no-tab placeholder (step 8 fills a pane that
+    // *has* a tab with the listing; this harness has none, which is the other half of the state).
+    harness.get_by_label_contains("no tab");
 }
 
 #[test]

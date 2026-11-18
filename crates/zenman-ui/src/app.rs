@@ -14,14 +14,18 @@ use std::time::Instant;
 
 use egui::{CentralPanel, Panel, Ui};
 
-use zenman_core::path::AbsPath;
-use zenman_core::session::{Session, StartupNote};
-use zenman_core::store::config::{LayoutMode, ThemeMode};
+use std::sync::Arc;
+
+use zenman_core::path::{AbsPath, FsPath};
+use zenman_core::services::dirs::ListDir;
+use zenman_core::session::{Receipt, Session, StartupNote};
+use zenman_core::store::config::{LayoutMode, PaneSlot, ThemeMode};
 
 use crate::dock::{self, Dock};
 use crate::jobs_ui::JobsUi;
+use crate::panels::{self, file_pane::PaneCommand};
 use crate::persist::Persisted;
-use crate::state::{AppModel, panes_for, quad_slots};
+use crate::state::{AppModel, TabId, panes_for, quad_slots};
 use crate::theme::{self, Tokens};
 use crate::widgets::{disk_meter, toast};
 
@@ -45,6 +49,8 @@ pub struct ZenApp {
     pub tokens: Tokens,
     /// The boot report lines (GPU profile, startup notes) shown in the header tooltip/status area.
     pub boot_lines: Vec<String>,
+    /// The context menu the panes asked for, waiting for step 10's `menus::Registry` to draw it.
+    pub context_request: Option<(PaneSlot, Option<usize>, egui::Pos2)>,
     /// When the next debounced persist is due (plan §5.7 `persist_at`).
     pub persist_at: Option<Instant>,
     /// The last frame's start, for the step-8 `perf_frame` budget check.
@@ -69,6 +75,7 @@ impl ZenApp {
             theme,
             tokens: Tokens::default(),
             boot_lines,
+            context_request: None,
             persist_at: None,
             last_frame: Instant::now(),
         }
@@ -89,6 +96,7 @@ impl ZenApp {
             theme,
             tokens: Tokens::default(),
             boot_lines,
+            context_request: None,
             persist_at: None,
             last_frame: Instant::now(),
         };
@@ -117,6 +125,278 @@ impl ZenApp {
         for note in notes {
             self.notices.post(toast::Level::Warning, note.message());
         }
+    }
+
+    /// Open a tab on `path` in `slot` and list it — the entry point step 8 exists for, and the
+    /// reason the panes are no longer empty (plan §7 row 8).
+    pub fn open_tab(&mut self, slot: PaneSlot, path: FsPath) -> TabId {
+        let title = tab_title(&path);
+        let id = self.model.next_tab_id();
+        {
+            let pane = self.model.pane_mut(slot);
+            pane.tabs.push(crate::state::Tab::new(id, path, title));
+            pane.active = pane.tabs.len() - 1;
+            pane.touch_mru(id);
+            id
+        };
+        self.list(slot, false, false);
+        id
+    }
+
+    /// List the shown tab, replacing or appending its page.
+    ///
+    /// The read goes through `Session::page_dir`, which answers `Done` when the directory cache has
+    /// it and `Running` when it must be read (plan §4.1); either way the frame that asked is the
+    /// frame that paints, because nothing here waits.
+    pub fn list(&mut self, slot: PaneSlot, append: bool, all: bool) {
+        let Some(tab) = self
+            .model
+            .panes
+            .get_mut(&slot)
+            .and_then(|p| p.active_tab_mut())
+        else {
+            return;
+        };
+        let origin = self.session.next_origin();
+        let limit = if all {
+            tab.total.max(tab.page_size)
+        } else {
+            tab.page_size
+        };
+        let cursor = if append {
+            Some(tab.entries.cursor)
+        } else {
+            None
+        };
+        let req = ListDir {
+            path: tab.path.clone(),
+            cursor,
+            limit,
+            sort: tab.sort,
+        };
+        tab.loading_more = append;
+        let receipt = self.session.page_dir(&req, origin);
+        match receipt {
+            Ok(Receipt::Done(page)) => {
+                let Some(tab) = self.tab_mut_of(slot) else {
+                    return;
+                };
+                if append {
+                    tab.append_page(page);
+                } else {
+                    tab.set_page(page);
+                }
+                tab.loading_more = false;
+            }
+            Ok(Receipt::Running { job, origin }) => {
+                if let Some(info) = self.session.job_info(job) {
+                    let tab_id = self.tab_id_of(slot);
+                    self.jobs.track(info, Some(slot), tab_id);
+                }
+                if let Some(pane) = self.model.panes.get_mut(&slot) {
+                    pane.loading.insert(origin);
+                    if let Some(tab) = pane.active_tab_mut() {
+                        tab.pending.insert(origin);
+                    }
+                }
+            }
+            Err(e) => {
+                if let Some(tab) = self.tab_mut_of(slot) {
+                    tab.error = Some(Arc::new(e));
+                    tab.loading_more = false;
+                }
+            }
+        }
+    }
+
+    fn tab_id_of(&self, slot: PaneSlot) -> Option<crate::state::TabId> {
+        self.model
+            .panes
+            .get(&slot)
+            .and_then(|p| p.active_tab())
+            .map(|t| t.id)
+    }
+
+    fn tab_mut_of(&mut self, slot: PaneSlot) -> Option<&mut crate::state::Tab> {
+        self.model.panes.get_mut(&slot)?.active_tab_mut()
+    }
+
+    /// Carry out one pane command (plan §4.1's bus, from `dock_content`'s draw).
+    pub fn run_command(&mut self, slot: PaneSlot, command: PaneCommand) {
+        match command {
+            PaneCommand::Navigate(path) => {
+                self.remember_selection(slot);
+                if let Some(tab) = self.tab_mut_of(slot) {
+                    tab.navigate_to(path.clone(), tab_title(&path));
+                }
+                self.list(slot, false, false);
+            }
+            PaneCommand::Back | PaneCommand::Forward => {
+                let path = {
+                    let Some(tab) = self.tab_mut_of(slot) else {
+                        return;
+                    };
+                    let path = if matches!(command, PaneCommand::Back) {
+                        tab.go_back()
+                    } else {
+                        tab.go_forward()
+                    };
+                    tab.sel.reset();
+                    path
+                };
+                if let Some(path) = path {
+                    if let Some(tab) = self.tab_mut_of(slot) {
+                        tab.path = path;
+                    }
+                    self.list(slot, false, false);
+                }
+            }
+            PaneCommand::Up => {
+                // `..` at the store root has nowhere to go: `FsPath::parent` is the honest guard
+                // (it answers `None` at `/`), so no extra filter is needed here — and a filter
+                // that is always true would be a comment pretending to be a check.
+                let parent = self.tab_mut_of(slot).and_then(|tab| tab.path.parent());
+                if let Some(parent) = parent {
+                    self.remember_selection(slot);
+                    if let Some(tab) = self.tab_mut_of(slot) {
+                        tab.navigate_to(parent.clone(), tab_title(&parent));
+                    }
+                    self.list(slot, false, false);
+                }
+            }
+            PaneCommand::BadAddress(text) => {
+                self.notices
+                    .post(crate::widgets::toast::Level::Warning, text);
+            }
+            PaneCommand::Open { ix } => {
+                let entry = self
+                    .tab_mut_of(slot)
+                    .and_then(|tab| tab.entries.entries.get(ix).cloned());
+                let Some(entry) = entry else { return };
+                let child = {
+                    let Some(tab) = self.tab_mut_of(slot) else {
+                        return;
+                    };
+                    tab.path
+                        .join_rel(&entry.rel_path)
+                        .ok()
+                        .or_else(|| tab.path.join(&entry.name).ok())
+                };
+                let Some(child) = child else { return };
+                if entry.is_dir {
+                    self.remember_selection(slot);
+                    if let Some(tab) = self.tab_mut_of(slot) {
+                        tab.navigate_to(child, entry.name.clone());
+                    }
+                    self.list(slot, false, false);
+                } else {
+                    // Plan §4.1's `Session::open` is step 9's write path; until then the shell says
+                    // so instead of pretending the row was opened.
+                    self.notices.post(
+                        crate::widgets::toast::Level::Info,
+                        format!("open: {}", entry.name),
+                    );
+                }
+            }
+            PaneCommand::Context { ix, at } => {
+                // Recorded, not drawn: `menus::Registry` is step 10's, and a right-click that
+                // selects its row is already half the behaviour.
+                self.context_request = Some((slot, ix, at));
+                if let Some(ix) = ix
+                    && let Some(tab) = self.tab_mut_of(slot)
+                {
+                    let keys: Vec<String> = tab
+                        .entries
+                        .entries
+                        .iter()
+                        .map(|e| crate::state::Tab::row_key(e).to_string())
+                        .collect();
+                    tab.sel.apply(
+                        crate::widgets::virtual_list::SelKind::Single,
+                        ix,
+                        keys.len(),
+                        |i| keys.get(i).map(String::as_str),
+                    );
+                }
+            }
+            PaneCommand::Sort(column) => {
+                if let Some(tab) = self.tab_mut_of(slot) {
+                    // Go's own rule (`api/dir.go:121-124`): a fresh column starts *ascending*, and
+                    // only a second click on the column already in play reverses it.
+                    let descending = tab.sort.column == column && !tab.sort.descending;
+                    tab.resort(zenman_core::store::config::SortSpec { column, descending });
+                }
+            }
+            PaneCommand::ToggleGrid => {
+                if let Some(tab) = self.tab_mut_of(slot) {
+                    tab.view = match tab.view {
+                        zenman_core::store::config::ViewMode::Grid => {
+                            zenman_core::store::config::ViewMode::List
+                        }
+                        _ => zenman_core::store::config::ViewMode::Grid,
+                    };
+                }
+            }
+            PaneCommand::SetFlat(flat) => {
+                if let Some(tab) = self.tab_mut_of(slot) {
+                    tab.flat = flat;
+                }
+            }
+            PaneCommand::LoadMore => self.list(slot, true, false),
+            PaneCommand::LoadAll => self.list(slot, true, true),
+            PaneCommand::Refresh => self.list(slot, false, false),
+            PaneCommand::NewTab => {
+                let path = self
+                    .tab_mut_of(slot)
+                    .map(|tab| tab.path.clone())
+                    .unwrap_or(FsPath::ROOT);
+                self.open_tab(slot, path);
+            }
+            PaneCommand::SelectTab(ix) => {
+                if let Some(pane) = self.model.panes.get_mut(&slot)
+                    && ix < pane.tabs.len()
+                {
+                    pane.active = ix;
+                    let id = pane.tabs[ix].id;
+                    pane.touch_mru(id);
+                }
+            }
+            PaneCommand::CloseTab(ix) => {
+                if let Some(pane) = self.model.panes.get_mut(&slot)
+                    && ix < pane.tabs.len()
+                {
+                    let id = pane.tabs.remove(ix).id;
+                    pane.mru.retain(|existing| *existing != id);
+                    pane.active = pane.active.min(pane.tabs.len().saturating_sub(1));
+                }
+            }
+            PaneCommand::SelectAll | PaneCommand::SelectNone => {
+                if let Some(tab) = self.tab_mut_of(slot) {
+                    let keys: Vec<String> = tab
+                        .entries
+                        .entries
+                        .iter()
+                        .map(|e| crate::state::Tab::row_key(e).to_string())
+                        .collect();
+                    if matches!(command, PaneCommand::SelectAll) {
+                        tab.sel
+                            .select_all(keys.len(), |i| keys.get(i).map(String::as_str));
+                    } else {
+                        tab.sel.select_none();
+                    }
+                }
+            }
+        }
+    }
+
+    /// File the active tab's selection under its directory (plan §4.3's `sel_by_path`).
+    fn remember_selection(&mut self, slot: PaneSlot) {
+        let Some(tab) = self.tab_mut_of(slot) else {
+            return;
+        };
+        let key = tab.path.to_string();
+        let sel = tab.sel.clone();
+        tab.sel_by_path.insert(key, sel);
     }
 
     /// Re-apply the theme after a change (settings load, `F5`-adjacent toggles from step 10).
@@ -198,17 +478,10 @@ impl ZenApp {
                     self.left_drawer(ui);
                 });
         }
-        let status = self.status_line();
         Panel::bottom("zenman-status")
             .exact_size(tokens.status_height)
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new(status)
-                            .color(tokens.text_muted)
-                            .size(tokens.font_size - 1.0),
-                    );
-                });
+                self.status_bar(ui);
             });
         CentralPanel::default().show(ui, |ui| {
             crate::dock_content::show(self, ui);
@@ -285,6 +558,60 @@ impl ZenApp {
         });
     }
 
+    /// The 30 px status bar (plan §5.8 `status_bar.rs`), fed by the active pane's tab.
+    fn status_bar(&mut self, ui: &mut Ui) {
+        let tokens = self.tokens;
+        let slot = self.model.active_pane;
+        let names = self
+            .model
+            .panes
+            .get(&slot)
+            .and_then(|p| p.active_tab())
+            .map(|tab| {
+                let order = panels::file_pane::RowOrder::build(tab);
+                order.selected_names(&tab.sel)
+            })
+            .unwrap_or_default();
+        let (selection, rows, error) = self
+            .model
+            .panes
+            .get(&slot)
+            .and_then(|p| p.active_tab())
+            .map(|tab| {
+                (
+                    tab.sel.clone(),
+                    tab.entries.entries.len(),
+                    tab.error.as_ref().map(|e| e.user_message()),
+                )
+            })
+            .unwrap_or_default();
+        // The live job, if any. Its own words and its own fraction — never a placeholder `0 of 0`,
+        // which is what this line used to print (plan §9.2 step-8 row, rough edge 5).
+        let live = self.jobs.foreground.iter().find(|job| job.live);
+        let info = match error {
+            Some(text) => panels::status_bar::StatusInfo::Error(text),
+            None => match live {
+                Some(job) if !job.spinner => panels::status_bar::StatusInfo::Running {
+                    label: job.label.clone(),
+                    frac: Some(job.frac),
+                },
+                Some(job) => panels::status_bar::StatusInfo::Running {
+                    label: job.label.clone(),
+                    frac: None,
+                },
+                None => panels::status_bar::StatusInfo::Count(rows),
+            },
+        };
+        let model = panels::status_bar::StatusModel {
+            selection: &selection,
+            names,
+            info,
+            jobs: &self.jobs.foreground,
+            panes: self.model.panes.len(),
+        };
+        panels::status_bar::show(ui, &model, &tokens);
+    }
+
     /// The right drawer: disks (plan §5.7: `widgets/disk_meter` is the point of it).
     fn right_drawer(&mut self, ui: &mut Ui) {
         let tokens = self.tokens;
@@ -331,7 +658,7 @@ impl ZenApp {
         }
         for bookmark in bookmarks {
             let label = bookmark.label.unwrap_or_else(|| bookmark.path.clone());
-            let _ = crate::icons::paint(
+            crate::icons::paint(
                 ui,
                 ui.available_rect_before_wrap(),
                 "folder",
@@ -390,6 +717,16 @@ impl ZenApp {
         if toggle.log {
             self.model.log_panel = !self.model.log_panel;
         }
+    }
+}
+
+/// The tab's title: the last path segment, `/` for the store root (Go used the same rule in
+/// `tabs.js`, where the tab's text was the directory name).
+#[must_use]
+pub fn tab_title(path: &FsPath) -> String {
+    match path.last_segment() {
+        Some(name) if !name.is_empty() => name.to_string(),
+        _ => "/".to_string(),
     }
 }
 
@@ -462,7 +799,7 @@ fn icon_button(
             ui.painter()
                 .rect_stroke(rect, radius, visuals.stroke, egui::StrokeKind::Inside);
         }
-        let _ = crate::icons::paint(ui, rect, icon, rect.height(), visuals.icon);
+        crate::icons::paint(ui, rect, icon, rect.height(), visuals.icon);
     }
     response.on_hover_text(tooltip)
 }

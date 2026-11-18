@@ -18,8 +18,12 @@ use std::sync::Arc;
 
 use zenman_core::entry::DirPage;
 use zenman_core::error::CoreError;
-use zenman_core::path::FsPath;
+use zenman_core::path::{AbsPath, FsPath};
 use zenman_core::session::Origin;
+use zenman_core::store::config::SortSpec;
+
+use crate::widgets::virtual_list::ScrollState;
+use crate::widgets::virtual_list::SelKind;
 
 pub use zenman_core::store::config::{GroupColor, LayoutMode, PaneSlot, ViewMode};
 
@@ -28,6 +32,216 @@ pub use zenman_core::store::config::{GroupColor, LayoutMode, PaneSlot, ViewMode}
 /// outlives every job it started).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TabId(pub u64);
+
+/// The listing's flat (recursive) view mode.
+///
+/// **Plan correction.** §5.8 calls this `FlatMode` and §5.7's `state.rs` row lists it among the
+/// `zenman_core::store::config` re-exports; the config enum is `ViewMode` and its `Flat` variant is
+/// the *persisted* "is this tab a flat listing" answer (`docs/contracts.md` deviation ledger row 4:
+/// Go stored `viewMode: "flat"`). The four-way answer Go kept in `tab.flatViewMode` was never in its
+/// config at all, so it has no wire spelling and belongs to the shell. `ViewMode::Flat` therefore
+/// stays the persisted value and this is the live one; [`FlatMode::from_view`] maps between them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FlatMode {
+    /// An ordinary directory listing.
+    #[default]
+    Off,
+    /// Every descendant, directories among them (Go's `mixed`).
+    Mixed,
+    /// Every descendant, files only (Go's `mixed_no_folders`).
+    MixedNoFolders,
+    /// Every descendant, files only, grouped under their directory (Go's `grouped`).
+    Grouped,
+}
+
+impl FlatMode {
+    /// The persisted spelling of this mode (`Flat` is "some flat mode", whichever the tab chose).
+    #[must_use]
+    pub const fn to_view(self) -> ViewMode {
+        match self {
+            Self::Off => ViewMode::List,
+            Self::Mixed | Self::MixedNoFolders | Self::Grouped => ViewMode::Flat,
+        }
+    }
+
+    /// The live mode a persisted value restores. The stored enum cannot tell the three flat modes
+    /// apart, so a migrated session comes back in Go's own default, `mixed`.
+    #[must_use]
+    pub const fn from_view(view: ViewMode) -> Self {
+        match view {
+            ViewMode::Flat => Self::Mixed,
+            ViewMode::List | ViewMode::Grid => Self::Off,
+        }
+    }
+
+    /// `true` when the listing is recursive, i.e. when rows carry a `rel_path`.
+    #[must_use]
+    pub const fn is_flat(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+}
+
+/// A tab's selection (plan §4.3 `sel` + `anchor`, §5.8's `PaneModel::sel`).
+///
+/// Keyed by the row's *listing-relative path* rather than by index, so a page swap or a reload
+/// cannot move the selection (plan F21 — Go re-sorted and re-assigned indexes and lost it).
+///
+/// `origin` is the anchor a shift-range extends from, and it is stored as a **key, not an index**:
+/// that is the "origin-preserving" half of plan §7 row 8. Go kept `anchorPath` (a path) for exactly
+/// this reason; an index anchor would point at a different file after a reload.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Selection {
+    /// The selected row keys.
+    keys: BTreeSet<String>,
+    /// The row a range extends from, by key.
+    origin: Option<String>,
+}
+
+impl Selection {
+    /// An empty selection.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The selected keys, in sort order (a `BTreeSet`).
+    #[must_use]
+    pub fn keys(&self) -> &BTreeSet<String> {
+        &self.keys
+    }
+
+    /// The range anchor, if one was ever set.
+    #[must_use]
+    pub fn origin(&self) -> Option<&str> {
+        self.origin.as_deref()
+    }
+
+    /// `true` when `key` is selected.
+    #[must_use]
+    pub fn contains(&self, key: &str) -> bool {
+        self.keys.contains(key)
+    }
+
+    /// The number of selected rows.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    /// `true` when nothing is selected.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    /// Forget the selection but keep the anchor (Go's `Esc` cleared the marks, not the anchor).
+    pub fn clear(&mut self) {
+        self.keys.clear();
+    }
+
+    /// Forget everything.
+    pub fn reset(&mut self) {
+        self.keys.clear();
+        self.origin = None;
+    }
+
+    /// The anchor's index in the visual order, if it is still part of it.
+    ///
+    /// A linear scan: it runs on a shift-click, not per frame, and the order is a closure because
+    /// the *pane* is what knows how a visual row maps to a row key (plan §5.8).
+    #[must_use]
+    pub fn origin_index<'a>(
+        &self,
+        len: usize,
+        key_at: impl Fn(usize) -> Option<&'a str>,
+    ) -> Option<usize> {
+        let origin = self.origin.as_deref()?;
+        (0..len).find(|ix| key_at(*ix) == Some(origin))
+    }
+
+    /// Apply one click (`Single`/`Add`/`Range`/`RangeAdd`, plan §5.8's `SelKind`).
+    ///
+    /// The semantics are Go's `handleItemClick` (`file-list.js:475-516`) with one fix: a range
+    /// whose anchor has vanished becomes a plain selection instead of silently toggling, and the
+    /// anchor always points at a real row.
+    pub fn apply<'a>(
+        &mut self,
+        kind: SelKind,
+        ix: usize,
+        len: usize,
+        key_at: impl Fn(usize) -> Option<&'a str>,
+    ) {
+        let Some(key) = key_at(ix).map(str::to_string) else {
+            return;
+        };
+        match kind {
+            SelKind::Single => {
+                self.keys.clear();
+                self.keys.insert(key.clone());
+                self.origin = Some(key);
+            }
+            SelKind::Add | SelKind::Drop => {
+                if !self.keys.remove(&key) {
+                    self.keys.insert(key.clone());
+                }
+                self.origin = Some(key);
+            }
+            SelKind::Range | SelKind::RangeAdd => {
+                let from = self.origin_index(len, &key_at);
+                let Some(from) = from else {
+                    self.keys.clear();
+                    self.keys.insert(key.clone());
+                    self.origin = Some(key);
+                    return;
+                };
+                if kind == SelKind::Range {
+                    self.keys.clear();
+                }
+                let (lo, hi) = if from <= ix { (from, ix) } else { (ix, from) };
+                for index in lo..=hi {
+                    if let Some(row) = key_at(index) {
+                        self.keys.insert(row.to_string());
+                    }
+                }
+                // Go leaves `anchorPath` where it was, and so does the port: repeated shift-clicks
+                // extend from the same origin.
+            }
+        }
+    }
+
+    /// Select every row of the visual order (Go's `selectAll`, `file-list.js:679-691`).
+    pub fn select_all<'a>(&mut self, len: usize, key_at: impl Fn(usize) -> Option<&'a str>) {
+        for index in 0..len {
+            if let Some(key) = key_at(index) {
+                self.keys.insert(key.to_string());
+            }
+        }
+        if self.origin.is_none() {
+            self.origin = key_at(0).map(str::to_string);
+        }
+    }
+
+    /// Select nothing, keeping the anchor.
+    pub fn select_none(&mut self) {
+        self.keys.clear();
+    }
+
+    /// Forget rows that are no longer in the listing (plan F21's second half, after a reload).
+    /// Adopt the keys of a reloaded listing that still exist (plan F21's second half).
+    pub fn retain<'a>(&mut self, len: usize, key_at: impl Fn(usize) -> Option<&'a str>) {
+        let alive: BTreeSet<String> = (0..len)
+            .filter_map(|ix| key_at(ix).map(str::to_string))
+            .collect();
+        self.keys.retain(|key| alive.contains(key));
+        if self
+            .origin
+            .as_ref()
+            .is_some_and(|origin| !alive.contains(origin))
+        {
+            self.origin = None;
+        }
+    }
+}
 
 /// One tab: a directory, a selection, a pending-job set (plan §4.3's field list).
 #[derive(Clone, Debug)]
@@ -42,16 +256,23 @@ pub struct Tab {
     pub history: Vec<FsPath>,
     /// Cursor into `history`; `history.len()` means "not in history" until the first navigation.
     pub hist_ix: usize,
-    /// Selected entry names — keyed by **name**, not index, so a reload cannot lose them
-    /// (plan F21's first half).
-    pub sel: BTreeSet<String>,
-    /// Anchor row for shift-click, an index into the *current* visual order.
-    pub anchor: Option<usize>,
+    /// The selection — keyed by row key, never by index, so a reload cannot lose it
+    /// (plan F21's first half), and carrying the range anchor (its *origin*).
+    pub sel: Selection,
     /// Per-directory selection memory (plan §4.3: the reason a tab that went away and came back
     /// still remembers what was picked).
-    pub sel_by_path: BTreeMap<String, BTreeSet<String>>,
+    pub sel_by_path: BTreeMap<String, Selection>,
     /// List or grid.
     pub view: ViewMode,
+    /// The flat (recursive) listing mode of this tab (plan §5.8's `flat`).
+    pub flat: FlatMode,
+    /// The column order the rows are shown in. A header click changes this *and re-sorts the loaded
+    /// rows*, which is the plan's "without a refetch" rule.
+    pub sort: SortSpec,
+    /// The flat listing's collapsed groups, by directory key (Go's `collapsedFileGroups`).
+    pub collapsed_groups: BTreeSet<String>,
+    /// The scroller's state (plan §5.8's `scroll: &mut ScrollState`).
+    pub scroll: ScrollState,
     /// The current page; shared, never cloned per frame (plan §4.3 rule 1).
     pub entries: Arc<DirPage>,
     /// Row count of the whole listing (the page's own `total_count`, mirrored for cheap reads).
@@ -62,12 +283,19 @@ pub struct Tab {
     pub group: Option<GroupColor>,
     /// A `load-more` page is in flight.
     pub loading_more: bool,
+    /// The page size this tab asked for (the banner quotes it; the shell sets it from
+    /// `Limits::dir_page_default`).
+    pub page_size: usize,
     /// The listing's error, shown *in this tab only* (plan §5.6: Go showed the last error
     /// globally). `Arc` because `CoreError` is not `Clone` (plan §9.2 step-3 fact) and the event
     /// hands out `Arc<CoreError>` — the plan's `Option<CoreError>` cannot be filled from one.
     pub error: Option<Arc<CoreError>>,
     /// Jobs asked of this tab, by origin — the correlation record (plan §4.3's correlation rule).
     pub pending: BTreeSet<Origin>,
+    /// The row a drag started on this frame, `None` when nothing is being dragged. Step 9's
+    /// `DockContent::resolve_drag` reads it to build the payload; the pane records it from
+    /// `RowEvent::DndGrab` (plan §5.8's `DndGrab{ix}`).
+    pub drag_row: Option<usize>,
 }
 
 impl Tab {
@@ -82,15 +310,20 @@ impl Tab {
             title,
             history: Vec::new(),
             hist_ix: 0,
-            sel: BTreeSet::new(),
-            anchor: None,
+            sel: Selection::new(),
             sel_by_path: BTreeMap::new(),
             view: ViewMode::default(),
+            flat: FlatMode::default(),
+            sort: SortSpec::DEFAULT_SORT,
+            collapsed_groups: BTreeSet::new(),
+            scroll: ScrollState::default(),
             entries: empty,
             total: 0,
             has_more: false,
             group: None,
             loading_more: false,
+            page_size: DEFAULT_PAGE_SIZE,
+            drag_row: None,
             error: None,
             pending: BTreeSet::new(),
         }
@@ -125,6 +358,145 @@ pub struct Pane {
     /// Refreshes in flight. **Not a bool**: two refreshes in one pane must not clear each other's
     /// spinner nor hang one (plan §4.3).
     pub loading: BTreeSet<Origin>,
+    /// The address field is open (plan §5.8's breadcrumb row; the pane owns it, Go owned one per
+    /// pane too).
+    pub address_editing: bool,
+    /// Its buffer.
+    pub address_buffer: String,
+    /// The tab strip's overflow list is open.
+    pub tabs_overflow_open: bool,
+}
+
+impl Tab {
+    /// The key a row is selected by: its listing-relative path, which is its name in an ordinary
+    /// directory and its `a/b/c.txt` in a flat one (where names repeat).
+    #[must_use]
+    pub fn row_key(entry: &zenman_core::entry::FileEntry) -> &str {
+        if entry.rel_path.is_empty() {
+            &entry.name
+        } else {
+            &entry.rel_path
+        }
+    }
+
+    /// Move the tab to `path`: the history grows (no depth cap, Go parity) and any forward entries
+    /// the user had gone back past are truncated (plan §5.8's breadcrumb Done-when).
+    ///
+    /// Returns the previous path, which is what the caller stores in the per-directory selection
+    /// memory before the view changes.
+    pub fn navigate_to(&mut self, path: FsPath, title: impl Into<String>) -> Option<FsPath> {
+        let previous = self.path.clone();
+        // Anything the user had gone *forward* past is gone: a new navigation from the middle of
+        // the trail truncates it (plan §5.8's breadcrumb Done-when).
+        self.history.truncate(self.hist_ix);
+        if previous != path {
+            self.history.push(previous.clone());
+        }
+        self.hist_ix = self.history.len();
+        self.title = title.into();
+        self.path = path;
+        self.sel.reset();
+        self.scroll = ScrollState::default();
+        self.collapsed_groups.clear();
+        (previous != self.path).then_some(previous)
+    }
+
+    /// `true` when there is somewhere to go back to.
+    #[must_use]
+    pub fn can_go_back(&self) -> bool {
+        self.hist_ix > 0
+    }
+
+    /// `true` when there is somewhere to go forward to.
+    #[must_use]
+    pub fn can_go_forward(&self) -> bool {
+        self.hist_ix < self.history.len()
+    }
+
+    /// Step back one entry, returning the path to list.
+    pub fn go_back(&mut self) -> Option<FsPath> {
+        if !self.can_go_back() {
+            return None;
+        }
+        self.hist_ix -= 1;
+        let path = self.history.get(self.hist_ix).cloned()?;
+        self.title = path.last_segment().unwrap_or("/").to_string();
+        Some(path)
+    }
+
+    /// Step forward one entry, returning the path to list.
+    pub fn go_forward(&mut self) -> Option<FsPath> {
+        if !self.can_go_forward() {
+            return None;
+        }
+        let path = self.history.get(self.hist_ix).cloned()?;
+        self.hist_ix += 1;
+        self.title = path.last_segment().unwrap_or("/").to_string();
+        Some(path)
+    }
+
+    /// The absolute path a row points at, `None` when the tab is on an archive (plan §4.2: only a
+    /// local path can have a `dir_size` answer).
+    #[must_use]
+    pub fn row_abs(&self, entry: &zenman_core::entry::FileEntry) -> Option<AbsPath> {
+        let path = if entry.rel_path.is_empty() {
+            self.path.clone()
+        } else {
+            self.path.join_rel(&entry.rel_path).ok()?
+        };
+        path.host_abs()
+    }
+
+    /// The selected rows' names, in listing order (the status bar's tooltip; Go's was insertion
+    /// order, plan §5.8's fix).
+    #[must_use]
+    pub fn selected_names(&self) -> Vec<String> {
+        self.entries
+            .entries
+            .iter()
+            .filter(|entry| self.sel.contains(Self::row_key(entry)))
+            .map(|entry| entry.name.clone())
+            .collect()
+    }
+
+    /// Rows of the whole listing that are not loaded yet.
+    #[must_use]
+    pub fn rows_left(&self) -> usize {
+        self.total.saturating_sub(self.entries.entries.len())
+    }
+
+    /// Install a freshly listed page (plan §4.3: the tab's `Arc`, never its contents, is replaced).
+    pub fn set_page(&mut self, page: Arc<DirPage>) {
+        self.total = page.total_count;
+        self.has_more = page.has_more;
+        self.entries = page;
+        self.error = None;
+        self.scroll.reset_load_more();
+    }
+
+    /// Append a `load-more` page (Go's `tab.loadedEntries.concat(data.entries)`).
+    ///
+    /// The one place a listing is copied, and it is copied on a page boundary, never per frame.
+    pub fn append_page(&mut self, page: Arc<DirPage>) {
+        let mut merged = (*self.entries).clone();
+        merged.entries.extend(page.entries.iter().cloned());
+        merged.cursor = page.cursor;
+        merged.has_more = page.has_more;
+        merged.total_count = page.total_count;
+        merged.loaded_so_far = merged.entries.len();
+        self.total = merged.total_count;
+        self.has_more = merged.has_more;
+        self.entries = Arc::new(merged);
+        self.scroll.reset_load_more();
+    }
+
+    /// Re-sort the loaded rows in place (the header click's "without a refetch", plan §5.8).
+    pub fn resort(&mut self, sort: SortSpec) {
+        self.sort = sort;
+        let mut rows = (*self.entries).clone();
+        zenman_core::services::sort::sort_entries(&mut rows.entries, sort);
+        self.entries = Arc::new(rows);
+    }
 }
 
 impl Pane {
@@ -150,6 +522,10 @@ impl Pane {
         }
     }
 }
+
+/// The page size a fresh tab asks the engine for, until the shell applies `Limits`
+/// (`Limits::dir_page_default` is the same 200 Go used; the value is passed in by the caller).
+pub const DEFAULT_PAGE_SIZE: usize = 200;
 
 /// [`Pane::mru`] capacity, plan §4.3's "cap 5".
 pub const MRU_CAP: usize = 5;

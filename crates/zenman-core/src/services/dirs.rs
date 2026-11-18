@@ -997,6 +997,31 @@ impl Row {
     }
 }
 
+/// The listing order reads a pre-projection row through the same comparator a wire row uses
+/// ([`crate::services::sort::SortRow`]), which is what keeps a page boundary and a header click in
+/// agreement (plan §5.8: "re-sorts locally **without a refetch**").
+impl crate::services::sort::SortRow for Row {
+    fn sort_name(&self) -> String {
+        self.dirent.file_name().to_lowercase()
+    }
+
+    fn raw_name(&self) -> &str {
+        self.dirent.file_name()
+    }
+
+    fn is_dir(&self) -> bool {
+        Row::is_dir(self)
+    }
+
+    fn sort_size(&self) -> i64 {
+        size_of(self)
+    }
+
+    fn sort_mtime(&self) -> i64 {
+        mtime_of(self)
+    }
+}
+
 /// The listing must be a filesystem path to be read here; an archive path belongs to the archive
 /// service, and this is plan §4.2's "one remaining `match` on `FsPath::Archive` in the dispatcher".
 fn require_local(path: &FsPath) -> Result<AbsPath, CoreError> {
@@ -1019,31 +1044,7 @@ fn require_local(path: &FsPath) -> Result<AbsPath, CoreError> {
 /// **within** each class so the dirs-first invariant survives both directions
 /// (`dir-sort-date-desc.json`).
 fn sort_rows(rows: &mut Vec<Row>, sort: SortSpec) {
-    rows.sort_by(|a, b| {
-        a.is_dir()
-            .cmp(&b.is_dir())
-            .reverse()
-            .then_with(|| match sort.column {
-                SortColumn::Size => size_of(a).cmp(&size_of(b)),
-                SortColumn::Date => mtime_of(a).cmp(&mtime_of(b)),
-                SortColumn::Name | SortColumn::Mode | SortColumn::Ext => a
-                    .dirent
-                    .file_name()
-                    .to_lowercase()
-                    .cmp(&b.dirent.file_name().to_lowercase()),
-            })
-    });
-    if sort.descending {
-        // Reverse *within* each class, so dirs-first survives both directions exactly as Go's reversed
-        // comparison does (`dir-sort-date-desc.json` starts with the directory too).
-        let (mut dirs, mut files): (Vec<Row>, Vec<Row>) =
-            rows.iter().cloned().partition(Row::is_dir);
-        dirs.reverse();
-        files.reverse();
-        rows.clear();
-        rows.extend(dirs);
-        rows.extend(files);
-    }
+    crate::services::sort::sort_by(rows, sort);
 }
 
 fn size_of(row: &Row) -> i64 {

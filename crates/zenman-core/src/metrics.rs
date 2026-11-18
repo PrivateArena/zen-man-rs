@@ -9,7 +9,7 @@
 //! quoted in plan §2.1). Encoding is UTC, per `docs/contracts.md` §2.4 row *Log timestamps* ("decode
 //! accepts any offset; encode in UTC").
 
-use chrono::TimeZone as _;
+use chrono::{Datelike as _, TimeZone as _};
 use serde::Serialize;
 
 /// A folder-size answer: bytes, and how many files that byte count was computed over.
@@ -107,6 +107,29 @@ fn format_mod_time_offset(unix: Option<i64>, offset: Option<chrono::FixedOffset>
         return "--".to_string();
     };
     dt.format("%Y-%m-%d %H:%M").to_string()
+}
+
+/// A file row's modification time, `YYYY MMM D, HH:MM` in UTC — the shape the Go frontend rendered
+/// (`frontend/js/utils.js:9-18`, `toLocaleDateString` with `month: "short"`), which plan §5.8's
+/// `format_mtime` keeps. `--` for unknown and for Go's zero `time.Time`, as in
+/// [`format_mod_time`].
+///
+/// It lives here rather than in the widget crate because formatting an instant needs `chrono`, and
+/// `chrono` is a core dependency: the UI's date cell is [`zenman_core::metrics::format_mtime`], not
+/// a second implementation (plan §2.3 counts Go's duplicated `formatSize` as a bug).
+#[must_use]
+pub fn format_mtime(unix: Option<i64>) -> String {
+    let Some(dt) = at(unix, chrono::FixedOffset::east_opt(0)) else {
+        return "--".to_string();
+    };
+    // `dt.day()` rather than a `%e`/`%-d` specifier: chrono has no unpadded-day token, and the
+    // Go shape (`toLocaleDateString`, `day: "numeric"`) is unpadded.
+    format!(
+        "{} {}, {}",
+        dt.format("%Y %b"),
+        dt.day(),
+        dt.format("%H:%M")
+    )
 }
 
 /// RFC 3339 timestamp in UTC (or `--`), the encoding half of *Log timestamps* in `docs/contracts.md`.
@@ -219,5 +242,18 @@ mod tests {
         assert_eq!(s.len(), "2026-01-01 00:00".len(), "{s}");
         assert!(s.as_bytes()[4] == b'-');
         assert_eq!(format_mod_time_local(None), "--");
+    }
+
+    #[test]
+    fn format_mtime_is_the_row_shape() {
+        // 1 767 225 600 is the fixture tree's mtime (`dir-root.json`), 2026-01-01 00:00 UTC.
+        assert_eq!(format_mtime(Some(1_767_225_600)), "2026 Jan 1, 00:00");
+        assert_eq!(
+            format_mtime(Some(1_767_225_600 + 41 * 86_400 + 12 * 3600 + 5)),
+            "2026 Feb 11, 12:00",
+            "the seconds are dropped, as Go's `HH:MM` drops them"
+        );
+        assert_eq!(format_mtime(None), "--");
+        assert_eq!(format_mtime(Some(GO_ZERO_TIME_UNIX)), "--");
     }
 }

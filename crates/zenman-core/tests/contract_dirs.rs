@@ -42,6 +42,7 @@ use zenman_core::entry::DirListing;
 use zenman_core::error::CoreError;
 use zenman_core::events::EngineEvent;
 use zenman_core::limits::Limits;
+use zenman_core::mode::ModeKind;
 use zenman_core::path::{AbsPath, FsPath};
 use zenman_core::platform::Env;
 use zenman_core::platform::env_probe::ProbeReport;
@@ -714,6 +715,388 @@ fn props_probed_once() {
         1
     );
     let _ = session.poll();
+}
+
+// ---------------------------------------------------------------------------- flat (recursive) listings
+
+/// One `dir-flat-*.json` capture and the request `tests/golden/INDEX.json` records behind it.
+struct FlatCase {
+    /// The capture name.
+    golden: &'static str,
+    /// The tree-relative listing root.
+    sub: &'static str,
+    /// `no_folders=true` (`api/dir.go:127`): the walk yields files only.
+    no_folders: bool,
+    /// The captured `total_count` — the walk's own row count, cap included.
+    total: usize,
+    /// The captured page's `has_more`.
+    has_more: bool,
+    /// Rows on the captured page.
+    page: usize,
+}
+
+const FLAT_CASES: &[FlatCase] = &[
+    // `flat=true` — every descendant, directories among them (the shell's `FlatMode::Mixed`).
+    FlatCase {
+        golden: "dir-flat-subdir",
+        sub: "tree/subdir",
+        no_folders: false,
+        total: 3,
+        has_more: false,
+        page: 3,
+    },
+    // `flat=true&no_folders=true` (`FlatMode::MixedNoFolders`): the two files, no directory rows.
+    FlatCase {
+        golden: "dir-flat-nofolders",
+        sub: "tree/subdir",
+        no_folders: true,
+        total: 2,
+        has_more: false,
+        page: 2,
+    },
+    // The deep tree: 21 rows, ordered by *base name* (dirs first), not by `rel_path` — the order
+    // is the sort's, and `d0/d1/d2…` nests deeper than `…/d10`, which is what makes this case the
+    // one that pins the comparator.
+    FlatCase {
+        golden: "dir-flat-deep",
+        sub: "tree/deep",
+        no_folders: false,
+        total: 21,
+        has_more: false,
+        page: 21,
+    },
+    // The cap: a 10 005-entry directory, `limit=5`, `total_count` the cap itself, `cursor: "5"`.
+    FlatCase {
+        golden: "dir-flat-cap",
+        sub: "tree/flatcap",
+        no_folders: false,
+        total: 10_000,
+        has_more: true,
+        page: 5,
+    },
+];
+
+/// Plan §7 step 8's contract row: the flat-mode captures, row by row, against the tree on disk.
+///
+/// # What this can assert today, and what it cannot
+///
+/// **Asserted here** — everything a capture states about a *real* path:
+///
+/// * every row's `mode` string is `ModeKind::from_unix(lstat(rel_path))` rendered through
+///   `Display`, and `ModeKind::parse_mode` reads that string back to the same kind (the round trip
+///   the file row depends on, plan §5.8's `mode_cell`);
+/// * `is_dir`, `size`, `mod_time`, `name` and `depth` are the lstat facts of that path — including
+///   Go's `depth = strings.Count(rel, "/")` (`api/dir.go:153-160`);
+/// * the **row set and its order** are what a recursive walk plus
+///   [`zenman_core::services::sort::sort_by`] produce, so the flat ordering rule (base name,
+///   lowercase byte compare, directories first in both directions) is a checked contract;
+/// * `total_count`, `has_more`, the page length and the walk cap of [`Limits::flat_walk_cap`]
+///   against a directory that exceeds it;
+/// * that the tree on disk *is* the captured tree, by comparing the walked paths against the
+///   `fixture-tree/1` manifest of `docs/fixtures.md` — the same manifest
+///   `cargo xtask fixture-tree` diffs the generator's output against, and the reason this test
+///   cannot quietly be comparing against a different tree.
+///
+/// **Not assertable today, and that is a fact about step 8, not about this test**: the *engine's*
+/// flat walk. `ListDir` has no `flat`/`no_folders` field — `services/dirs.rs:162` says so out loud
+/// ("`flat`/`no_folders`, whose walk arrives with `ops/list.rs` in step 9") — so there is no
+/// `Session` call that could produce these pages. Step 9 adds the field and the walk; the
+/// *expectation* is already computed here, so what is missing is only the call, never the answer.
+/// Recorded in plan §9.2's step-8 row, together with the pane's matching disabled buttons.
+#[test]
+fn flat_modes_match_go() {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let fix = fixtures();
+    let cap = Limits::default().flat_walk_cap;
+    let manifest = fixture_tree_manifest();
+    let mut rows_checked = 0usize;
+    let mut modes = std::collections::BTreeSet::new();
+    for case in FLAT_CASES {
+        let payload = golden(case.golden);
+        let root = fix.root.join(case.sub);
+        assert!(
+            root.is_dir(),
+            "{}: {} must exist",
+            case.golden,
+            root.display()
+        );
+
+        // 1. the capture's own fields.
+        assert_eq!(
+            payload["path"].as_str().expect("a path"),
+            format!("${{FIXTURE_ROOT}}/{}", case.sub),
+            "{}: the capture's own root",
+            case.golden
+        );
+        let rows = payload["entries"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{}: no entries array", case.golden));
+        assert_eq!(rows.len(), case.page, "{}: page length", case.golden);
+        assert_eq!(
+            payload["total_count"].as_u64().expect("a total") as usize,
+            case.total,
+            "{}: total_count",
+            case.golden
+        );
+        assert_eq!(
+            payload["has_more"].as_bool().expect("has_more"),
+            case.has_more,
+            "{}: has_more",
+            case.golden
+        );
+        assert_eq!(
+            case.total.min(cap),
+            case.total,
+            "{}: a walk never exceeds its cap",
+            case.golden
+        );
+
+        // 2. every row against the lstat of the path it names.
+        for row in rows {
+            let rel = row["rel_path"].as_str().expect("a flat row has a rel_path");
+            assert!(
+                !rel.is_empty(),
+                "{}: flat rows carry `rel_path`",
+                case.golden
+            );
+            let path = root.join(rel);
+            let meta = path
+                .symlink_metadata()
+                .unwrap_or_else(|e| panic!("{}: {} missing: {e}", case.golden, path.display()));
+            let kind = ModeKind::from_unix(meta.mode());
+            let want = row["mode"].as_str().expect("a mode string");
+            assert_eq!(kind.to_string(), want, "{}: {rel}'s mode", case.golden);
+            assert_eq!(
+                ModeKind::parse_mode(want),
+                kind,
+                "{}: {rel}'s mode string must read back to the kind that wrote it",
+                case.golden
+            );
+            assert_eq!(
+                ModeKind::parse_mode(want).to_string(),
+                want,
+                "{rel}: Display round trip"
+            );
+            modes.insert(want.to_string());
+            assert_eq!(
+                row["is_dir"].as_bool().expect("is_dir"),
+                meta.is_dir(),
+                "{}: {rel}'s is_dir is the lstat answer (a symlink is not a directory)",
+                case.golden
+            );
+            if !meta.is_dir() || fix.go_directory_sizes {
+                // A directory's `st_size` belongs to its filesystem (the capture's tree was on tmpfs);
+                // the same field `dir_listing_matches_go` skips, and for the same reason.
+                assert_eq!(
+                    row["size"].as_i64().expect("a size") as u64,
+                    meta.len(),
+                    "{}: {rel}'s size is the lstat size",
+                    case.golden
+                );
+            }
+            assert_eq!(
+                row["mod_time"].as_i64().expect("a mod_time"),
+                meta.mtime(),
+                "{}: {rel}'s mtime is the lstat mtime",
+                case.golden
+            );
+            assert_eq!(
+                row["name"].as_str().expect("a name"),
+                rel.rsplit('/').next().expect("a last component"),
+                "{}: {rel}'s name is its last component",
+                case.golden
+            );
+            assert_eq!(
+                row["depth"].as_i64().unwrap_or(0),
+                rel.matches('/').count() as i64,
+                "{}: {rel}'s depth is its separator count (`api/dir.go:153-160`)",
+                case.golden
+            );
+            assert!(
+                !case.no_folders || !meta.is_dir(),
+                "{}: `no_folders` yields no directory rows, and {:?} is one",
+                case.golden,
+                rel
+            );
+            rows_checked += 1;
+        }
+
+        // 3. the whole walk: the captured row *sequence* is a recursive walk of this tree in
+        //    the listing order, truncated at the cap. The flat captures are name-ordered, which is
+        //    Go's own default, so the comparison is exact rather than set-shaped.
+        let mut walked = walk_flat(&root, case.no_folders);
+        assert_eq!(
+            walked.len().min(cap),
+            case.total,
+            "{}: walking {} yields the captured count ({} rows, cap {cap})",
+            case.golden,
+            root.display(),
+            case.total
+        );
+        zenman_core::services::sort::sort_by(&mut walked, SortSpec::DEFAULT_SORT);
+        let got: Vec<&str> = walked.iter().map(|row| row.rel.as_str()).collect();
+        let want: Vec<&str> = rows
+            .iter()
+            .map(|row| row["rel_path"].as_str().expect("rel"))
+            .collect();
+        assert_eq!(
+            got[..want.len()],
+            want,
+            "{}: the flat listing order",
+            case.golden
+        );
+
+        // 4. the tree on disk is the captured tree: every walked path is in the manifest, with the
+        //    same kind. `cargo xtask fixture-tree` is the byte-exact gate; this is the link between
+        //    *this* test's tree and that manifest.
+        if case.sub != "tree/flatcap" {
+            for rel in walk_paths(&root) {
+                let key = format!("{}/{}", case.sub.trim_start_matches("tree/"), rel);
+                assert!(
+                    manifest.contains_key(&key),
+                    "{}: {} is not in the `fixture-tree/1` manifest, so the tree this test walked
+   is not the tree the capture was taken from",
+                    case.golden,
+                    key
+                );
+            }
+        }
+    }
+    assert!(rows_checked > 20, "{rows_checked} rows is not a gate");
+    assert!(
+        modes.contains("drwxr-xr-x") && modes.contains("-rw-r--r--"),
+        "the flat captures must cover both a directory and a regular file mode: {modes:?}"
+    );
+    println!(
+        "contract_dirs::flat_modes_match_go: {rows_checked} rows, {} distinct mode strings, all \
+         round-tripped through ModeKind",
+        modes.len()
+    );
+}
+
+/// One walked row: enough to sort and compare, which is what the flat order is made of.
+struct Walked {
+    /// The listing-relative path (`rel_path` on the wire).
+    rel: String,
+    /// The base name, which is what the sort compares.
+    name: String,
+    /// The lstat directory answer.
+    is_dir: bool,
+}
+
+impl zenman_core::services::sort::SortRow for Walked {
+    fn sort_name(&self) -> String {
+        self.name.to_lowercase()
+    }
+
+    fn raw_name(&self) -> &str {
+        &self.name
+    }
+
+    fn is_dir(&self) -> bool {
+        self.is_dir
+    }
+
+    fn sort_size(&self) -> i64 {
+        // The name sort never reads it, and this walk is compared in name order only.
+        0
+    }
+
+    fn sort_mtime(&self) -> i64 {
+        zenman_core::metrics::GO_ZERO_TIME_UNIX
+    }
+}
+
+/// Every descendant of `dir`, as the flat walk sees it (`filepath.WalkDir`, minus the root).
+fn walk_flat(dir: &std::path::Path, no_folders: bool) -> Vec<Walked> {
+    walk_flat_from(dir, dir, no_folders)
+}
+
+fn walk_flat_from(root: &std::path::Path, dir: &std::path::Path, no_folders: bool) -> Vec<Walked> {
+    let mut out = Vec::new();
+    let entries =
+        std::fs::read_dir(dir).unwrap_or_else(|e| panic!("walking {}: {e}", dir.display()));
+    let mut names: Vec<_> = entries.flatten().map(|entry| entry.path()).collect();
+    names.sort();
+    for path in names {
+        let meta = path
+            .symlink_metadata()
+            .unwrap_or_else(|e| panic!("lstat {}: {e}", path.display()));
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .into_owned();
+        let is_dir = meta.is_dir();
+        if !(no_folders && is_dir) {
+            out.push(Walked {
+                rel,
+                name: path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+                is_dir,
+            });
+        }
+        if is_dir {
+            out.extend(walk_flat_from(root, &path, no_folders));
+        }
+    }
+    out
+}
+
+/// The same walk, as paths only (for the manifest cross-check).
+fn walk_paths(dir: &std::path::Path) -> Vec<String> {
+    walk_flat(dir, false)
+        .into_iter()
+        .map(|row| row.rel)
+        .collect()
+}
+
+/// The `fixture-tree/1` block of `docs/fixtures.md`: `path -> kind`.
+///
+/// Parsed here rather than shelled out to `cargo xtask fixture-tree` because this test needs the
+/// *rows*, and the gate prints a verdict. A missing manifest is a hard failure: unlike the gate,
+/// which may skip on a fresh clone, this file already requires the generated tree to exist.
+fn fixture_tree_manifest() -> std::collections::BTreeMap<String, String> {
+    let file = Path::new(REPO).join("docs/fixtures.md");
+    let text = std::fs::read_to_string(&file).unwrap_or_else(|e| {
+        panic!(
+            "{} is what ties this test's tree to the capture: {e}",
+            file.display()
+        )
+    });
+    let open = "```fixture-tree/1";
+    let start = text
+        .find(open)
+        .unwrap_or_else(|| panic!("{}: no {open} block", file.display()));
+    let body = &text[start + open.len()..];
+    let end = body
+        .find(
+            "
+```",
+        )
+        .unwrap_or_else(|| panic!("{}: an unterminated manifest block", file.display()));
+    let value: Value = serde_json::from_str(&body[..end]).expect("the manifest block is JSON");
+    let mut out = std::collections::BTreeMap::new();
+    for row in value["entries"].as_array().expect("manifest entries") {
+        let hex = row[0].as_str().expect("a hex path");
+        let kind = row[1].as_str().expect("a kind");
+        let Ok(bytes) = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).map_err(|e| e.to_string()))
+            .collect::<Result<Vec<u8>, String>>()
+        else {
+            panic!("manifest hex path {hex} is not hex");
+        };
+        out.insert(
+            String::from_utf8(bytes).expect("a UTF-8 manifest path"),
+            kind.to_string(),
+        );
+    }
+    out
 }
 
 // ------------------------------------------------------------------------------------ tree sanity

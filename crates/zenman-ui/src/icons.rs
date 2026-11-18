@@ -8,7 +8,7 @@
 
 use std::sync::OnceLock;
 
-use egui::{Color32, Image, ImageSource, Rect, Response, Ui, Vec2};
+use egui::{Color32, Image, ImageSource, Rect, Ui, Vec2};
 
 use zenman_core::entry::FileEntry;
 
@@ -178,12 +178,14 @@ pub fn image(name: &str, size: f32, tint: Color32) -> Image<'static> {
         .show_loading_spinner(false)
 }
 
-/// Paint an icon centred in `rect`, tinted `tint`. Returns the response so callers can make the
-/// icon interactive (the `craft_ui::buttons::IconButton::show` paint callback is the other consumer).
-pub fn paint(ui: &mut Ui, rect: Rect, name: &str, size: f32, tint: Color32) -> Response {
+/// Paint an icon centred in `rect`, tinted `tint` — **paint-only** (plan §9.2 step 8: `ui.put`
+/// allocates a rect, and the last-allocated overlapping rect wins hover/click in this egui fork,
+/// so decoration over a row's interaction rect would steal its clicks). Interactivity comes from
+/// the caller's own `ui.interact`/button, never from this call.
+pub fn paint(ui: &mut Ui, rect: Rect, name: &str, size: f32, tint: Color32) {
     let side = size.min(rect.width()).min(rect.height());
     let centred = Rect::from_center_size(rect.center(), Vec2::splat(side));
-    ui.put(centred, image(name, side, tint))
+    image(name, side, tint).paint_at(ui, centred);
 }
 
 /// The glyph for one directory row (plan row: this **replaces the `📁/📄/🔗` emoji scheme**).

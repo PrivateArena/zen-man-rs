@@ -16,3 +16,4 @@
 //!   it is the only place under `services/` where a filesystem call happens.
 
 pub mod dirs;
+pub mod sort;

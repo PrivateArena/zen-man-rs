@@ -14,6 +14,8 @@ use std::time::{Duration, Instant};
 
 use egui::ViewportCommand;
 
+use zenman_core::path::{AbsPath, FsPath};
+
 use crate::app_dirs::AppPaths;
 
 /// The window: the real shell plus the binary's own smoke timer.
@@ -66,6 +68,18 @@ impl ShellApp {
         }
         let mut shell = zenman_ui::app::ZenApp::with_persist(session, lines, persist);
         shell.post_startup_notes(notes);
+        // Plan §7 step 8: the binary opens a **real tab**, on the user's home directory — the
+        // Go app opened on the server's cwd, which is the kind of accident a desktop port does not
+        // repeat. When the host has no home at all (a container with an unset `HOME`, the same case
+        // `AppPaths::resolve` refuses for the config directory) the store root is the honest
+        // fallback, and it is listed through the engine like any other path.
+        let slot = shell.model.active_pane;
+        let start = paths
+            .home()
+            .and_then(|home| AbsPath::from_path(home).ok())
+            .map(FsPath::from_abs)
+            .unwrap_or(FsPath::ROOT);
+        shell.open_tab(slot, start);
         Self {
             shell,
             smoke_after,

@@ -109,6 +109,18 @@ impl AppPaths {
         self.data.join("run")
     }
 
+    /// The user's home directory — the directory a file manager opens on.
+    ///
+    /// Plan §7 step 8: `apps/zenman` opens its first tab here. Read through
+    /// [`directories::BaseDirs`] (the same source [`Self::zenman_go_legacy_config`] uses, and the
+    /// one that honours `HOME` on every platform), and `None` when the host has no home at all —
+    /// a container with an unset `HOME`, which is why the boot path has a fallback rather than an
+    /// unwrap. The Go app opened on `"/"` because its frontend had no home concept at all
+    /// (`tabs.js`, whose default tab path came from the server's cwd).
+    pub fn home(&self) -> Option<PathBuf> {
+        directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf())
+    }
+
     /// The Go app's hard-coded `~/.config/zen-man/config.json`, read-only (plan §5.4 step 4).
     ///
     /// Built without `ProjectDirs` on purpose: the Go program ignored XDG (plan §5.1 "Go's hard-coded

@@ -50,9 +50,18 @@ pub struct Tokens {
     pub selected_row_border: Color32,
     /// Active-pane border, `rgba(88,101,242,0.4)`.
     pub active_pane_border: Color32,
+    /// A grouped flat listing's header fill: `rgba(33, 37, 52, 0.4)` (`file-list.css:230`).
+    pub group_header_bg: Color32,
+    /// The `⚠ Loading limited…` banner's wash: `rgba(240, 178, 50, 0.05)` (`file-list.css:124`).
+    pub banner_bg: Color32,
+    /// The column-header row's height: the `padding: 10px 20px` of `.file-list-header`
+    /// (`file-list.css:11-17`) around one line of text.
+    pub header_row_height: f32,
     /// Menu shadow wash, the paint of `0 10px 25px rgba(0,0,0,.5)`; egui has no shadow blur, so the
     /// shadow is a darkened panel fill (deviation recorded in the step-7 §9.2 row).
     pub menu_shadow: Color32,
+    /// A disabled control's label (`--text-muted` at half weight; the CSS has no token for it).
+    pub disabled_text: Color32,
     /// A fully transparent colour, re-exported so no other module names `Color32::TRANSPARENT`.
     pub transparent: Color32,
     // ---- group colours (§2.3 `#ff4a4a #3b82f6 #10b981 #fbbf24 #8b5cf6`) -------------------------
@@ -89,6 +98,17 @@ pub struct Tokens {
     pub grid_tile_min: f32,
     /// Grid gap: 15.
     pub grid_gap: f32,
+    /// A grid tile's glyph, as a fraction of the tile's width (`file-list.css:88`, `font-size:
+    /// 2.5rem` against a 16 px root).
+    pub grid_glyph_fraction: f32,
+    /// …and of its height, so a narrow pane never gives the glyph more room than the tile has.
+    pub grid_glyph_height_fraction: f32,
+    /// Gap between a tile's glyph and its label (`file-list.css:87`, `margin-top: 5px`).
+    pub grid_label_gap: f32,
+    /// The share of a tile its two-line label may take.
+    pub grid_label_height_fraction: f32,
+    /// A tile's label size (`file-list.css:84`, `font-size: 0.85rem`).
+    pub grid_font_size: f32,
     /// Quick-find dialog width fraction: 0.8 (of the viewport, capped by [`Self::dialog_max_width`]).
     pub quick_find_fraction: f32,
     /// Search-manager dialog area fraction: 0.85.
@@ -126,6 +146,18 @@ pub struct Tokens {
     /// Nominal per-character advance of the placeholder tab-width estimate (step 8 replaces the
     /// estimate with galleys, and this token with it).
     pub tab_glyph_advance: f32,
+    /// Nominal advance as a fraction of the font size, for the breadcrumb's width estimate.
+    pub tab_glyph_advance_fraction: f32,
+    /// Smallest width [`craft_ui::tabs::fit`] may squeeze a tab to before it overflows.
+    pub tab_min_width: f32,
+    /// Width the strip reserves for its `▾` overflow button.
+    pub tab_overflow_width: f32,
+    /// Width the strip reserves for its `+` button.
+    pub tab_new_button: f32,
+    /// The `×` of a tab.
+    pub tab_close_size: f32,
+    /// Widest single breadcrumb segment.
+    pub crumb_max_width: f32,
     /// Fixed chrome the same estimate adds to a tab's text width (padding on both sides).
     pub tab_fixed_chrome: f32,
     /// Space the empty-pane placeholder leaves above its first line.
@@ -136,6 +168,23 @@ pub struct Tokens {
     pub drawer_icon_size: f32,
     /// How much narrower a header icon button is than the 48 px header it lives in.
     pub header_button_inset: f32,
+    // ---- file-list geometry (step 8; `frontend/css/file-list.css`) ------------------------------
+    /// Horizontal padding inside a file row: the `20px` of `padding: 8px 20px` (`file-list.css:33`).
+    pub row_pad_x: f32,
+    /// Vertical padding inside a file row: the `8px` of the same rule.
+    pub row_pad_y: f32,
+    /// Gap between two cells of a row (the name's `gap: 10px`, the right-aligned cells' inset).
+    pub cell_padding: f32,
+    /// The glyph a row or a drawer line paints.
+    pub row_icon_size: f32,
+    /// Gap between a row's glyph and its label (`file-list.css:49`, `gap: 10px`).
+    pub row_icon_gap: f32,
+    /// The width a group header gives its `▶`/`▼` toggle.
+    pub group_arrow_width: f32,
+    /// Rows built beyond the viewport in each direction (`file-list.js:127`, `const buffer = 5`).
+    pub overscan_rows: usize,
+    /// The height of the `⚠️ Loading limited…` banner (`file-list.js:120`, `warningHeight = 80`).
+    pub load_more_height: f32,
     // ---- type -----------------------------------------------------------------------------------
     /// Base UI font size (egui's default; the Go app's body text is 13 px Outfit, decision R9
     /// records that the port ships no bundled font).
@@ -167,6 +216,9 @@ impl Tokens {
             selected_row_border: Color32::from_rgba_unmultiplied(0x58, 0x65, 0xf2, 77),
             active_pane_border: Color32::from_rgba_unmultiplied(0x58, 0x65, 0xf2, 102),
             menu_shadow: Color32::from_rgba_unmultiplied(0x00, 0x00, 0x00, 128),
+            group_header_bg: Color32::from_rgba_unmultiplied(0x21, 0x25, 0x33, 102),
+            banner_bg: Color32::from_rgba_unmultiplied(0xf0, 0xb2, 0x32, 13),
+            disabled_text: Color32::from_rgba_unmultiplied(0x95, 0x9b, 0xa4, 110),
             transparent: Color32::TRANSPARENT,
             group_red: Color32::from_rgb(0xff, 0x4a, 0x4a),
             group_blue: Color32::from_rgb(0x3b, 0x82, 0xf6),
@@ -198,11 +250,31 @@ impl Tokens {
             tab_label_indent: 10.0,
             tab_label_reserve: 20.0,
             tab_glyph_advance: 8.0,
+            tab_glyph_advance_fraction: 0.62,
+            tab_min_width: 60.0,
+            tab_overflow_width: 22.0,
+            tab_new_button: 22.0,
+            tab_close_size: 14.0,
+            crumb_max_width: 220.0,
             tab_fixed_chrome: 32.0,
             empty_pane_space: 24.0,
             drawer_section_gap: 4.0,
             drawer_icon_size: 16.0,
             header_button_inset: 16.0,
+            row_pad_x: 20.0,
+            row_pad_y: 8.0,
+            cell_padding: 8.0,
+            row_icon_size: 16.0,
+            row_icon_gap: 10.0,
+            group_arrow_width: 16.0,
+            overscan_rows: 5,
+            header_row_height: 30.0,
+            load_more_height: 80.0,
+            grid_glyph_fraction: 0.45,
+            grid_glyph_height_fraction: 0.55,
+            grid_label_gap: 6.0,
+            grid_label_height_fraction: 0.35,
+            grid_font_size: 11.0,
             font_size: 13.0,
             corner_radius: 8,
         }
@@ -230,6 +302,9 @@ impl Tokens {
             selected_row_border: Color32::from_rgba_unmultiplied(0x4a, 0x56, 0xd6, 77),
             active_pane_border: Color32::from_rgba_unmultiplied(0x4a, 0x56, 0xd6, 102),
             menu_shadow: Color32::from_rgba_unmultiplied(0x00, 0x00, 0x00, 64),
+            disabled_text: Color32::from_rgba_unmultiplied(0x5c, 0x63, 0x70, 110),
+            group_header_bg: Color32::from_rgba_unmultiplied(0xc9, 0xcd, 0xd8, 102),
+            banner_bg: Color32::from_rgba_unmultiplied(0xc2, 0x8a, 0x1d, 13),
             transparent: Color32::TRANSPARENT,
             group_red: Color32::from_rgb(0xd6, 0x32, 0x32),
             group_blue: Color32::from_rgb(0x25, 0x63, 0xd0),
@@ -258,6 +333,26 @@ impl Tokens {
     #[must_use]
     pub fn font(&self) -> FontId {
         FontId::proportional(self.font_size)
+    }
+
+    /// A colour at the file row's cut opacity — the `opacity: 0.5` of `.cut-state`
+    /// (`file-list.css:41-43`), which egui cannot express per widget, so it is a colour: the mix of
+    /// the row's own colour with the card it sits on. The one place that blends two colours, which is
+    /// why it lives with the colours.
+    #[must_use]
+    pub fn dimmed(self, colour: Color32) -> Color32 {
+        /// The CSS opacity of a cut row.
+        const CUT_OPACITY: f32 = 0.5;
+        let mix = |a: u8, b: u8| {
+            let v = f32::from(a) * CUT_OPACITY + f32::from(b) * (1.0 - CUT_OPACITY);
+            v.round().clamp(0.0, 255.0) as u8
+        };
+        let bg = self.bg_card;
+        Color32::from_rgb(
+            mix(colour[0], bg[0]),
+            mix(colour[1], bg[1]),
+            mix(colour[2], bg[2]),
+        )
     }
 
     /// The hairline stroke every panel border uses.
@@ -469,6 +564,41 @@ mod tests {
     /// The glyph the font decision turns on: a tree/group arrow, drawn by step 8's tab bar and file
     /// rows, that egui's own proportional chain has no face for.
     const SYMBOL: char = '\u{25b8}';
+
+    /// Every non-ASCII glyph the shell paints, in one list (plan §9.2 step-8 row).
+    ///
+    /// This fork of egui **panics** on a missing glyph (`epaint/src/text/fonts.rs:825-851`), so a
+    /// character the stack cannot draw is a crash in the listing, not a cosmetic defect. Two
+    /// candidates step 8 removed for exactly that reason: `⟳` U+27F3 (the toolbar now paints the
+    /// `refresh` SVG) and `⚠` U+26A0 (the banner and the error row use a warning-coloured `!`).
+    /// Both are asserted *absent* below, so this list cannot silently grow back to include them.
+    const SHELL_GLYPHS: [char; 14] = [
+        '▸', '▾', '▴', '▲', '▼', '▶', '×', '·', '—', '…', '●', '←', '↑', '→',
+    ];
+
+    /// …and the two the stack provably lacks.
+    const UNDRAWABLE_GLYPHS: [char; 2] = ['\u{27f3}', '\u{26a0}'];
+
+    #[test]
+    fn every_glyph_the_shell_paints_has_a_face_in_the_installed_stack() {
+        let font = Tokens::dark().font();
+        let mut fonts = fonts::stack().fonts(false);
+        for glyph in SHELL_GLYPHS {
+            assert!(
+                fonts.has_glyph(&font, glyph),
+                "the installed stack cannot draw {glyph} (U+{:04X}), which in this fork is a panic \
+                 in the first frame that shows it",
+                u32::from(glyph)
+            );
+        }
+        for glyph in UNDRAWABLE_GLYPHS {
+            assert!(
+                !fonts.has_glyph(&font, glyph),
+                "U+{:04X} became drawable — the shell may stop working around it",
+                u32::from(glyph)
+            );
+        }
+    }
 
     #[test]
     fn fonts_install_adds_the_symbol_face_eguis_defaults_lack() {

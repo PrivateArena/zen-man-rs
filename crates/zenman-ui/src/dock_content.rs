@@ -8,10 +8,15 @@
 use craft_ui::docking::{DockArea, DockContent, DockOutput, DockStyle, Permissions};
 use egui::{Color32, Rect, Stroke, Ui, Window};
 
+use zenman_core::session::Session;
 use zenman_core::store::config::PaneSlot;
 
 use crate::app::ZenApp;
 use crate::dock::{self, DockId};
+use crate::panels::breadcrumb;
+use crate::panels::file_pane::{self, PaneCommand, PaneModel};
+use crate::panels::tab_bar::{self, TabBarModel, TabCommand};
+use crate::state::Pane;
 use crate::theme::Tokens;
 
 /// What a drop on a pane body should produce (plan row: `UiCommand::PasteInto`). The command bus
@@ -22,17 +27,20 @@ pub enum DropIntent {
     PasteInto { pane: PaneSlot },
 }
 
-/// One tab as the strip sees it: label, selected flag, group colour.
-type TabStripEntry = (String, bool, Option<zenman_core::store::config::GroupColor>);
-
 /// The mutable adapter `DockArea::show_content` calls into.
 pub struct PaneDock<'a> {
-    /// The shell state the bodies read (tab titles, empty pages).
+    /// The shell state the bodies read (tab titles, pages, selections).
     pub model: &'a mut crate::state::AppModel,
+    /// The engine, for the size cache the directory rows paint from.
+    pub session: &'a Session,
     /// The design tokens, so bodies never re-derive colours (the colour guard's other half).
     pub tokens: Tokens,
     /// Drops the body consumed this frame (drained by `show`).
     pub intents: Vec<DropIntent>,
+    /// The shell's job slots, so a pane can say "busy" (plan row's `busy: &[JobSlot]`).
+    pub jobs: &'a crate::jobs_ui::JobsUi,
+    /// Commands the panes produced this frame, in `(pane, command)` order.
+    pub commands: Vec<(PaneSlot, PaneCommand)>,
 }
 
 impl<'a> DockContent<DockId> for PaneDock<'a> {
@@ -95,8 +103,8 @@ impl<'a> DockContent<DockId> for PaneDock<'a> {
 }
 
 impl PaneDock<'_> {
-    /// One empty pane: strip, toolbar, placeholder (plan §5.7 Done-when: "four panes render with no
-    /// dock-drawn tab strip and no reserved header height").
+    /// One pane: its tab strip, its address strip, its listing (plan §5.7 `dock_content.rs`: the
+    /// dock draws no header of its own, so all three live here).
     fn pane(&mut self, ui: &mut Ui, slot: PaneSlot) {
         let tokens = self.tokens;
         let active = slot == self.model.active_pane;
@@ -106,29 +114,29 @@ impl PaneDock<'_> {
             Stroke::new(1.0, tokens.border)
         });
         frame.show(ui, |ui| {
-            let pane_has_tabs = self
+            let has_tabs = self
                 .model
                 .panes
                 .get(&slot)
                 .is_some_and(|pane| !pane.tabs.is_empty());
-            if pane_has_tabs {
+            if has_tabs {
                 self.tab_strip(ui, slot);
+                self.address_strip(ui, slot);
+                self.listing(ui, slot);
+            } else {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(tokens.empty_pane_space);
+                    ui.label(
+                        egui::RichText::new(placeholder_title(slot))
+                            .color(tokens.text_main)
+                            .strong(),
+                    );
+                    ui.label(
+                        egui::RichText::new("no tab — press + to open a directory")
+                            .color(tokens.text_muted),
+                    );
+                });
             }
-            ui.vertical_centered(|ui| {
-                ui.add_space(tokens.empty_pane_space);
-                let title = self
-                    .model
-                    .panes
-                    .get(&slot)
-                    .and_then(|pane| pane.active_tab())
-                    .map(|tab| tab.title.clone())
-                    .unwrap_or_else(|| placeholder_title(slot));
-                ui.label(egui::RichText::new(title).color(tokens.text_main).strong());
-                ui.label(
-                    egui::RichText::new("empty pane — step 8 fills it with the listing")
-                        .color(tokens.text_muted),
-                );
-            });
             // The pane takes focus on click (DockOutput::focused also reports it; both agree).
             if ui.input(|i| i.pointer.any_pressed())
                 && ui
@@ -140,92 +148,113 @@ impl PaneDock<'_> {
         });
     }
 
+    /// The listing half of the pane (plan §5.8 `file_pane.rs`).
+    fn listing(&mut self, ui: &mut Ui, slot: PaneSlot) {
+        let tokens = self.tokens;
+        let session = self.session;
+        let jobs: Vec<crate::jobs_ui::JobSlot> = self
+            .jobs
+            .foreground
+            .iter()
+            .filter(|job| job.live && job.pane == Some(slot))
+            .cloned()
+            .collect();
+        let Some(pane) = self.model.panes.get_mut(&slot) else {
+            return;
+        };
+        let loading = !pane.loading.is_empty();
+        let active = pane.active.min(pane.tabs.len().saturating_sub(1));
+        let sizes = |path: &zenman_core::path::AbsPath| {
+            session
+                .cached_dir_sizes(std::slice::from_ref(path))
+                .into_iter()
+                .next()
+                .flatten()
+                .map(|stat| stat.sizes())
+        };
+        let Pane { tabs, .. } = pane;
+        let Some(tab) = tabs.get_mut(active) else {
+            return;
+        };
+        let mut model = PaneModel {
+            slot,
+            tab,
+            loading,
+            jobs: &jobs,
+            sizes: &sizes,
+            visible_rows: 0,
+        };
+        let panel = DockId::FilePane(slot);
+        let commands = file_pane::show(ui, &panel, &mut model, &tokens);
+        self.commands
+            .extend(commands.into_iter().map(|cmd| (slot, cmd)));
+    }
+
+    /// The address strip (plan §5.8 `breadcrumb.rs`).
+    fn address_strip(&mut self, ui: &mut Ui, slot: PaneSlot) {
+        let tokens = self.tokens;
+        let Some(pane) = self.model.panes.get_mut(&slot) else {
+            return;
+        };
+        let active = pane.active.min(pane.tabs.len().saturating_sub(1));
+        let Pane {
+            tabs,
+            address_editing,
+            address_buffer,
+            ..
+        } = pane;
+        let Some(tab) = tabs.get(active) else {
+            return;
+        };
+        let can_back = tab.can_go_back();
+        let can_forward = tab.can_go_forward();
+        let mut out = Vec::new();
+        let mut model = breadcrumb::BreadcrumbModel {
+            path: &tab.path,
+            can_back,
+            can_forward,
+            editing: address_editing,
+            buffer: address_buffer,
+        };
+        breadcrumb::show(ui, &mut model, &tokens, &mut out);
+        self.commands.extend(out.into_iter().map(|cmd| (slot, cmd)));
+    }
+
     /// The coloured 38 px strip the pane owns *while its group is stripless* (plan §5.7: the dock
     /// reserves no header height for a protected single-panel group, which is what lets this live
-    /// here). Step 8's `panels/tab_bar.rs` inherits this job and its `craft_ui::tabs::fit` policy.
+    /// here). Step 8's `panels::tab_bar` is the implementation; this is the call site.
     fn tab_strip(&mut self, ui: &mut Ui, slot: PaneSlot) {
         let tokens = self.tokens;
-        let (active_ix, titles): (usize, Vec<TabStripEntry>) = {
-            let pane = match self.model.panes.get(&slot) {
-                Some(pane) => pane,
-                None => return,
+        let id = file_pane::pane_id(slot).with("strip");
+        let (commands, overflow_open) = {
+            let Some(pane) = self.model.panes.get(&slot) else {
+                return;
             };
-            let titles = pane
-                .tabs
-                .iter()
-                .enumerate()
-                .map(|(ix, tab)| (tab.title.clone(), ix == pane.active, tab.group))
-                .collect();
-            (pane.active, titles)
+            let mut model = TabBarModel {
+                tabs: &pane.tabs,
+                active: pane.active,
+                overflow_open: pane.tabs_overflow_open,
+            };
+            let mut out = Vec::new();
+            tab_bar::show(ui, id, &mut model, &tokens, &mut out);
+            (out, model.overflow_open)
         };
-        let _ = active_ix;
-        let (rect, response) = ui.allocate_at_least(
-            egui::vec2(ui.available_width(), tokens.tab_bar_height),
-            egui::Sense::hover(),
-        );
-        if !ui.is_rect_visible(rect) {
-            return;
+        if let Some(pane) = self.model.panes.get_mut(&slot) {
+            pane.tabs_overflow_open = overflow_open;
         }
-        let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 0.0, tokens.bg_card);
-        let mut x = rect.min.x + tokens.tab_gap;
-        let budget = tokens.tab_max_width;
-        for (ix, (title, selected, group)) in titles.iter().enumerate() {
-            let width = (title.len() as f32 * tokens.tab_glyph_advance + tokens.tab_fixed_chrome)
-                .min(budget);
-            let tab = Rect::from_min_size(
-                egui::pos2(x, rect.min.y + tokens.tab_vertical_inset),
-                egui::vec2(width, rect.height() - 2.0 * tokens.tab_vertical_inset),
-            );
-            let fill = if *selected {
-                tokens.bg_hover
-            } else {
-                tokens.transparent
-            };
-            painter.rect_filled(tab, tokens.tab_corner_radius, fill);
-            if let Some(color) = group {
-                painter.rect_filled(
-                    Rect::from_min_size(tab.min, egui::vec2(tokens.accent_bar_width, tab.height())),
-                    2.0,
-                    tokens.group_color(*color),
-                );
+        for command in commands {
+            match command {
+                TabCommand::Select(ix) => self.commands.push((slot, PaneCommand::SelectTab(ix))),
+                TabCommand::Close(ix) => self.commands.push((slot, PaneCommand::CloseTab(ix))),
+                TabCommand::NewTab => self.commands.push((slot, PaneCommand::NewTab)),
+                TabCommand::ToggleOverflow => {
+                    if let Some(pane) = self.model.panes.get_mut(&slot) {
+                        pane.tabs_overflow_open = !pane.tabs_overflow_open;
+                    }
+                }
             }
-            let label = truncate(title, budget - tokens.tab_label_reserve, &tokens);
-            painter.text(
-                Rect::from_min_size(
-                    tab.min + egui::vec2(tokens.tab_label_indent, 0.0),
-                    tab.size(),
-                )
-                .center(),
-                egui::Align2::LEFT_CENTER,
-                &label,
-                tokens.font(),
-                if *selected {
-                    tokens.text_active
-                } else {
-                    tokens.text_muted
-                },
-            );
-            x += width + tokens.tab_gap;
-            let _ = ix;
         }
-        let _ = response;
     }
-}
-
-/// Ellipsize a tab label to `max` points (the CSS `text-overflow: ellipsis` the strip needs).
-/// The measure is the token font's nominal advance (`0.55 em`) — a deliberate approximation until
-/// step 8's `panels/tab_bar.rs` replaces this with `craft_ui::tabs::fit` + galleys.
-fn truncate(text: &str, max: f32, tokens: &Tokens) -> String {
-    let advance = tokens.font_size * 0.55;
-    let wide = advance * text.chars().count() as f32;
-    if wide <= max {
-        return text.to_string();
-    }
-    let keep = (max / advance).floor() as usize;
-    let mut out: String = text.chars().take(keep.saturating_sub(1)).collect();
-    out.push('…');
-    out
 }
 
 fn placeholder_title(slot: PaneSlot) -> String {
@@ -257,11 +286,14 @@ pub fn show(app: &mut ZenApp, ui: &mut Ui) {
     style.font = tokens.font();
     style.floating_background = tokens.bg_card;
 
-    let (out, mut dock_error, focus, intents) = {
+    let (out, mut dock_error, focus, intents, commands) = {
         let mut content = PaneDock {
             model: &mut app.model,
+            session: &app.session,
             tokens,
             intents: Vec::new(),
+            jobs: &app.jobs,
+            commands: Vec::new(),
         };
         let output: DockOutput<DockId> = DockArea::new(dock::dock_area_id()).show_content(
             ui,
@@ -280,6 +312,7 @@ pub fn show(app: &mut ZenApp, ui: &mut Ui) {
             error.map(|e| e.to_string()),
             focused.as_ref().map(dock::slot_of),
             std::mem::take(&mut content.intents),
+            std::mem::take(&mut content.commands),
         )
     };
     if let Some(slot) = focus {
@@ -291,7 +324,12 @@ pub fn show(app: &mut ZenApp, ui: &mut Ui) {
     if let Some(text) = dock_error {
         app.notices.post(crate::widgets::toast::Level::Error, text);
     }
-    let _ = intents; // step 9's command bus drains these
+    let _ = intents; // step 9's paste path reads these (plan §5.7 `DropIntent::PasteInto`)
+    // The pane's commands are the shell's per-frame input (plan §4.1): they run *after* the draw,
+    // so a navigation never mutates the state another pane is painting from.
+    for (slot, command) in commands {
+        app.run_command(slot, command);
+    }
 }
 
 /// The floating-window pass the plan row names (`send_keys(ctx, typing_window(ctx)?, events)`):
@@ -327,20 +365,6 @@ mod tests {
     use zenman_core::path::FsPath;
 
     #[test]
-    fn truncate_ellipses_only_when_needed() {
-        let tokens = Tokens::dark();
-        assert_eq!(truncate("abc", 200.0, &tokens), "abc");
-        let long = truncate(
-            "a-really-long-directory-name-that-cannot-fit-150px",
-            60.0,
-            &tokens,
-        );
-        assert!(long.ends_with('…'), "{long}");
-        assert!(long.chars().count() < 52);
-        assert_eq!(truncate("exactly", 60.0, &tokens), "exactly");
-    }
-
-    #[test]
     fn placeholder_titles_are_distinct_per_slot() {
         let titles: Vec<String> = [
             PaneSlot::Left,
@@ -369,10 +393,15 @@ mod tests {
             .pane_mut(PaneSlot::Left)
             .tabs
             .push(Tab::new(id, FsPath::ROOT, "downloads"));
+        let session = crate::app::tests::memory_session();
+        let jobs = crate::jobs_ui::JobsUi::default();
         let content = PaneDock {
             model: &mut model,
+            session: &session,
             tokens: Tokens::dark(),
             intents: Vec::new(),
+            jobs: &jobs,
+            commands: Vec::new(),
         };
         assert_eq!(
             content.logical_label(&DockId::FilePane(PaneSlot::Left)),
