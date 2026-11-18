@@ -297,7 +297,7 @@ impl ZenApp {
         match path.map(|p| self.session.env().disk_space(&p)) {
             Ok(Ok(space)) => {
                 let used = space.total.saturating_sub(space.free);
-                ui.add_space(4.0);
+                ui.add_space(tokens.drawer_section_gap);
                 let _ = disk_meter::show(ui, &tokens, "/", used, space.total);
             }
             Ok(Err(e)) => {
@@ -335,7 +335,7 @@ impl ZenApp {
                 ui,
                 ui.available_rect_before_wrap(),
                 "folder",
-                16.0,
+                tokens.drawer_icon_size,
                 tokens.text_muted,
             );
             ui.label(label);
@@ -429,7 +429,10 @@ fn icon_button(
     tooltip: &str,
     selected: bool,
 ) -> egui::Response {
-    let size = egui::vec2(tokens.header_height - 16.0, tokens.header_height - 16.0);
+    let size = egui::vec2(
+        tokens.header_height - tokens.header_button_inset,
+        tokens.header_height - tokens.header_button_inset,
+    );
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
     let visuals = if selected {
         craft_ui::buttons::ButtonVisuals {

@@ -56,10 +56,14 @@ impl<'a> DockContent<DockId> for PaneDock<'a> {
 
     fn limits(&self, _panel: &DockId) -> craft_ui::docking::PanelLimits {
         // Small but never zero: the empty pane still shows its strip, and the split tree must be
-        // able to give every pane of the quad grid a real rect at the 900x480 window minimum.
+        // able to give every pane of the quad grid a real rect at the window minimum. Both numbers
+        // are the token table's (plan §5.7: the geometry guard keeps them there).
         craft_ui::docking::PanelLimits {
-            min: egui::vec2(180.0, 120.0),
-            max: egui::vec2(100_000.0, 100_000.0),
+            min: self.tokens.pane_min,
+            max: egui::vec2(
+                self.tokens.pane_unbounded_max,
+                self.tokens.pane_unbounded_max,
+            ),
         }
     }
 
@@ -111,7 +115,7 @@ impl PaneDock<'_> {
                 self.tab_strip(ui, slot);
             }
             ui.vertical_centered(|ui| {
-                ui.add_space(24.0);
+                ui.add_space(tokens.empty_pane_space);
                 let title = self
                     .model
                     .panes
@@ -164,30 +168,35 @@ impl PaneDock<'_> {
         }
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, tokens.bg_card);
-        let mut x = rect.min.x + 4.0;
+        let mut x = rect.min.x + tokens.tab_gap;
         let budget = tokens.tab_max_width;
         for (ix, (title, selected, group)) in titles.iter().enumerate() {
-            let width = (title.len() as f32 * 8.0 + 32.0).min(budget);
+            let width = (title.len() as f32 * tokens.tab_glyph_advance + tokens.tab_fixed_chrome)
+                .min(budget);
             let tab = Rect::from_min_size(
-                egui::pos2(x, rect.min.y + 3.0),
-                egui::vec2(width, rect.height() - 6.0),
+                egui::pos2(x, rect.min.y + tokens.tab_vertical_inset),
+                egui::vec2(width, rect.height() - 2.0 * tokens.tab_vertical_inset),
             );
             let fill = if *selected {
                 tokens.bg_hover
             } else {
                 tokens.transparent
             };
-            painter.rect_filled(tab, 4.0, fill);
+            painter.rect_filled(tab, tokens.tab_corner_radius, fill);
             if let Some(color) = group {
                 painter.rect_filled(
-                    Rect::from_min_size(tab.min, egui::vec2(3.0, tab.height())),
+                    Rect::from_min_size(tab.min, egui::vec2(tokens.accent_bar_width, tab.height())),
                     2.0,
                     tokens.group_color(*color),
                 );
             }
-            let label = truncate(title, budget - 20.0, &tokens);
+            let label = truncate(title, budget - tokens.tab_label_reserve, &tokens);
             painter.text(
-                Rect::from_min_size(tab.min + egui::vec2(10.0, 0.0), tab.size()).center(),
+                Rect::from_min_size(
+                    tab.min + egui::vec2(tokens.tab_label_indent, 0.0),
+                    tab.size(),
+                )
+                .center(),
                 egui::Align2::LEFT_CENTER,
                 &label,
                 tokens.font(),
@@ -197,7 +206,7 @@ impl PaneDock<'_> {
                     tokens.text_muted
                 },
             );
-            x += width + 4.0;
+            x += width + tokens.tab_gap;
             let _ = ix;
         }
         let _ = response;
@@ -237,7 +246,7 @@ pub fn show(app: &mut ZenApp, ui: &mut Ui) {
     let tokens = app.tokens;
     let mut style = DockStyle::from_ui(ui);
     style.tab_height = tokens.tab_bar_height;
-    style.gap = 4.0;
+    style.gap = tokens.dock_gap;
     style.background = tokens.bg_main;
     style.tab_background = tokens.bg_sidebar;
     style.active_background = tokens.bg_card;

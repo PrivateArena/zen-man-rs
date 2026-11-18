@@ -2,9 +2,12 @@
 //!
 //! `ci` is the gate a reviewer trusts; `deps` and `licenses` are the two custom linters it ends
 //! with, and since step 7 it opens with two more: the colour guard (`Color32::` literals only in
-//! `zenman-ui/src/theme.rs`) and the IO guard (`std::fs::` nowhere in `zenman-ui/src` outside
-//! `#[cfg(test)]` tails). `snapshots` is real since step 7 (the kittest/wgpu render of
-//! `crates/zenman-ui/tests/snapshots/01-empty.png`, or a printed skip reason when no adapter
+//! `zenman-ui/src/theme.rs`, and since step 7c the *geometry* half — an unnamed point measurement
+//! anywhere else fails) and the IO guard (`std::fs` nowhere in `zenman-ui/src` outside a
+//! `#[cfg(test)]` item). Step 7c added the two gates that had been claimed but not built: `assets`
+//! (every file under `assets/**` attributed by literal path — `ATTRIBUTION.md`'s own claim) and the
+//! snapshot-artefact check (the committed `01-empty.png` must exist, decode, and be the size the
+//! token geometry implies). `snapshots` renders that PNG (or prints a skip reason when no adapter
 //! exists); `parity` is the one remaining stub, landing with the human review in step 15.
 //! `contracts` is real since step 2: it guards the frozen Go golden capture in
 //! `tests/golden/` (`xtask/src/contracts.rs`), and since step 2 it also runs the two completeness
@@ -25,8 +28,11 @@ use std::process::{Command, Stdio};
 
 use serde_json::Value;
 
+mod assets;
 mod contracts;
 mod fixture_tree;
+mod png;
+mod source_guards;
 
 fn main() {
     if let Err(e) = run() {
@@ -43,6 +49,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         "ci" => ci(),
         "deps" => deps(),
         "licenses" => licenses(),
+        "assets" => assets::assets(),
         "snapshots" => snapshots(),
         "parity" => stub(
             "parity",
@@ -54,7 +61,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         "golden-index" => contracts::golden_index(&workspace_root()?.join("tests/golden")),
         "help" | "-h" | "--help" => {
             println!(
-                "usage: cargo xtask <ci|deps|licenses|snapshots|parity|contracts|fixture-tree|golden-index>"
+                "usage: cargo xtask <ci|deps|licenses|assets|snapshots|parity|contracts|fixture-tree|golden-index>"
             );
             println!(
                 "  fixture-tree and golden-index are the two step-2 gates that `contracts` also runs"
@@ -80,15 +87,37 @@ fn ci() -> Result<(), Box<dyn Error>> {
     contracts::contracts()?;
     deps()?;
     licenses()?;
+    // Step 7c: `licenses` is the *dependency* gate; the asset claim in `ATTRIBUTION.md` needs its
+    // own check, and it runs here (and as `cargo xtask assets`) rather than inside `licenses`, so
+    // that `licenses` stays the one thing its name says — cargo metadata against `deny.toml`.
+    assets::assets()?;
+    snapshot_artefact_gate()?;
     println!("xtask ci: all gates green");
     Ok(())
 }
 
-/// Plan §5.7 `theme.rs` row: "no colour literal appears anywhere else in the crate". The literals
-/// themselves are `Color32::<anything>` — associated constructors (`from_rgb`, named colours) — and
-/// `theme.rs` is their one home. A test module inside a file is fine to use them only when the
-/// file *is* `theme.rs`; anywhere else, even a test literal would drift silently, so the rule is
-/// absolute outside `theme.rs`.
+/// Plan §5.7 `theme.rs` row, in two halves.
+///
+/// **Colour**: the literals are `Color32::<anything>` — associated constructors (`from_rgb`, named
+/// colours) — and `theme.rs` is their one home. A test module inside a file is fine to use them
+/// only when the file *is* `theme.rs`; anywhere else, even a test literal would drift silently, so
+/// the rule is absolute outside `theme.rs`.
+///
+/// **Geometry** (`xtask::source_guards::geometry_offences`, step 7c): a *point* value — a float of
+/// [`source_guards::MIN_MEASUREMENT`] or more, or an integer of that size inside one of egui's
+/// integer-point constructors — must be named. The rule is deliberately narrow, because a growing
+/// allowlist is the failure mode it exists to prevent:
+///
+/// 1. values below the threshold (`0.0`, `1.0`, `2.0`, `0.5`, `1.5`) are arithmetic identities and
+///    ratios, not measurements off the token table;
+/// 2. integers are read only inside the integer-point constructors listed in
+///    [`source_guards::INTEGER_GEOMETRY_CALLS`] — elsewhere an integer is a count or an index (the
+///    dock slot order, the four-pane check, `MRU_CAP`), and the gate would only teach people to
+///    write `4.0` where `4` belongs;
+/// 3. a `const`/`static` declaration line may name its own number — the shape
+///    `widgets/disk_meter.rs::BAR_HEIGHT` already had. The gate asks for a *name*; `theme.rs` is
+///    where the names more than one widget uses live;
+/// 4. lines inside a `#[cfg(test)]` item are exempt: a test that asserts on the numbers is the point.
 fn colour_guard() -> Result<(), Box<dyn Error>> {
     let root = workspace_root()?;
     let ui_src = root.join("crates/zenman-ui/src");
@@ -100,17 +129,47 @@ fn colour_guard() -> Result<(), Box<dyn Error>> {
         )
         .into());
     }
+    let mut geometry = Vec::new();
+    let mut files = Vec::new();
+    collect_rs(&ui_src, &mut files)?;
+    files.sort();
+    for file in files {
+        if file.file_name().is_some_and(|n| n == "theme.rs") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&file)?;
+        let shown = file.strip_prefix(&root).unwrap_or(file.as_path()).display();
+        geometry.extend(
+            source_guards::geometry_offences(&text)
+                .into_iter()
+                .map(|o| format!("{shown}:{}: {}", o.line, o.text)),
+        );
+    }
+    if !geometry.is_empty() {
+        return Err(format!(
+            "xtask ci: unnamed point measurements outside `theme.rs` (plan §5.7: the token table owns \
+             every measurement — add the token, or name the value `const` in the module that alone \
+             uses it; the whole rule is in the geometry-guard note above):\n  {}",
+            geometry.join("\n  ")
+        )
+        .into());
+    }
     println!(
-        "xtask ci: colour guard — `Color32::` appears only in `crates/zenman-ui/src/theme.rs`"
+        "xtask ci: colour + geometry guards — `Color32::` and every unnamed point measurement are kept out of `crates/zenman-ui/src` outside `theme.rs`"
     );
     Ok(())
 }
 
-/// Rule 7 (and plan §5.1's `grep -rn "std::fs::" crates/zenman-ui/src`): the UI crate does no IO;
-/// `zenman-core` and `craft-settings` own every file operation. `#[cfg(test)]` tails are exempt —
-/// a test may build the temp directories the *engine* opens — and the exemption is positional:
-/// everything from the first `#[cfg(test)]` line on is test code (every module in this crate puts
-/// its tests last, which `io_guard` also relies on and the tree keeps true).
+/// Rule 7 (plan §5.7): the UI crate does no IO; `zenman-core` and `craft-settings` own every file
+/// operation. The scan is [`source_guards::io_offences`], which reads the whole `std::fs` surface —
+/// `use std::fs`, `std::fs` with any following character, `std::io::fs`, and `use std::{… fs …}`
+/// import lists including multi-line ones — and exempts only the lines inside a `#[cfg(test)]`
+/// **item**, tracked by brace depth from the attribute to that item's own closing brace.
+///
+/// The step-7 version grepped the literal `std::fs::` and exempted everything from the first
+/// `#[cfg(test)]` line to end of file, so `use std::fs;` + `fs::read_dir(..)`, a bare `std::fs`
+/// path, and a mid-file test module that whitelisted every line below it all walked straight past
+/// it. Both halves are unit-tested in `xtask/src/source_guards.rs`.
 fn io_guard() -> Result<(), Box<dyn Error>> {
     let root = workspace_root()?;
     let ui_src = root.join("crates/zenman-ui/src");
@@ -120,30 +179,87 @@ fn io_guard() -> Result<(), Box<dyn Error>> {
     files.sort();
     for file in files {
         let text = std::fs::read_to_string(&file)?;
-        let mut in_tests = false;
-        for (n, line) in text.lines().enumerate() {
-            if line.trim_start().starts_with("#[cfg(test)]") {
-                in_tests = true;
-            }
-            if !in_tests && line.contains("std::fs::") {
-                offenders.push(format!(
-                    "{}:{}: {}",
-                    file.strip_prefix(&root).unwrap_or(file.as_path()).display(),
-                    n + 1,
-                    line.trim()
-                ));
-            }
-        }
+        let shown = file.strip_prefix(&root).unwrap_or(file.as_path()).display();
+        offenders.extend(
+            source_guards::io_offences(&text)
+                .into_iter()
+                .map(|o| format!("{shown}:{}: {}", o.line, o.text)),
+        );
     }
     if !offenders.is_empty() {
         return Err(format!(
-            "xtask ci: `std::fs::` in `zenman-ui` outside test code (rule 7: IO goes through zenman-core/craft-settings):\n  {}",
+            "xtask ci: `std::fs` in `zenman-ui` outside `#[cfg(test)]` items (rule 7: IO goes through zenman-core/craft-settings):\n  {}",
             offenders.join("\n  ")
         )
         .into());
     }
-    println!("xtask ci: IO guard — `zenman-ui/src` opens no files outside `#[cfg(test)]` tails");
+    println!("xtask ci: IO guard — `zenman-ui/src` opens no files outside `#[cfg(test)]` items");
     Ok(())
+}
+
+/// The committed snapshot artefact, checked without rendering (plan §7 step 7's artefact, step 7c's
+/// gate). `crates/zenman-ui/tests/snapshots.rs` still *skips with a printed reason* when the machine
+/// has no rasteriser — that is the plan's acceptance path — but that skip is only honest while the
+/// artefact the last machine left behind is the one it claims, so this gate fails when
+/// `01-empty.png` is missing, corrupt, truncated, or not the size the shell geometry implies.
+///
+/// The expected size is read out of the test's own `SIZE` constant rather than repeated here, so
+/// the artefact and the harness cannot drift apart unnoticed.
+fn snapshot_artefact_gate() -> Result<(), Box<dyn Error>> {
+    let root = workspace_root()?;
+    let png = root.join("crates/zenman-ui/tests/snapshots/01-empty.png");
+    let relative = png
+        .strip_prefix(&root)
+        .unwrap_or(png.as_path())
+        .display()
+        .to_string();
+    let want = harness_size(&root)?;
+    if !png.is_file() {
+        return Err(format!(
+            "xtask ci: {relative} is missing — run `cargo xtask snapshots` on a machine with a \
+             rasteriser and commit the PNG (plan §7 step 7: the artefact is part of the step)"
+        )
+        .into());
+    }
+    let bytes = std::fs::read(&png)?;
+    let info = png::check_dimensions(&relative, &bytes, want)?;
+    println!(
+        "xtask ci: snapshot artefact — {relative} is a valid {}x{} PNG ({} bytes), the harness size",
+        info.width,
+        info.height,
+        bytes.len()
+    );
+    Ok(())
+}
+
+/// The `const SIZE: egui::Vec2 = egui::vec2(w, h)` of the snapshot test — the size the token
+/// geometry (48 px header + 38 px strip + 30 px status bar at the reference window size) implies.
+fn harness_size(root: &Path) -> Result<(u32, u32), Box<dyn Error>> {
+    let file = root.join("crates/zenman-ui/tests/snapshots.rs");
+    let text = std::fs::read_to_string(&file)?;
+    let shown = file.strip_prefix(root).unwrap_or(file.as_path()).display();
+    for line in text.lines() {
+        let tight = line.replace(' ', "");
+        let Some(rest) = tight.strip_prefix("constSIZE:egui::Vec2=egui::vec2(") else {
+            continue;
+        };
+        let args = rest.trim_end_matches(");");
+        let mut numbers = args.split(',').map(|n| n.trim().parse::<f64>());
+        let (Some(w), Some(h)) = (
+            numbers.next().and_then(Result::ok),
+            numbers.next().and_then(Result::ok),
+        ) else {
+            break;
+        };
+        if w < 1.0 || h < 1.0 || w != w.round() || h != h.round() {
+            return Err(format!("{shown}: SIZE is not an integer pixel size ({w}x{h})").into());
+        }
+        return Ok((w as u32, h as u32));
+    }
+    Err(format!(
+        "{shown}: no `const SIZE: egui::Vec2 = egui::vec2(w, h)` to size the artefact against"
+    )
+    .into())
 }
 
 /// Grep a directory tree of `.rs` files for needles, skipping files whose name is exempt.
@@ -541,7 +657,7 @@ struct LicenceRules {
 /// the `[bans] deny` names. A real TOML parser would be tidier; a second dependency inside the licence
 /// gate itself is the sort of thing the gate exists to notice, so this is a deliberately narrow reader
 /// (arrays of quoted strings, and `key = "value"` lines inside tables).
-fn licence_rules(path: &Path) -> Result<LicenceRules, Box<dyn Error>> {
+pub(crate) fn licence_rules(path: &Path) -> Result<LicenceRules, Box<dyn Error>> {
     let text = std::fs::read_to_string(path)?;
     let mut rules = LicenceRules::default();
     let mut section = String::new();
@@ -613,7 +729,7 @@ fn unquote(value: &str) -> String {
 
 /// SPDX satisfiability, in the direction that matters for a gate: every `AND` term must be covered, and
 /// an `OR` group passes when one alternative is. `(...)` is flattened; `/` is cargo's old `AND`.
-fn expression_is_satisfiable(expression: &str, allow: &[String]) -> bool {
+pub(crate) fn expression_is_satisfiable(expression: &str, allow: &[String]) -> bool {
     let cleaned = expression.replace(['(', ')'], " ");
     let mut and_terms: Vec<String> = Vec::new();
     for chunk in cleaned.split(" AND ") {

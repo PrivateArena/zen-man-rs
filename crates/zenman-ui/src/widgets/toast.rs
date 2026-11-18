@@ -44,6 +44,15 @@ pub const NOTICE_TTL: Duration = Duration::from_secs(6);
 /// of warnings from a partial paste must not grow the queue without bound).
 pub const NOTICE_CAP: usize = 8;
 
+/// How far the stack sits inside the window's right-bottom corner.
+const ANCHOR_INSET: f32 = 12.0;
+/// Gap between two stacked notices.
+const STACK_GAP: f32 = 6.0;
+/// A card's own padding (egui takes `Margin` in integer points).
+const CARD_SIDE_MARGIN: i8 = 12;
+/// …and its smaller vertical padding, so the stack reads as one block.
+const CARD_TOP_MARGIN: i8 = 8;
+
 /// The toast queue, owned by `ZenApp` (plan §4.3: notices are app-level, not pane-level).
 #[derive(Clone, Debug, Default)]
 pub struct State {
@@ -102,11 +111,11 @@ impl State {
         }
         let queue = self.queue.clone();
         Area::new(Id::unique("zenman-notices"))
-            .anchor(Align2::RIGHT_BOTTOM, Vec2::new(-12.0, -12.0))
+            .anchor(Align2::RIGHT_BOTTOM, Vec2::splat(-ANCHOR_INSET))
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
                 ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing = Vec2::new(0.0, 6.0);
+                    ui.spacing_mut().item_spacing = Vec2::new(0.0, STACK_GAP);
                     for notice in &queue {
                         card(ui, notice, tokens);
                     }
@@ -122,7 +131,7 @@ fn card(ui: &mut Ui, notice: &Notice, tokens: &Tokens) {
         .fill(tokens.bg_card)
         .stroke(Stroke::new(1.0, tokens.border))
         .corner_radius(CornerRadius::same(tokens.corner_radius))
-        .inner_margin(Margin::symmetric(12, 8))
+        .inner_margin(Margin::symmetric(CARD_SIDE_MARGIN, CARD_TOP_MARGIN))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("●").color(accent).strong());

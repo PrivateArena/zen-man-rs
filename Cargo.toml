@@ -34,7 +34,10 @@ craft-i18n = { git = "https://github.com/storytold/craft-libs", rev = "6e03f65bf
 # `crates/ui-egui` and so omits it, and this step-1 scaffold ships none (plan R9 defers font
 # bundling to step 7), so egui's built-in fonts are what the stub window can draw with.
 egui = { version = "0.37", default-features = false, features = ["default_fonts"] }
-eframe = { version = "0.37", default-features = false, features = ["wgpu", "accesskit", "wayland", "x11", "clipboard", "persistence"] }
+# `system_fonts` is the shell's system-font fallback (plan §10 R9, step 7c): it installs
+# `egui_system_font_provider` into the context, so a CJK or Arabic file name draws from the fonts the
+# machine has, which is what `zenman_ui::theme::fonts` documents and what makes that patch entry live.
+eframe = { version = "0.37", default-features = false, features = ["wgpu", "accesskit", "wayland", "x11", "clipboard", "persistence", "system_fonts"] }
 egui_extras = { version = "0.37", default-features = false, features = ["svg"] }
 # The kittest harness (plan §7 step 7: `xtask snapshots` and the widget-tree asserts). The
 # `[patch.crates-io]` entry below is what makes this the *fork's* kittest, same rev as egui itself.

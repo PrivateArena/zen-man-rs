@@ -97,6 +97,45 @@ pub struct Tokens {
     pub dialog_max_width: f32,
     /// Search-manager max width: 1100.
     pub search_manager_max_width: f32,
+    // ---- shell geometry the widgets ask for (step 7c: the literals `dock_content`/`app` used to
+    //      carry; the `xtask ci` geometry guard is what keeps them here) -------------------------
+    /// Smallest rect a dock pane accepts (`PanelLimits::min`): enough for the 38 px strip, a toolbar
+    /// row and a placeholder line, and small enough that the quad grid fits the 900x480 window
+    /// minimum.
+    pub pane_min: egui::Vec2,
+    /// "No ceiling" for a pane: `PanelLimits::max` has no infinity, so this is the value the dock
+    /// treats as unbounded — far larger than any viewport.
+    pub pane_unbounded_max: f32,
+    /// Gap the dock leaves between panes (`DockStyle::gap`).
+    pub dock_gap: f32,
+    /// Gap before the first tab and between two tabs in a pane's own strip.
+    pub tab_gap: f32,
+    /// How far a tab is inset from the top and bottom of its strip (the tab is this much shorter
+    /// than the strip on each edge).
+    pub tab_vertical_inset: f32,
+    /// Corner radius of a tab.
+    pub tab_corner_radius: f32,
+    /// Width of the group-colour bar a tab paints down its left edge.
+    pub accent_bar_width: f32,
+    /// How far a tab's label sits from the tab's left edge — the room for the accent bar plus the
+    /// text's own bearing, so a label never touches the group colour.
+    pub tab_label_indent: f32,
+    /// Width subtracted from a tab's budget before a label is ellipsised (accent bar + indent +
+    /// the ellipsis itself).
+    pub tab_label_reserve: f32,
+    /// Nominal per-character advance of the placeholder tab-width estimate (step 8 replaces the
+    /// estimate with galleys, and this token with it).
+    pub tab_glyph_advance: f32,
+    /// Fixed chrome the same estimate adds to a tab's text width (padding on both sides).
+    pub tab_fixed_chrome: f32,
+    /// Space the empty-pane placeholder leaves above its first line.
+    pub empty_pane_space: f32,
+    /// Gap between the sections of a drawer (label, then the rows under it).
+    pub drawer_section_gap: f32,
+    /// Icon size a drawer row draws (bookmarks, places).
+    pub drawer_icon_size: f32,
+    /// How much narrower a header icon button is than the 48 px header it lives in.
+    pub header_button_inset: f32,
     // ---- type -----------------------------------------------------------------------------------
     /// Base UI font size (egui's default; the Go app's body text is 13 px Outfit, decision R9
     /// records that the port ships no bundled font).
@@ -149,6 +188,21 @@ impl Tokens {
             search_manager_fraction: 0.85,
             dialog_max_width: 1200.0,
             search_manager_max_width: 1100.0,
+            pane_min: egui::vec2(180.0, 120.0),
+            pane_unbounded_max: 100_000.0,
+            dock_gap: 4.0,
+            tab_gap: 4.0,
+            tab_vertical_inset: 3.0,
+            tab_corner_radius: 4.0,
+            accent_bar_width: 3.0,
+            tab_label_indent: 10.0,
+            tab_label_reserve: 20.0,
+            tab_glyph_advance: 8.0,
+            tab_fixed_chrome: 32.0,
+            empty_pane_space: 24.0,
+            drawer_section_gap: 4.0,
+            drawer_icon_size: 16.0,
+            header_button_inset: 16.0,
             font_size: 13.0,
             corner_radius: 8,
         }
@@ -297,20 +351,51 @@ pub fn apply(ctx: &egui::Context, choice: ThemeMode) {
     });
 }
 
-/// Font installation (plan §5.7 `theme::fonts` row; §10 decision R9: **no bundled Outfit**).
+/// The font stack (plan §5.7 `theme::fonts` row; §10 decision R9: **no bundled Outfit**, so the
+/// families come from the framework's shared stack and the operating system).
 ///
-/// The plan's first choice was `craft_ui::fonts::UiFonts`, which needs a `LanguageScripts` provider
-/// and a `craft_i18n` catalogue to resolve families; egui's built-in proportional+emoji fonts are
-/// what the scaffold window has been drawing with since step 1, they need no vendored files, and
-/// R9 already records the Outfit compromise. So this installs the defaults and is the single place
-/// a later step swaps in `UiFonts`/`craft_fonts_build` faces.
+/// Step 7 left this a no-op with a test that could not fail. Step 7c wired the decision R9 actually
+/// names: [`craft_ui::fonts::UiFonts`] builds the Craft fallback order — the app's own faces (it has
+/// none: R9 forbids vendoring), then the system faces, then egui's defaults — and `Stack::install`
+/// is what puts a `FontDefinitions` set and a provider list into the context. Two things follow, and
+/// both are asserted by `tests::fonts_install_...`:
+///
+/// * the shell gets a **symbol face egui's defaults do not have**. `egui_face("Hack",
+///   &[Proportional])` is the framework's documented use of the hook, and it is the case this shell
+///   has: `Ubuntu-Light` + `egui-icons` (egui's whole proportional chain) carry no `▸`/`▾`, which is
+///   what a tree, an expanded group and a sort arrow draw with. Without the stack those glyphs are
+///   boxes; with it they are Hack's.
+/// * the **system fallback is real**, and it is eframe's: the binary enables eframe's `system_fonts`
+///   feature (root `Cargo.toml`), which installs `egui_system_font_provider` into the context, so a
+///   CJK or Arabic file name draws from the installed fonts. `UiFonts` deliberately installs *no*
+///   provider of its own here: with craft-ui's `system_fonts` feature off it would have none to
+///   offer, and with it on it would *replace* eframe's provider with a second, equivalent index.
+///
+/// Outfit itself still arrives only through `storytold/craft-fonts` + `craft_fonts_build` faces
+/// (R9); `app_face` is then the one call to add, and the snapshot baselines move with it (step 15).
 pub mod fonts {
-    /// Install the font stack. Idempotent: egui's defaults are already resident, so this is a hook,
-    /// not work — its job is to be the one call site the binary makes.
-    pub fn install(ctx: &egui::Context) {
-        // No faces to add today; touching the context keeps the API honest (and a test can prove
-        // the context still resolves its default families after the call).
-        let _ = ctx;
+    use egui::FontFamily;
+
+    /// The UI language the stack is ordered for. zen-man's catalogue is English passthrough today
+    /// (plan §10 D5/R5); this is the value a translation build passes on.
+    const UI_LANGUAGE: &str = "en";
+
+    /// The stack, without installing it — the shape the tests assert against.
+    #[must_use]
+    pub fn stack() -> craft_ui::fonts::Stack {
+        craft_ui::fonts::UiFonts::new(&craft_ui::fonts::I18nScripts)
+            .languages(&[UI_LANGUAGE])
+            .ui_language(UI_LANGUAGE)
+            .egui_face("Hack", &[FontFamily::Proportional])
+            .stack()
+    }
+
+    /// Install the font stack in `ctx` (idempotent: it sets definitions and providers, it does not
+    /// accumulate). Call before [`apply`](super::apply) so the token text styles are set last.
+    pub fn install(ctx: &egui::Context) -> craft_ui::fonts::Stack {
+        let stack = stack();
+        stack.install(ctx);
+        stack
     }
 }
 
@@ -381,11 +466,61 @@ mod tests {
         );
     }
 
+    /// The glyph the font decision turns on: a tree/group arrow, drawn by step 8's tab bar and file
+    /// rows, that egui's own proportional chain has no face for.
+    const SYMBOL: char = '\u{25b8}';
+
     #[test]
-    fn fonts_install_keeps_the_default_families_resolvable() {
+    fn fonts_install_adds_the_symbol_face_eguis_defaults_lack() {
+        let font = Tokens::dark().font();
+        // 1. the untouched egui default cannot draw it — this is the state step 7 shipped in.
+        let mut defaults = egui::epaint::text::Fonts::new(
+            egui::epaint::text::TextOptions::default(),
+            egui::FontDefinitions::default(),
+        );
+        assert!(
+            !defaults.has_glyph(&font, SYMBOL),
+            "egui's own proportional faces must be the failing baseline, or the test proves nothing"
+        );
+        // 2. the stack does: Hack follows the token face in the proportional chain.
+        let stack = fonts::stack();
+        assert!(
+            stack.fonts(false).has_glyph(&font, SYMBOL),
+            "the installed stack is what draws the shell's arrows"
+        );
+        let chain = stack.chain(&egui::FontFamily::Proportional);
+        assert_eq!(
+            chain.first().map(String::as_str),
+            Some("Ubuntu-Light"),
+            "the stack keeps egui's proportional face first (R9: no bundled face)"
+        );
+        assert_eq!(
+            chain.last().map(String::as_str),
+            Some("Hack"),
+            "the symbol face is the last configured face, ahead of the system fallback"
+        );
+        // 3. and `install` really moves the *context*, not just the value it returns: after one
+        //    pass the context's own definitions are the stack's chains.
         let ctx = egui::Context::default();
-        fonts::install(&ctx);
-        let style = ctx.global_style();
-        assert!(style.text_styles.contains_key(&egui::TextStyle::Body));
+        let installed = fonts::install(&ctx);
+        let mut output = ctx.run_ui(egui::RawInput::default(), |_| {});
+        // The pass may leave a font-texture delta with no backend to apply it: egui asserts on drop.
+        output.textures_delta.clear();
+        let chain = installed.chain(&egui::FontFamily::Proportional).to_vec();
+        let definitions = ctx.fonts(|f| f.definitions().clone());
+        assert_eq!(
+            definitions.families.get(&egui::FontFamily::Proportional),
+            Some(&chain),
+            "`install` left the context on egui's own definitions"
+        );
+        assert!(
+            definitions.font_data.contains_key("Hack"),
+            "the symbol face's data never reached the context"
+        );
+        assert!(
+            ctx.global_style()
+                .text_styles
+                .contains_key(&egui::TextStyle::Body)
+        );
     }
 }

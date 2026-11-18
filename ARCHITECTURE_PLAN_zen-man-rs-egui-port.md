@@ -213,7 +213,7 @@ flowchart LR
 **Hard boundary rules**
 
 1. `crates/zenman-core` **must not** depend on `egui`, `eframe`, `wgpu`, or `craft-ui` (enforced by a `cargo xtask deps` check, §8). This is what makes the eventual CLI/MCP target a link-only job.
-2. `crates/zenman-ui` contains **zero** filesystem calls: every side effect is a method on `Session`. Grep gate: no `std::fs::` in `crates/zenman-ui/src/**`.
+2. `crates/zenman-ui` contains **zero** filesystem calls: every side effect is a method on `Session`. Grep gate: no `std::fs` surface in `crates/zenman-ui/src/**` outside a `#[cfg(test)]` **item** — `xtask`'s IO guard reads `use std::fs`, `std::fs` with any following character, `std::io::fs` and `use std::{… fs …}` import lists (multi-line included), on comment/string-blanked text, and exempts only the attribute-through-closing-brace range of the test item (step 7c; the step-7 grep of the literal `std::fs::` with an exempt-to-EOF tail was bypassable).
 3. `apps/zenman` is the only place that knows about `eframe::NativeOptions`, GPU backend selection, single-instance, and OS dirs.
 4. Worker threads never call into `egui`; they publish events. Repaint is requested by the UI from `Session::poll` results (`jobs_ui::keep_polling` equivalent).
 5. **The header bar and the two overlay drawers are NOT dock panels.** `craft_ui::docking::Side` is `Start|End` only (§2.2), so the 48 px global header is an `egui::TopBottomPanel` drawn before the `DockArea`, and the drawers are overlays above the area (`DockArea::blocked_rects` keeps drops out of them). Only the pane grid lives in the `Layout`.
@@ -823,5 +823,68 @@ one caught by compiling, all of them binding for step 8+:
 
 `xtask snapshots` is real: it renders `01-empty.png` here (Vulkan, `Vulkan | 5056` + `Gl | 0`
 adapters) in ~0.1 s and prints the skip reason on a machine without one. The remaining
-`[patch.crates-io]` warnings are `egui_inspection`, `egui_demo_lib`, `egui_system_font_provider`
-(`egui_kittest` is now live, as step 7 intended).
+`[patch.crates-io]` warnings were `egui_inspection`, `egui_demo_lib`, `egui_system_font_provider`
+(`egui_kittest` is now live, as step 7 intended); step 7c made the third one live too, so two are
+left (`egui_inspection`, `egui_demo_lib`).
+
+**Step 7c completed (harden the step-7 gates)** — five defects a read-only review of step 7 found, each
+fixed at the gate rather than at the symptom; `cargo xtask ci` exit 0, workspace 287 → **309 tests**
+(`xtask` had none: +22 of them are the gates testing themselves), no rustc/clippy warnings.
+
+* **IO guard, new scope rule** (`xtask/src/source_guards.rs`, `io_offences`). It reads the whole
+  `std::fs` surface — `use std::fs`, `std::fs` followed by any character, `std::io::fs`, and
+  `use std::{… fs …}` import lists merged across lines — on text with **comments and string/char
+  literals blanked out** (so prose about `std::fs::` no longer trips it, and never did), and the
+  `#[cfg(test)]` exemption is now **item-scoped**: the attribute line through that item's own closing
+  brace, tracked by brace depth, not to end of file. A mid-file test module therefore no longer
+  whitelists the production code beneath it. Offences still print `file:line: text`.
+* **The attribution gate exists**: **`cargo xtask assets`** (also run by `cargo xtask ci`; deliberately
+  *not* inside `licenses`, which stays what its name says — `cargo metadata` against `deny.toml`).
+  Every file under `assets/` must appear in `ATTRIBUTION.md` by **literal path**, every path the file
+  names must exist, and every row must carry a licence from `deny.toml`'s allowlist. The four
+  `chevron-{left,right,up,down}.svg` rows and the `assets/icons/*.svg` heading are gone: the table is
+  40 literal rows with a `Licence` column. Proven to bite — renaming `assets/icons/folder.svg` fails
+  the gate with both "does not exist" and "not attributed" lines and exit 1; restoring it passes.
+* **Snapshot artefact gate**: `crates/zenman-ui/tests/snapshots.rs` writes its PNG through
+  `env!("CARGO_MANIFEST_DIR")` (the old path was cwd-relative, correct only under
+  `cargo test -p zenman-ui`), and `ci` now checks the *committed* artefact exists, is a decodable PNG
+  (signature + every chunk CRC + IHDR/IDAT/IEND framing — `xtask/src/png.rs`, a ~150-line header
+  reader rather than a dependency inside the gate layer), and matches the size parsed out of the
+  test's own `const SIZE` (1440x900), so a wrong-size or hand-edited PNG cannot leave `ci` green. The
+  test's "skip with a printed reason when no adapter exists" behaviour is unchanged.
+* **Geometry literals** are tokens now: `pane_min`, `pane_unbounded_max`, `dock_gap`, `tab_gap`,
+  `tab_vertical_inset`, `tab_corner_radius`, `accent_bar_width`, `tab_label_indent` (what `dock_content`'s
+  `10.0` at `:190` actually is — the label's clearance from the tab's left edge, past the accent bar),
+  `tab_label_reserve`, `tab_glyph_advance`, `tab_fixed_chrome`, `empty_pane_space`,
+  `drawer_section_gap`, `drawer_icon_size`, `header_button_inset`. The colour guard gained the geometry
+  half, with the narrow rule a growing allowlist would defeat: a **float of 3.0 or more** is a
+  measurement and must be named; values below it (`0.0`, `1.0`, `2.0`, `0.5`) are identities and ratios;
+  **integers are read only inside `CornerRadius::same/new` and `Margin::same/symmetric/from_box`**,
+  because elsewhere an integer in this crate is a count or an index (dock slot order, `MRU_CAP`, the
+  four-pane check) and the gate would only push people to write `4.0` where `4` belongs; a
+  `const`/`static` declaration may name its own number (the pre-existing `disk_meter::BAR_HEIGHT`
+  shape, used for the meter's and the toast's widget-private sizes); `#[cfg(test)]` items are exempt.
+* **Fonts — decision (a), the real install.** `theme::fonts` now builds and installs
+  `craft_ui::fonts::UiFonts` (`I18nScripts`, UI language `en`) with `egui_face("Hack", &[Proportional])`
+  and the dead test is replaced by `theme::tests::fonts_install_adds_the_symbol_face_eguis_defaults_lack`,
+  which asserts the specific documented difference: egui's own proportional chain
+  (`Ubuntu-Light`, `egui-icons`) **cannot draw `▸` U+25B8**, the stack can, and after one pass the
+  *context's* definitions are the stack's chain with Hack's data present. That is a real defect fixed,
+  not a tautology: `▸`/`▾` are what step 8's tree arrows, group toggles and sort indicators draw with.
+  The system half of §10 R9 comes from **eframe's `system_fonts` feature** (root `Cargo.toml`), which
+  installs `egui_system_font_provider` in the context — that also retires the third unused-`[patch]`
+  warning, leaving only `egui_inspection` and `egui_demo_lib`; the app still boots head-lessly
+  (`xvfb-run -a cargo run -p zenman -- --safe-gpu --smoke 1` → exit 0) and the re-rendered
+  `01-empty.png` is **byte-identical** to the committed one, because the added face sits *after*
+  Ubuntu-Light in the chain and the Latin-only shell text never reaches it.
+* Framework facts measured at the pinned revs, for whoever reads §2.2 next: craft-ui's `system_fonts`
+  is **not** in its `default` feature list (`crates/ui/Cargo.toml:44,51`), so
+  `craft_ui::fonts::system_font_provider` compiles to `None` here
+  (`crates/ui/src/fonts/mod.rs:1009`) and `Stack::install` then *keeps* the context's existing
+  providers instead of replacing them (`mod.rs:776` doc, `install_faces`) — which is exactly why
+  eframe's provider is the right vehicle and a second craft-side index is not. `Stack::chain` and
+  `Stack::fonts(bool)` are public, so a stack is testable with no context and no adapter at all
+  (`mod.rs:816`, `:892`). In the egui fork, `Context::run` is gone but **`Context::run_ui(RawInput,
+  FnMut(&mut Ui))` exists** (`crates/egui/src/context.rs:966`); `ctx.fonts(…)` is invalid until after
+  that first pass (`context.rs:1398`), and the returned `FullOutput.textures_delta` must be `clear()`ed
+  or egui panics on drop (`crates/epaint/src/textures.rs:337`).

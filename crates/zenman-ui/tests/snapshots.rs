@@ -68,6 +68,7 @@ fn shell_harness() -> Harness<'static, ZenApp> {
         .with_size(SIZE)
         .with_context_setup(|ctx| {
             egui_extras::install_image_loaders(ctx);
+            zenman_ui::theme::fonts::install(ctx);
             zenman_ui::theme::apply(ctx, ThemeMode::Dark);
         })
         .build_ui_state(
@@ -122,16 +123,23 @@ fn empty_shell_snapshot_renders_or_skips_with_a_reason() {
     );
 
     if std::env::var("ZENMAN_SNAPSHOT_WRITE").is_ok() {
-        let out: PathBuf = ["tests", "snapshots", "01-empty.png"].iter().collect();
+        // Absolute, from the crate manifest: `cargo xtask snapshots` runs the test from the
+        // workspace root, where a cwd-relative `tests/snapshots/…` would have written a PNG in the
+        // wrong directory and left the committed artefact stale-but-green (step 7c).
+        let out: PathBuf = [
+            env!("CARGO_MANIFEST_DIR"),
+            "tests",
+            "snapshots",
+            "01-empty.png",
+        ]
+        .iter()
+        .collect();
         std::fs::create_dir_all(out.parent().expect("tests/snapshots has a parent"))
             .expect("the snapshot directory is creatable");
         image
             .save(&out)
             .unwrap_or_else(|e| panic!("writing {}: {e}", out.display()));
-        println!(
-            "wrote {}",
-            std::path::absolute(&out).unwrap_or(out).display()
-        );
+        println!("wrote {}", out.display());
     } else {
         println!(
             "render OK ({}x{}); set ZENMAN_SNAPSHOT_WRITE=1 (or run `cargo xtask snapshots`) to write the PNG",

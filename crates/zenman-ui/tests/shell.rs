@@ -30,6 +30,7 @@ fn shell_harness(app: ZenApp) -> Harness<'static, ZenApp> {
         .with_size(egui::vec2(1440.0, 900.0))
         .with_context_setup(|ctx| {
             egui_extras::install_image_loaders(ctx);
+            zenman_ui::theme::fonts::install(ctx);
             zenman_ui::theme::apply(ctx, zenman_core::store::config::ThemeMode::Dark);
         })
         .build_ui_state(
