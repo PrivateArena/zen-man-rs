@@ -26,3 +26,7 @@ open = "5.4.5"
 # `rustix` (safe `statvfs`, incl. the `f_fsid` VFS id), `trash` (plan R/D6 delete path) and `open` (the
 # `xdg-open` seam, plan F2) entered with plan §5.2's `platform/{linux,env_probe}.rs` — this step.
 # `bitflags` backs `PlatformCaps`/`ProbeFlags` as well as `mode::ModeBits`.
+# `rusqlite` (plan §5.4 `store/sql.rs` row) arrived with step 5's persistence work; `bundled` is what
+# makes the FTS5 + trigram tokenizer the Go schema needs available, and what lets `xtask licenses` see a
+# C SQLite we control rather than whatever the distro ships.
+rusqlite = { workspace = true }

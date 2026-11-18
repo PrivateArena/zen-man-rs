@@ -85,6 +85,14 @@ pub const LIVE_JOB_TTL: Duration = Duration::from_secs(30 * 60);
 /// Progress events are throttled to one per this interval (plan F2, `ops/mod.rs::Progress::report`).
 pub const PROGRESS_THROTTLE: Duration = Duration::from_millis(50);
 
+/// Whether an undo-log append is `flush`+`sync_all`ed before it returns (plan §6.1 F4).
+///
+/// Go never synced (`api/log.go:249-252` is a bare `Write`), so a power loss after an append could
+/// lose the last record — acceptable for a *history view*, not for the only undo record of a
+/// `paste-move`. `history::store` therefore defaults to durable appends; the cost is one `fsync` per
+/// user action, not per file.
+pub const SYNC_EACH_WRITE: bool = true;
+
 /// Per-directory TTLs, indexed by [`DirCacheTier`].
 ///
 /// Go re-read every page of every directory and cached nothing, so these are ours; the three sizes
@@ -177,6 +185,8 @@ pub struct Limits {
     pub index_max_entries: usize,
     /// Directory cache TTLs.
     pub dir_cache_ttls: [Duration; 3],
+    /// `flush` + `sync_all` every undo-log append (see [`SYNC_EACH_WRITE`]).
+    pub sync_each_write: bool,
 }
 
 impl Default for Limits {
@@ -200,6 +210,7 @@ impl Default for Limits {
             index_max_depth: INDEX_MAX_DEPTH,
             index_max_entries: INDEX_MAX_ENTRIES,
             dir_cache_ttls: DIR_CACHE_TTLS,
+            sync_each_write: SYNC_EACH_WRITE,
         }
     }
 }

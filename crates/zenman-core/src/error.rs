@@ -165,6 +165,14 @@ pub enum CoreError {
     #[error("database error: {msg}")]
     Sql { msg: String },
 
+    /// The index database is held by another process (plan §6.1 F5). Separate from [`CoreError::Sql`]
+    /// because it is the one database failure with a defined fallback: the caller degrades to
+    /// [`StoreMode::NoDb`](crate::store::config::StoreMode) and runs index-less rather than blocking the
+    /// UI for the whole `busy_timeout` again. Go had no such concept — it set no `busy_timeout`
+    /// (`docs/contracts.md` §*SQLite storage*) and aborted the process at startup.
+    #[error("database is locked: {path} (after {attempts} attempt(s))")]
+    DatabaseBusy { path: String, attempts: u32 },
+
     /// A custom action or `open` helper failed (`api/actions.go:236-262`, plan F10).
     #[error("command failed: {cmd}")]
     Shell {
@@ -221,6 +229,7 @@ impl CoreError {
             Self::Nested(_) => "nested",
             Self::LogCorrupt { .. } => "log_corrupt",
             Self::Sql { .. } => "sql_error",
+            Self::DatabaseBusy { .. } => "database_busy",
             Self::Shell { .. } => "shell_error",
             Self::Watcher { .. } => "watcher_error",
             Self::CapacityExceeded { .. } => "capacity_exceeded",
@@ -264,6 +273,9 @@ impl CoreError {
             Self::Nested(inner) => inner.status_code(),
             Self::LogCorrupt { .. } => 500,
             Self::Sql { .. } => 500,
+            // Go had no status for this because it never got this far: a locked database was a
+            // `log.Fatalf` at startup, so 500 keeps it in the "server-side failure" family.
+            Self::DatabaseBusy { .. } => 500,
             Self::Shell { .. } => 500,
             Self::Watcher { .. } => 500,
             Self::CapacityExceeded { .. } => 507,

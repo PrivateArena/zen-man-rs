@@ -42,6 +42,8 @@
 pub mod cursor;
 pub mod entry;
 pub mod error;
+pub mod history;
+pub mod index;
 pub mod limits;
 pub mod metrics;
 pub mod mode;
