@@ -1,0 +1,18 @@
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# Plan §5.1: the gates are part of the workspace and inherit its lints (`unsafe_code = "forbid"`, the
+# clippy denials). Cargo warned about the missing inheritance before; inheriting is the honest answer —
+# a build tool is not a place for an unsafe exception.
+[lints]
+workspace = true
+
+[dependencies]
+# `cargo xtask deps`/`licenses` read `cargo metadata --format-version 1`, so this crate needs a JSON
+# reader and nothing else (no `cargo-deny`, which is not installed here: plan §9 disposition 17).
+serde_json = { workspace = true }
