@@ -27,9 +27,12 @@
 //! recursion is in [`Env::chmod_all`], which is `async` and yields between items, so cancellation at an
 //! item boundary is the job runner's normal `Cancelled` path.
 
-mod env_probe;
-mod linux;
-mod stub;
+// The three submodules are public because their contents *are* this module's API: `mod.rs`'s own docs
+// point at `platform::stub::Unsupported`, step 6 needs `platform::linux::Linux::probe_symlinks`, and
+// `env_probe` is the probe behind `/api/props`.
+pub mod env_probe;
+pub mod linux;
+pub mod stub;
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -54,8 +57,8 @@ pub use stub::Unsupported;
 pub type PlatformFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Box `value` as an already-complete [`PlatformFuture`] — the return value of every action that ran
-/// synchronously inside its own poll.
-#[must_use]
+/// synchronously inside its own poll. (No `#[must_use]`: the returned pinned-boxed future is already
+/// `#[must_use]` by type, and doubling the attribute is a clippy warning.)
 pub fn ready<T: Send + 'static>(value: T) -> PlatformFuture<'static, T> {
     Box::pin(std::future::ready(value))
 }
@@ -193,7 +196,7 @@ pub struct CopyItem {
 }
 
 /// What a platform copy produced.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default)]
 pub struct CopyReport {
     /// Destinations that now exist.
     pub copied: Vec<AbsPath>,
@@ -204,7 +207,7 @@ pub struct CopyReport {
 }
 
 /// One failed [`CopyItem`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct CopyFailure {
     /// The destination we could not produce.
     pub dest: AbsPath,
@@ -332,7 +335,7 @@ pub enum Recursive {
 }
 
 /// What a recursive `chmod` did.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default)]
 pub struct ChmodReport {
     /// Every path whose mode was set, in the order it was applied (plan F3's "truthful record" rule: this
     /// is what the undo log gets).
@@ -356,7 +359,7 @@ impl ChmodReport {
 }
 
 /// One path whose mode could not be set.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct ChmodFailure {
     /// What we tried to change.
     pub path: AbsPath,
@@ -388,7 +391,11 @@ pub trait Env: Send + Sync {
     fn supports_symlink(&self) -> Result<bool, CoreError>;
 
     /// Set the mode of *these* paths, nothing else — Go's bare `os.Chmod` per path (`api/ops.go:929`).
-    fn chmod(&self, targets: &[AbsPath], mode: ModeBits) -> PlatformFuture<'_, Result<(), CoreError>>;
+    fn chmod(
+        &self,
+        targets: &[AbsPath],
+        mode: ModeBits,
+    ) -> PlatformFuture<'_, Result<(), CoreError>>;
 
     /// Whether this particular path can reach a trash (`trash::can_be_trashed`; plan OQ2, R/D6).
     fn can_trash(&self, path: &AbsPath) -> bool;
@@ -440,13 +447,13 @@ impl dyn Env {
 
         for target in targets {
             queue.push(target.clone());
-            if recursive == Recursive::Yes {
-                if let Err(e) = walk_into(target, &mut queue) {
-                    report.failures.push(ChmodFailure {
-                        path: target.clone(),
-                        error: e,
-                    });
-                }
+            if recursive == Recursive::Yes
+                && let Err(e) = walk_into(target, &mut queue)
+            {
+                report.failures.push(ChmodFailure {
+                    path: target.clone(),
+                    error: e,
+                });
             }
         }
 
@@ -466,8 +473,8 @@ impl dyn Env {
 /// its `x` bit mid-walk does not hide its own subtree).
 fn walk_into(root: &AbsPath, out: &mut Vec<AbsPath>) -> Result<(), CoreError> {
     let mut stack: Vec<PathBuf> = Vec::new();
-    for entry in std::fs::read_dir(root.as_path())
-        .map_err(|e| CoreError::io(root.to_string_lossy(), e))?
+    for entry in
+        std::fs::read_dir(root.as_path()).map_err(|e| CoreError::io(root.to_string_lossy(), e))?
     {
         let entry = entry.map_err(|e| CoreError::io(root.to_string_lossy(), e))?;
         let path = entry.path();
@@ -541,7 +548,9 @@ impl MountTable {
     /// `posix.rs` row "`mounts()` returns `vec![]` … (no error)").
     #[must_use]
     pub fn empty() -> Self {
-        Self { entries: Vec::new() }
+        Self {
+            entries: Vec::new(),
+        }
     }
 
     /// Is `path` on a listed mount (i.e. is it mounted at all, or under something that is)?
@@ -585,11 +594,21 @@ mod tests {
         let p = detect();
         assert_eq!(p.os, Os::current());
         // props-dir.json: {"platform":"linux","symlink_supported":true}
-        assert_eq!(p.os.as_str(), if cfg!(target_os = "linux") { "linux" } else { p.os.as_str() });
+        assert_eq!(
+            p.os.as_str(),
+            if cfg!(target_os = "linux") {
+                "linux"
+            } else {
+                p.os.as_str()
+            }
+        );
         assert!(p.caps.contains(PlatformCaps::DISK_SPACE));
         assert!(p.caps.contains(PlatformCaps::EXEC));
         assert_eq!(p.caps.contains(PlatformCaps::CHMOD), p.os.is_unix());
-        assert_eq!(p.caps.contains(PlatformCaps::MOUNT_TABLE), p.os == Os::Linux);
+        assert_eq!(
+            p.caps.contains(PlatformCaps::MOUNT_TABLE),
+            p.os == Os::Linux
+        );
         assert_eq!(p.caps.contains(PlatformCaps::SHORTCUT), p.os == Os::Windows);
         assert_ne!(p.os, Os::Windows, "this suite runs on a unix host");
         assert_eq!(Os::Linux.to_string(), "linux");
@@ -602,7 +621,10 @@ mod tests {
         let tmp = std::env::temp_dir();
         let path = AbsPath::from_path(&tmp).expect("temp dir is absolute");
         // Whatever the platform, none of these may panic and the table must be well-formed.
-        assert!(matches!(env.os(), Os::Linux | Os::Macos | Os::Other | Os::Windows));
+        assert!(matches!(
+            env.os(),
+            Os::Linux | Os::Macos | Os::Other | Os::Windows
+        ));
         let space = env.disk_space(&path);
         assert!(space.is_ok(), "disk_space: {space:?}");
         let space = space.expect("space");
@@ -611,7 +633,10 @@ mod tests {
             env.mount_entries().is_ok(),
             "mount_entries must answer, empty is fine"
         );
-        assert!(env.mount_entries().expect("table").entries.len() >= 1);
+        assert!(
+            !env.mount_entries().expect("table").entries.is_empty(),
+            "a linux host always has a mount table"
+        );
         assert!(env.supports_symlink().is_ok());
     }
 
@@ -633,10 +658,18 @@ mod tests {
             }],
         };
         assert!(table.is_mounted(Path::new("/mnt/usb/x")));
-        assert!(!table.is_mounted(Path::new("/mnt/usbstick/x")), "string prefix is not a mount");
+        assert!(
+            !table.is_mounted(Path::new("/mnt/usbstick/x")),
+            "string prefix is not a mount"
+        );
         assert!(!table.is_mounted(Path::new("/mnt")));
         assert!(table.is_removable(Path::new("/mnt/usb/x")));
-        assert_eq!(table.mount_for(Path::new("/mnt/usb/x")).map(|e| e.fstype.as_str()), Some("vfat"));
+        assert_eq!(
+            table
+                .mount_for(Path::new("/mnt/usb/x"))
+                .map(|e| e.fstype.as_str()),
+            Some("vfat")
+        );
         assert!(MountTable::empty().entries.is_empty());
         assert!(!MountTable::empty().is_removable(Path::new("/")));
     }

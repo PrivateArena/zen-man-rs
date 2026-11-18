@@ -46,6 +46,7 @@ pub mod limits;
 pub mod metrics;
 pub mod mode;
 pub mod path;
+pub mod platform;
 
 /// The step-1 placeholder: `CoreError` and friends arrive in plan §5.2 (`error.rs`, step 3), and the
 /// `pub use session::{Session, SessionConfig, Receipt}` re-export listed in plan §5.1 arrives with
