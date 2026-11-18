@@ -843,6 +843,22 @@ impl Session {
             for parent in parents {
                 sess.invalidate_from(&FsPath::from_abs(parent), ChangeCause::LocalJob, origin);
             }
+            // The index hears about the same set the log did: a copy/link put rows somewhere new, a cut
+            // relocated them (plan §5.3's no-connection rule — an op, never a `Connection`).
+            let ops = report
+                .placed()
+                .into_iter()
+                .map(|(source, target)| match req.mode {
+                    PasteMode::Cut => IndexOp::Moved {
+                        from: source.clone(),
+                        to: target.clone(),
+                    },
+                    PasteMode::Copy | PasteMode::Link => IndexOp::Created {
+                        path: target.clone(),
+                    },
+                })
+                .collect::<Vec<_>>();
+            sess.intent().note_all(&ops);
             // Go clears the clipboard only after a cut that met no error (`api/ops.go:339-344`): a partial
             // cut keeps the selection so the remainder can be retried.
             if req.mode == PasteMode::Cut && report.placed_any() && report.failed().is_empty() {
@@ -1071,14 +1087,15 @@ impl Session {
     /// `chmod(2)` failure naming the path it failed on.
     pub fn chmod(&self, req: &ChmodReq, origin: Origin) -> Result<ChmodReport, CoreError> {
         let cancel = CancelToken::new();
-        let report = chmod::chmod(self.inner.env.as_ref(), req, &cancel)?;
-        if let Some(entry) = report.log_entry(req)
-            && let Err(e) = self.append_log(&entry)
-        {
-            self.push(EngineEvent::Notice {
-                level: crate::events::NoticeLevel::Warn,
-                message: format!("chmod log: {}", e.user_message()),
-            });
+        let mut report = chmod::chmod(self.inner.env.as_ref(), req, &cancel)?;
+        if let Some(entry) = report.log_entry(req) {
+            match self.append_log(&entry) {
+                Ok(id) => report.log_id = Some(id),
+                Err(e) => self.push(EngineEvent::Notice {
+                    level: crate::events::NoticeLevel::Warn,
+                    message: format!("chmod log: {}", e.user_message()),
+                }),
+            }
         }
         for parent in report.affected_parents() {
             self.invalidate_from(&FsPath::from_abs(parent), ChangeCause::LocalJob, origin);

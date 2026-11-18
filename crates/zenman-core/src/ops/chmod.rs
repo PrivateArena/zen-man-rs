@@ -24,6 +24,7 @@ use std::sync::Arc;
 
 use crate::error::CoreError;
 use crate::history::codec::{ActionEntry, ActionType};
+use crate::history::store::LogId;
 use crate::jobs::CancelToken;
 use crate::mode::{self, ModeBits};
 use crate::ops::guard::{ensure_writable, vfs_write_guard};
@@ -140,6 +141,8 @@ pub struct ChmodReport {
     pub mode: ModeBits,
     /// The text the record carried.
     pub text: String,
+    /// The undo-log record's id, once the caller has appended it (`Session::chmod` sets this).
+    pub log_id: Option<LogId>,
 }
 
 impl ChmodReport {
@@ -215,5 +218,6 @@ pub fn chmod(
         applied: targets,
         mode: req.mode,
         text: req.text.clone(),
+        log_id: None,
     })
 }

@@ -273,6 +273,7 @@ mod tests {
             },
             IndexOp::Pruned { path: abs("/a") },
             IndexOp::Refreshed { path: abs("/a/n") },
+            IndexOp::AttributesChanged { path: abs("/a/n") },
         ];
         for op in &ops {
             noop.note(op.clone());
@@ -315,6 +316,29 @@ mod tests {
         assert!(
             IndexOp::merged(&deleted, &deleted).is_some(),
             "identical ops collapse"
+        );
+        // A chmod is a note, not a refresh: it changes neither of the two numbers the index stores.
+        assert_eq!(
+            IndexOp::AttributesChanged { path: abs("/a/n") }
+                .subject()
+                .to_string_lossy(),
+            "/a/n"
+        );
+        assert!(
+            IndexOp::merged(
+                &IndexOp::AttributesChanged { path: abs("/a/n") },
+                &IndexOp::AttributesChanged { path: abs("/a/n") }
+            )
+            .is_some(),
+            "two chmods collapse"
+        );
+        assert!(
+            IndexOp::merged(
+                &IndexOp::AttributesChanged { path: abs("/a/n") },
+                &IndexOp::Refreshed { path: abs("/a/n") }
+            )
+            .is_none(),
+            "a chmod followed by a size change is both"
         );
     }
 }

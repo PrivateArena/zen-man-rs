@@ -1044,7 +1044,8 @@ use zenman_core::index::intent::{IndexIntent, IndexOp, RecordingIntent};
 use zenman_core::mode::{self, ModeBits};
 use zenman_core::ops::chmod::{self, ChmodReq, Recursive};
 use zenman_core::ops::delete::{DeleteMode, DeleteOutcome, DeleteReport, DeleteReq};
-use zenman_core::ops::mkdir::{DEFAULT_DIR_MODE, MkdirReq};
+use zenman_core::ops::mkdir::DEFAULT_DIR_MODE;
+use zenman_core::ops::mkdir::MkdirReq;
 use zenman_core::ops::open::{self, OpenRoute};
 use zenman_core::ops::rename::{self, RenameOutcome, RenameReq, RenameTarget};
 use zenman_core::platform::{
@@ -1297,7 +1298,7 @@ fn running<T: std::fmt::Debug>(receipt: Result<Receipt<T>, PubError>) -> JobId {
 
 /// The `(action, sources, dest, name)` roles of one written record, against the capture's record of the
 /// same action byte.
-fn assert_record_roles(session: &Session, root: &Path, id: i64, want: ActionType) {
+fn assert_record_roles(_session: &Session, root: &Path, id: i64, want: ActionType) {
     let bytes = fs::read(root.join("action.log")).expect("the log exists");
     let mut pos = 0usize;
     let mut found = None;
@@ -1583,7 +1584,7 @@ fn a_permanent_delete_removes_a_tree_and_records_the_paths_that_went() {
 #[test]
 fn rename_answers_a_taken_name_by_policy() {
     let root = temp_dir("rename-policy");
-    let mut session = open_session(&root);
+    let session = open_session(&root);
     let taken = write(&root.join("tree/new-name.txt"), b"occupant");
     let _ = taken;
 
@@ -1678,9 +1679,10 @@ fn a_rename_name_is_one_component_and_nothing_else() {
     }
 
     let root = temp_dir("rename-name");
-    let mut session = open_session(&root);
+    let session = open_session(&root);
     let file = write(&root.join("tree/keep.txt"), b"payload");
-    let escape = RenameReq::one(file.clone(), "../../etc/passwd");
+    let mut escape = RenameReq::one(file.clone(), "../../etc/passwd");
+    escape.target = RenameTarget::One("../../etc/passwd".to_string());
     let report = session
         .rename(&escape, session.next_origin())
         .expect("the request is a rename, refused per item");
@@ -1790,7 +1792,14 @@ fn mkdir_makes_the_dir_returns_the_row_and_collides_honestly() {
 
     let origin = session.next_origin();
     let entry = session
-        .mkdir(&MkdirReq::new(tree.clone(), "made-dir"), origin)
+        .mkdir(
+            &MkdirReq {
+                dest: tree.clone(),
+                name: "made-dir".to_string(),
+                mode: DEFAULT_DIR_MODE,
+            },
+            origin,
+        )
         .expect("the directory is made");
     assert_eq!(entry.name, "made-dir");
     assert!(entry.is_dir, "Go's `isDir`");
@@ -1881,5 +1890,799 @@ fn mkdir_makes_the_dir_returns_the_row_and_collides_honestly() {
         !root.join("escape").exists(),
         "and nothing was created outside the tree"
     );
+    let _ = remove_tree(&root);
+}
+
+// ── chmod ──────────────────────────────────────────────────────────────────────────────────────
+
+/// The octal↔symbolic pair the Go UI shows (`fs.FileMode`'s permission run vs. the text its dialog
+/// sends), the mode actually landing on the file, and the record carrying **the text as typed** — golden
+/// records 9 and 10 of `log.json` are `0o600`/`0o644` spelled `"600"` and `"0644"`, which only a
+/// verbatim-text record can reproduce byte for byte.
+#[test]
+fn chmod_round_trips_octal_to_symbolic_and_logs_the_text_as_typed() {
+    // The parse/format pair first, with no filesystem in sight.
+    let bits = mode::parse_octal("0644").expect("four digits");
+    assert_eq!(bits.bits_octal(), 0o644);
+    assert_eq!(
+        bits.to_string(),
+        "rw-r--r--",
+        "the nine glyphs Go's `FileMode.String()` ends with"
+    );
+    assert_eq!(
+        chmod::octal_text(bits),
+        "0644",
+        "and the canonical text back"
+    );
+    assert_eq!(
+        mode::parse_octal(&chmod::octal_text(bits))
+            .expect("stable")
+            .bits_octal(),
+        0o644,
+        "octal → text → octal is the identity"
+    );
+    assert_eq!(
+        mode::parse_octal("600")
+            .expect("three digits, as the capture typed")
+            .bits_octal(),
+        0o600
+    );
+    for bad in ["", "8", "888", "0o755", "77777", "64x"] {
+        assert_eq!(
+            mode::parse_octal(bad)
+                .expect_err("`{bad}` is not a mode")
+                .kind(),
+            "invalid_mode",
+            "`{bad}`: Go's `Invalid permission mode` (`err-chmod-octaltext.json`)"
+        );
+    }
+
+    let root = temp_dir("chmod");
+    let bin = root.join("bin");
+    fs::create_dir_all(&bin).expect("bin dir");
+    let env = Arc::new(OpEnv::new(&bin));
+    let mut session = open_session_env(&root, Arc::clone(&env) as Arc<dyn Env>);
+    let file = write(&root.join("tree/perm.txt"), b"x");
+    set_mode(&root.join("tree/perm.txt"), 0o644);
+    let intent = Arc::new(RecordingIntent::new());
+    session.set_intent(Arc::clone(&intent) as Arc<dyn IndexIntent>);
+
+    let origin = session.next_origin();
+    let mut non_recursive = ChmodReq::parse(vec![file.clone()], "600").expect("a mode");
+    assert_eq!(
+        non_recursive.recursive,
+        Recursive::No,
+        "Go's chmod was not recursive"
+    );
+    non_recursive.recursive = Recursive::default();
+    assert_eq!(non_recursive.recursive, Recursive::No);
+    let report = session
+        .chmod(&non_recursive, origin)
+        .expect("the platform applies the mode");
+    assert_eq!(
+        mode_of(&root.join("tree/perm.txt")),
+        0o600,
+        "it landed on the file"
+    );
+    assert_eq!(
+        report.text, "600",
+        "the text the record carries is what the user typed"
+    );
+    let id = report.log_id.expect("a record was appended");
+    assert_record_roles(&session, &root, id, ActionType::CHMOD);
+    let record = session.log_record(id).expect("it reads back");
+    assert_eq!(record.name, "600", "verbatim, as golden record 9 has it");
+    assert_eq!(record.dest, "", "Go logged no dest for a chmod");
+    assert_eq!(record.sources, vec![file.to_string_lossy()]);
+    assert!(
+        !record.is_reversible(),
+        "chmod stores no previous mode, so it cannot be undone"
+    );
+
+    // The same bits spelled the capture's other way, which is golden record 10.
+    let second = session
+        .chmod(
+            &ChmodReq::parse(vec![file.clone()], "0644").expect("a mode"),
+            session.next_origin(),
+        )
+        .expect("the platform applies the mode");
+    assert_eq!(mode_of(&root.join("tree/perm.txt")), 0o644);
+    assert_eq!(
+        session
+            .log_record(second.log_id.expect("a record"))
+            .expect("it reads back")
+            .name,
+        "0644",
+        "two records, two spellings, one pair of bits — the capture's own pair"
+    );
+
+    // The intent and the invalidation the listing needs (the mode is a listed column).
+    let ops = intent.recorded();
+    assert!(
+        ops.contains(&IndexOp::AttributesChanged { path: file.clone() }),
+        "the mode change is noted, as the op step 12 may drop: {ops:?}"
+    );
+    let _ = session.poll();
+    let changed = dir_changed(&session.dirs().flush_invalidations());
+    assert!(
+        changed
+            .iter()
+            .any(|(p, _)| *p == fskey(&abs(&root.join("tree")))),
+        "the directory whose row changed is invalidated: {changed:?}"
+    );
+
+    // A read-only *file* is not a read-only *directory*: `chmod(2)` needs ownership, not write
+    // permission, so the Go UI's "clear the read-only box" flow must work on a `0000` file — and the
+    // platform's `is_writable` answer must not talk us out of it. (Nothing here self-skips: unlike a
+    // read-only *mount*, this case is producible for real, and it is the one the guard could get wrong.)
+    set_mode(&root.join("tree/perm.txt"), 0o000);
+    let reread = session
+        .chmod(
+            &ChmodReq::new(vec![file.clone()], ModeBits::from_bits_retain(0o644)),
+            session.next_origin(),
+        )
+        .expect("a 0000 file owned by us is chmod-able");
+    assert_eq!(
+        mode_of(&root.join("tree/perm.txt")),
+        0o644,
+        "and it changed: {:?}",
+        reread.applied
+    );
+
+    // The two failure lanes: the path is gone (`io_error`, naming it), and the platform has no
+    // `st_mode` at all (`unsupported`, the stub's answer — plan §5.2's "typed refusal, never a silent
+    // success"). Both are the operation's own `Err`, because there is nothing partial about them.
+    let missing = abs(&root.join("tree/nope.txt"));
+    let err = session
+        .chmod(
+            &ChmodReq::new(vec![missing], ModeBits::EXECUTABLE),
+            session.next_origin(),
+        )
+        .expect_err("chmod of a path that is not there fails");
+    assert_eq!(err.kind(), "io_error", "{err}");
+    assert!(
+        err.user_message().contains("nope.txt"),
+        "and it names the path: {err}"
+    );
+
+    let refused = Arc::new(OpEnv {
+        chmod_refused: true,
+        ..OpEnv::new(&bin)
+    });
+    let session2 = open_session_env(&root, refused as Arc<dyn Env>);
+    let err = session2
+        .chmod(
+            &ChmodReq::new(vec![file.clone()], ModeBits::EXECUTABLE),
+            session2.next_origin(),
+        )
+        .expect_err("a platform without chmod(2) says so");
+    assert_eq!(err.kind(), "unsupported");
+    assert!(!exists(&root.join("tree/perm.txt.bak")));
+    let _ = remove_tree(&root);
+}
+
+// ── open ───────────────────────────────────────────────────────────────────────────────────────
+
+/// The launcher seam, recorded rather than run: files go to the desktop, **directories are reported as
+/// navigation** (Go ran `xdg-open` on those too, `api/ops.go:122-143`), a missing opener is a typed
+/// user-facing error, and nothing about an `open` touches the log or a listing.
+#[test]
+fn open_launches_files_routes_directories_and_reports_a_missing_opener() {
+    let root = temp_dir("open");
+    let bin = root.join("bin");
+    fs::create_dir_all(&bin).expect("bin dir");
+    let env = Arc::new(OpEnv::new(&bin));
+    let mut session = open_session_env(&root, Arc::clone(&env) as Arc<dyn Env>);
+    let file = write(&root.join("tree/doc.txt"), b"x");
+    let dir = mkdir(&root.join("tree/sub"));
+    let link = {
+        let target = root.join("tree/doc.txt");
+        let link = root.join("tree/link.txt");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        abs(&link)
+    };
+
+    let report = session
+        .open_paths(&[file.clone(), dir.clone(), link.clone()])
+        .expect("the batch is accepted");
+    assert_eq!(
+        report.launched,
+        vec![file.clone(), link.clone()],
+        "a link is a file"
+    );
+    assert_eq!(
+        report.navigated,
+        vec![dir.clone()],
+        "and a directory is a route, not a launch"
+    );
+    assert!(report.failed.is_empty(), "{:?}", report.failed);
+    assert_eq!(
+        env.opened(),
+        vec![file.to_string_lossy(), link.to_string_lossy()],
+        "the directory was never handed to the launcher — that is the navigation the UI must act on"
+    );
+    assert!(matches!(open::route(&dir), OpenRoute::Navigate(p) if p == dir));
+    assert!(matches!(open::route(&file), OpenRoute::Launch(p) if p == file));
+
+    // Nothing changed, so nothing is logged and nothing is invalidated.
+    assert!(
+        session
+            .log_recent(None)
+            .expect("the log reads")
+            .records
+            .is_empty(),
+        "open writes no record"
+    );
+    let _ = session.poll();
+    assert!(dir_changed(&session.dirs().flush_invalidations()).is_empty());
+
+    // `reveal` is the parent directory, through the same seam (plan §5.3: Go had no reveal at all).
+    session.reveal(&file).expect("the parent opens");
+    assert_eq!(
+        env.opened().last().map(String::as_str),
+        Some(abs(&root.join("tree")).to_string_lossy().as_str())
+    );
+
+    // The measured `open` 5.4 fact: no `open::Error`, so a host with no opener is detected up front and
+    // answered with a typed, installable-something error rather than a panic (`platform::linux::open_with`
+    // does exactly this when `open::commands()` is empty).
+    let no_opener = Arc::new(OpEnv {
+        no_opener: true,
+        ..OpEnv::new(&bin)
+    });
+    let session2 = open_session_env(&root, no_opener as Arc<dyn Env>);
+    let report = session2
+        .open_paths(std::slice::from_ref(&file))
+        .expect("a per-path failure is not the call's error");
+    assert_eq!(report.failed.len(), 1, "{report:?}");
+    assert_eq!(
+        report.failed[0].1.kind(),
+        "shell_error",
+        "the launcher's own failure, typed"
+    );
+    assert!(
+        !report.failed[0].1.user_message().is_empty(),
+        "and it says something usable"
+    );
+    assert!(report.launched.is_empty());
+
+    assert_eq!(
+        session.open_paths(&[]).expect_err("nothing to open").kind(),
+        "empty",
+        "Go's `No files specified to open` (`api/ops.go:124`)"
+    );
+    let _ = remove_tree(&root);
+}
+
+// ── revert (`api/log_revert.go`) ───────────────────────────────────────────────────────────────
+
+/// Reverting a **copy** removes the copies and leaves the sources — Go's `revertPasteCopy`, whose
+/// "already gone is success" is kept, and whose record flagging is the capture's own single revert
+/// (`action.log` record 1: patched in place, nothing appended).
+#[test]
+fn reverting_a_copy_removes_the_copies_and_leaves_the_sources() {
+    let root = temp_dir("revert-copy");
+    let mut session = open_session(&root);
+    let src = write(&root.join("src/one.txt"), b"payload");
+    let dest = mkdir(&root.join("dest"));
+    let (job, _origin) = started(
+        &mut session,
+        &paste_req(vec![src.clone()], dest.clone(), PasteMode::Copy),
+    );
+    let (report, _ev) = wait_paste(&mut session, job);
+    let id = report.log_id.expect("the paste logged itself");
+    assert!(exists(&root.join("dest/one.txt")));
+
+    let job = running(session.revert(id, session.next_origin()));
+    let (done, events) = pump(&mut session, job, |p| p.revert().cloned());
+    let done: RevertReport = done.expect("the revert finished");
+    assert_eq!(done.action, ActionType::PASTE_COPY);
+    assert_eq!(
+        done.removed,
+        vec![abs(&root.join("dest/one.txt"))],
+        "{done:?}"
+    );
+    assert!(done.restored.is_empty(), "a copy has nothing to put back");
+    assert!(!exists(&root.join("dest/one.txt")), "the copy is gone");
+    assert_eq!(
+        read(&root.join("src/one.txt")),
+        b"payload",
+        "the source never was touched"
+    );
+    assert_eq!(
+        session.log_record(id).expect("the record").status,
+        LogStatus::REVERTED
+    );
+    assert_eq!(
+        session.log_recent(None).expect("the log").records.len(),
+        1,
+        "a revert appends no frame — the capture's log stays at its original length"
+    );
+    assert!(
+        dir_changed(&events).iter().any(|(p, _)| *p == fskey(&dest)),
+        "the directory the copy was removed from is invalidated: {:?}",
+        dir_changed(&events)
+    );
+    // Idempotent second attempt: refused for the *status*, not for the missing file.
+    let err = session
+        .revert(id, session.next_origin())
+        .expect_err("an already-reverted record is refused");
+    assert_eq!(err.kind(), "unsupported");
+    let _ = remove_tree(&root);
+}
+
+/// Reverting a **move** puts the file back where it came from, through the same `move_item` the paste
+/// used — and unlike the copy revert it *refuses* when the placed file is missing (`log_revert.go:88`).
+#[test]
+fn reverting_a_move_puts_the_source_back_where_it_came_from() {
+    let root = temp_dir("revert-move");
+    let mut session = open_session(&root);
+    let src = write(&root.join("src/victim.txt"), b"payload");
+    let dest = mkdir(&root.join("dest"));
+    let (job, _origin) = started(
+        &mut session,
+        &paste_req(vec![src.clone()], dest.clone(), PasteMode::Cut),
+    );
+    let (report, _ev) = wait_paste(&mut session, job);
+    assert!(
+        !exists(&root.join("src/victim.txt")),
+        "the cut moved it away"
+    );
+    let id = report.log_id.expect("the move logged itself");
+
+    let job = running(session.revert(id, session.next_origin()));
+    let (done, _ev) = pump(&mut session, job, |p| p.revert().cloned());
+    let done = done.expect("the revert finished");
+    assert_eq!(done.restored.len(), 1, "{done:?}");
+    assert_eq!(done.restored[0].1, src, "back to the recorded source path");
+    assert_eq!(read(&root.join("src/victim.txt")), b"payload");
+    assert!(!exists(&root.join("dest/victim.txt")));
+    assert_eq!(
+        session.log_record(id).expect("the record").status,
+        LogStatus::REVERTED
+    );
+
+    // Go's non-idempotence for this type: with the placed file gone, the revert refuses rather than
+    // marking an undone move that left the user with nothing.
+    fs::remove_file(root.join("src/victim.txt")).expect("moved away by hand");
+    let mut fresh = open_session_env(&root, zenman_core::platform::default_env());
+    let id2 = {
+        let other = write(&root.join("src/other.txt"), b"o");
+        let (job, _o) = started(
+            &mut fresh,
+            &paste_req(vec![other], dest.clone(), PasteMode::Cut),
+        );
+        let (r, _e) = wait_paste(&mut fresh, job);
+        r.log_id.expect("logged")
+    };
+    fs::remove_file(root.join("dest/other.txt")).expect("the placed copy is gone");
+    let job = running(fresh.revert(id2, fresh.next_origin()));
+    let (done, _ev) = pump(&mut fresh, job, |p| p.revert().cloned());
+    assert!(done.is_none(), "a move revert does not pretend: {done:?}");
+    assert_ne!(
+        fresh.log_record(id2).expect("the record").status,
+        LogStatus::REVERTED,
+        "and the record is not flagged when nothing was undone"
+    );
+    let _ = remove_tree(&root);
+}
+
+/// Reverting a **link** unlinks the link, never the target — Go's deliberate `os.Remove` and not
+/// `RemoveAll` (`api/log_revert.go:31-45`).
+#[test]
+fn reverting_a_link_unlinks_the_link_and_never_the_target() {
+    let root = temp_dir("revert-link");
+    let mut session = open_session(&root);
+    let target = write(&root.join("src/target.txt"), b"payload");
+    let dest = mkdir(&root.join("dest"));
+    let (job, _origin) = started(
+        &mut session,
+        &paste_req(vec![target.clone()], dest.clone(), PasteMode::Link),
+    );
+    let (report, _ev) = wait_paste(&mut session, job);
+    let link = root.join("dest/target.txt");
+    if !report.placed_any() {
+        // The host refuses symlinks (the same self-skip `paste_link_creates_links…` uses): nothing to
+        // revert, and asserting a link that was never made would prove nothing.
+        println!(
+            "SKIPPED: this platform refused the link paste: {:?}",
+            report.outcomes
+        );
+        let _ = remove_tree(&root);
+        return;
+    }
+    assert!(
+        fs::symlink_metadata(&link)
+            .expect("the link")
+            .file_type()
+            .is_symlink()
+    );
+    let id = report.log_id.expect("the link logged itself");
+
+    let job = running(session.revert(id, session.next_origin()));
+    let (done, _ev) = pump(&mut session, job, |p| p.revert().cloned());
+    let done = done.expect("the revert finished");
+    assert_eq!(done.removed, vec![abs(&link)], "the link went");
+    assert!(!exists(&link), "and it is gone");
+    assert!(
+        fs::symlink_metadata(&link).is_err(),
+        "no dangling link left behind"
+    );
+    assert_eq!(
+        read(&root.join("src/target.txt")),
+        b"payload",
+        "the target survived — `os.Remove`, not `RemoveAll`"
+    );
+    assert_eq!(
+        session.log_record(id).expect("the record").status,
+        LogStatus::REVERTED
+    );
+    let _ = remove_tree(&root);
+}
+
+/// Reverting an **`mkdir`** removes the directory Go made — but only while it is still empty, which is
+/// Go's data-loss guard (`api/log_revert.go:146-162`) and the reason this type is reversible at all.
+#[test]
+fn reverting_an_empty_mkdir_removes_it_and_a_full_one_refuses() {
+    let root = temp_dir("revert-mkdir");
+    let mut session = open_session(&root);
+    let tree = mkdir(&root.join("tree"));
+    let empty = session
+        .mkdir(
+            &MkdirReq::new(tree.clone(), "empty-dir"),
+            session.next_origin(),
+        )
+        .expect("made");
+    let full = session
+        .mkdir(
+            &MkdirReq::new(tree.clone(), "full-dir"),
+            session.next_origin(),
+        )
+        .expect("made");
+    write(
+        &root.join("tree/full-dir/inside.txt"),
+        b"the user put this here",
+    );
+    let records = session.log_recent(None).expect("the log").records;
+    let empty_id = records
+        .iter()
+        .find(|r| r.name == empty.name)
+        .expect("the mkdir record")
+        .id;
+    let full_record = records
+        .iter()
+        .find(|r| r.name == full.name)
+        .expect("the other mkdir record")
+        .clone();
+
+    let job = running(session.revert(empty_id, session.next_origin()));
+    let (done, _ev) = pump(&mut session, job, |p| p.revert().cloned());
+    let done = done.expect("the revert finished");
+    assert_eq!(done.removed, vec![abs(&root.join("tree/empty-dir"))]);
+    assert!(!root.join("tree/empty-dir").exists());
+    assert!(
+        root.join("tree/full-dir").exists(),
+        "and the untouched one is untouched"
+    );
+
+    // The non-empty case, at the ops level so the refusal is the *revert's* answer and not a job's:
+    // Go names the item count, we name the path (`CoreError::AlreadyExists`).
+    let cancel = zenman_core::jobs::CancelToken::new();
+    let err = revert_ops::revert(
+        zenman_core::platform::default_env().as_ref(),
+        &OsMoveFs,
+        &full_record,
+        &cancel,
+        &zenman_core::ops::NoProgress,
+    )
+    .expect_err("a directory someone filled is not removed");
+    assert_eq!(err.kind(), "already_exists", "{err}");
+    assert!(
+        root.join("tree/full-dir/inside.txt").exists(),
+        "nothing inside was lost"
+    );
+    assert_eq!(
+        session
+            .log_record(full_record.id)
+            .expect("the record")
+            .status,
+        LogStatus::DONE,
+        "and the record is still un-reverted"
+    );
+
+    // Go's idempotence for this type: a directory someone else already removed is a success, not an
+    // error (`log_revert.go:152-154`).
+    let gone = session
+        .mkdir(
+            &MkdirReq::new(tree.clone(), "gone-dir"),
+            session.next_origin(),
+        )
+        .expect("made");
+    let gone_id = session
+        .log_recent(None)
+        .expect("the log")
+        .records
+        .iter()
+        .find(|r| r.name == gone.name)
+        .expect("its record")
+        .id;
+    fs::remove_dir(root.join("tree/gone-dir")).expect("removed by hand");
+    let mut empty_record = session.log_record(gone_id).expect("the record");
+    empty_record.status = LogStatus::DONE; // pretend it was never flagged, to exercise the walk
+    revert_ops::revert(
+        zenman_core::platform::default_env().as_ref(),
+        &OsMoveFs,
+        &empty_record,
+        &cancel,
+        &zenman_core::ops::NoProgress,
+    )
+    .expect("already gone is success");
+    let _ = remove_tree(&root);
+}
+
+/// The coverage matrix: `isReversible` (`api/log.go:600-602`) is the whole of the admission rule, and
+/// every rejection says so **before** a path is touched.
+#[test]
+fn exactly_the_five_action_types_go_admits_are_reversible() {
+    let root = temp_dir("revert-matrix");
+    let mut session = open_session(&root);
+    let tree = mkdir(&root.join("tree"));
+    // One record of each of the eight types, all real: the five by doing the actions, the three by
+    // letting the ops that log them run.
+    let file = write(&root.join("tree/one.txt"), b"x");
+    session
+        .clipboard_store(&ClipboardStore {
+            op: ClipOp::Copy,
+            sources: vec![file.clone()],
+            scope: ClipScope::Selected,
+        })
+        .expect("a copy logs `copy` (type 1)");
+    let dest = mkdir(&root.join("dest"));
+    let (job, _o) = started(
+        &mut session,
+        &paste_req(vec![file.clone()], dest.clone(), PasteMode::Copy),
+    );
+    let (_copy_report, _e) = wait_paste(&mut session, job);
+    // A *different* file: the copy above already put `one.txt` in `dest`, and a cut that places nothing
+    // appends nothing (plan F3's rule, which is what makes a record truthful).
+    let victim = write(&root.join("tree/victim.txt"), b"v");
+    let (job, _o) = started(
+        &mut session,
+        &paste_req(vec![victim.clone()], dest.clone(), PasteMode::Cut),
+    );
+    let (move_report, _e) = wait_paste(&mut session, job);
+    assert!(move_report.placed_any(), "{:?}", move_report.outcomes);
+    session
+        .rename(
+            &RenameReq::one(abs(&root.join("dest/one.txt")), "renamed.txt"),
+            session.next_origin(),
+        )
+        .expect("renamed");
+    session
+        .mkdir(&MkdirReq::new(tree.clone(), "made"), session.next_origin())
+        .expect("made");
+    session
+        .chmod(
+            &ChmodReq::parse(vec![abs(&root.join("dest/renamed.txt"))], "600").expect("a mode"),
+            session.next_origin(),
+        )
+        .expect("chmodded");
+    let (job, _o) = started(
+        &mut session,
+        &paste_req(vec![file.clone()], dest.clone(), PasteMode::Link),
+    );
+    let _ = wait_paste(&mut session, job);
+    let del = running(session.delete(
+        &DeleteReq::permanent(vec![file.clone()]),
+        session.next_origin(),
+    ));
+    let (del_report, _e) = pump(&mut session, del, |p| p.delete().cloned());
+    let del_report: DeleteReport = del_report.expect("deleted");
+
+    let mut by_action: Vec<(ActionType, i64)> = session
+        .log_recent(None)
+        .expect("the log")
+        .records
+        .iter()
+        .map(|r| (r.action, r.id))
+        .collect();
+    by_action.sort();
+    let ids: Vec<ActionType> = by_action.iter().map(|(a, _)| *a).collect();
+    for want in [
+        ActionType::COPY,
+        ActionType::PASTE_COPY,
+        ActionType::PASTE_MOVE,
+        ActionType::RENAME,
+        ActionType::MKDIR,
+        ActionType::CHMOD,
+        ActionType::PASTE_LINK,
+        ActionType::DELETE,
+    ] {
+        assert!(
+            ids.contains(&want),
+            "the run produced a `{want}` record: {ids:?}"
+        );
+    }
+    for &(action, id) in &by_action {
+        let record = session.log_record(id).expect("the record");
+        assert_eq!(
+            record.is_reversible(),
+            matches!(
+                action,
+                ActionType::PASTE_COPY
+                    | ActionType::PASTE_MOVE
+                    | ActionType::RENAME
+                    | ActionType::MKDIR
+                    | ActionType::PASTE_LINK
+            ),
+            "`{action}` reversibility is Go's derived set (`api/log.go:600-602`)"
+        );
+        let verdict = revert_ops::ensure_reversible(&record);
+        if record.is_reversible() {
+            assert!(verdict.is_ok(), "`{action}` is admitted");
+        } else {
+            let err = verdict.expect_err("`{action}` is refused");
+            assert_eq!(err.kind(), "unsupported");
+            if action == ActionType::DELETE {
+                assert!(
+                    err.to_string().contains("permanent"),
+                    "and the delete refusal says why: {err}"
+                );
+            }
+        }
+    }
+    // The plan §7 row-9 criterion, named: a delete is logged and *cannot* be reverted.
+    assert_eq!(
+        session
+            .revert(
+                del_report.log_id.expect("a delete record"),
+                session.next_origin()
+            )
+            .expect_err("a delete is not undoable")
+            .kind(),
+        "unsupported"
+    );
+    assert!(
+        !exists(&root.join("tree/one.txt")),
+        "and the file really is gone"
+    );
+    let _ = remove_tree(&root);
+}
+
+// ── the two cross-cutting rules every mutation owes the engine ─────────────────────────────────
+
+/// Plan §5.3's "every mutation calls `IndexIntent::note`" and plan F13's "every mutation invalidates",
+/// asserted side by side for all five write operations plus the paste — the two things step 12 and the
+/// file pane depend on and cannot check for themselves.
+#[test]
+fn every_write_op_notes_the_index_and_invalidates_the_directories_it_changed() {
+    let root = temp_dir("write-events");
+    let mut session = open_session(&root);
+    let intent = Arc::new(RecordingIntent::new());
+    session.set_intent(Arc::clone(&intent) as Arc<dyn IndexIntent>);
+    let tree = mkdir(&root.join("tree"));
+    let src_dir = mkdir(&root.join("src"));
+    let dest = mkdir(&root.join("dest"));
+
+    let expect = |session: &mut Session,
+                  extra: &[EngineEvent],
+                  origin,
+                  what: &str,
+                  want_dir: AbsPath,
+                  want_op: IndexOp| {
+        let _ = session.poll();
+        let mut changed = dir_changed(extra);
+        changed.extend(dir_changed(&session.dirs().flush_invalidations()));
+        assert!(
+            changed
+                .iter()
+                .any(|(p, o)| *p == fskey(&want_dir) && *o == Some(origin)),
+            "{what}: {} was not invalidated with its origin: {changed:?}",
+            want_dir.to_string_lossy()
+        );
+        assert!(
+            intent.recorded().contains(&want_op),
+            "{what}: the index was not told ({want_op:?}); got {:?}",
+            intent.recorded()
+        );
+    };
+
+    // mkdir → the parent, `Created`.
+    let origin = session.next_origin();
+    session
+        .mkdir(&MkdirReq::new(tree.clone(), "made"), origin)
+        .expect("made");
+    expect(
+        &mut session,
+        &[],
+        origin,
+        "mkdir",
+        tree.clone(),
+        IndexOp::Created {
+            path: abs(&root.join("tree/made")),
+        },
+    );
+
+    // rename → the directory the name lives in, `Renamed`.
+    let made = abs(&root.join("tree/made"));
+    let origin = session.next_origin();
+    session
+        .rename(&RenameReq::one(made.clone(), "renamed"), origin)
+        .expect("renamed");
+    expect(
+        &mut session,
+        &[],
+        origin,
+        "rename",
+        tree.clone(),
+        IndexOp::Renamed {
+            from: made.clone(),
+            to: abs(&root.join("tree/renamed")),
+        },
+    );
+
+    // chmod → the directory whose row changed, `AttributesChanged`.
+    let file = write(&root.join("src/one.txt"), b"x");
+    let origin = session.next_origin();
+    session
+        .chmod(
+            &ChmodReq::parse(vec![file.clone()], "640").expect("a mode"),
+            origin,
+        )
+        .expect("chmodded");
+    expect(
+        &mut session,
+        &[],
+        origin,
+        "chmod",
+        src_dir.clone(),
+        IndexOp::AttributesChanged { path: file.clone() },
+    );
+
+    // paste (copy) → the destination, `Created`; the source directory is *not* invalidated by a copy.
+    let origin = session.next_origin();
+    let job = running(session.paste(
+        &paste_req(vec![file.clone()], dest.clone(), PasteMode::Copy),
+        origin,
+    ));
+    let (_report, ev) = pump(&mut session, job, |p| p.paste().cloned());
+    expect(
+        &mut session,
+        &ev,
+        origin,
+        "paste-copy",
+        dest.clone(),
+        IndexOp::Created {
+            path: abs(&root.join("dest/one.txt")),
+        },
+    );
+
+    // delete → the parent that lost the child, `Deleted` for a file.
+    let copy = abs(&root.join("dest/one.txt"));
+    let origin = session.next_origin();
+    let job = running(session.delete(&DeleteReq::permanent(vec![copy.clone()]), origin));
+    let (_report, ev) = pump(&mut session, job, |p| p.delete().cloned());
+    expect(
+        &mut session,
+        &ev,
+        origin,
+        "delete",
+        dest.clone(),
+        IndexOp::Deleted { path: copy.clone() },
+    );
+
+    // open changes nothing, so it owes nothing: no invalidation, no index op, no record.
+    let before = intent.len();
+    session
+        .open_paths(std::slice::from_ref(&file))
+        .expect("the launcher was asked, not the filesystem");
+    let _ = session.poll();
+    assert!(dir_changed(&session.dirs().flush_invalidations()).is_empty());
+    assert_eq!(
+        intent.len(),
+        before,
+        "an `open` notes nothing, because nothing changed"
+    );
+    // (The fifth op, `chmod`, and the paste are both covered above; `open` is the one that owes nothing.)
     let _ = remove_tree(&root);
 }
