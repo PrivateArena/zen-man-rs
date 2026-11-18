@@ -22,6 +22,7 @@ use crate::entry::DirPage;
 use crate::error::CoreError;
 use crate::history::store::LogId;
 use crate::jobs::{JobId, JobKind, JobOutcome, JobProgress};
+use crate::ops::clipboard::Clipboard;
 use crate::path::AbsPath;
 use crate::services::dirs::DirSizeStat;
 use crate::session::Origin;
@@ -84,6 +85,12 @@ pub enum EngineEvent {
         /// The walk's answer, in the `/api/dir/size` fields.
         stat: DirSizeStat,
     },
+    /// The clipboard queue changed (`Session::clipboard_store` / [`crate::session::Session::clipboard_clear`],
+    /// plan §4.1). Broadcast, not origin-routed: every pane showing a clipboard badge must agree at once.
+    ClipboardChanged {
+        /// The new queue; `None` after a clear (Go's `handleClearClipboard`).
+        clip: Option<Clipboard>,
+    },
     /// A listing went stale. `FsPath` (not `AbsPath`) so archive members can be named — plan §9.1.
     DirChanged {
         /// The directory that must be re-read.
@@ -126,9 +133,10 @@ impl EngineEvent {
             | Self::JobFinished { origin, .. }
             | Self::DirPageReady { origin, .. } => Some(*origin),
             Self::DirChanged { origin, .. } => *origin,
-            Self::DirSizeReady { .. } | Self::IndexChanged { .. } | Self::LogAppended { .. } => {
-                None
-            }
+            Self::DirSizeReady { .. }
+            | Self::IndexChanged { .. }
+            | Self::LogAppended { .. }
+            | Self::ClipboardChanged { .. } => None,
             Self::Notice { .. } => None,
         }
     }

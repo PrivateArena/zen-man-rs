@@ -17,7 +17,7 @@ use egui::{CentralPanel, Panel, Ui};
 use std::sync::Arc;
 
 use zenman_core::path::{AbsPath, FsPath};
-use zenman_core::services::dirs::ListDir;
+use zenman_core::services::dirs::{FlatMode, ListDir};
 use zenman_core::session::{Receipt, Session, StartupNote};
 use zenman_core::store::config::{LayoutMode, PaneSlot, ThemeMode};
 
@@ -173,6 +173,9 @@ impl ZenApp {
             cursor,
             limit,
             sort: tab.sort,
+            // The flat buttons are still disabled (step 9d wires them to `FlatMode::Mixed`); a plain
+            // listing is what a pane asks for today.
+            flat: FlatMode::Off,
         };
         tab.loading_more = append;
         let receipt = self.session.page_dir(&req, origin);

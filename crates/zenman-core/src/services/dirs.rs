@@ -158,8 +158,43 @@ impl FsSource for CountingSource {
 
 // ---------------------------------------------------------------------------------------- page types
 
-/// What a caller asks for: the `GET /api/dir` parameters (plan §4.1's `ListDir`), minus
-/// `flat`/`no_folders`, whose walk arrives with `ops/list.rs` in step 9.
+/// Recursive ("flat") listing mode — the `GET /api/dir` `flat`/`no_folders` pair (`api/dir.go:126-127`).
+///
+/// [`Self::Grouped`] walks **exactly like [`Self::Mixed`]**: grouping is a shell-side render over
+/// `rel_path`, not a second walk (`frontend/js/navigation.js:92-97`, where `mixed` → `flat=true`,
+/// `mixed-no-folders` → `flat=true&no_folders=true` and `grouped` → `flat=true`). The backend therefore
+/// never learns which of the two a pane is drawing, and one walk serves both.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum FlatMode {
+    /// A plain single-directory listing (Go's request without `flat`).
+    #[default]
+    Off,
+    /// Every descendant, directories among the rows (`flat=true`).
+    Mixed,
+    /// Every descendant, directory *rows* suppressed (`flat=true&no_folders=true`) — the walk still
+    /// recurses through directories, which is the whole point (`api/dir.go:141-143`).
+    MixedNoFolders,
+    /// `Mixed`, rendered grouped by the shell (`rel_path` is the grouping key).
+    Grouped,
+}
+
+impl FlatMode {
+    /// Does this mode ask for the recursive walk at all?
+    #[must_use]
+    pub const fn is_flat(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    /// Does this mode keep the directory rows? `false` only for [`Self::MixedNoFolders`]: the
+    /// suppression is of rows, never of recursion.
+    #[must_use]
+    pub const fn includes_dirs(self) -> bool {
+        !matches!(self, Self::MixedNoFolders)
+    }
+}
+
+/// What a caller asks for: the `GET /api/dir` parameters (plan §4.1's `ListDir`), `flat` included now
+/// that step 9 landed the walk.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ListDir {
     /// The store + relative path to list.
@@ -170,10 +205,12 @@ pub struct ListDir {
     pub limit: usize,
     /// Column and direction. Dirs-first is an invariant, not a field (plan §5.3's `sort_entries` row).
     pub sort: SortSpec,
+    /// The recursive-listing mode ([`FlatMode`]).
+    pub flat: FlatMode,
 }
 
 impl ListDir {
-    /// The first page, default sort — what a pane asks for on `cd`.
+    /// The first page, default sort, non-flat — what a pane asks for on `cd`.
     #[must_use]
     pub fn first(path: FsPath) -> Self {
         Self {
@@ -181,6 +218,7 @@ impl ListDir {
             cursor: None,
             limit: DEFAULT_PAGE_SIZE,
             sort: SortSpec::DEFAULT_SORT,
+            flat: FlatMode::default(),
         }
     }
 }
@@ -219,6 +257,9 @@ pub struct DirCacheKey {
     pub limit: usize,
     /// Sort column + direction.
     pub sort: SortSpec,
+    /// The flat-listing mode. Part of the key because **a flat page must never be served to a
+    /// non-flat request** — the row sets are different, not just ordered differently.
+    pub flat: FlatMode,
 }
 
 impl DirCacheKey {
@@ -230,12 +271,13 @@ impl DirCacheKey {
     pub fn token(&self) -> String {
         let cursor = self.cursor.map_or(String::new(), |c| c.encode());
         format!(
-            "{}|{}|{}|{:?}/{}",
+            "{}|{}|{}|{:?}/{}|{:?}",
             self.store_root.dir_token(),
             cursor,
             self.limit,
             self.sort.column,
-            if self.sort.descending { "desc" } else { "asc" }
+            if self.sort.descending { "desc" } else { "asc" },
+            self.flat
         )
     }
 }
@@ -567,12 +609,27 @@ impl DirService {
     /// cannot be read, [`CoreError::NotADir`] when it is a file, [`CoreError::VfsReadOnly`] when the
     /// path names an archive store (that is the archive service's listing, not this one).
     pub fn page(&self, req: &ListDir) -> Result<Arc<DirPage>, CoreError> {
+        self.page_with_cancel(req, &CancelToken::new())
+    }
+
+    /// [`Self::page`] with the caller's cancel token — the form a job body calls, because a flat walk
+    /// of a 10 000-entry tree is plan §4.1's definition of a read that must be interruptible.
+    ///
+    /// # Errors
+    /// As [`Self::page`], plus [`CoreError::Cancelled`].
+    pub fn page_with_cancel(
+        &self,
+        req: &ListDir,
+        cancel: &CancelToken,
+    ) -> Result<Arc<DirPage>, CoreError> {
         let key = self.key_for(req);
         let now = Instant::now();
         if let Some(hit) = self.fresh_page(&key, now) {
             return Ok(hit);
         }
-        let page = Arc::new(self.read_page(&req.path, req.cursor, key.limit, req.sort)?);
+        let page = Arc::new(
+            self.read_page_flat(&req.path, req.cursor, key.limit, req.sort, req.flat, cancel)?,
+        );
         let tier = DirCacheTier::for_entry_count(page.total_count);
         let ttl = self.limits.dir_cache_ttls[tier_index(tier)];
         let mut inner = lock(&self.inner);
@@ -604,6 +661,7 @@ impl DirService {
             cursor: req.cursor,
             limit: self.limits.page_size(Some(req.limit)),
             sort: req.sort,
+            flat: req.flat,
         }
     }
 
@@ -639,6 +697,35 @@ impl DirService {
         limit: usize,
         sort: SortSpec,
     ) -> Result<DirPage, CoreError> {
+        self.read_page_flat(
+            path,
+            cursor,
+            limit,
+            sort,
+            FlatMode::Off,
+            &CancelToken::new(),
+        )
+    }
+
+    /// [`Self::read_page`] plus the flat-listing mode and the cancel token.
+    ///
+    /// A flat request walks the tree ([`Self::walk_flat`]) and then does *exactly* what the plain
+    /// listing does with the rows: the same [`sort_rows`] comparator over the base name (dirs first),
+    /// the same pagination, the same page-window `lstat` for `mode`. That is what makes Go's
+    /// `dir-flat-*.json` order — `d0`, `d0/d1`, `d0/d1/d2…` by base name, not by `rel_path` — fall out
+    /// of the code rather than out of a special case.
+    ///
+    /// # Errors
+    /// As [`Self::read_page`], plus [`CoreError::Cancelled`].
+    pub fn read_page_flat(
+        &self,
+        path: &FsPath,
+        cursor: Option<Cursor>,
+        limit: usize,
+        sort: SortSpec,
+        flat: FlatMode,
+        cancel: &CancelToken,
+    ) -> Result<DirPage, CoreError> {
         let host = require_local(path)?;
         let meta = self
             .source
@@ -654,24 +741,32 @@ impl DirService {
                 path: path.to_string(),
             });
         }
-        let raw = self.source.read_dir(&host)?;
+        let mut rows: Vec<Row> = if flat.is_flat() {
+            let (rows, _stats) = self.walk_flat(&host, self.limits.flat_walk_cap, flat, cancel)?;
+            rows
+        } else {
+            self.source
+                .read_dir(&host)?
+                .into_iter()
+                .map(Row::at)
+                .collect()
+        };
         let needs_stats = matches!(sort.column, SortColumn::Size | SortColumn::Date);
-        let mut rows: Vec<Row> = raw
-            .into_iter()
-            .map(|dirent| Row {
-                info: needs_stats
-                    .then(|| self.stat_entry(&host, &dirent).ok())
-                    .flatten(),
-                dirent,
-            })
-            .collect();
+        if needs_stats {
+            // Go stats the whole row set only when the sort column needs it (`api/dir.go:166-171`
+            // for the flat branch, `:186-196` for the plain one); the page window is re-statted below
+            // either way, for `mode`.
+            for row in &mut rows {
+                row.info = self.stat_at(&host, &row.rel).ok();
+            }
+        }
         sort_rows(&mut rows, sort);
         let total_count = rows.len();
         let start = cursor.unwrap_or(Cursor::FIRST);
         let (page_rows, next, has_more) = cursor::page(rows.as_slice(), start, limit);
         let entries: Vec<FileEntry> = page_rows
             .iter()
-            .map(|row| self.build_entry(path, &host, row))
+            .map(|row| self.build_entry(path, &host, row, flat.is_flat()))
             .collect();
         let loaded_so_far = usize::try_from(
             start
@@ -691,28 +786,33 @@ impl DirService {
     }
 
     /// The `entry.Info()` half, which may fail: the caller then builds the degraded row.
-    fn stat_entry(&self, host: &AbsPath, dirent: &DirEntryLike) -> Result<InfoEntry, CoreError> {
-        let path = host.join(dirent.file_name())?;
+    fn stat_at(&self, host: &AbsPath, rel: &str) -> Result<InfoEntry, CoreError> {
+        let path = host.join_rel(rel)?;
         self.source.lstat(path.as_path())
     }
 
-    fn build_entry(&self, listing: &FsPath, host: &AbsPath, row: &Row) -> FileEntry {
+    fn build_entry(&self, listing: &FsPath, host: &AbsPath, row: &Row, flat: bool) -> FileEntry {
         // Go re-stats the page window unconditionally for the mode (`api/dir.go:236-247`), which is
         // also what makes the degraded row possible; `FsSource::lstat` keeps it off the link's target.
-        let info = self.stat_entry(host, &row.dirent).ok();
+        let info = self.stat_at(host, &row.rel).ok();
         let entry_path = listing
-            .join(row.dirent.file_name())
+            .join_rel(&row.rel)
             .unwrap_or_else(|_| listing.clone());
-        // `rel_base` is the row itself, so `rel_path` comes out empty: Go fills `rel_path` **only for a
-        // flat (recursive) listing** — `api/dir.go:141-149` sets it inside the `flat=true` branch and
-        // leaves it `""` otherwise, which is why `dir-root.json` has no `rel_path` key at all while
-        // `dir-flat-subdir.json` has `rel_path:"b"`. Step 9's flat walk passes the listing root here.
-        let stat = EntryStat::in_listing(entry_path.clone(), entry_path, row.dirent.clone(), info);
+        // `rel_base` is the row itself for a plain listing, so `rel_path` comes out empty: Go fills
+        // `rel_path` **only for a flat (recursive) listing** — `api/dir.go:141-149` sets it inside the
+        // `flat=true` branch and leaves it `""` otherwise, which is why `dir-root.json` has no
+        // `rel_path` key at all while `dir-flat-subdir.json` has `rel_path:"b"`.
+        let rel_base = if flat {
+            listing.clone()
+        } else {
+            entry_path.clone()
+        };
+        let stat = EntryStat::in_listing(entry_path.clone(), rel_base, row.dirent.clone(), info);
         let files_count = row
             .dirent
             .kind()
             .is_dir()
-            .then(|| host.join(row.dirent.file_name()).ok())
+            .then(|| host.join_rel(&row.rel).ok())
             .flatten()
             .and_then(|dir| {
                 self.cached_sizes(std::slice::from_ref(&dir))
@@ -722,8 +822,78 @@ impl DirService {
             })
             .map(|s| s.files_count);
         crate::entry::EntryBuilder::from_stat(&stat)
+            .depth(row.depth)
             .files_count(files_count)
             .build()
+    }
+
+    /// The flat walk — `filepath.WalkDir` (`api/dir.go:132-180`), as an explicit stack.
+    ///
+    /// * **pre-order, per directory in lexical name order**, which is what `WalkDir` does and what makes
+    ///   the *truncated* row set reproducible: a stack that popped directories in the wrong order would
+    ///   drop a different 5 files than Go's walk did (`dir-flat-cap.json`).
+    /// * a directory that will not read is **skipped, not an error** (Go's callback returns `nil` on
+    ///   `walkErr`); the root itself is an error, because `read_page_flat` has already `lstat`ed it.
+    /// * `no_folders` suppresses the directory *row* and still descends into it
+    ///   (`api/dir.go:141-143` returns `nil`, not `SkipDir`) — that is why `dir-flat-nofolders.json`
+    ///   still lists `b/c.txt`.
+    /// * the cap is checked **after** the append (`api/dir.go:172-174`, `len(entries) >= limitWalk`), so a
+    ///   walk that hit it kept exactly `cap` rows and `total_count == 10_000` with `has_more` true — the
+    ///   cap is a row budget, not a refusal.
+    /// * [`CancelToken::check`] runs per directory (and once up front), so a cancelled walk stops on a
+    ///   directory boundary.
+    pub(crate) fn walk_flat(
+        &self,
+        root: &AbsPath,
+        cap: usize,
+        mode: FlatMode,
+        cancel: &CancelToken,
+    ) -> Result<(Vec<Row>, WalkStats), CoreError> {
+        let mut stats = WalkStats::default();
+        let mut rows: Vec<Row> = Vec::new();
+        cancel.check()?;
+        let mut stack = vec![Frame::new(
+            root.clone(),
+            String::new(),
+            self.source.read_dir(root)?,
+        )];
+        while let Some(frame) = stack.last_mut() {
+            if frame.idx >= frame.names.len() {
+                stack.pop();
+                continue;
+            }
+            let entry = frame.names[frame.idx].clone();
+            frame.idx += 1;
+            let (parent, parent_rel) = (frame.path.clone(), frame.rel.clone());
+            cancel.check()?;
+            stats.visited += 1;
+            let Ok(child) = parent.join(&entry.name) else {
+                continue;
+            };
+            let rel = if parent_rel.is_empty() {
+                entry.name.clone()
+            } else {
+                format!("{parent_rel}/{}", entry.name)
+            };
+            let is_dir = entry.kind().is_dir();
+            if is_dir {
+                stats.dirs += 1;
+            }
+            if mode.includes_dirs() || !is_dir {
+                rows.push(Row::rel(entry, rel.clone()));
+                stats.rows = rows.len();
+                // After the append, as in Go: the kept count is what the cap bounds.
+                if rows.len() >= cap {
+                    stats.truncated = true;
+                    return Ok((rows, stats));
+                }
+            }
+            if is_dir && let Ok(names) = self.source.read_dir(&child) {
+                stack.push(Frame::new(child, rel, names));
+            }
+        }
+        stats.rows = rows.len();
+        Ok((rows, stats))
     }
 
     // --------------------------------------------------------------------------------------- sizes
@@ -984,11 +1154,78 @@ pub struct DirCacheStats {
     pub misses: u64,
 }
 
-/// One pre-page row: the readdir half plus the optional stat half.
+/// One pre-page row: the readdir half plus the optional stat half, plus where the row sits in the
+/// listing. For a plain listing `rel` is the name and `depth` 0, which is what makes
+/// [`DirService::build_entry`] one code path for both walks.
 #[derive(Clone, Debug)]
-struct Row {
-    dirent: DirEntryLike,
-    info: Option<InfoEntry>,
+pub struct Row {
+    /// The `readdir` half (its `name` is the **base** name, which is what the sort compares).
+    pub dirent: DirEntryLike,
+    /// The stat half, filled only when the sort column needs it (`None` = not asked for, or it failed).
+    pub info: Option<InfoEntry>,
+    /// Listing-relative slash path (`rel_path` on the wire; the name for a plain listing).
+    pub rel: String,
+    /// `rel`'s separator count — Go's `depth` (`api/dir.go:153-160`), 0 for a top-level row.
+    pub depth: i32,
+}
+
+impl Row {
+    /// A row of a plain listing (or the walk's own first level): `rel` is the name.
+    fn at(dirent: DirEntryLike) -> Self {
+        let rel = dirent.file_name().to_string();
+        Self {
+            dirent,
+            info: None,
+            depth: 0,
+            rel,
+        }
+    }
+
+    /// A walked row, at its listing-relative path.
+    fn rel(dirent: DirEntryLike, rel: String) -> Self {
+        let depth = i32::try_from(rel.matches('/').count()).unwrap_or(i32::MAX);
+        Self {
+            dirent,
+            info: None,
+            depth,
+            rel,
+        }
+    }
+}
+
+/// What a flat walk reports about itself (the counters a job summary and the tests read).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WalkStats {
+    /// Rows kept — the number that becomes `total_count`.
+    pub rows: usize,
+    /// Directory entries seen, kept or not: `no_folders` suppresses rows, not directories.
+    pub dirs: usize,
+    /// Entries the walk looked at, including the rows it suppressed and the ones the cap cut off.
+    pub visited: usize,
+    /// The walk stopped because [`Limits::flat_walk_cap`] rows had been kept (`dir-flat-cap.json`).
+    pub truncated: bool,
+}
+
+/// One open directory of the explicit walk stack, its names in Go's `os.ReadDir` order.
+struct Frame {
+    path: AbsPath,
+    /// The directory's own listing-relative path (`""` for the root).
+    rel: String,
+    names: Vec<DirEntryLike>,
+    idx: usize,
+}
+
+impl Frame {
+    fn new(path: AbsPath, rel: String, mut names: Vec<DirEntryLike>) -> Self {
+        // `WalkDir` sorts each directory's names lexically; the walk order *is* the truncation order.
+        names.sort_by(|a, b| a.name.cmp(&b.name));
+        Self {
+            path,
+            rel,
+            names,
+            idx: 0,
+        }
+    }
 }
 
 impl Row {
@@ -1553,6 +1790,268 @@ mod tests {
             svc.cached_page(&req).is_none(),
             "the expired entry is not served"
         );
+    }
+
+    // ------------------------------------------------------------------------------ the flat walk
+
+    /// `/f` = `a.txt` + `sub/`; `sub` = `b.txt` + `deep/`; `deep` = `c.txt`.
+    fn flat_fake() -> (DirService, Arc<Fake>) {
+        let (svc, fake) = svc();
+        fake.add_tree("/f", vec![file("a.txt", 2, 1).0, dir("sub")]);
+        fake.add_stat("/f/a.txt", file("a.txt", 2, 1).1);
+        fake.add_tree("/f/sub", vec![file("b.txt", 2, 1).0, dir("deep")]);
+        fake.add_stat("/f/sub/b.txt", file("b.txt", 2, 1).1);
+        fake.add_tree("/f/sub/deep", vec![file("c.txt", 3, 1).0]);
+        fake.add_stat("/f/sub/deep/c.txt", file("c.txt", 3, 1).1);
+        (svc, fake)
+    }
+
+    #[test]
+    fn no_folders_suppresses_dir_rows_and_still_recurses() {
+        let (svc, _fake) = flat_fake();
+        let page = svc
+            .read_page_flat(
+                &FsPath::fs("/f").unwrap(),
+                None,
+                10,
+                SortSpec::DEFAULT_SORT,
+                FlatMode::MixedNoFolders,
+                &CancelToken::new(),
+            )
+            .expect("no-folders listing");
+        let rels: Vec<&str> = page.entries.iter().map(|e| e.rel_path.as_str()).collect();
+        assert_eq!(
+            rels,
+            ["a.txt", "sub/b.txt", "sub/deep/c.txt"],
+            "`dir-flat-nofolders.json`: no directory rows, but `sub/deep` was still walked"
+        );
+        assert!(
+            page.entries.iter().all(|e| !e.is_dir),
+            "not one directory row survived"
+        );
+        // The walk's own counters say what the page cannot: the directories were *seen*.
+        let (_rows, stats) = svc
+            .walk_flat(
+                &abs("/f"),
+                100,
+                FlatMode::MixedNoFolders,
+                &CancelToken::new(),
+            )
+            .expect("walk");
+        assert_eq!(
+            (stats.rows, stats.dirs, stats.visited),
+            (3, 2, 5),
+            "rows suppressed, recursion not (`api/dir.go:141-143` returns nil, not SkipDir)"
+        );
+    }
+
+    #[test]
+    fn flat_rows_carry_rel_path_and_depth_and_grouped_walks_like_mixed() {
+        let (svc, _fake) = flat_fake();
+        let page = svc
+            .read_page_flat(
+                &FsPath::fs("/f").unwrap(),
+                None,
+                10,
+                SortSpec::DEFAULT_SORT,
+                FlatMode::Mixed,
+                &CancelToken::new(),
+            )
+            .expect("flat listing");
+        let got: Vec<(&str, &str, i32)> = page
+            .entries
+            .iter()
+            .map(|e| (e.name.as_str(), e.rel_path.as_str(), e.depth))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("deep", "sub/deep", 1),
+                ("sub", "sub", 0),
+                ("a.txt", "a.txt", 0),
+                ("b.txt", "sub/b.txt", 1),
+                ("c.txt", "sub/deep/c.txt", 2),
+            ],
+            "dirs first by base name, `rel_path` from the listing root, `depth` = separator count"
+        );
+        // Grouped is a render over the same rows (`frontend/js/navigation.js:92-97`), so it must be
+        // the *same* listing — a different page here would be a second walk to keep in sync.
+        let grouped = svc
+            .read_page_flat(
+                &FsPath::fs("/f").unwrap(),
+                None,
+                10,
+                SortSpec::DEFAULT_SORT,
+                FlatMode::Grouped,
+                &CancelToken::new(),
+            )
+            .expect("grouped listing");
+        assert_eq!(
+            grouped
+                .entries
+                .iter()
+                .map(|e| &e.rel_path)
+                .collect::<Vec<_>>(),
+            page.entries.iter().map(|e| &e.rel_path).collect::<Vec<_>>(),
+            "Grouped walks exactly like Mixed"
+        );
+        // A plain listing of the same directory has neither field (Go's `omitempty`).
+        let plain = svc
+            .read_page(&FsPath::fs("/f").unwrap(), None, 10, SortSpec::DEFAULT_SORT)
+            .expect("plain listing");
+        assert!(
+            plain
+                .entries
+                .iter()
+                .all(|e| e.rel_path.is_empty() && e.depth == 0),
+            "only the flat walk fills `rel_path`/`depth`"
+        );
+    }
+
+    #[test]
+    fn the_flat_cap_counts_kept_rows_and_truncates_lexically() {
+        let (svc, fake) = svc();
+        fake.add_tree(
+            "/c",
+            (0..5)
+                .map(|i| DirEntryLike::new(format!("f{i}"), EntryKind::File))
+                .collect(),
+        );
+        for i in 0..5 {
+            fake.add_stat(
+                &format!("/c/f{i}"),
+                InfoEntry::new("f", EntryKind::File, 1, Some(1), Some(0o100644)),
+            );
+        }
+        let (rows, stats) = svc
+            .walk_flat(&abs("/c"), 3, FlatMode::Mixed, &CancelToken::new())
+            .expect("capped walk");
+        let kept: Vec<&str> = rows.iter().map(|r| r.rel.as_str()).collect();
+        assert_eq!(
+            kept,
+            ["f0", "f1", "f2"],
+            "the kept rows are the lexically first ones — the truncation Go's `WalkDir` produced"
+        );
+        assert!(
+            stats.truncated,
+            "the cap was reached, not the end of the tree"
+        );
+        assert_eq!(stats.visited, 3, "the walk stopped at the cap");
+        // And the page answers the way `dir-flat-cap.json` does: `total_count` *is* the cap and
+        // `has_more` is true, because Go checks `len(entries) >= cap` **after** the append.
+        let svc = DirService::new(
+            Arc::clone(&fake) as Arc<dyn FsSource>,
+            Arc::new(Limits {
+                flat_walk_cap: 3,
+                ..Limits::default()
+            }),
+        );
+        let page = svc
+            .read_page_flat(
+                &FsPath::fs("/c").unwrap(),
+                None,
+                2,
+                SortSpec::DEFAULT_SORT,
+                FlatMode::Mixed,
+                &CancelToken::new(),
+            )
+            .expect("capped page");
+        assert_eq!(
+            page.total_count, 3,
+            "total_count is the cap, not the tree's 5"
+        );
+        assert!(page.has_more, "a truncated walk always has more");
+        assert_eq!(page.entries.len(), 2);
+        assert_eq!(page.cursor_wire(), "2");
+        assert_eq!(page.loaded_so_far, 2);
+    }
+
+    #[test]
+    fn a_flat_page_is_never_served_to_a_plain_request() {
+        let (svc, _fake) = flat_fake();
+        let plain = ListDir::first(FsPath::fs("/f").unwrap());
+        let flat = ListDir {
+            flat: FlatMode::Mixed,
+            ..ListDir::first(FsPath::fs("/f").unwrap())
+        };
+        let plain_page = svc.page(&plain).expect("plain page");
+        assert!(
+            svc.cached_page(&flat).is_none(),
+            "the flat request must not hit the plain entry — different row sets, same path"
+        );
+        let flat_page = svc.page(&flat).expect("flat page");
+        assert!(!Arc::ptr_eq(&plain_page, &flat_page), "two distinct pages");
+        assert_eq!((plain_page.total_count, flat_page.total_count), (2, 5));
+        assert!(
+            svc.cached_page(&plain).is_some(),
+            "and both are cached apart"
+        );
+        assert!(
+            Arc::ptr_eq(&flat_page, &svc.page(&flat).expect("cached flat")),
+            "the flat entry is served from the flat key"
+        );
+    }
+
+    /// A source that asks for cancellation the first time it reads a *sub*directory: the deterministic
+    /// form of "the user hit cancel while the flat walk was descending".
+    struct CancelOnSecondRead {
+        inner: Arc<Fake>,
+        token: CancelToken,
+        after: u64,
+        reads: std::sync::atomic::AtomicU64,
+    }
+
+    impl FsSource for CancelOnSecondRead {
+        fn read_dir(&self, path: &AbsPath) -> Result<Vec<DirEntryLike>, CoreError> {
+            if self.reads.fetch_add(1, std::sync::atomic::Ordering::AcqRel) >= self.after {
+                self.token.cancel();
+            }
+            self.inner.read_dir(path)
+        }
+
+        fn lstat(&self, path: &Path) -> Result<InfoEntry, CoreError> {
+            self.inner.lstat(path)
+        }
+    }
+
+    #[test]
+    fn the_flat_walk_cancels_on_a_directory_boundary() {
+        let fake = Arc::new(Fake::new());
+        fake.add_tree("/r", vec![dir("d1"), dir("d2")]);
+        fake.add_tree("/r/d1", vec![file("x", 1, 1).0]);
+        fake.add_tree("/r/d2", vec![file("y", 1, 1).0]);
+        let token = CancelToken::new();
+        let src = Arc::new(CancelOnSecondRead {
+            inner: Arc::clone(&fake),
+            token: token.clone(),
+            after: 1,
+            reads: std::sync::atomic::AtomicU64::new(0),
+        });
+        let svc = DirService::new(src as Arc<dyn FsSource>, Arc::new(Limits::default()));
+        let err = svc
+            .read_page_flat(
+                &FsPath::fs("/r").unwrap(),
+                None,
+                10,
+                SortSpec::DEFAULT_SORT,
+                FlatMode::Mixed,
+                &token,
+            )
+            .expect_err("cancelled");
+        assert!(matches!(err, CoreError::Cancelled), "{err:?}");
+        // Uncancelled, the same walk completes — the cancellation was the token's, not the tree's.
+        let svc = DirService::new(fake as Arc<dyn FsSource>, Arc::new(Limits::default()));
+        let page = svc
+            .read_page_flat(
+                &FsPath::fs("/r").unwrap(),
+                None,
+                10,
+                SortSpec::DEFAULT_SORT,
+                FlatMode::Mixed,
+                &CancelToken::new(),
+            )
+            .expect("uncancelled");
+        assert_eq!(page.total_count, 4, "d1, d2, x, y");
     }
 
     #[test]

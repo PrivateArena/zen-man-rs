@@ -33,12 +33,13 @@ use serde::Serialize;
 use crate::entry::DirPage;
 use crate::error::CoreError;
 use crate::events::{ChangeCause, EngineEvent};
-use crate::history::codec::ActionLog;
+use crate::history::codec::{ActionEntry, ActionLog, ActionType};
 use crate::history::store::{ActionLogStore, LogId};
 use crate::index::intent::{IndexIntent, IndexOp};
 use crate::jobs::{CancelToken, JobId, JobInfo, JobKind, JobRegistry, JobResult, JobSpec};
 use crate::limits::Limits;
-use crate::path::AbsPath;
+use crate::ops::clipboard::{self, Clipboard, ClipboardStore};
+use crate::path::{AbsPath, FsPath};
 use crate::platform::Env;
 use crate::platform::env_probe::ProbeReport;
 use crate::services::dirs::{
@@ -389,6 +390,8 @@ struct Inner {
     db_disabled: Mutex<Option<String>>,
     intent: Arc<dyn IndexIntent>,
     events: Mutex<std::collections::VecDeque<EngineEvent>>,
+    /// The queued copy/cut selection (plan §5.3's `ops/clipboard.rs`, Go's `clipboardState`).
+    clipboard: Mutex<Option<Clipboard>>,
     origins: OriginAlloc,
     /// Plan F21: the symlink probe is answered **once** and cached here, so `/api/props` — which the
     /// properties dialog can ask for on every repaint — is a lock read.
@@ -476,6 +479,7 @@ impl Session {
                 db_disabled: Mutex::new(db_disabled),
                 intent: crate::index::intent::noop_intent(),
                 events: Mutex::new(std::collections::VecDeque::new()),
+                clipboard: Mutex::new(None),
                 origins: OriginAlloc::new(),
                 probe: Arc::new(RwLock::new(None)),
                 config: Mutex::new(config),
@@ -643,10 +647,11 @@ impl Session {
 
     /// One page of a directory listing, with the origin story attached (plan §4.1's `page_dir`).
     ///
-    /// Step 6 answers `Done` on every path it can serve: a single `readdir` is the plan's definition of
-    /// a read that may run on the caller's thread. The `Running` half is real and used by
-    /// [`Self::dir_size`]; step 9's flat walk and step 13's archive-manifest build return `Running` from
-    /// this same function, which is why the signature is a [`Receipt`] already.
+    /// A page the cache can answer comes back `Done` — that is the read that may run on the caller's
+    /// thread. A **flat** request that is not cached is a recursive walk of up to
+    /// [`Limits::flat_walk_cap`] entries, so it becomes a [`JobKind::List`] job and answers
+    /// `Receipt::Running`; the page arrives as [`EngineEvent::DirPageReady`] with this same `origin`
+    /// (plan §4.3's correlation rule). Step 13's archive-manifest build returns `Running` from here too.
     ///
     /// # Errors
     /// The listing's own errors (see [`DirService::page`]), and only for the synchronous answer.
@@ -655,7 +660,24 @@ impl Session {
         req: &ListDir,
         origin: Origin,
     ) -> Result<Receipt<Arc<DirPage>>, CoreError> {
-        let _ = origin;
+        if let Some(cached) = self.inner.dirs.cached_page(req) {
+            return Ok(Receipt::Done(cached));
+        }
+        if req.flat.is_flat() {
+            let dirs = Arc::clone(&self.inner.dirs);
+            let req = req.clone();
+            let label = format!("List {} recursively", req.path);
+            let spec = JobSpec::new(self.inner.jobs.next_id(), JobKind::List, label, origin);
+            let id = spec.id;
+            self.inner.jobs.attach(spec, move |cancel, _progress| {
+                let page = dirs.page_with_cancel(&req, cancel)?;
+                Ok(JobResult::done(
+                    Arc::clone(&page),
+                    format!("{} row(s)", page.total_count),
+                ))
+            });
+            return Ok(Receipt::Running { job: id, origin });
+        }
         Ok(Receipt::Done(self.inner.dirs.page(req)?))
     }
 
@@ -708,11 +730,91 @@ impl Session {
         self.inner.dirs.dir_size(path, opts, cancel, progress)
     }
 
-    /// The size of a path, in bytes, plus the file count — the `/api/dir/size` pair. Cached answers
-    /// only (this is what a listing's `files_count` column asks before deciding to show `--`).
+    /// The cached answers only, no job, no walk: what a listing's `files_count` column asks before
+    /// deciding to show `--`.
     #[must_use]
     pub fn cached_dir_sizes(&self, dirs: &[AbsPath]) -> Vec<Option<DirSizeStat>> {
         self.inner.dirs.cached_sizes(dirs)
+    }
+
+    // ------------------------------------------------------------------------------------ the clipboard
+
+    /// The queued selection, `None` when there is none (plan §5.3's `ops/clipboard.rs`).
+    #[must_use]
+    pub fn clipboard(&self) -> Option<Clipboard> {
+        lock(&self.inner.clipboard).clone()
+    }
+
+    /// Queue a copy/cut selection — Go's `handleClipboardSet` (`api/ops.go:144-186`), in Go's order:
+    ///
+    /// 1. the VFS write guard (an archive selection is [`CoreError::VfsReadOnly`], `api/ops.go:73`);
+    /// 2. [`clipboard::store`], which expands a [`ClipScope::Inside`](clipboard::ClipScope) request into
+    ///    the directory's children and refuses an empty selection with [`CoreError::Empty`];
+    /// 3. the undo-log record Go appended — `Append(ActionCopy, sources, "", "")`, a *record of the
+    ///    copy*, not an undoable action (a log failure is a notice, never a failed copy);
+    /// 4. [`EngineEvent::ClipboardChanged`] so every badge repaints;
+    /// 5. best-effort [`clipboard::publish_system`] (Go's `writeToSystemClipboard`, whose spawn error Go
+    ///    ignored and whose child exit status it never read — a clipboard manager that refuses the
+    ///    payload must not turn a successful copy into a failed one; here the refusal is *reported* as a
+    ///    notice instead of vanishing).
+    ///
+    /// # Errors
+    /// [`CoreError::VfsReadOnly`] for an archive source, [`CoreError::Empty`] for an empty selection,
+    /// [`CoreError::NotADir`] for a `Inside` request naming a file, and the source's own errors.
+    pub fn clipboard_store(&self, req: &ClipboardStore) -> Result<Clipboard, CoreError> {
+        let paths: Vec<FsPath> = req.sources.iter().cloned().map(FsPath::from_abs).collect();
+        let refs: Vec<&FsPath> = paths.iter().collect();
+        crate::ops::guard::vfs_write_guard(&refs)?;
+        let clip = clipboard::store(self.inner.dirs.source().as_ref(), req)?;
+        // The record carries the **resolved** sources: Go assigned `clipboard.Sources = paths` *after*
+        // `resolveInsideSources` had widened an `Inside` request into the directory's children
+        // (`api/ops.go:158-166`), so the log names what a paste will actually place.
+        let sources: Vec<String> = clip
+            .items
+            .iter()
+            .map(|item| item.path.to_string_lossy())
+            .collect();
+        if let Err(e) = self.append_log(&ActionEntry::new(ActionType::COPY, sources, "", "")) {
+            self.push(EngineEvent::Notice {
+                level: crate::events::NoticeLevel::Warn,
+                message: format!("clipboard log: {}", e.user_message()),
+            });
+        }
+        *lock(&self.inner.clipboard) = Some(clip.clone());
+        self.push(EngineEvent::ClipboardChanged {
+            clip: Some(clip.clone()),
+        });
+        self.publish_clipboard(Some(&clip));
+        Ok(clip)
+    }
+
+    /// Clear the selection — Go's `handleClearClipboard` (`api/ops.go:216-221`), which also publishes an
+    /// **empty** uri-list so another application's paste stops offering the old selection. No log record:
+    /// Go appended none.
+    pub fn clipboard_clear(&self) {
+        *lock(&self.inner.clipboard) = None;
+        self.push(EngineEvent::ClipboardChanged { clip: None });
+        self.publish_clipboard(None);
+    }
+
+    /// The Go-parity undo-log append, shared by every mutating op: write the frame, then announce its id
+    /// so the history pane refreshes (plan §4.1's `LogAppended`).
+    fn append_log(&self, entry: &ActionEntry) -> Result<LogId, CoreError> {
+        let mut store = lock(&self.inner.log);
+        let id = store.append_entry(entry)?.0;
+        self.push(EngineEvent::LogAppended { id });
+        Ok(id)
+    }
+
+    /// Best-effort system-clipboard sync: a spawn failure is reported as a notice, and the child's exit
+    /// status is not read (Go's `_ = cmd.Run()`, `api/ops.go:571-573`).
+    fn publish_clipboard(&self, clip: Option<&Clipboard>) {
+        if let Err(e) = clipboard::publish_system(self.inner.env.as_ref(), clip) {
+            self.push(EngineEvent::Notice {
+                level: crate::events::NoticeLevel::Warn,
+                message: format!("system clipboard: {}", e.user_message()),
+            });
+        }
     }
 
     /// The most recent undo-log records, bounded by [`SessionOptions::history_limit`] when the caller
@@ -806,6 +908,24 @@ impl Session {
             })
             .collect();
         out.extend(sizes);
+        // The same synthesis for a listing job: the page a `JobKind::List` produced is announced as
+        // `DirPageReady`, carrying the request's origin back to the pane that asked (plan §4.1).
+        let pages: Vec<EngineEvent> = out
+            .iter()
+            .filter_map(|ev| match ev {
+                EngineEvent::JobFinished {
+                    origin,
+                    payload: crate::events::JobPayload::DirPage(page),
+                    ..
+                } => Some(EngineEvent::DirPageReady {
+                    origin: *origin,
+                    path: page.path.clone(),
+                    page: Arc::clone(page),
+                }),
+                _ => None,
+            })
+            .collect();
+        out.extend(pages);
         out.extend(self.inner.dirs.take_invalidations());
         let mut guard = self
             .inner
@@ -960,6 +1080,12 @@ fn check_config_file(path: &Path) -> Result<Option<StartupNote>, CoreError> {
             }))
         }
     }
+}
+
+/// Lock, ignoring poisoning: every value behind these mutexes is either fully updated or untouched, so
+/// one panicked job must not disable the session's clipboard or event queue.
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// `Session`'s convenience: the intent sink every service holds (plan §5.3's no-connection rule).
@@ -1359,6 +1485,166 @@ mod tests {
             vec!["platform", "symlink_supported"]
         );
         session.close();
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn clipboard_store_queues_logs_and_clears() {
+        // Plan §5.3's `ops/clipboard.rs` façade on `Session`: guard → store → log record → event →
+        // best-effort system sync (`api/ops.go:144-186`, `handleClipboardSet`).
+        let dir = temp_dir("clipboard");
+        fs::create_dir_all(dir.join("probe")).expect("probe dir");
+        let sel = dir.join("sel");
+        fs::create_dir_all(sel.join("sub")).expect("sel tree");
+        fs::write(sel.join("a.txt"), b"x").expect("a file");
+        fs::write(sel.join("sub").join("b.txt"), b"yy").expect("a nested file");
+        let (mut session, _notes) = Session::open(
+            paths(&dir),
+            ZenConfig::default(),
+            Arc::new(Unsupported::new()),
+            Limits::default(),
+        )
+        .expect("open");
+        let a = AbsPath::try_from(sel.join("a.txt").as_path()).expect("absolute");
+        let sub = AbsPath::try_from(sel.join("sub").as_path()).expect("absolute");
+        let root = AbsPath::try_from(sel.as_path()).expect("absolute");
+        assert!(
+            session.clipboard().is_none(),
+            "a fresh session has nothing queued"
+        );
+
+        // An empty selection is Go's "No files selected" (`api/ops.go:146`), never a silent clear.
+        let err = session
+            .clipboard_store(&ClipboardStore {
+                op: clipboard::ClipOp::Copy,
+                sources: Vec::new(),
+                scope: clipboard::ClipScope::Selected,
+            })
+            .expect_err("nothing selected");
+        assert!(matches!(err, CoreError::Empty { .. }), "{err:?}");
+        assert!(
+            session.clipboard().is_none(),
+            "a refused request leaves the queue alone"
+        );
+
+        let clip = session
+            .clipboard_store(&ClipboardStore {
+                op: clipboard::ClipOp::Copy,
+                sources: vec![a.clone()],
+                scope: clipboard::ClipScope::Selected,
+            })
+            .expect("queue a selection");
+        assert_eq!(clip.items.len(), 1, "one named item");
+        assert_eq!(
+            clip.origin.as_ref(),
+            Some(&root),
+            "the queue came from `sel/`"
+        );
+        assert_eq!(
+            session.clipboard().expect("kept").paths(),
+            vec![a.clone()],
+            "the queue is what a paste will place"
+        );
+
+        // The Go-parity log record (`api/ops.go:176`): COPY, the sources, empty dest and name.
+        let records = session.log_recent(None).expect("the log reads");
+        let rec = records.entries().last().expect("one record was appended");
+        assert_eq!(rec.action, crate::history::codec::ActionType::COPY);
+        assert_eq!(
+            rec.sources,
+            vec![a.to_string_lossy()],
+            "the resolved sources"
+        );
+        assert_eq!(rec.dest, "", "a copy has no destination yet");
+        assert_eq!(rec.name, "");
+
+        // And the two events: the history pane's id, then the new queue. No notice — with neither
+        // `wl-copy` nor `xclip` the system sync is Go's silent no-op (`api/ops.go:573`).
+        let mut saw_log = false;
+        let mut saw_clip = None;
+        let mut notices = Vec::new();
+        for event in session.poll() {
+            match event {
+                EngineEvent::LogAppended { id } => {
+                    assert_eq!(
+                        Some(id),
+                        records.entries().last().map(|r| r.id),
+                        "the event names the record that was just written"
+                    );
+                    saw_log = true;
+                }
+                EngineEvent::ClipboardChanged { clip } => saw_clip = clip,
+                EngineEvent::Notice { message, .. } => notices.push(message),
+                other => panic!("unexpected event from a copy: {other:?}"),
+            }
+        }
+        assert!(saw_log, "the history pane is told about the record");
+        assert_eq!(
+            saw_clip.expect("every clipboard badge is told").items.len(),
+            1,
+            "the event carries the new queue"
+        );
+        assert!(notices.is_empty(), "no platform noise: {notices:?}");
+
+        // `Inside` widens to the directory's children (`api/ops.go:189-211`), and a file is refused.
+        let expanded = session
+            .clipboard_store(&ClipboardStore {
+                op: clipboard::ClipOp::Cut,
+                sources: vec![sub.clone()],
+                scope: clipboard::ClipScope::Inside,
+            })
+            .expect("expand a directory");
+        assert_eq!(expanded.items.len(), 1, "`sub/` holds b.txt");
+        assert_eq!(expanded.op, clipboard::ClipOp::Cut);
+        assert_eq!(
+            expanded.items[0].path,
+            sub.join("b.txt").expect("joined"),
+            "the expansion is the child, in Go's lexical order"
+        );
+        let err = session
+            .clipboard_store(&ClipboardStore {
+                op: clipboard::ClipOp::Copy,
+                sources: vec![a.clone()],
+                scope: clipboard::ClipScope::Inside,
+            })
+            .expect_err("a file is not a directory");
+        assert!(matches!(err, CoreError::NotADir { .. }), "{err:?}");
+
+        // Clear (`api/ops.go:216-221`): the queue is gone, and the event says so with `None`.
+        session.clipboard_clear();
+        assert!(session.clipboard().is_none(), "cleared");
+        let mut cleared = None;
+        for event in session.poll() {
+            if let EngineEvent::ClipboardChanged { clip } = event {
+                cleared = Some(clip.is_none());
+            }
+        }
+        assert_eq!(cleared, Some(true), "the clear was announced");
+        // Two more copies, and the log holds one record per copy (Go appended one per request).
+        for _ in 0..2 {
+            session
+                .clipboard_store(&ClipboardStore {
+                    op: clipboard::ClipOp::Copy,
+                    sources: vec![a.clone()],
+                    scope: clipboard::ClipScope::Selected,
+                })
+                .expect("copy again");
+        }
+        let records = session.log_recent(None).expect("the log reads");
+        assert_eq!(
+            records
+                .entries()
+                .iter()
+                .filter(|r| r.action == crate::history::codec::ActionType::COPY)
+                .count(),
+            4,
+            "one COPY record per queued selection"
+        );
+        session.close();
+        let _ = fs::remove_file(sel.join("a.txt"));
+        let _ = fs::remove_file(sel.join("sub").join("b.txt"));
+        let _ = fs::remove_dir(sel.join("sub"));
+        let _ = fs::remove_dir(&sel);
         cleanup(&dir);
     }
 

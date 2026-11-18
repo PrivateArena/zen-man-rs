@@ -221,9 +221,11 @@ pub fn route(jobs: &mut JobsUi, model: &mut AppModel, event: EngineEvent) -> Rou
         EngineEvent::DirSizeReady { .. }
         | EngineEvent::DirChanged { .. }
         | EngineEvent::IndexChanged { .. }
-        | EngineEvent::LogAppended { .. } => {
+        | EngineEvent::LogAppended { .. }
+        | EngineEvent::ClipboardChanged { .. } => {
             // Disk sizes paint from the cache (step 8+); DirChanged invalidation is core-side
-            // (`Session::invalidate`) and the panes re-page. Nothing to route until step 9 emits.
+            // (`Session::invalidate`) and the panes re-page. The clipboard badge is step 10's UI, so
+            // there is nothing to route here yet.
         }
     }
     notices

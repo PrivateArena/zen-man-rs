@@ -46,7 +46,7 @@ use zenman_core::mode::ModeKind;
 use zenman_core::path::{AbsPath, FsPath};
 use zenman_core::platform::Env;
 use zenman_core::platform::env_probe::ProbeReport;
-use zenman_core::services::dirs::{DirSizeOpts, ListDir, SilentSink};
+use zenman_core::services::dirs::{DirSizeOpts, FlatMode, ListDir, SilentSink};
 use zenman_core::session::{Receipt, Session, SessionPaths};
 use zenman_core::store::config::{SortSpec, ZenConfig};
 
@@ -307,6 +307,7 @@ fn dir_listing_matches_go() {
             cursor: case.cursor.map(Cursor::decode),
             limit: case.limit.unwrap_or(200),
             sort: SortSpec::DEFAULT_SORT,
+            flat: FlatMode::Off,
         };
         let origin = session.next_origin();
         let receipt = session
@@ -725,8 +726,10 @@ struct FlatCase {
     golden: &'static str,
     /// The tree-relative listing root.
     sub: &'static str,
-    /// `no_folders=true` (`api/dir.go:127`): the walk yields files only.
-    no_folders: bool,
+    /// The engine's flat mode — `flat`/`no_folders` as one field (`api/dir.go:126-127`).
+    flat: FlatMode,
+    /// The captured `limit` (`INDEX.json`'s request; Go's default is 200).
+    limit: usize,
     /// The captured `total_count` — the walk's own row count, cap included.
     total: usize,
     /// The captured page's `has_more`.
@@ -740,7 +743,8 @@ const FLAT_CASES: &[FlatCase] = &[
     FlatCase {
         golden: "dir-flat-subdir",
         sub: "tree/subdir",
-        no_folders: false,
+        flat: FlatMode::Mixed,
+        limit: 200,
         total: 3,
         has_more: false,
         page: 3,
@@ -749,18 +753,21 @@ const FLAT_CASES: &[FlatCase] = &[
     FlatCase {
         golden: "dir-flat-nofolders",
         sub: "tree/subdir",
-        no_folders: true,
+        flat: FlatMode::MixedNoFolders,
+        limit: 200,
         total: 2,
         has_more: false,
         page: 2,
     },
     // The deep tree: 21 rows, ordered by *base name* (dirs first), not by `rel_path` — the order
     // is the sort's, and `d0/d1/d2…` nests deeper than `…/d10`, which is what makes this case the
-    // one that pins the comparator.
+    // one that pins the comparator. `Grouped` walks exactly like `Mixed` (the grouping is a shell-side
+    // render, `frontend/js/navigation.js:92-97`), so this capture is that mode's expectation too.
     FlatCase {
         golden: "dir-flat-deep",
         sub: "tree/deep",
-        no_folders: false,
+        flat: FlatMode::Grouped,
+        limit: 200,
         total: 21,
         has_more: false,
         page: 21,
@@ -769,7 +776,8 @@ const FLAT_CASES: &[FlatCase] = &[
     FlatCase {
         golden: "dir-flat-cap",
         sub: "tree/flatcap",
-        no_folders: false,
+        flat: FlatMode::Mixed,
+        limit: 5,
         total: 10_000,
         has_more: true,
         page: 5,
@@ -797,12 +805,11 @@ const FLAT_CASES: &[FlatCase] = &[
 ///   `cargo xtask fixture-tree` diffs the generator's output against, and the reason this test
 ///   cannot quietly be comparing against a different tree.
 ///
-/// **Not assertable today, and that is a fact about step 8, not about this test**: the *engine's*
-/// flat walk. `ListDir` has no `flat`/`no_folders` field — `services/dirs.rs:162` says so out loud
-/// ("`flat`/`no_folders`, whose walk arrives with `ops/list.rs` in step 9") — so there is no
-/// `Session` call that could produce these pages. Step 9 adds the field and the walk; the
-/// *expectation* is already computed here, so what is missing is only the call, never the answer.
-/// Recorded in plan §9.2's step-8 row, together with the pane's matching disabled buttons.
+/// **and, since step 9a, the engine's own flat walk**: every row is also produced by
+/// [`Session::page_dir`] with a `ListDir { flat, .. }` request, drained through `poll()` until
+/// [`EngineEvent::DirPageReady`] (a flat request is a job, not a synchronous read), and the whole
+/// serialised page is compared against the capture — the same field-for-field claim
+/// `dir_listing_matches_go` makes of a plain listing.
 #[test]
 fn flat_modes_match_go() {
     use std::os::unix::fs::MetadataExt as _;
@@ -810,8 +817,10 @@ fn flat_modes_match_go() {
     let fix = fixtures();
     let cap = Limits::default().flat_walk_cap;
     let manifest = fixture_tree_manifest();
+    let mut session = open_session(fix, "flat", real_env());
     let mut rows_checked = 0usize;
     let mut modes = std::collections::BTreeSet::new();
+    let mut engine_pages = 0usize;
     for case in FLAT_CASES {
         let payload = golden(case.golden);
         let root = fix.root.join(case.sub);
@@ -914,7 +923,7 @@ fn flat_modes_match_go() {
                 case.golden
             );
             assert!(
-                !case.no_folders || !meta.is_dir(),
+                case.flat.includes_dirs() || !meta.is_dir(),
                 "{}: `no_folders` yields no directory rows, and {:?} is one",
                 case.golden,
                 rel
@@ -925,7 +934,7 @@ fn flat_modes_match_go() {
         // 3. the whole walk: the captured row *sequence* is a recursive walk of this tree in
         //    the listing order, truncated at the cap. The flat captures are name-ordered, which is
         //    Go's own default, so the comparison is exact rather than set-shaped.
-        let mut walked = walk_flat(&root, case.no_folders);
+        let mut walked = walk_flat(&root, !case.flat.includes_dirs());
         assert_eq!(
             walked.len().min(cap),
             case.total,
@@ -947,6 +956,19 @@ fn flat_modes_match_go() {
             case.golden
         );
 
+        // 3b. **the engine's page**, through `Session::page_dir` + the job path, compared field for
+        //     field against the capture (see `engine_flat_page`/`assert_page_matches_capture`).
+        let page = engine_flat_page(&mut session, case, &root);
+        let got = serde_json::to_value(page.to_listing()).expect("a listing serialises");
+        assert_page_matches_capture(&got, case, fix);
+        assert_eq!(
+            page.total_count,
+            case.total.min(cap),
+            "{}: the engine's own walk reached the captured row count",
+            case.golden
+        );
+        engine_pages += 1;
+
         // 4. the tree on disk is the captured tree: every walked path is in the manifest, with the
         //    same kind. `cargo xtask fixture-tree` is the byte-exact gate; this is the link between
         //    *this* test's tree and that manifest.
@@ -964,6 +986,11 @@ fn flat_modes_match_go() {
         }
     }
     assert!(rows_checked > 20, "{rows_checked} rows is not a gate");
+    assert_eq!(
+        engine_pages,
+        FLAT_CASES.len(),
+        "every flat capture must be produced by the engine, not only checked on disk"
+    );
     assert!(
         modes.contains("drwxr-xr-x") && modes.contains("-rw-r--r--"),
         "the flat captures must cover both a directory and a regular file mode: {modes:?}"
@@ -972,6 +999,123 @@ fn flat_modes_match_go() {
         "contract_dirs::flat_modes_match_go: {rows_checked} rows, {} distinct mode strings, all \
          round-tripped through ModeKind",
         modes.len()
+    );
+}
+
+/// Drive one `FLAT_CASES` row through the engine: `Session::page_dir` with `ListDir { flat, .. }`, then
+/// the `Receipt::Running` drain loop `dir_size_matches_go` uses for the size walk.
+///
+/// A flat request *must* be a job (a recursive walk of up to [`Limits::flat_walk_cap`] entries is not a
+/// read that may park a window thread), must come back with the caller's `Origin`, and must then be
+/// served from the cache on the **flat** key — a second identical request answers `Done` synchronously.
+fn engine_flat_page(
+    session: &mut Session,
+    case: &FlatCase,
+    root: &Path,
+) -> Arc<zenman_core::entry::DirPage> {
+    let req = ListDir {
+        path: FsPath::from_abs(abs(root)),
+        cursor: None,
+        limit: case.limit,
+        sort: SortSpec::DEFAULT_SORT,
+        flat: case.flat,
+    };
+    let origin = session.next_origin();
+    let (job, back) = match session
+        .page_dir(&req, origin)
+        .unwrap_or_else(|e| panic!("{}: {e}", case.golden))
+    {
+        Receipt::Running { job, origin } => (job, origin),
+        Receipt::Done(page) => panic!(
+            "{}: a flat walk is a job, not a synchronous read ({} rows came back inline)",
+            case.golden, page.total_count
+        ),
+    };
+    assert_eq!(back, origin, "the receipt returns the caller's origin");
+    let mut ready = None;
+    let mut terminal = None;
+    for _ in 0..30_000 {
+        for event in session.poll() {
+            match event {
+                EngineEvent::DirPageReady {
+                    origin: ev_origin,
+                    path,
+                    page,
+                } => {
+                    assert_eq!(ev_origin, back, "the page carries the request's origin");
+                    assert_eq!(path, req.path, "and names the directory it listed");
+                    ready = Some(page);
+                }
+                EngineEvent::JobStarted { id, origin, .. } => {
+                    assert_eq!(origin, back, "JobStarted carries the same origin");
+                    assert_eq!(id, job, "and the job the receipt named");
+                }
+                EngineEvent::JobFinished {
+                    id,
+                    origin,
+                    outcome,
+                    payload,
+                    ..
+                } => {
+                    assert_eq!(origin, back, "and so does the terminal event");
+                    assert!(outcome.succeeded(), "{outcome:?}");
+                    assert!(
+                        payload.dir_page().is_some(),
+                        "a typed page payload, got {payload:?}"
+                    );
+                    terminal = Some(id);
+                }
+                EngineEvent::JobProgress { .. } | EngineEvent::Notice { .. } => {}
+                other => panic!("unexpected event on the flat-listing job: {other:?}"),
+            }
+        }
+        if ready.is_some() && terminal.is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let page = ready.unwrap_or_else(|| panic!("{}: no DirPageReady arrived", case.golden));
+    assert_eq!(terminal, Some(job), "the job announced exactly one ending");
+    assert!(
+        session
+            .page_dir(&req, session.next_origin())
+            .expect("the second ask")
+            .is_done(),
+        "{}: a cached flat request answers synchronously, on its own key",
+        case.golden
+    );
+    page
+}
+
+/// The strong comparison: the whole serialised page against the whole capture.
+///
+/// The one field that belongs to the filesystem rather than to the engine is a directory row's `size`
+/// (the captures were taken on tmpfs), and that escape is the same one `dir_listing_matches_go`
+/// documents — announced out loud, never taken silently.
+fn assert_page_matches_capture(got: &Value, case: &FlatCase, fix: &Fixtures) {
+    let want = expected_listing(case.golden, &fix.root);
+    if got == &want {
+        return;
+    }
+    let adjusted = substitute_directory_sizes(&want, got);
+    assert_eq!(
+        got, &adjusted,
+        "{} differs in more than the directory `size` field, so this is not a filesystem-shape \
+         difference\n  expected: {want}\n  ours:     {got}",
+        case.golden
+    );
+    assert!(
+        !fix.go_directory_sizes,
+        "{} differs only in directory `size`, which this filesystem does report go-shaped: that is \
+         a real mismatch",
+        case.golden
+    );
+    eprintln!(
+        "contract_dirs::flat_modes_match_go: SKIPPED the directory `size` field of {} — a fresh \
+         directory under {} is not the 40 bytes the capture has; every other field of every row was \
+         compared and matched.",
+        case.golden,
+        fix.root.display()
     );
 }
 
