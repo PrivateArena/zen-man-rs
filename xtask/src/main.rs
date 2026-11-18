@@ -6,8 +6,9 @@
 //! anywhere else fails) and the IO guard (`std::fs` nowhere in `zenman-ui/src` outside a
 //! `#[cfg(test)]` item). Step 7c added the two gates that had been claimed but not built: `assets`
 //! (every file under `assets/**` attributed by literal path — `ATTRIBUTION.md`'s own claim) and the
-//! snapshot-artefact check (the committed `01-empty.png` must exist, decode, and be the size the
-//! token geometry implies). `snapshots` renders that PNG (or prints a skip reason when no adapter
+//! snapshot-artefact check (step 8c: *every* PNG under `crates/zenman-ui/tests/snapshots/` must
+//! exist, decode, and be the size the test's own `SIZE` implies, and no PNG may sit there that the
+//! test does not render). `snapshots` renders them (or prints a skip reason when no adapter
 //! exists); `parity` is the one remaining stub, landing with the human review in step 15.
 //! `contracts` is real since step 2: it guards the frozen Go golden capture in
 //! `tests/golden/` (`xtask/src/contracts.rs`), and since step 2 it also runs the two completeness
@@ -197,39 +198,123 @@ fn io_guard() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// The committed snapshot artefact, checked without rendering (plan §7 step 7's artefact, step 7c's
-/// gate). `crates/zenman-ui/tests/snapshots.rs` still *skips with a printed reason* when the machine
-/// has no rasteriser — that is the plan's acceptance path — but that skip is only honest while the
-/// artefact the last machine left behind is the one it claims, so this gate fails when
-/// `01-empty.png` is missing, corrupt, truncated, or not the size the shell geometry implies.
+/// Every committed snapshot artefact, checked without rendering (plan §7 step 7's artefact, step
+/// 7c's gate, step 8c's extension to the whole directory).
 ///
-/// The expected size is read out of the test's own `SIZE` constant rather than repeated here, so
-/// the artefact and the harness cannot drift apart unnoticed.
+/// `crates/zenman-ui/tests/snapshots.rs` still *skips with a printed reason* when the machine has
+/// no rasteriser — that is the plan's acceptance path — but that skip is only honest while the
+/// artefacts the last machine left behind are the ones they claim. So this gate fails when
+/// a baseline is missing, corrupt, truncated, not the size the shell geometry implies, or when the
+/// directory carries a PNG the test does not render (a renamed or stale artefact, which would
+/// otherwise sit in review forever).
+///
+/// Both expectations are read out of the test's own source — its `SIZE` constant and its
+/// `"NN-<what>.png"` literals — rather than repeated here, so the artefacts and the harness cannot
+/// drift apart unnoticed as steps 10/12/14 add their own baselines.
 fn snapshot_artefact_gate() -> Result<(), Box<dyn Error>> {
     let root = workspace_root()?;
-    let png = root.join("crates/zenman-ui/tests/snapshots/01-empty.png");
-    let relative = png
-        .strip_prefix(&root)
-        .unwrap_or(png.as_path())
-        .display()
-        .to_string();
-    let want = harness_size(&root)?;
-    if !png.is_file() {
-        return Err(format!(
-            "xtask ci: {relative} is missing — run `cargo xtask snapshots` on a machine with a \
-             rasteriser and commit the PNG (plan §7 step 7: the artefact is part of the step)"
-        )
-        .into());
-    }
-    let bytes = std::fs::read(&png)?;
-    let info = png::check_dimensions(&relative, &bytes, want)?;
-    println!(
-        "xtask ci: snapshot artefact — {relative} is a valid {}x{} PNG ({} bytes), the harness size",
-        info.width,
-        info.height,
-        bytes.len()
-    );
+    println!("xtask ci: {}", check_snapshot_artefacts(&root)?);
     Ok(())
+}
+
+/// The gate's body, rooted at `root` so it is testable against a copy of the artefacts in a
+/// temporary directory (`tests::a_corrupt_or_stale_artefact_fails_the_gate`). On success, the summary
+/// line; on any problem, every problem at once — one run must report all of them.
+fn check_snapshot_artefacts(root: &Path) -> Result<String, Box<dyn Error>> {
+    let dir = root.join("crates/zenman-ui/tests/snapshots");
+    let want = harness_size(root)?;
+    let expected = harness_snapshot_names(root)?;
+    let mut problems = Vec::new();
+    let mut on_disk = Vec::new();
+    match std::fs::read_dir(&dir) {
+        Ok(entries) => {
+            for entry in entries {
+                let path = entry?.path();
+                if path.is_file() && path.extension().is_some_and(|e| e == "png") {
+                    on_disk.push(
+                        path.file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_default(),
+                    );
+                }
+            }
+        }
+        Err(e) => problems.push(format!("{}: {e}", dir.display())),
+    }
+    on_disk.sort();
+    let relative = |name: &str| -> String {
+        let path = dir.join(name);
+        path.strip_prefix(root)
+            .unwrap_or(path.as_path())
+            .display()
+            .to_string()
+    };
+    for name in expected.iter().filter(|n| !on_disk.contains(n)) {
+        problems.push(format!(
+            "{} is missing — run `cargo xtask snapshots` on a machine with a rasteriser and \
+             commit the PNG (plan §7 step 7: the artefact is part of the step)",
+            relative(name)
+        ));
+    }
+    for name in on_disk.iter().filter(|n| !expected.contains(n)) {
+        problems.push(format!(
+            "{} is not a baseline `snapshots.rs` renders ({}) — delete it or add the scene it \
+             belongs to",
+            relative(name),
+            expected.join(", ")
+        ));
+    }
+    let mut lines = Vec::new();
+    for name in &on_disk {
+        if !snapshot_name_is_recognised(name) {
+            problems.push(format!(
+                "{} does not follow the `NN-<what>.png` baseline scheme",
+                relative(name)
+            ));
+            continue;
+        }
+        let path = dir.join(name);
+        let bytes = std::fs::read(&path)?;
+        match png::check_dimensions(&relative(name), &bytes, want) {
+            Ok(info) => lines.push(format!(
+                "  {}: {}x{} px, {} bytes",
+                relative(name),
+                info.width,
+                info.height,
+                bytes.len()
+            )),
+            Err(e) => problems.push(e.to_string()),
+        }
+    }
+    if !problems.is_empty() {
+        return Err(format!("xtask ci: snapshot artefacts:\n  {}", problems.join("\n  ")).into());
+    }
+    Ok(format!(
+        "snapshot artefacts — {} valid PNG(s) at the harness size {}x{}:\n{}",
+        lines.len(),
+        want.0,
+        want.1,
+        lines.join("\n")
+    ))
+}
+
+/// The `NN-<what>.png` baseline scheme: two digits, a `-`, a lowercase slug of letters, digits and
+/// inner hyphens, and the `.png` extension in lower case.
+fn snapshot_name_is_recognised(name: &str) -> bool {
+    let Some(rest) = name.strip_suffix(".png") else {
+        return false;
+    };
+    let Some((digits, slug)) = rest.split_once('-') else {
+        return false;
+    };
+    digits.len() == 2
+        && digits.bytes().all(|b| b.is_ascii_digit())
+        && !slug.is_empty()
+        && !slug.starts_with('-')
+        && !slug.ends_with('-')
+        && slug
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 /// The `const SIZE: egui::Vec2 = egui::vec2(w, h)` of the snapshot test — the size the token
@@ -260,6 +345,49 @@ fn harness_size(root: &Path) -> Result<(u32, u32), Box<dyn Error>> {
         "{shown}: no `const SIZE: egui::Vec2 = egui::vec2(w, h)` to size the artefact against"
     )
     .into())
+}
+
+/// The baseline file names `crates/zenman-ui/tests/snapshots.rs` renders: every `"….png"` string
+/// literal outside its comments. The test is the only place a baseline is named, so the artefact
+/// set is derived from it — a scene added there is demanded here, and a PNG left there is refused.
+fn harness_snapshot_names(root: &Path) -> Result<Vec<String>, Box<dyn Error>> {
+    let file = root.join("crates/zenman-ui/tests/snapshots.rs");
+    let text = std::fs::read_to_string(&file)?;
+    let shown = file.strip_prefix(root).unwrap_or(file.as_path()).display();
+    let names = png_string_literals(&text);
+    if names.is_empty() {
+        return Err(format!("{shown}: no `\"NN-<what>.png\"` baseline to validate").into());
+    }
+    Ok(names)
+}
+
+/// The `"….png"` string literals of a Rust source text, ignoring comment lines (a doc comment that
+/// quotes a path is prose, not a baseline). Sorted, deduplicated.
+fn png_string_literals(text: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for line in text.lines() {
+        let code = line.trim_start();
+        if code.starts_with("//") {
+            continue;
+        }
+        let mut rest = code;
+        while let Some(from_quote) = rest.find('"') {
+            let after = &rest[from_quote + 1..];
+            let Some(to_quote) = after.find('"') else {
+                break;
+            };
+            let token = &after[..to_quote];
+            if token.ends_with(".png")
+                && !token.contains('/')
+                && !names.contains(&token.to_string())
+            {
+                names.push(token.to_string());
+            }
+            rest = &after[to_quote + 1..];
+        }
+    }
+    names.sort();
+    names
 }
 
 /// Grep a directory tree of `.rs` files for needles, skipping files whose name is exempt.
@@ -307,8 +435,9 @@ fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), Box<dyn Error>> 
     Ok(())
 }
 
-/// Plan §7 step 7: write `crates/zenman-ui/tests/snapshots/01-empty.png` from the kittest+wgpu
-/// rasteriser, or skip with the reason the test printed. This box has Vulkan (AMD integrated) and
+/// Plan §7 step 7 (+ step 8c's baselines): write every PNG under
+/// `crates/zenman-ui/tests/snapshots/` from the kittest+wgpu rasteriser, or skip with the reason the
+/// test printed. This box has Vulkan (AMD integrated) and
 /// GL and no lavapipe (plan OQ3), so the real path is the hardware adapter head-lessly — which is
 /// also what `xvfb-run -a cargo xtask snapshots` exercises on CI images.
 fn snapshots() -> Result<(), Box<dyn Error>> {
@@ -330,13 +459,28 @@ fn snapshots() -> Result<(), Box<dyn Error>> {
     if !status.success() {
         return Err("`cargo xtask snapshots`: the snapshot test failed (above)".into());
     }
-    let png = root.join("crates/zenman-ui/tests/snapshots/01-empty.png");
-    if png.is_file() {
-        let bytes = std::fs::metadata(&png)?.len();
+    let dir = root.join("crates/zenman-ui/tests/snapshots");
+    let mut written = 0usize;
+    if dir.is_dir() {
+        for entry in std::fs::read_dir(&dir)? {
+            let path = entry?.path();
+            if path.is_file() && path.extension().is_some_and(|e| e == "png") {
+                let bytes = std::fs::metadata(&path)?.len();
+                println!(
+                    "xtask snapshots: wrote {} ({bytes} bytes)",
+                    path.strip_prefix(&root).unwrap_or(path.as_path()).display()
+                );
+                written += 1;
+            }
+        }
+    }
+    if written > 0 {
         println!(
-            "xtask snapshots: wrote {} ({bytes} bytes) — human review against `docs/parity/` is step 15's gate, never a pixel diff",
-            png.display()
+            "xtask snapshots: {written} baseline(s) — human review against `docs/parity/` is              step 15's gate, never a pixel diff"
         );
+        // The same gate `ci` runs, so an artefact that came out at the wrong size is reported here
+        // and not only at the next `cargo xtask ci`.
+        check_snapshot_artefacts(&root)?;
         Ok(())
     } else {
         println!(
@@ -754,4 +898,145 @@ pub(crate) fn expression_is_satisfiable(expression: &str, allow: &[String]) -> b
 
 fn normalise(id: &str) -> String {
     id.trim().trim_matches('"').to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        check_snapshot_artefacts, harness_size, harness_snapshot_names, png_string_literals,
+        snapshot_name_is_recognised,
+    };
+
+    /// A copy of the committed artefacts under `<temp>/xtask-snap-<pid>-<tag>`, so the gate can be
+    /// seen failing without touching the tree. `size_override` rewrites the copied `SIZE`, which is
+    /// how a test can make every artefact "the wrong dimensions" the way a real size change does.
+    /// (The copy is what the gate reads; the committed tree is never touched.)
+    fn artefact_tree(tag: &str, size_override: Option<(u32, u32)>) -> std::path::PathBuf {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask is a workspace member")
+            .to_path_buf();
+        let root = std::env::temp_dir().join(format!("xtask-snap-{}-{tag}", std::process::id()));
+        let dir = root.join("crates/zenman-ui/tests/snapshots");
+        std::fs::create_dir_all(&dir).expect("the copy directory is creatable");
+        let mut source = harness_snapshot_names(&repo).expect("the test names its baselines");
+        for name in &source {
+            std::fs::copy(
+                repo.join("crates/zenman-ui/tests/snapshots").join(name),
+                dir.join(name),
+            )
+            .expect("the committed artefact is copyable");
+        }
+        source.sort();
+        assert!(!source.is_empty(), "there are committed baselines to copy");
+        let text = std::fs::read_to_string(repo.join("crates/zenman-ui/tests/snapshots.rs"))
+            .expect("the snapshot test is readable");
+        let text = match size_override {
+            None => text,
+            Some((w, h)) => {
+                let (cur_w, cur_h) = harness_size(&repo).expect("the test states its size");
+                text.replace(
+                    &format!("egui::vec2({}.0, {}.0)", cur_w, cur_h),
+                    &format!("egui::vec2({}.0, {}.0)", w, h),
+                )
+            }
+        };
+        std::fs::write(root.join("crates/zenman-ui/tests/snapshots.rs"), text)
+            .expect("the copied test is writable");
+        root
+    }
+
+    #[test]
+    fn a_corrupt_or_stale_artefact_fails_the_gate() {
+        // The green case first: the committed artefacts, copied verbatim.
+        let good = artefact_tree("green", None);
+        let summary = check_snapshot_artefacts(&good).expect("the committed artefacts pass");
+        println!("gate, faithful copy: {summary}");
+
+        // A truncated PNG.
+        let truncated = good.join("crates/zenman-ui/tests/snapshots/02-file-list.png");
+        let mut bytes = std::fs::read(&truncated).expect("the artefact is readable");
+        let cut = bytes.len() - 40;
+        bytes.truncate(cut);
+        std::fs::write(&truncated, &bytes).expect("the copy is writable");
+        let error = check_snapshot_artefacts(&good).expect_err("a truncated PNG must fail");
+        println!("gate, truncated: {error}");
+        assert!(
+            error.to_string().contains("ends early"),
+            "the reason must name the fault"
+        );
+
+        // A stale artefact the test does not render.
+        let stale = artefact_tree("stale", None);
+        let bytes = std::fs::read(stale.join("crates/zenman-ui/tests/snapshots/01-empty.png"))
+            .expect("the artefact is readable");
+        std::fs::write(
+            stale.join("crates/zenman-ui/tests/snapshots/09-removed-scene.png"),
+            &bytes,
+        )
+        .expect("the copy is writable");
+        let error = check_snapshot_artefacts(&stale).expect_err("a stray PNG must fail");
+        println!("gate, stale: {error}");
+        assert!(error.to_string().contains("not a baseline"));
+
+        // A missing artefact.
+        let missing = artefact_tree("missing", None);
+        std::fs::remove_file(missing.join("crates/zenman-ui/tests/snapshots/03-file-grid.png"))
+            .expect("the copy is deletable");
+        let error = check_snapshot_artefacts(&missing).expect_err("a missing baseline must fail");
+        println!("gate, missing: {error}");
+        assert!(error.to_string().contains("03-file-grid.png is missing"));
+
+        // And the dimension property, driven from the *test's* own `SIZE`: a harness that changes
+        // size without a re-render is exactly the drift the gate exists to catch.
+        let resized = artefact_tree("resized", Some((640, 480)));
+        let error = check_snapshot_artefacts(&resized).expect_err("a wrong-size PNG must fail");
+        println!("gate, wrong dimensions: {error}");
+        assert!(
+            error
+                .to_string()
+                .contains("the shell geometry says 640x480"),
+            "the expected size must come from the test's SIZE"
+        );
+    }
+
+    #[test]
+    fn the_baseline_naming_scheme_is_accepted_and_strays_are_not() {
+        for good in ["01-empty.png", "02-file-list.png", "14-batch-rename.png"] {
+            assert!(snapshot_name_is_recognised(good), "{good} is a baseline");
+        }
+        for bad in [
+            "empty.png",           // no order prefix
+            "1-empty.png",         // one digit
+            "01-.png",             // empty slug
+            "01-file_.png",        // not a lowercase slug
+            "01-file-list.PNG",    // the extension is lowercase
+            "01-file-list.jpg",    // not a PNG
+            "01-file-list.png.rs", // not an artefact
+            "README.png",
+        ] {
+            assert!(
+                !snapshot_name_is_recognised(bad),
+                "{bad} must be refused by the artefact gate"
+            );
+        }
+    }
+
+    #[test]
+    fn the_expected_baselines_come_from_the_test_source_not_from_comments() {
+        let source = "//! writes `tests/snapshots/01-empty.png` from the rasteriser\n\
+                      const SIZE: egui::Vec2 = egui::vec2(1440.0, 900.0);\n\
+                      \x20   Self::Empty => \"01-empty.png\",\n\
+                          } => \"02-file-list.png\",\n\
+                      let other = \"notes.txt\";\n";
+        assert_eq!(
+            png_string_literals(source),
+            vec!["01-empty.png".to_string(), "02-file-list.png".to_string()],
+            "the artefact set is what the test renders, deduplicated and in order"
+        );
+        assert!(
+            png_string_literals("// only a comment mentions \"09-stale.png\"").is_empty(),
+            "prose about a PNG must not create a required artefact"
+        );
+    }
 }
