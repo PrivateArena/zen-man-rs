@@ -30,18 +30,10 @@ use crate::ops::guard::{ensure_writable, vfs_write_guard};
 use crate::path::{AbsPath, FsPath};
 use crate::platform::Env;
 
-/// Whether a chmod walks the selection's subtrees.
-///
-/// Plan §5.3: the type exists, the v1 UI always passes [`Recursive::No`], because Go was non-recursive
-/// (`api/ops.go:940-944` chmods exactly the paths it was given).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum Recursive {
-    /// The selected paths only — Go's behaviour.
-    #[default]
-    No,
-    /// Every path under each selection, the selection included.
-    Yes,
-}
+/// Whether the chmod walks the selection's subtrees — the platform's own type, so there is exactly one
+/// spelling of "recursive" in the crate (plan §5.3: the v1 UI always passes [`Recursive::No`], because Go
+/// chmods exactly the paths it was given, `api/ops.go:940-944`).
+pub use crate::platform::Recursive;
 
 /// One chmod request.
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -1024,3 +1024,554 @@ fn a_refused_paste_never_becomes_a_job() {
     assert!(session.jobs().is_empty(), "a refused paste spawns no job");
     let _ = remove_tree(&root);
 }
+
+// ════════════════════════════════════════════════════════════════════════════════════════════
+// step 9c: the rest of the write path — delete / rename / mkdir / chmod / open, and the revert of
+// every record type that admits one.
+//
+// Same rules as the paste tests above: real temporary trees, the real undo-log file, the real job
+// table, and the frozen capture as the authority on what a record has to look like. The one new
+// seam is [`OpEnv`], a controllable [`Env`] — because the plan's delete ladder (trash / refused /
+// broken) and the open path (never spawn `xdg-open` from a test) are both platform answers, and
+// `trash`-ing a test's file into the developer's real `~/.local/share/Trash` is not a test, it is
+// vandalism.
+// ════════════════════════════════════════════════════════════════════════════════════════════
+
+use zenman_core::error::CoreError as PubError;
+use zenman_core::history::codec::LogStatus;
+use zenman_core::history::revert::{self as revert_ops, RevertReport};
+use zenman_core::index::intent::{IndexIntent, IndexOp, RecordingIntent};
+use zenman_core::mode::{self, ModeBits};
+use zenman_core::ops::chmod::{self, ChmodReq, Recursive};
+use zenman_core::ops::delete::{DeleteMode, DeleteOutcome, DeleteReport, DeleteReq};
+use zenman_core::ops::mkdir::{DEFAULT_DIR_MODE, MkdirReq};
+use zenman_core::ops::open::{self, OpenRoute};
+use zenman_core::ops::rename::{RenameOutcome, RenameReq, RenameTarget};
+use zenman_core::platform::{
+    CopyItem, CopyReport, DiskSpace, Env, ExecOutput, ExecRequest, LinkItem, MountTable, Os,
+    PlatformCaps, PlatformFuture, Shortcut, ready,
+};
+
+/// An [`Env`] whose three answers a test decides: is there a trash bin, does it accept this path, and
+/// what did the launcher get asked to open.
+///
+/// The remaining methods are the minimum that keeps `Session::open` honest: `supports_symlink` yes (the
+/// link tests need it), `copy_paths`/`exec_program` refused (nothing here should reach them, and a call
+/// that does becomes a loud typed error rather than a spawn).
+struct OpEnv {
+    /// Where this fake bin puts what it "trashes" — a real directory in the test's own temp tree.
+    bin: PathBuf,
+    /// `false` models the measured `/media/…` case (plan §9.1): a volume with its own fsid has no
+    /// native trash, so [`Env::can_trash`] answers no.
+    has_trash: bool,
+    /// `true` models `trash::Error::TargetedRoot` — the bin exists and refuses *this* path (`Ok(false)`).
+    refuses: bool,
+    /// `true` models a failure *while* trashing (`Err`), the rung that must never escalate to a delete.
+    broken: bool,
+    /// `true` makes the platform refuse `chmod` (the `Unsupported` lane, and the stub's answer).
+    chmod_refused: bool,
+    /// `true` makes the platform report "no opener configured" (`CoreError::Shell`, as
+    /// `platform::linux::open_with` does when `open::commands()` is empty).
+    no_opener: bool,
+    opened: Mutex<Vec<String>>,
+    trashed: Mutex<Vec<String>>,
+}
+
+impl OpEnv {
+    fn new(bin: &Path) -> Self {
+        Self {
+            bin: bin.to_path_buf(),
+            has_trash: true,
+            refuses: false,
+            broken: false,
+            chmod_refused: false,
+            no_opener: false,
+            opened: Mutex::new(Vec::new()),
+            trashed: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn opened(&self) -> Vec<String> {
+        self.opened.lock().expect("not poisoned").clone()
+    }
+
+    fn trashed(&self) -> Vec<String> {
+        self.trashed.lock().expect("not poisoned").clone()
+    }
+}
+
+impl Env for OpEnv {
+    fn os(&self) -> Os {
+        Os::current()
+    }
+
+    fn caps(&self) -> PlatformCaps {
+        PlatformCaps::empty()
+    }
+
+    fn open_with(&self, path: &AbsPath) -> PlatformFuture<'_, Result<(), PubError>> {
+        // The recorder's whole point: the test asserts the argv-equivalent (the path handed over) and no
+        // `xdg-open` is ever spawned.
+        self.opened
+            .lock()
+            .expect("not poisoned")
+            .push(path.to_string_lossy());
+        if self.no_opener {
+            return ready(Err(PubError::Shell {
+                cmd: "xdg-open".to_string(),
+                code: None,
+                stderr: "no opener found (simulated: open::commands() is empty)".to_string(),
+            }));
+        }
+        ready(Ok(()))
+    }
+
+    fn copy_paths(&self, _items: &[CopyItem]) -> PlatformFuture<'_, Result<CopyReport, PubError>> {
+        ready(Err(PubError::Unsupported {
+            what: "the test env does not copy (ops::copy does)",
+        }))
+    }
+
+    fn paste_link(&self, items: &[LinkItem]) -> PlatformFuture<'_, Result<(), PubError>> {
+        #[cfg(unix)]
+        {
+            for item in items {
+                if let Err(e) =
+                    std::os::unix::fs::symlink(item.target.as_path(), item.link.as_path())
+                {
+                    return ready(Err(PubError::Io {
+                        path: item.link.to_string_lossy(),
+                        io: Arc::new(e),
+                    }));
+                }
+            }
+            ready(Ok(()))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = items;
+            ready(Err(PubError::SymlinkUnsupported))
+        }
+    }
+
+    fn supports_symlink(&self) -> Result<bool, PubError> {
+        Ok(true)
+    }
+
+    fn chmod(
+        &self,
+        targets: &[AbsPath],
+        mode: ModeBits,
+    ) -> PlatformFuture<'_, Result<(), PubError>> {
+        if self.chmod_refused {
+            return ready(Err(PubError::Unsupported {
+                what: "chmod (simulated: this platform has no st_mode)",
+            }));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for target in targets {
+                if let Err(e) = fs::set_permissions(
+                    target.as_path(),
+                    fs::Permissions::from_mode(mode.bits_octal()),
+                ) {
+                    return ready(Err(PubError::Io {
+                        path: target.to_string_lossy(),
+                        io: Arc::new(e),
+                    }));
+                }
+            }
+            ready(Ok(()))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (targets, mode);
+            ready(Err(PubError::Unsupported {
+                what: "chmod (no st_mode on this platform)",
+            }))
+        }
+    }
+
+    fn can_trash(&self, _path: &AbsPath) -> bool {
+        self.has_trash
+    }
+
+    fn trash(&self, path: &AbsPath) -> Result<bool, PubError> {
+        if self.broken {
+            return Err(PubError::Io {
+                path: path.to_string_lossy(),
+                io: Arc::new(std::io::Error::other("simulated trash failure")),
+            });
+        }
+        if self.refuses {
+            return Ok(false);
+        }
+        let name = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        fs::rename(path.as_path(), self.bin.join(&name))
+            .unwrap_or_else(|e| panic!("the fake bin cannot take {}: {e}", path.to_string_lossy()));
+        self.trashed.lock().expect("not poisoned").push(name);
+        Ok(true)
+    }
+
+    fn create_shortcut(&self, _shortcut: &Shortcut) -> Result<(), PubError> {
+        Err(PubError::Unsupported {
+            what: "shortcuts (not in plan §5.3)",
+        })
+    }
+
+    fn disk_space(&self, _path: &AbsPath) -> Result<DiskSpace, PubError> {
+        Ok(DiskSpace::default())
+    }
+
+    fn mount_entries(&self) -> Result<MountTable, PubError> {
+        Err(PubError::Unsupported {
+            what: "mounts (not needed here)",
+        })
+    }
+
+    fn exec_program(&self, req: ExecRequest) -> PlatformFuture<'_, Result<ExecOutput, PubError>> {
+        let _ = req;
+        ready(Err(PubError::Unsupported {
+            what: "spawns (the test env never starts a process)",
+        }))
+    }
+}
+
+/// As [`open_session`], over a caller-supplied platform.
+fn open_session_env(dir: &Path, env: Arc<dyn Env>) -> Session {
+    let (session, notes) = Session::open(
+        SessionPaths::new(
+            dir.join("config.json"),
+            dir.join("action.log"),
+            None,
+            dir.join("probe"),
+        ),
+        ZenConfig::default(),
+        env,
+        Limits::default(),
+    )
+    .expect("a session over a clean scratch directory opens");
+    assert!(notes.is_empty(), "nothing here is damaged: {notes:?}");
+    session
+}
+
+/// Drive any job to its terminal event. `None` when it failed or was cancelled — which some of these
+/// tests want, and which is why this is not `wait_paste` again.
+fn pump<T: Clone>(
+    session: &mut Session,
+    job: JobId,
+    pick: impl Fn(&JobPayload) -> Option<T>,
+) -> (Option<T>, Vec<EngineEvent>) {
+    let mut events = Vec::new();
+    let mut done: Option<T> = None;
+    for round in 0..160 {
+        events.extend(session.poll());
+        if done.is_none() {
+            done = events.iter().find_map(|ev| match ev {
+                EngineEvent::JobFinished { id, payload, .. } if *id == job => pick(payload),
+                _ => None,
+            });
+        }
+        let terminal = events
+            .iter()
+            .any(|ev| matches!(ev, EngineEvent::JobFinished { id, .. } if *id == job));
+        if terminal && round > 8 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    events.extend(session.dirs().flush_invalidations());
+    (done, events)
+}
+
+fn running<T: std::fmt::Debug>(receipt: Result<Receipt<T>, PubError>) -> JobId {
+    match receipt {
+        Ok(Receipt::Running { job, .. }) => job,
+        other => panic!("expected a running job: {other:?}"),
+    }
+}
+
+/// The `(action, sources, dest, name)` roles of one written record, against the capture's record of the
+/// same action byte.
+fn assert_record_roles(session: &Session, root: &Path, id: i64, want: ActionType) {
+    let bytes = fs::read(root.join("action.log")).expect("the log exists");
+    let mut pos = 0usize;
+    let mut found = None;
+    while pos < bytes.len() {
+        let d = codec::decode_at(&bytes[pos..], pos as u64).expect("every frame decodes");
+        assert!(d.crc_ok, "frame at {pos} has a bad CRC");
+        assert_eq!(
+            codec::encode_vec(&d.record).expect("re-encodes"),
+            &bytes[pos..pos + d.consumed],
+            "the frame the op wrote is byte-stable (house rule 8)"
+        );
+        if d.record.id == id {
+            found = Some(d.record.clone());
+        }
+        pos += d.consumed;
+    }
+    let record = found.unwrap_or_else(|| panic!("record {id} is in the log: {bytes:?}"));
+    assert_eq!(record.action, want);
+    let golden = golden_json("log.json");
+    let go = golden["records"]
+        .as_array()
+        .expect("records")
+        .iter()
+        .find(|r| r["action"].as_i64() == Some(i64::from(want.0)))
+        .unwrap_or_else(|| panic!("the capture contains a {} record", want));
+    assert_eq!(
+        record.action_str(),
+        go["action_str"].as_str().expect("action_str"),
+        "the action name is Go's"
+    );
+    assert_eq!(
+        record.is_reversible(),
+        go["reversible"].as_bool().expect("reversible"),
+        "reversibility is the byte `api/log.go:600-602` derives, per action"
+    );
+}
+
+// ── delete ─────────────────────────────────────────────────────────────────────────────────────
+
+/// Ladder rungs 1 and 3, plus the record: a root **with** a bin trashes, and the log says `delete`
+/// with the Go field roles and `reversible:false` (golden records 7/8 — Go logged deletes, and
+/// `log_revert.go` refuses to undo them).
+#[test]
+fn delete_trashes_on_a_root_that_has_a_bin() {
+    let root = temp_dir("del-trash");
+    let bin = root.join("bin");
+    fs::create_dir_all(&bin).expect("bin dir");
+    let env = Arc::new(OpEnv::new(&bin));
+    let mut session = open_session_env(&root, Arc::clone(&env) as Arc<dyn Env>);
+    let file = write(&root.join("tree/victim.txt"), b"gone");
+    let dir = mkdir(&root.join("tree/sub"));
+    let intent = Arc::new(RecordingIntent::new());
+    session.set_intent(Arc::clone(&intent) as Arc<dyn IndexIntent>);
+
+    let origin = session.next_origin();
+    let job = match session.delete(
+        &DeleteReq::to_trash(vec![file.clone(), dir.clone()]),
+        origin,
+    ) {
+        Ok(Receipt::Running { job, .. }) => job,
+        other => panic!("a delete is never synchronous: {other:?}"),
+    };
+    let (report, events) = pump(&mut session, job, |p| p.delete().cloned());
+    let report = report.expect("the delete job finished with a report");
+
+    assert_eq!(report.mode_used, DeleteMode::Trash);
+    assert!(
+        matches!(&report.outcomes[0], DeleteOutcome::Trashed { path } if *path == file),
+        "{:?}",
+        report.outcomes
+    );
+    assert_eq!(report.trashed().len(), 2, "both went to the bin");
+    assert!(report.removed().is_empty(), "nothing was destroyed");
+    assert!(report.failed().is_empty());
+    assert!(!exists(&root.join("tree/victim.txt")));
+    assert!(!exists(&root.join("tree/sub")));
+    assert_eq!(
+        env.trashed(),
+        vec!["victim.txt".to_string(), "sub".to_string()],
+        "the bin holds them"
+    );
+
+    // The Go-parity record: one `delete` for the call, sources = what actually went, empty dest/name,
+    // and *not* reversible (`api/ops.go:378`, `api/log.go:600-602`).
+    let id = report.log_id.expect("a record was appended");
+    assert_record_roles(&session, &root, id, ActionType::DELETE);
+    let record = session.log_record(id).expect("the record reads back");
+    assert_eq!(record.dest, "", "Go appended none (`api/ops.go:378`)");
+    assert_eq!(record.name, "");
+    assert_eq!(record.sources.len(), 2);
+    assert!(
+        !record.is_reversible(),
+        "a delete is recorded, never undone"
+    );
+    assert!(!report.incomplete(), "everything asked for happened");
+
+    // Invalidation and the index, per affected directory.
+    let parent = abs(&root.join("tree"));
+    let changed = dir_changed(&events);
+    assert!(
+        changed
+            .iter()
+            .any(|(p, o)| *p == fskey(&parent) && *o == Some(origin)),
+        "the parent that lost two children is invalidated with the caller's origin: {changed:?}"
+    );
+    let ops = intent.recorded();
+    assert!(
+        ops.contains(&IndexOp::Deleted { path: file.clone() }),
+        "a file is one row: {ops:?}"
+    );
+    assert!(
+        ops.contains(&IndexOp::Pruned { path: dir.clone() }),
+        "a directory is a subtree: {ops:?}"
+    );
+    let _ = remove_tree(&root);
+}
+
+/// The whole of plan §6.2 **D6** and §9.1's measured trash facts, rung by rung.
+#[test]
+fn the_delete_ladder_only_destroys_what_the_user_agreed_to() {
+    // Rung A: no bin at all (the `/media/…` volume case), no opt-in → refused, and the file survives.
+    let root = temp_dir("del-no-bin");
+    let bin = root.join("bin");
+    fs::create_dir_all(&bin).expect("bin dir");
+    let env = Arc::new(OpEnv {
+        has_trash: false,
+        ..OpEnv::new(&bin)
+    });
+    let mut session = open_session_env(&root, Arc::clone(&env) as Arc<dyn Env>);
+    let file = write(&root.join("keep.txt"), b"still here");
+    let job = running(session.delete(
+        &DeleteReq::to_trash(vec![file.clone()]),
+        session.next_origin(),
+    ));
+    let (report, _ev) = pump(&mut session, job, |p| p.delete().cloned());
+    let report = report.expect("the job ran");
+    assert!(
+        matches!(&report.outcomes[0], DeleteOutcome::Failed { error, .. }
+            if error.kind() == "permission_denied"),
+        "a trash request the volume cannot honour is a refusal: {:?}",
+        report.outcomes
+    );
+    assert!(exists(&root.join("keep.txt")), "and nothing was destroyed");
+    assert!(
+        report.log_entry().is_none(),
+        "no record for work that did not run (plan F3)"
+    );
+
+    // Rung A′: the same volume, the D6 opt-in set → permanent, and the outcome *says* it was a fallback.
+    let mut session = open_session_env(&root, Arc::clone(&env) as Arc<dyn Env>);
+    let job = running(session.delete(
+        &DeleteReq {
+            sources: vec![file.clone()],
+            mode: DeleteMode::Trash,
+            permanent_fallback: true,
+        },
+        session.next_origin(),
+    ));
+    let (report, _ev) = pump(&mut session, job, |p| p.delete().cloned());
+    let report = report.expect("the job ran");
+    assert!(
+        matches!(
+            &report.outcomes[0],
+            DeleteOutcome::Removed { fallback: true, .. }
+        ),
+        "the escalation is a value in the report: {:?}",
+        report.outcomes
+    );
+    assert!(!exists(&root.join("keep.txt")));
+
+    // Rung B: a bin that refuses *this* path (`trash::Error::TargetedRoot` → `Ok(false)`) with the opt-in.
+    let root2 = temp_dir("del-refused");
+    let bin2 = root2.join("bin");
+    fs::create_dir_all(&bin2).expect("bin dir");
+    let env2 = Arc::new(OpEnv {
+        refuses: true,
+        ..OpEnv::new(&bin2)
+    });
+    let mut session2 = open_session_env(&root2, Arc::clone(&env2) as Arc<dyn Env>);
+    let anchored = write(&root2.join("root-item.txt"), b"x");
+    let job = running(session2.delete(
+        &DeleteReq::to_trash(vec![anchored.clone()]),
+        session2.next_origin(),
+    ));
+    let (report, _ev) = pump(&mut session2, job, |p| p.delete().cloned());
+    let report = report.expect("the job ran");
+    assert!(
+        matches!(&report.outcomes[0], DeleteOutcome::Failed { error, .. }
+            if error.kind() == "permission_denied"),
+        "a refused path without the opt-in is not a silent delete: {:?}",
+        report.outcomes
+    );
+    assert!(exists(&root2.join("root-item.txt")));
+
+    // Rung C: the bin *errored* while trying → a failure, never escalated, opt-in or not.
+    let env3 = Arc::new(OpEnv {
+        broken: true,
+        ..OpEnv::new(&bin2)
+    });
+    let mut session3 = open_session_env(&root2, Arc::clone(&env3) as Arc<dyn Env>);
+    let job = running(session3.delete(
+        &DeleteReq {
+            sources: vec![anchored.clone()],
+            mode: DeleteMode::Trash,
+            permanent_fallback: true,
+        },
+        session3.next_origin(),
+    ));
+    let (report, _ev) = pump(&mut session3, job, |p| p.delete().cloned());
+    let report = report.expect("the job ran");
+    assert!(
+        matches!(&report.outcomes[0], DeleteOutcome::Failed { .. }),
+        "{:?}",
+        report.outcomes
+    );
+    assert!(
+        exists(&root2.join("root-item.txt")),
+        "a trash error never becomes a delete"
+    );
+    let _ = remove_tree(&root);
+    let _ = remove_tree(&root2);
+}
+
+/// Go's own behaviour, through the *real* platform: one `ActionDelete` per call naming every path that
+/// went, a directory and all of it (`api/ops.go:367-387`).
+#[test]
+fn a_permanent_delete_removes_a_tree_and_records_the_paths_that_went() {
+    let root = temp_dir("del-permanent");
+    let mut session = open_session(&root);
+    let tree = root.join("tree");
+    write(&tree.join("a.txt"), b"a");
+    write(&tree.join("deep/b.txt"), b"b");
+    let dir = abs(&tree);
+    let ghost = write(&root.join("doomed.txt"), b"x");
+    fs::remove_file(root.join("doomed.txt")).expect("removed by hand first");
+
+    let origin = session.next_origin();
+    let job = match session.delete(
+        &DeleteReq::permanent(vec![dir.clone(), ghost.clone()]),
+        origin,
+    ) {
+        Ok(Receipt::Running { job, .. }) => job,
+        other => panic!("a delete is never synchronous: {other:?}"),
+    };
+    let (report, events) = pump(&mut session, job, |p| p.delete().cloned());
+    let report = report.expect("the delete job finished with a report");
+    assert_eq!(report.mode_used, DeleteMode::Permanent);
+    assert_eq!(
+        report.removed().len(),
+        1,
+        "one existed: {:?}",
+        report.removed()
+    );
+    assert_eq!(
+        report.removed()[0],
+        (&dir, false),
+        "asked for, not escalated"
+    );
+    assert_eq!(report.failed().len(), 1, "the other was already gone");
+    assert_eq!(report.failed()[0].1.kind(), "not_found");
+    assert!(!exists(&tree), "the whole tree went");
+    let id = report.log_id.expect("a record");
+    let record = session.log_record(id).expect("it reads back");
+    assert_eq!(
+        record.sources,
+        vec![dir.to_string_lossy()],
+        "the record names what actually disappeared (Go's comment at api/ops.go:376)"
+    );
+    assert!(
+        dir_changed(&events)
+            .iter()
+            .any(|(p, o)| *o == Some(origin) && *p == fskey(&abs(&root))),
+        "the directory that lost the tree is invalidated with the caller's origin: {:?}",
+        dir_changed(&events)
+    );
+    let _ = remove_tree(&root);
+}
