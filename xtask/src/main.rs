@@ -4,7 +4,9 @@
 //! `snapshots`/`parity` are honest stubs that print the step that lands them, because the plan
 //! sequences the `egui_kittest` harness (step 7) and the human parity review (step 15) after this
 //! commit. `contracts` is real since step 2: it guards the frozen Go golden capture in
-//! `tests/golden/` (`xtask/src/contracts.rs`).
+//! `tests/golden/` (`xtask/src/contracts.rs`), and since step 2 it also runs the two completeness
+//! gates: `golden-index` (every file in `tests/golden/` is accounted for in `INDEX.json`) and
+//! `fixture-tree` (`scripts/make-fixtures.py` still produces the tree `MANIFEST.md` promises).
 //!
 //! `cargo-deny` is **not installed** on this machine (`command -v cargo-deny` → nothing), so
 //! `licenses` is pure Rust over `cargo metadata --format-version 1`, with `deny.toml` as its data file
@@ -21,6 +23,7 @@ use std::process::{Command, Stdio};
 use serde_json::Value;
 
 mod contracts;
+mod fixture_tree;
 
 fn main() {
     if let Err(e) = run() {
@@ -48,8 +51,15 @@ fn run() -> Result<(), Box<dyn Error>> {
             "the human reference review over `docs/parity/*.png` (plan §7 step 15)",
         ),
         "contracts" => contracts::contracts(),
+        "fixture-tree" => fixture_tree::fixture_tree(),
+        "golden-index" => contracts::golden_index(&workspace_root()?.join("tests/golden")),
         "help" | "-h" | "--help" => {
-            println!("usage: cargo xtask <ci|deps|licenses|snapshots|parity|contracts>");
+            println!(
+                "usage: cargo xtask <ci|deps|licenses|snapshots|parity|contracts|fixture-tree|golden-index>"
+            );
+            println!(
+                "  fixture-tree and golden-index are the two step-2 gates that `contracts` also runs"
+            );
             Ok(())
         }
         other => Err(format!("unknown task {other:?} (try `cargo xtask help`)").into()),

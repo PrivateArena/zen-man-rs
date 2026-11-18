@@ -39,6 +39,9 @@ USER_REAL_CONFIG="$HOME/.config/zen-man/config.json"
 MINBIN="${TMPDIR:-/tmp}/zm-golden-bin"
 SRVLOG="${TMPDIR:-/tmp}/zm-golden-server.log"
 SRVPID="${TMPDIR:-/tmp}/zm-golden-server.pid"
+# The instance is launched from here and never `cd`s, so its working directory is this one: that is
+# where a relative extract `dest` lands (see step 10, `probe-only-not-used/` and `relative/`).
+SRVCWD="$PWD"
 
 export ZM_URL FIXTURE_ROOT HOME_ROOT
 CURL=/usr/bin/curl
@@ -408,7 +411,12 @@ cap err-archive-status-unknown 404 "$ZM_URL/api/archive/extract/status?$(q job_i
 # FINDING (quirk 14 / F19): a *relative* dest is NOT rejected. ResolvePath runs
 # filepath.Abs, so "relative/path" silently becomes <server cwd>/relative/path -
 # validateDest never sees a relative path, and "absoluteness" is therefore
-# meaningless.  We capture the response only; no file was created.
+# meaningless.  This is NOT a read-only probe: the extraction WRITES INTO THE
+# SERVER'S WORKING DIRECTORY (the directory capture-golden.sh was invoked from,
+# $SRVCWD - the server never `cd`s).  That is exactly how `probe-only-not-used/`
+# and `relative/` showed up next to the checkout. The response is captured and the
+# two directories are removed again at the end of this script (step 14); if the run
+# dies before that, delete them by hand before committing anything.
 cap archive-extract-relative-dest 200 "$ZM_URL/api/archive/extract" -X POST -H 'Content-Type: application/json' --data "{\"archive\":\"$A/plain.zip\",\"sources\":[],\"dest\":\"./probe-only-not-used\"}"
 cap archive-extract-dotdot-falsepositive 403 "$ZM_URL/api/archive/extract" -X POST -H 'Content-Type: application/json' --data "{\"archive\":\"$A/plain.zip\",\"sources\":[],\"dest\":\"$OPSDIR/dotdot..name\"}"
 get archive-extracted-tree "$ZM_URL/api/dir?$(q path=$OPSDIR/ex-one)"
@@ -501,6 +509,17 @@ say "done"
 printf 'golden artefacts in %s\n' "$GOLDEN"
 printf 'binary artefacts: action.log=%s bytes  zen-man.db=%s bytes\n' \
   "$(stat -c %s "$GOLDEN/action.log")" "$(stat -c %s "$GOLDEN/zen-man.db")"
+# ---------------------------------------------------------------------------
+# 14. undo what the relative-dest probe wrote into the server's working directory
+# ---------------------------------------------------------------------------
+say "cleaning up the relative-dest side effects in $SRVCWD"
+for polluted in probe-only-not-used relative; do
+  if [ -e "$SRVCWD/$polluted" ]; then
+    rm -rf "$SRVCWD/$polluted" && say "removed $SRVCWD/$polluted" \
+      || say "WARN: could not remove $SRVCWD/$polluted - delete it by hand"
+  fi
+done
+
 if [ "$STARTED_OURS" = "1" ]; then
   printf 'note: this script started the instance (pid %s, log %s); it is left running so the capture can be re-run. Stop it with\n      kill %s\n' "$(cat "$SRVPID")" "$SRVLOG" "$(cat "$SRVPID")"
 fi

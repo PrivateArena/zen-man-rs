@@ -9,8 +9,15 @@
 //! 3. every `tests/golden/*.json` parses as JSON, except the two files listed in
 //!    [`KNOWN_NOT_JSON`] — which are themselves evidence of a Go wire-format bug;
 //! 4. `action.log` starts with the `ZMLG` magic, every record's trailing CRC-32
-//!    (IEEE) verifies, and the record count equals `log.json`'s `count`.
+//!    (IEEE) verifies, and the record count equals `log.json`'s `count`;
+//! 5. `INDEX.json` accounts for **every** file in `tests/golden/` — via `captures[].file`
+//!    for endpoint captures and via `artifacts[].file` for the files the harness produces
+//!    but never requests (`PROVENANCE.json`, `action.log`, the database, the derived
+//!    `LOG-*.txt/json` evidence, the deleted-duplicate records) — and its `count` equals
+//!    `captures.len() + artifacts.len()`;
+//! 6. the fixture tree still matches `MANIFEST.md` (`xtask/src/fixture_tree.rs`).
 
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::path::{Path, PathBuf};
 
@@ -148,7 +155,117 @@ pub(crate) fn contracts() -> Result<(), Box<dyn Error>> {
                 .into(),
         );
     }
+    // (5) the index accounts for the whole directory --------------------------
+    golden_index(&golden)?;
+
+    // (6) the generator still matches its own manifest ------------------------
+    crate::fixture_tree::fixture_tree()?;
+
     println!("contracts: all golden-fixture gates green");
+    Ok(())
+}
+
+/// Gate 5: nothing in `tests/golden/` may be unaccounted for, and nothing may be listed twice,
+/// listed under a path outside the directory, or listed while missing. `INDEX.json` itself is the
+/// only exempt file. `artifacts[]` rows whose `kind` is `superseded-by:<file>` document a *deleted*
+/// duplicate, so they are checked in the opposite direction: the file must be gone and the file that
+/// superseded it must exist.
+pub(crate) fn golden_index(golden: &Path) -> Result<(), Box<dyn Error>> {
+    let index = read_json(&golden.join("INDEX.json"))?;
+    let mut listed: BTreeMap<String, &str> = BTreeMap::new();
+    let mut rows = 0usize;
+    for collection in ["captures", "artifacts"] {
+        let value = &index[collection];
+        if value.is_null() {
+            if collection == "artifacts" {
+                continue; // an index with no artefacts is fine as long as the directory agrees
+            }
+            return Err(format!("contracts: INDEX.json has no `{collection}` array").into());
+        }
+        let entries = value.as_array().ok_or(format!(
+            "contracts: INDEX.json `{collection}` is not an array"
+        ))?;
+        for (i, row) in entries.iter().enumerate() {
+            let file = row["file"].as_str().ok_or(format!(
+                "contracts: INDEX.json {collection}[{i}] has no `file`"
+            ))?;
+            let name = file.strip_prefix("tests/golden/").ok_or(format!(
+                "contracts: INDEX.json {collection}[{i}].file = {file:?} is not under tests/golden/"
+            ))?;
+            let kind = if collection == "captures" {
+                "capture"
+            } else {
+                row["kind"].as_str().ok_or(format!(
+                    "contracts: INDEX.json artifacts[{i}] has no `kind`"
+                ))?
+            };
+            if listed.insert(name.to_string(), kind).is_some() {
+                return Err(format!("contracts: INDEX.json lists {name} more than once").into());
+            }
+            rows += 1;
+        }
+    }
+    let counted = index["count"]
+        .as_u64()
+        .ok_or("contracts: INDEX.json has no numeric `count`")?;
+    if usize::try_from(counted).map_err(|_| "contracts: INDEX.json count is huge")? != rows {
+        return Err(format!(
+            "contracts: INDEX.json `count` is {counted} but captures[] + artifacts[] hold {rows} \
+             entr(ies)"
+        )
+        .into());
+    }
+
+    let on_disk: Vec<String> = std::fs::read_dir(golden)?
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n != "INDEX.json")
+        .collect();
+    let mut problems: Vec<String> = Vec::new();
+    for name in &on_disk {
+        if !listed.contains_key(name.as_str()) {
+            problems.push(format!(
+                "{name} is on disk but is in neither captures[] nor artifacts[]"
+            ));
+        }
+    }
+    for (name, kind) in &listed {
+        let superseded = kind.strip_prefix("superseded-by:");
+        let present = golden.join(name).is_file();
+        match superseded {
+            Some(replacement) => {
+                if present {
+                    problems.push(format!(
+                        "{name} is recorded as superseded by {replacement} but is still on disk"
+                    ));
+                }
+                if !golden.join(replacement).is_file() {
+                    problems.push(format!(
+                        "{name} is recorded as superseded by {replacement}, which is missing"
+                    ));
+                }
+            }
+            None if !present => problems.push(format!("{name} is listed as {kind} but is missing")),
+            None => {}
+        }
+    }
+    if !problems.is_empty() {
+        for p in &problems {
+            eprintln!("contracts: FAIL index {p}");
+        }
+        return Err(format!(
+            "contracts: INDEX.json is incomplete ({} problem(s))",
+            problems.len()
+        )
+        .into());
+    }
+    println!(
+        "contracts: INDEX.json ok — {rows} listed entr(ies) cover all {} file(s) in tests/golden/ \
+         ({} capture(s), {} artefact record(s), count {counted})",
+        on_disk.len(),
+        index["captures"].as_array().map_or(0, |v| v.len()),
+        index["artifacts"].as_array().map_or(0, |v| v.len())
+    );
     Ok(())
 }
 
@@ -164,12 +281,9 @@ fn walk_log(raw: &[u8]) -> Result<(usize, usize, usize), Box<dyn Error>> {
             off += 1; // Go resyncs one byte at a time
             continue;
         }
-        let rec_len = u32::from_be_bytes([
-            raw[off + 22],
-            raw[off + 23],
-            raw[off + 24],
-            raw[off + 25],
-        ]) as usize;
+        let rec_len =
+            u32::from_be_bytes([raw[off + 22], raw[off + 23], raw[off + 24], raw[off + 25]])
+                as usize;
         if rec_len < LOG_HEADER_FIXED || off + rec_len + 4 > raw.len() {
             off += 1;
             continue;

@@ -855,5 +855,87 @@
       "file": "tests/golden/archive-modified-409.json"
     }
   ],
-  "count": 122
+  "artifacts": [
+    {
+      "file": "tests/golden/PROVENANCE.json",
+      "kind": "provenance",
+      "note": "Written by scripts/capture-golden.sh step 4: Go repo, commit SHA, binary SHA-256, base URL, capture time. Read by `xtask contracts` gate 1."
+    },
+    {
+      "file": "tests/golden/LOG-HEXDUMP.txt",
+      "kind": "derived-evidence",
+      "note": "Hexdump of the first three action.log records, emitted by capture-golden.sh step 12 from action.log. Not an endpoint capture."
+    },
+    {
+      "file": "tests/golden/LOG-RECORDS.json",
+      "kind": "derived-evidence",
+      "note": "Decoded ZMLG record table (offset/id/ts/action/status/CRC) from action.log, capture-golden.sh step 12. contracts gate 4 compares its count with the log."
+    },
+    {
+      "file": "tests/golden/LOG-PATHS.json",
+      "kind": "path-mapping",
+      "note": "Written by scripts/normalise-golden.py: the original capture-machine paths that action.log deliberately keeps byte-exact (its CRCs seal them). Exempt from the banned-path scan."
+    },
+    {
+      "file": "tests/golden/action.log",
+      "kind": "binary-artefact",
+      "note": "The disposable instance's CRC-sealed undo log, copied out of XDG_DATA_HOME in step 11. contracts gate 4 walks it."
+    },
+    {
+      "file": "tests/golden/zen-man.db",
+      "kind": "binary-artefact",
+      "note": "The disposable instance's SQLite index database, copied out of XDG_DATA_HOME in step 11. Binary, never parsed by the suite."
+    },
+    {
+      "file": "tests/golden/config.json",
+      "kind": "state-artefact",
+      "note": "Disposable-instance config written by the Go server itself (step 11 copy), showing the on-disk shape of ${FIXTURE_ROOT} roots/tabs."
+    },
+    {
+      "file": "tests/golden/search-config.json",
+      "kind": "state-artefact",
+      "note": "Disposable-instance search config written by the Go server (step 11: 'a file, not an endpoint'). Not captured by any request."
+    },
+    {
+      "file": "tests/golden/legacy-config-real.json",
+      "kind": "developer-config-copy",
+      "note": "Read-only copy of the developer's real ~/.config/zen-man/config.json (step 11), kept because it is the only artefact carrying pre-placeholder paths (see normalise-golden.py)."
+    },
+    {
+      "file": "tests/golden/archive-stream-plain.txt",
+      "kind": "raw-payload",
+      "note": "Body of /api/archive/stream for plain.zip!top.txt: the raw file payload, deliberately not JSON (listed in contracts KNOWN_NOT_JSON)."
+    },
+    {
+      "file": "tests/golden/dir-search-term.json",
+      "kind": "unmatched-duplicate-candidate",
+      "note": "KEPT, not deleted: it is a stale-looking dir listing of tree/many, but NO golden file differs from it only in a timestamp field. Closest candidate dir-many-p1.json differs by 198 extra entries plus cursor/loaded_so_far; every other same-shape file differs in content. Needs a human verdict before deletion."
+    },
+    {
+      "file": "tests/golden/err-method-POST.json",
+      "kind": "superseded-by:dir-post-returns-listing.json",
+      "note": "Deleted as a stale duplicate: byte-identical (cmp) to dir-post-returns-listing.json, which IS in captures[]."
+    },
+    {
+      "file": "tests/golden/err-op-empty-sources.json",
+      "kind": "superseded-by:op-delete-empty-sources.json",
+      "note": "Deleted as a stale duplicate: byte-identical (cmp) to op-delete-empty-sources.json."
+    },
+    {
+      "file": "tests/golden/err-perm-denied-exec.json",
+      "kind": "superseded-by:dir-perm-noexec.json",
+      "note": "Deleted as a stale duplicate: byte-identical (cmp) to dir-perm-noexec.json."
+    },
+    {
+      "file": "tests/golden/index-config-file.json",
+      "kind": "superseded-by:search-config.json",
+      "note": "Deleted as a stale duplicate: differs from search-config.json ONLY in index_state.last_indexed_unix (diff), i.e. an earlier revision wrote the same body twice."
+    },
+    {
+      "file": "tests/golden/err-batch-rename-mismatch.json",
+      "kind": "superseded-by:op-single-rename-json-name.json",
+      "note": "Deleted as a stale duplicate: differs from op-single-rename-json-name.json ONLY in entry.mod_time (diff); both record the same success body for the JSON-array rename."
+    }
+  ],
+  "count": 138
 }
