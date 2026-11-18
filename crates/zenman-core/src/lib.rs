@@ -24,15 +24,27 @@
 // named unsafe exception, unlike `apps/zenman`/`zenman-ui` (see the workspace lint note in
 // Cargo.toml).
 #![forbid(unsafe_code)]
-#![deny(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::unimplemented,
-    clippy::todo,
-    clippy::unreachable
+// The `unwrap_used`-class denials apply to shipping code only; the `#[cfg(test)]` modules below are
+// full of `unwrap()`, which photocraft's precedent (`crates/*/src/lib.rs`) allows in tests.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unimplemented,
+        clippy::todo,
+        clippy::unreachable
+    )
 )]
 #![deny(clippy::wildcard_imports)]
+
+pub mod cursor;
+pub mod error;
+pub mod limits;
+pub mod metrics;
+pub mod mode;
+pub mod path;
 
 /// The step-1 placeholder: `CoreError` and friends arrive in plan §5.2 (`error.rs`, step 3), and the
 /// `pub use session::{Session, SessionConfig, Receipt}` re-export listed in plan §5.1 arrives with
