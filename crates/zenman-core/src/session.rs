@@ -30,17 +30,23 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-use crate::entry::DirPage;
+use crate::entry::{DirPage, FileEntry};
 use crate::error::CoreError;
 use crate::events::{ChangeCause, EngineEvent};
 use crate::history::codec::{ActionEntry, ActionLog, ActionType};
+use crate::history::revert::{self as revert_ops, RevertReport, ensure_reversible};
 use crate::history::store::{ActionLogStore, LogId};
-use crate::index::intent::{IndexIntent, IndexOp};
+use crate::index::intent::{IndexIntent, IndexOp, SharedIntent};
 use crate::jobs::{CancelToken, JobId, JobInfo, JobKind, JobRegistry, JobResult, JobSpec};
 use crate::limits::Limits;
+use crate::ops::chmod::{self, ChmodReport, ChmodReq};
 use crate::ops::clipboard::{self, Clipboard, ClipboardStore};
+use crate::ops::delete::{self, DeleteReport, DeleteReq};
+use crate::ops::mkdir::{self, MkdirReq};
 use crate::ops::r#move::{MoveFs, OsMoveFs};
+use crate::ops::open::{self, OpenReport};
 use crate::ops::paste::{self, PasteMode, PasteReport, PasteReq};
+use crate::ops::rename::{self, RenameReport, RenameReq};
 use crate::ops::{ConflictPolicy, guard};
 use crate::path::{AbsPath, FsPath};
 use crate::platform::Env;
@@ -391,7 +397,9 @@ struct Inner {
     /// Why the database is absent, when it is: kept so a later retry and the diagnostics pane can say
     /// something better than "no".
     db_disabled: Mutex<Option<String>>,
-    intent: Arc<dyn IndexIntent>,
+    /// The index sink, behind a mutex so [`Session::set_intent`] can swap it (plan §5.5: step 12's
+    /// queue replaces the noop without touching a caller).
+    intent: Mutex<SharedIntent>,
     events: Mutex<std::collections::VecDeque<EngineEvent>>,
     /// The queued copy/cut selection (plan §5.3's `ops/clipboard.rs`, Go's `clipboardState`).
     clipboard: Mutex<Option<Clipboard>>,
@@ -480,7 +488,7 @@ impl Session {
                 log: Mutex::new(log),
                 db: Mutex::new(db),
                 db_disabled: Mutex::new(db_disabled),
-                intent: crate::index::intent::noop_intent(),
+                intent: Mutex::new(crate::index::intent::noop_intent()),
                 events: Mutex::new(std::collections::VecDeque::new()),
                 clipboard: Mutex::new(None),
                 origins: OriginAlloc::new(),
@@ -523,14 +531,18 @@ impl Session {
     }
 
     /// The index intent sink every mutating service holds instead of a connection.
+    ///
+    /// A clone of the `Arc`, not a borrow: the slot is swap-able (see [`Self::set_intent`]), so it cannot
+    /// hand out a reference. Step 9c's signature change from `&Arc<dyn IndexIntent>`; no caller in the tree
+    /// held the borrow.
     #[must_use]
-    pub fn intent(&self) -> &Arc<dyn IndexIntent> {
-        &self.inner.intent
+    pub fn intent(&self) -> SharedIntent {
+        Arc::clone(&lock(&self.inner.intent))
     }
 
     /// Hand one intent to a service (plan §5.3's rename row: the service holds this, never a `Connection`).
     pub fn note_index(&self, op: IndexOp) {
-        self.inner.intent.note(op);
+        self.intent().note(op);
     }
 
     /// The config the session booted with. Mutation of it is step 14's settings dialog, not step 6's.
@@ -874,6 +886,314 @@ impl Session {
             policy,
         };
         self.paste(&req, origin)
+    }
+
+    // ------------------------------------------------------------------------------------ delete
+
+    /// Delete `req.sources` — trash-first (plan §5.3 `ops/delete.rs`, Go `handleDelete` `api/ops.go:367`,
+    /// plan §6.2 **D6**).
+    ///
+    /// The synchronous prefix is everything the UI must learn before a worker exists: the archive read-only
+    /// rule, the empty selection, and the writability of each affected parent. What follows is a
+    /// [`JobKind::Delete`] job — removing a 500 GB tree from a spinning disk is plan F1's frozen window.
+    ///
+    /// The job appends the Go-parity `ActionDelete` record (**after** the walk, carrying only the paths that
+    /// actually disappeared, `api/ops.go:376-379`), invalidates every parent that lost a child, and notes
+    /// one [`IndexOp::Pruned`] per removed path.
+    ///
+    /// # Errors
+    /// [`CoreError::Empty`] for an empty selection, [`CoreError::VfsReadOnly`] for an archive path, and the
+    /// parents' own [`CoreError::PermissionDenied`]. A partial delete is **not** an error: it is a report.
+    pub fn delete(
+        &self,
+        req: &DeleteReq,
+        origin: Origin,
+    ) -> Result<Receipt<DeleteReport>, CoreError> {
+        let paths: Vec<FsPath> = req.sources.iter().cloned().map(FsPath::from_abs).collect();
+        let refs: Vec<&FsPath> = paths.iter().collect();
+        guard::vfs_write_guard(&refs)?;
+        if req.sources.is_empty() {
+            return Err(CoreError::Empty { what: "selection" });
+        }
+        // The kind of each target, taken *before* anything is removed: after the delete there is nothing
+        // left to `stat`, and the index needs to know whether it is dropping a row or a subtree.
+        let kinds: Vec<bool> = req
+            .sources
+            .iter()
+            .map(|p| std::fs::metadata(p.as_path()).is_ok_and(|m| m.is_dir()))
+            .collect();
+        for source in &req.sources {
+            if let Some(parent) = source.parent() {
+                guard::ensure_writable(self.inner.env.as_ref(), &parent)?;
+            }
+        }
+        let label = format!("Delete {} item(s)", req.sources.len());
+        let spec = JobSpec::new(self.inner.jobs.next_id(), JobKind::Delete, label, origin);
+        let id = spec.id;
+        let env = Arc::clone(&self.inner.env);
+        let sess = self.clone();
+        let req = req.clone();
+        self.inner.jobs.attach(spec, move |cancel, progress| {
+            let mut report = delete::delete(env.as_ref(), &req, cancel, progress)?;
+            if let Some(entry) = report.log_entry() {
+                match sess.append_log(&entry) {
+                    Ok(log_id) => report.log_id = Some(log_id),
+                    Err(e) => sess.push(EngineEvent::Notice {
+                        level: crate::events::NoticeLevel::Warn,
+                        message: format!("delete log: {}", e.user_message()),
+                    }),
+                }
+            }
+            for parent in report.affected_parents() {
+                sess.invalidate_from(&FsPath::from_abs(parent), ChangeCause::LocalJob, origin);
+            }
+            for (gone, is_dir) in report.deleted().into_iter().zip(kinds) {
+                // A directory is a subtree drop, a file a single row (`index/intent.rs`).
+                sess.note_index(if is_dir {
+                    IndexOp::Pruned { path: gone.clone() }
+                } else {
+                    IndexOp::Deleted { path: gone.clone() }
+                });
+            }
+            if report.incomplete() {
+                sess.push(EngineEvent::Notice {
+                    level: crate::events::NoticeLevel::Warn,
+                    message: format!("Delete: {}", report.summary()),
+                });
+            }
+            Ok(JobResult::done(report.clone(), report.summary()))
+        });
+        Ok(Receipt::Running { job: id, origin })
+    }
+
+    // ------------------------------------------------------------------------------------ rename
+
+    /// Rename the selection (plan §5.3 `ops/rename.rs`, Go `handleRename` `api/ops.go:391`).
+    ///
+    /// Synchronous, per plan §4.1's `rename` row: a rename is one `rename(2)` per item, and the only path
+    /// that can take long — a directory crossing a device boundary — goes through
+    /// [`crate::ops::r#move::move_item`]'s copy+delete, which Go ran synchronously too. (Go's asynchrony was
+    /// the browser's, not the handler's.)
+    ///
+    /// Appends the Go-parity `ActionRename` record — the plain new name for a single rename, the JSON array
+    /// of the names that applied for a batch (`api/ops.go:414,477`) — invalidates the directory the names
+    /// live in, and notes one [`IndexOp::Renamed`] per pair.
+    ///
+    /// # Errors
+    /// [`CoreError::Empty`] for an empty selection or a name-less request, [`CoreError::InvalidPath`] for a
+    /// name that is not one legal component (`..`, `.`, `/`, a glob, a Windows reserved device name),
+    /// [`CoreError::VfsReadOnly`] for an archive path. A per-item refusal (taken name, I/O failure) is in
+    /// the report.
+    pub fn rename(&self, req: &RenameReq, origin: Origin) -> Result<RenameReport, CoreError> {
+        let paths: Vec<FsPath> = req.sources.iter().cloned().map(FsPath::from_abs).collect();
+        let refs: Vec<&FsPath> = paths.iter().collect();
+        guard::vfs_write_guard(&refs)?;
+        for source in &req.sources {
+            if let Some(parent) = source.parent() {
+                guard::ensure_writable(self.inner.env.as_ref(), &parent)?;
+            }
+        }
+        let fs: Arc<dyn MoveFs> = Arc::new(OsMoveFs);
+        let cancel = CancelToken::new();
+        let mut report = rename::rename(fs.as_ref(), req, &cancel, &crate::ops::NoProgress)?;
+        if let Some(entry) = report.log_entry() {
+            match self.append_log(&entry) {
+                Ok(id) => report.log_id = Some(id),
+                Err(e) => self.push(EngineEvent::Notice {
+                    level: crate::events::NoticeLevel::Warn,
+                    message: format!("rename log: {}", e.user_message()),
+                }),
+            }
+        }
+        let mut touched: Vec<AbsPath> = Vec::new();
+        let mut ops = Vec::new();
+        for (from, to) in report.renamed() {
+            if let Some(parent) = from.parent()
+                && !touched.contains(&parent)
+            {
+                touched.push(parent);
+            }
+            ops.push(IndexOp::Renamed {
+                from: from.clone(),
+                to: to.clone(),
+            });
+        }
+        for parent in touched {
+            self.invalidate_from(&FsPath::from_abs(parent), ChangeCause::LocalJob, origin);
+        }
+        self.intent().note_all(&ops);
+        Ok(report)
+    }
+
+    // ------------------------------------------------------------------------------------ mkdir
+
+    /// Create one directory and return the row Go returned (`api/ops.go:488-521`).
+    ///
+    /// Appends `ActionMkdir` with **no sources**, `dest` = the parent and `name` = the new directory
+    /// (`api/ops.go:501`, golden record 1 — the record the capture itself reverted), invalidates the parent
+    /// and notes one [`IndexOp::Created`].
+    ///
+    /// # Errors
+    /// [`CoreError::VfsReadOnly`], [`CoreError::InvalidPath`] (an illegal name, `..` included),
+    /// [`CoreError::PermissionDenied`] for an unwritable parent, [`CoreError::AlreadyExists`] for a taken
+    /// name (Go's raw `file exists` 500), and the `mkdir(2)` failure.
+    pub fn mkdir(&self, req: &MkdirReq, origin: Origin) -> Result<FileEntry, CoreError> {
+        let entry = mkdir::mkdir(self.inner.env.as_ref(), req)?;
+        let target = req.target()?;
+        if let Err(e) = self.append_log(&ActionEntry::mkdir(req.dest.to_string_lossy(), &req.name))
+        {
+            self.push(EngineEvent::Notice {
+                level: crate::events::NoticeLevel::Warn,
+                message: format!("mkdir log: {}", e.user_message()),
+            });
+        }
+        self.invalidate_from(
+            &FsPath::from_abs(req.dest.clone()),
+            ChangeCause::LocalJob,
+            origin,
+        );
+        self.note_index(IndexOp::Created { path: target });
+        Ok(entry)
+    }
+
+    // ------------------------------------------------------------------------------------ chmod
+
+    /// Apply a mode to the selection (plan §5.3 `ops/chmod.rs`, Go `handleChmod` `api/ops.go:925`).
+    ///
+    /// Appends `ActionChmod` with the mode **text as the user typed it** (`api/ops.go:950`; golden records
+    /// 9/10 hold `"600"` and `"0644"` for the same bits), invalidates every affected directory (the mode is
+    /// a listed column), and notes one [`IndexOp::AttributesChanged`] per path — the op step 12's writer may
+    /// drop, since the index has no mode column.
+    ///
+    /// # Errors
+    /// [`CoreError::Empty`], [`CoreError::InvalidMode`] (via [`ChmodReq::parse`]),
+    /// [`CoreError::VfsReadOnly`], [`CoreError::Unsupported`] on a platform with no `st_mode`, and the
+    /// `chmod(2)` failure naming the path it failed on.
+    pub fn chmod(&self, req: &ChmodReq, origin: Origin) -> Result<ChmodReport, CoreError> {
+        let cancel = CancelToken::new();
+        let report = chmod::chmod(self.inner.env.as_ref(), req, &cancel)?;
+        if let Some(entry) = report.log_entry(req)
+            && let Err(e) = self.append_log(&entry)
+        {
+            self.push(EngineEvent::Notice {
+                level: crate::events::NoticeLevel::Warn,
+                message: format!("chmod log: {}", e.user_message()),
+            });
+        }
+        for parent in report.affected_parents() {
+            self.invalidate_from(&FsPath::from_abs(parent), ChangeCause::LocalJob, origin);
+        }
+        let ops = report
+            .applied
+            .iter()
+            .map(|path| IndexOp::AttributesChanged { path: path.clone() })
+            .collect::<Vec<_>>();
+        self.intent().note_all(&ops);
+        Ok(report)
+    }
+
+    // ------------------------------------------------------------------------------------ open
+
+    /// Hand each path to the desktop, routing directories as navigation (Go `handleOpen`
+    /// `api/ops.go:122`, with the module-doc difference: a directory is reported, not launched).
+    ///
+    /// No log record and no invalidation — nothing changed — and no `origin` for the same reason. A missing
+    /// opener is a typed [`CoreError::Shell`] in [`OpenReport::failed`], never a panic and never a silent
+    /// success.
+    ///
+    /// # Errors
+    /// [`CoreError::Empty`] for an empty selection. Per-path failures are in the report.
+    pub fn open_paths(&self, paths: &[AbsPath]) -> Result<OpenReport, CoreError> {
+        let cancel = CancelToken::new();
+        open::open_paths(self.inner.env.as_ref(), paths, &cancel)
+    }
+
+    /// Show one path in its parent directory (plan §5.3's `reveal`, which Go had no endpoint for).
+    ///
+    /// # Errors
+    /// As [`Self::open_paths`] for the parent directory.
+    pub fn reveal(&self, path: &AbsPath) -> Result<(), CoreError> {
+        open::reveal(self.inner.env.as_ref(), path)
+    }
+
+    // ------------------------------------------------------------------------------------ revert
+
+    /// Undo one undo-log record (plan §5.3/§5.6, Go `POST /api/log/revert` `api/log.go:662-718`).
+    ///
+    /// The two request-time refusals are answered **synchronously**, because Go answered them before
+    /// touching anything: an already-reverted record (Go's 409) and a non-reversible action (its 422, the
+    /// [`ActionType::is_reversible`] set). What follows is a [`JobKind::Revert`] job: a revert of a 200 GB
+    /// move is a move.
+    ///
+    /// The job applies the inverse through the *same* `ops` primitives the forward operation used, then
+    /// patches the record's status byte in place ([`ActionLogStore::mark_reverted`]) — the capture proves a
+    /// revert appends **no new frame** (`tests/golden/action.log` is 19 records post-revert; see
+    /// [`revert_ops`]'s module docs). It then invalidates every affected directory and notes the inverse
+    /// index ops.
+    ///
+    /// # Errors
+    /// The record's own read errors, and [`CoreError::Unsupported`] for the two refusals above.
+    pub fn revert(&self, id: LogId, origin: Origin) -> Result<Receipt<RevertReport>, CoreError> {
+        let record = self.log_record(id)?;
+        ensure_reversible(&record)?;
+        let label = format!("Revert {}", record.action_str());
+        let spec = JobSpec::new(self.inner.jobs.next_id(), JobKind::Revert, label, origin);
+        let job = spec.id;
+        let env = Arc::clone(&self.inner.env);
+        let fs: Arc<dyn MoveFs> = Arc::new(OsMoveFs);
+        let sess = self.clone();
+        self.inner.jobs.attach(spec, move |cancel, progress| {
+            let mut report =
+                revert_ops::revert(env.as_ref(), fs.as_ref(), &record, cancel, progress)?;
+            report.marked = sess.mark_log_reverted(id).is_ok();
+            for parent in report.affected_parents() {
+                sess.invalidate_from(&FsPath::from_abs(parent), ChangeCause::LocalJob, origin);
+            }
+            let move_back = record.action == ActionType::PASTE_MOVE;
+            let ops = report
+                .restored
+                .iter()
+                .map(|(from, to)| {
+                    if move_back {
+                        IndexOp::Moved {
+                            from: from.clone(),
+                            to: to.clone(),
+                        }
+                    } else {
+                        IndexOp::Renamed {
+                            from: from.clone(),
+                            to: to.clone(),
+                        }
+                    }
+                })
+                .chain(
+                    report
+                        .removed
+                        .iter()
+                        .map(|path| IndexOp::Pruned { path: path.clone() }),
+                )
+                .collect::<Vec<_>>();
+            sess.intent().note_all(&ops);
+            Ok(JobResult::done(report.clone(), report.summary()))
+        });
+        Ok(Receipt::Running { job, origin })
+    }
+
+    /// Replace the index-intent sink — the seam plan §5.5/§5.6 built this for: step 12's queueing
+    /// implementation is installed here and no caller changes. A test installs
+    /// [`RecordingIntent`](crate::index::intent::RecordingIntent) to see what a mutation reported.
+    pub fn set_intent(&self, intent: SharedIntent) {
+        let mut slot = lock(&self.inner.intent);
+        *slot = intent;
+    }
+
+    /// Mark one undo-log record reverted (the in-place status patch; see [`Self::revert`]).
+    pub(crate) fn mark_log_reverted(
+        &self,
+        id: LogId,
+    ) -> Result<crate::history::codec::ActionRecord, CoreError> {
+        let mut store = lock(&self.inner.log);
+        store.mark_reverted(id)
     }
 
     // ------------------------------------------------------------------------------------ the clipboard

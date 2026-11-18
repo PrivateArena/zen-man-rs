@@ -7,19 +7,21 @@
 //! function in this module returns `Result<_, CoreError>` for that reason, and plan §6.1 F4's
 //! "never panics on a truncated log" is satisfied without a second error type.
 //!
-//! `history/revert.rs` — the filesystem half of `/api/log/revert` — is **not** here: it needs
-//! `ops/*`, which is step 9 (plan §7), and the codec side it will call ([`codec::patch_reverted`]) is
-//! complete and tested now.
+//! Step 9c added [`revert`] — the filesystem half of `/api/log/revert`, which drives the `ops/*` write
+//! path backwards and ends in [`codec::patch_reverted`]'s in-place status patch (the capture's revert
+//! appends no record; see the module docs there).
 //!
 //! [`codec::patch_reverted`]: codec::patch_reverted
 
 pub mod codec;
+pub mod revert;
 pub mod store;
 
 pub use codec::{
     ActionEntry, ActionLog, ActionRecord, ActionType, Decoded, LogStatus, encode, encode_vec,
     patch_reverted,
 };
+pub use revert::{RevertReport, ensure_reversible, revert};
 pub use store::{
     ActionLogStore, LogOpenOptions, LogRecordRange, PruneLimit, PruneReport, ResyncReport,
 };

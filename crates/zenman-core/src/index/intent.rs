@@ -72,6 +72,16 @@ pub enum IndexOp {
         /// The touched path.
         path: AbsPath,
     },
+    /// The entry's **attributes** (mode, and nothing else) changed — `ops::chmod`.
+    ///
+    /// Distinct from [`Self::Refreshed`] for exactly the reason that comment gives: the index has no mode
+    /// column, so a writer has nothing to update. The op is still emitted, because plan §5.3's rule is that
+    /// every mutation reports itself through this seam — and a step-12 implementation that *does* cache
+    /// modes (or that invalidates a row's `is_executable` filter) has one place to learn about it.
+    AttributesChanged {
+        /// The re-moded path.
+        path: AbsPath,
+    },
 }
 
 impl IndexOp {
@@ -82,7 +92,8 @@ impl IndexOp {
             Self::Created { path }
             | Self::Deleted { path }
             | Self::Pruned { path }
-            | Self::Refreshed { path } => path,
+            | Self::Refreshed { path }
+            | Self::AttributesChanged { path } => path,
             Self::Renamed { to, .. } | Self::Moved { to, .. } => to,
         }
     }
@@ -167,6 +178,71 @@ pub type SharedIntent = std::sync::Arc<dyn IndexIntent>;
 #[must_use]
 pub fn noop_intent() -> SharedIntent {
     std::sync::Arc::new(NoopIntent::new())
+}
+
+/// An [`IndexIntent`] that keeps every op it was handed — [`NoopIntent`]'s test twin.
+///
+/// `NoopIntent` can only prove that a call *happened* (its counter); this proves *what* was reported,
+/// which is the assertion every step-9c mutation test needs: that a delete of a directory is a
+/// [`IndexOp::Pruned`] and not a [`IndexOp::Deleted`], that a rename reports `from`/`to` in the right
+/// order. It is also what a step-12 caller installs through
+/// [`Session::set_intent`](crate::session::Session::set_intent) to watch a live session.
+#[derive(Debug, Default)]
+pub struct RecordingIntent {
+    ops: std::sync::Mutex<Vec<IndexOp>>,
+}
+
+impl RecordingIntent {
+    /// A fresh recorder.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Everything noted so far, in call order.
+    #[must_use]
+    pub fn recorded(&self) -> Vec<IndexOp> {
+        self.ops
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// How many ops have arrived.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.ops.lock().map(|g| g.len()).unwrap_or_default()
+    }
+
+    /// `true` when nothing has arrived — the assertion a "this op must not touch the index" test makes.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl IndexIntent for RecordingIntent {
+    fn note(&self, op: IndexOp) {
+        self.ops
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(op);
+    }
+
+    fn note_all(&self, ops: &[IndexOp]) {
+        let mut guard = self
+            .ops
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.extend(ops.iter().cloned());
+    }
+}
+
+/// The shared recorder — the pair of [`Session::set_intent`](crate::session::Session::set_intent) in a
+/// test.
+#[must_use]
+pub fn recording_intent() -> SharedIntent {
+    std::sync::Arc::new(RecordingIntent::new())
 }
 
 #[cfg(test)]

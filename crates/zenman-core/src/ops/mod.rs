@@ -19,9 +19,18 @@
 //! platform seam, the move seam, the cancel token and the progress sink, and they are four named
 //! parameters rather than a struct that would have to grow a `Db`/`Limits` field step 12+ can fill in.
 //!
-//! The remaining write-path files (`delete`, `rename`, `mkdir`, `chmod`, `open`) and
-//! [`crate::history`]’s revert arrive with step 9c; they will call [`guard`] and [`ConflictPolicy`] rather
-//! than re-deriving any of it, which is the reason both are module-level and not private to [`paste`].
+//! Step 9c added the rest of the write path, all of it on top of the same two pieces rather than
+//! re-deriving any of it:
+//!
+//! * [`delete`] — trash-first deletion with the plan §6.2 **D6** fallback ladder and a per-source outcome;
+//! * [`rename`] — single and batch rename, Go's parent-rename source rewrite included, through
+//!   [`ConflictPolicy`] and [`crate::ops::r#move::move_item`];
+//! * [`mkdir`] — the validated name, Go's `0755`, and the new row back;
+//! * [`chmod`] — the octal text in, the mode bits out, with the record keeping the text the user typed;
+//! * [`open`] — the desktop launcher, with a directory routed as navigation instead.
+//!
+//! [`crate::history::revert`] completes the pair: it drives *these* functions backwards, so an undo can
+//! never disagree with what the forward operation did.
 //!
 //! Two rules bind everything under `ops/`:
 //!
@@ -33,11 +42,16 @@
 //!
 //! [`crate::error::CoreError`]: crate::error::CoreError
 
+pub mod chmod;
 pub mod clipboard;
 pub mod copy;
+pub mod delete;
 pub mod guard;
+pub mod mkdir;
 pub mod r#move;
+pub mod open;
 pub mod paste;
+pub mod rename;
 
 use std::sync::Arc;
 

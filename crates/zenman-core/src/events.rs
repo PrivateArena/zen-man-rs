@@ -23,6 +23,7 @@ use crate::error::CoreError;
 use crate::history::store::LogId;
 use crate::jobs::{JobId, JobKind, JobOutcome, JobProgress};
 use crate::ops::clipboard::Clipboard;
+use crate::ops::delete::DeleteReport;
 use crate::ops::paste::PasteReport;
 use crate::path::AbsPath;
 use crate::services::dirs::DirSizeStat;
@@ -188,6 +189,10 @@ pub enum JobPayload {
     DirPage(Arc<DirPage>),
     /// A completed paste (`JobKind::Paste`).
     Paste(PasteReport),
+    /// A completed delete (`JobKind::Delete`).
+    Delete(DeleteReport),
+    /// A completed undo-log revert (`JobKind::Revert`).
+    Revert(crate::history::revert::RevertReport),
     /// A completed size walk (`JobKind::DirSize`).
     DirSize(DirSizeStat),
     /// Live search hits (`JobKind::SearchLive`).
@@ -227,11 +232,41 @@ impl JobPayload {
             _ => None,
         }
     }
+
+    /// The `DeleteReport` payload, when that is what this is.
+    #[must_use]
+    pub fn delete(&self) -> Option<&DeleteReport> {
+        match self {
+            Self::Delete(r) => Some(r),
+            _ => None,
+        }
+    }
+
+    /// The `RevertReport` payload, when that is what this is.
+    #[must_use]
+    pub fn revert(&self) -> Option<&crate::history::revert::RevertReport> {
+        match self {
+            Self::Revert(r) => Some(r),
+            _ => None,
+        }
+    }
 }
 
 impl From<PasteReport> for JobPayload {
     fn from(value: PasteReport) -> Self {
         Self::Paste(value)
+    }
+}
+
+impl From<DeleteReport> for JobPayload {
+    fn from(value: DeleteReport) -> Self {
+        Self::Delete(value)
+    }
+}
+
+impl From<crate::history::revert::RevertReport> for JobPayload {
+    fn from(value: crate::history::revert::RevertReport) -> Self {
+        Self::Revert(value)
     }
 }
 
