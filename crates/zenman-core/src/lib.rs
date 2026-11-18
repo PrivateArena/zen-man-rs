@@ -42,16 +42,31 @@
 pub mod cursor;
 pub mod entry;
 pub mod error;
+pub mod events;
 pub mod history;
 pub mod index;
+pub mod jobs;
 pub mod limits;
 pub mod metrics;
 pub mod mode;
 pub mod path;
 pub mod platform;
+pub mod services;
+pub mod session;
 pub mod store;
 
-/// The step-1 placeholder: `CoreError` and friends arrive in plan §5.2 (`error.rs`, step 3), and the
-/// `pub use session::{Session, SessionConfig, Receipt}` re-export listed in plan §5.1 arrives with
-/// §5.6 (`session.rs`, step 6). Until then the crate is an empty, documented, gate-checked shell.
-pub const PLAN_STEP: u32 = 1;
+/// Plan §5.1's `lib.rs` row: the façade re-export the UI is allowed to reach for.
+///
+/// `SessionConfig` was renamed to [`session::SessionOptions`] + [`session::SessionPaths`] in plan
+/// §7 step 6's brief (the config the binary loads is `store::config::ZenConfig`, and keeping both under
+/// one name would have been a trap); the re-export therefore names what exists.
+pub use session::{
+    Origin, OriginAlloc, Receipt, Session, SessionOptions, SessionPaths, StartupNote,
+};
+
+/// The plan step this crate is implemented up to (plan §5.1 `lib.rs` row; `apps/zenman` prints the
+/// three crates' values in `--smoke` so a boot log says what is real and what is scaffold).
+///
+/// Step 6 of plan §7: the value types, the platform seam, the persistence layer, and now the job table,
+/// the `DirService` listing/size path and the `Session` façade.
+pub const PLAN_STEP: u32 = 6;

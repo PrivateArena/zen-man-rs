@@ -1,0 +1,1429 @@
+//! `Session` — the only façade the UI is allowed to call (plan §4.1, §5.6 `session.rs` row).
+//!
+//! A `Session` is a cheap-clone `Arc` handle over [`Inner`]; `Send + Sync`, UI-free, and it never blocks
+//! the caller's thread for longer than one directory read (plan §4.1's rule for the read group).
+//! Everything longer is a job: `dir_size` today, paste/delete/revert/search/rebuild/extract in steps
+//! 9-13, all through the same [`Receipt`] + [`Origin`] + [`EngineEvent`] machinery defined here.
+//!
+//! # F1: startup never fails because of the user's files
+//!
+//! Go `log.Fatalf`'d on a database it could not open and silently discarded a config it could not
+//! parse. Here [`Session::open`] takes the three damaged-file cases it can survive — a corrupt undo
+//! log, a locked/garbage database, an unparseable `config.json` — repairs or disables what it can, and
+//! *reports* what it did as [`StartupNote`]s. `open` still returns `Err` for the things that are not
+//! damaged files but impossible requests (the log file cannot even be created, the caller handed a
+//! relative path where an absolute one was required); those are the caller's bug, not the user's.
+//!
+//! # Ownership
+//!
+//! The single SQLite [`Connection`](rusqlite::Connection) is a **private** field of the private
+//! `Inner`, per plan §5.4's as-built correction: nothing outside `session.rs` may hold it, and services
+//! that need index writes go through [`crate::index::intent::IndexIntent`] instead. The undo log is
+//! behind a mutex (its append path mutates the offsets index), the caches behind their own mutexes, and
+//! the job table behind its own — plan §4.3's "each with its own mutex, so the dependency is explicit
+//! and a test can inject temp dirs".
+
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
+
+use serde::Serialize;
+
+use crate::entry::DirPage;
+use crate::error::CoreError;
+use crate::events::{ChangeCause, EngineEvent};
+use crate::history::codec::ActionLog;
+use crate::history::store::{ActionLogStore, LogId};
+use crate::index::intent::{IndexIntent, IndexOp};
+use crate::jobs::{CancelToken, JobId, JobInfo, JobKind, JobRegistry, JobResult, JobSpec};
+use crate::limits::Limits;
+use crate::path::AbsPath;
+use crate::platform::Env;
+use crate::platform::env_probe::ProbeReport;
+use crate::services::dirs::{
+    DirService, DirSizeOpts, DirSizeSink, DirSizeStat, FsSource, ListDir, OsDirRead,
+};
+use crate::store::config::ZenConfig;
+
+// ------------------------------------------------------------------------------------- correlation
+
+/// The correlation token that ties an event back to the widget that asked for it (plan §4.1).
+///
+/// Four tabs can point at one directory and one pane can have several jobs in flight, so
+/// `(JobId, path)` is not enough to know which spinner to clear.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct Origin(pub u64);
+
+impl Origin {
+    /// The numeric token.
+    #[must_use]
+    pub const fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for Origin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Allocates [`Origin`]s. Monotonic for the life of the process, so an origin never aliases a live one.
+#[derive(Debug, Default)]
+pub struct OriginAlloc(AtomicU64);
+
+impl OriginAlloc {
+    /// A fresh allocator whose first token is `Origin(1)`.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(AtomicU64::new(1))
+    }
+
+    /// The next token.
+    pub fn next(&self) -> Origin {
+        Origin(self.0.fetch_add(1, Ordering::AcqRel))
+    }
+}
+
+/// A read that finished, or the job that will answer it (plan §4.1's `Receipt<T>`).
+///
+/// The caller stores the [`Origin`] it passed in, plus the [`JobId`] when it gets a `Running` back, and
+/// applies the result only through that pair (plan §4.3's correlation rule).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Receipt<T> {
+    /// The answer is here — the cache or a short read served it synchronously.
+    Done(T),
+    /// The answer will arrive as [`EngineEvent::JobFinished`] for this `(job, origin)` pair.
+    Running {
+        /// The job that will answer.
+        job: JobId,
+        /// The token the caller passed in, returned to sender.
+        origin: Origin,
+    },
+}
+
+impl<T> Receipt<T> {
+    /// `true` for the synchronous answer.
+    #[must_use]
+    pub const fn is_done(&self) -> bool {
+        matches!(self, Self::Done(_))
+    }
+
+    /// `true` when a job will answer.
+    #[must_use]
+    pub const fn is_running(&self) -> bool {
+        matches!(self, Self::Running { .. })
+    }
+
+    /// The job, when running.
+    #[must_use]
+    pub const fn job(&self) -> Option<JobId> {
+        match self {
+            Self::Running { job, .. } => Some(*job),
+            Self::Done(_) => None,
+        }
+    }
+
+    /// The origin, in both cases — which is what makes the round trip testable.
+    #[must_use]
+    pub const fn origin(&self) -> Option<Origin> {
+        match self {
+            Self::Running { origin, .. } => Some(*origin),
+            Self::Done(_) => None,
+        }
+    }
+
+    /// Borrow the answer, when it is here.
+    #[must_use]
+    pub const fn done(&self) -> Option<&T> {
+        match self {
+            Self::Done(v) => Some(v),
+            Self::Running { .. } => None,
+        }
+    }
+
+    /// Take the answer, leaving the job half alone.
+    #[must_use]
+    pub fn into_done(self) -> Option<T> {
+        match self {
+            Self::Done(v) => Some(v),
+            Self::Running { .. } => None,
+        }
+    }
+
+    /// Map the answer, e.g. to erase a cache-internal `Arc` wrapper.
+    #[must_use]
+    pub fn map<U>(self, f: impl FnOnce(T) -> U) -> Receipt<U> {
+        match self {
+            Self::Done(v) => Receipt::Done(f(v)),
+            Self::Running { job, origin } => Receipt::Running { job, origin },
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------------------- options
+
+/// Engine knobs that Go had as package-level constants and the port takes from
+/// [`ZenConfig::limits`] (plan §5.2's `Limits`, §5.4's `ConfigLimits` validation).
+///
+/// Every field is a *bound*, never a behaviour: the plan's F8/F12 rule is that a hostile or mistaken
+/// input must produce a reported error rather than an unbounded walk.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SessionOptions {
+    /// How many undo-log records a history query returns when the caller does not say
+    /// (`None` = "however many the caller asks for", the Go `/api/log` behaviour).
+    pub history_limit: Option<usize>,
+    /// Default directory page size (Go's `limit := 200`, `api/dir.go:106`).
+    pub dir_page_size: usize,
+    /// Live-search result ceiling (Go's `api/search.go:72`).
+    pub live_search_cap: i64,
+    /// Live-search node budget before the walk gives up (plan §5.2 `live_search_nodes`).
+    pub max_live_nodes: usize,
+    /// Archive manifest LRU size (Go's `maxCacheEntries = 10`).
+    pub archive_cache_cap: usize,
+    /// Archive manifest TTL (Go's 15 minutes).
+    pub archive_cache_ttl: Duration,
+    /// Nested-archive/uncompressed ceiling (plan F8; the port's addition).
+    pub nested_archive_max_bytes: u64,
+    /// How deep a `.zip` inside a `.7z` inside a … may go before the read refuses. Go recursed without
+    /// a bound; `0` means "no nested archives at all".
+    pub nested_archive_max_depth: u8,
+}
+
+impl Default for SessionOptions {
+    fn default() -> Self {
+        Self::from_limits(&Limits::default())
+    }
+}
+
+impl SessionOptions {
+    /// Derive every knob from the engine limits, so one [`Limits`] value is the single tuning point
+    /// (plan §5.2's `Limits` is the type [`ZenConfig::limits`] produces).
+    #[must_use]
+    pub fn from_limits(limits: &Limits) -> Self {
+        Self {
+            history_limit: None,
+            dir_page_size: limits.dir_page_default,
+            live_search_cap: limits.live_search_cap,
+            max_live_nodes: limits.live_search_nodes,
+            archive_cache_cap: limits.archive_cache_entries,
+            archive_cache_ttl: limits.archive_cache_ttl,
+            nested_archive_max_bytes: limits.nested_archive_max_bytes,
+            // Plan §5.5: the manifest split recognises one nesting level (`host` + `nested`), which is
+            // what `FsPath`/`VfsKind` can even name, so the engine refuses deeper.
+            nested_archive_max_depth: 1,
+        }
+    }
+}
+
+/// Every file the session is allowed to touch, named by the caller (plan §5.2's `SystemInfo` note:
+/// `AppPaths` stays the authority; nothing here guesses a directory).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionPaths {
+    /// The `config.json` the app booted from. Read-only to the session: it is checked, and copied
+    /// aside if it cannot be parsed, but the settings store owns writing it (plan §5.4's
+    /// `craft-settings` row).
+    pub config: PathBuf,
+    /// The `action.log` undo log.
+    pub action_log: PathBuf,
+    /// The `zen-man.db` index database, or `None` to run without one (`--no-index`, a read-only data
+    /// directory, and every contract test).
+    pub database: Option<PathBuf>,
+    /// Where the capability probe may write its scratch files (Go used the data directory,
+    /// `main.go:24-49`).
+    pub probe_scratch: PathBuf,
+    /// How hard to fight for the database at startup. Bounded because SQLite's own `busy_timeout` is
+    /// [`crate::store::sql::BUSY_TIMEOUT_MS`] *per attempt*: the default eight attempts is what a user
+    /// who left the Go app running deserves, and a test who wants the lock reported immediately passes
+    /// `attempts: 1`.
+    pub db_open: DbOpenBudget,
+}
+
+/// The retry budget for opening `zen-man.db` (plan §6.1 F5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DbOpenBudget {
+    /// Total tries.
+    pub attempts: u32,
+    /// Wait between tries.
+    pub backoff: Duration,
+}
+
+impl Default for DbOpenBudget {
+    fn default() -> Self {
+        Self {
+            attempts: crate::store::sql::DEFAULT_RETRY_ATTEMPTS,
+            backoff: crate::store::sql::DEFAULT_RETRY_BACKOFF,
+        }
+    }
+}
+
+impl SessionPaths {
+    /// The three caller-named paths plus the probe scratch directory.
+    #[must_use]
+    pub fn new(
+        config: impl Into<PathBuf>,
+        action_log: impl Into<PathBuf>,
+        database: Option<PathBuf>,
+        probe_scratch: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            config: config.into(),
+            action_log: action_log.into(),
+            database,
+            probe_scratch: probe_scratch.into(),
+            db_open: DbOpenBudget::default(),
+        }
+    }
+
+    /// The same paths with a bounded database retry — the form a test, and any caller that must not
+    /// stall startup, uses.
+    #[must_use]
+    pub fn with_db_open(mut self, attempts: u32, backoff: Duration) -> Self {
+        self.db_open = DbOpenBudget { attempts, backoff };
+        self
+    }
+}
+
+/// What [`Session::open`] had to repair or give up on. Every variant is a *user-visible* fact: the
+/// app shows them as notices on the first frame (plan F1: "it degrades and says so").
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StartupNote {
+    /// The undo log had damage past its last good frame; the good prefix was kept and the rest
+    /// discarded by [`ActionLogStore::resync`].
+    LogRepaired {
+        /// Frames that survived.
+        kept: usize,
+        /// Frames that were readable but sat past the damage, and were therefore dropped.
+        dropped: usize,
+        /// Bytes removed from the file.
+        bytes: u64,
+    },
+    /// The index database could not be used, so the session runs without one: search falls back to the
+    /// live walker, `folder_sizes` is memory-only, and no rebuild is possible until it is fixed.
+    /// Go's answer to the same condition was `log.Fatalf` (plan F5).
+    DatabaseDisabled {
+        /// SQLite's or the OS's words, already rendered.
+        reason: String,
+    },
+    /// `config.json` at this path is not parseable; the bytes were copied to `copied_to` and the
+    /// session booted on the config the caller supplied (Go discarded it silently — plan §5.4's
+    /// `store/config.rs` row).
+    ConfigReset {
+        /// The file that was garbage.
+        path: PathBuf,
+        /// Where its bytes went.
+        copied_to: PathBuf,
+    },
+}
+
+impl StartupNote {
+    /// The toast text. Kept here so the wording is the same wherever the notes are surfaced.
+    #[must_use]
+    pub fn message(&self) -> String {
+        match self {
+            Self::LogRepaired {
+                kept,
+                dropped,
+                bytes,
+            } => format!(
+                "action log repaired: {kept} record(s) kept, {dropped} discarded ({bytes} B)"
+            ),
+            Self::DatabaseDisabled { reason } => {
+                format!("index database disabled: {reason}")
+            }
+            Self::ConfigReset { path, copied_to } => format!(
+                "config {} could not be read and was copied to {}",
+                path.display(),
+                copied_to.display()
+            ),
+        }
+    }
+
+    /// The event the UI should show it with.
+    #[must_use]
+    pub fn notice(&self) -> EngineEvent {
+        EngineEvent::Notice {
+            level: crate::events::NoticeLevel::Warn,
+            message: self.message(),
+        }
+    }
+}
+
+// ------------------------------------------------------------------------------------------ session
+
+/// A handle to the engine (plan §4.1's `Session`).
+#[derive(Clone)]
+pub struct Session {
+    inner: Arc<Inner>,
+}
+
+impl std::fmt::Debug for Session {
+    /// A hand-written `Debug`: the fields are a connection, a platform seam and a job table, none of
+    /// which has anything a log line should print, and `#[derive(Debug)]` would need all of them to.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Session")
+            .field("config", &self.inner.paths.config)
+            .field("action_log", &self.inner.paths.action_log)
+            .field("database", &self.inner.paths.database)
+            .field("live_jobs", &self.inner.jobs.live_count())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Everything a session owns. Private by construction (plan §5.4's correction: the `Connection` is not
+/// reachable from a service, and neither is anything else here).
+struct Inner {
+    paths: SessionPaths,
+    options: SessionOptions,
+    limits: Arc<Limits>,
+    env: Arc<dyn Env>,
+    dirs: Arc<DirService>,
+    jobs: Arc<JobRegistry>,
+    log: Mutex<ActionLogStore>,
+    /// The single connection (Go's `SetMaxOpenConns(1)`). `None` when [`StartupNote::DatabaseDisabled`].
+    db: Mutex<Option<rusqlite::Connection>>,
+    /// Why the database is absent, when it is: kept so a later retry and the diagnostics pane can say
+    /// something better than "no".
+    db_disabled: Mutex<Option<String>>,
+    intent: Arc<dyn IndexIntent>,
+    events: Mutex<std::collections::VecDeque<EngineEvent>>,
+    origins: OriginAlloc,
+    /// Plan F21: the symlink probe is answered **once** and cached here, so `/api/props` — which the
+    /// properties dialog can ask for on every repaint — is a lock read.
+    probe: Arc<RwLock<Option<bool>>>,
+    config: Mutex<ZenConfig>,
+}
+
+impl Session {
+    /// Boot the engine over caller-named files.
+    ///
+    /// `env` is the platform seam (a test passes a recorder, the binary passes
+    /// [`crate::platform::default_env`]); `config` is what the boot loader produced, defaults included.
+    ///
+    /// # Errors
+    /// Only for requests that cannot be honoured at all — an undo log that cannot be opened or
+    /// created. A corrupt log, a locked database and a garbage config are **not** errors: they come
+    /// back as notes (plan F1).
+    pub fn open(
+        paths: SessionPaths,
+        config: ZenConfig,
+        env: Arc<dyn Env>,
+        limits: Limits,
+    ) -> Result<(Session, Vec<StartupNote>), CoreError> {
+        let mut notes = Vec::new();
+        let limits = Arc::new(limits);
+        let options = SessionOptions::from_limits(&limits);
+
+        // 1. the undo log: open, then repair the strict prefix if it is damaged.
+        let mut log = ActionLogStore::open(&paths.action_log).map_err(|e| {
+            // This is the one startup failure that is a real failure: no log, no undo, and pretending
+            // otherwise would silently lose the next `paste-move` record.
+            CoreError::Config {
+                msg: format!("{}: {}", paths.action_log.display(), e.user_message()),
+            }
+        })?;
+        if !log.is_clean() {
+            let report = log.resync()?;
+            notes.push(StartupNote::LogRepaired {
+                kept: report.records_kept,
+                dropped: report.records_dropped,
+                bytes: report.bytes_dropped,
+            });
+        }
+
+        // 2. the config file: a garbage `config.json` is copied aside, never rewritten here.
+        if let Some(note) = check_config_file(&paths.config)? {
+            notes.push(note);
+        }
+
+        // 3. the database: any failure at all degrades to "no index".
+        let (db, db_disabled) = match paths.database.as_ref() {
+            None => (
+                None,
+                Some("no database path was supplied; running index-less".to_string()),
+            ),
+            Some(path) => match crate::store::sql::connect_with_retry(
+                path,
+                crate::store::config::StoreMode::Full,
+                paths.db_open.attempts,
+                paths.db_open.backoff,
+            ) {
+                Ok(conn) => (Some(conn), None),
+                Err(e) => {
+                    // Plan F5: a lock is a toast, not an abort. Note it only when the caller asked for
+                    // a database, which they did here.
+                    notes.push(StartupNote::DatabaseDisabled {
+                        reason: e.user_message(),
+                    });
+                    (None, Some(e.user_message()))
+                }
+            },
+        };
+
+        let dirs = Arc::new(DirService::new(Arc::new(OsDirRead), Arc::clone(&limits)));
+        let session = Session {
+            inner: Arc::new(Inner {
+                paths,
+                options,
+                limits,
+                env,
+                dirs,
+                jobs: Arc::new(JobRegistry::new()),
+                log: Mutex::new(log),
+                db: Mutex::new(db),
+                db_disabled: Mutex::new(db_disabled),
+                intent: crate::index::intent::noop_intent(),
+                events: Mutex::new(std::collections::VecDeque::new()),
+                origins: OriginAlloc::new(),
+                probe: Arc::new(RwLock::new(None)),
+                config: Mutex::new(config),
+            }),
+        };
+        Ok((session, notes))
+    }
+
+    /// The path set this session was opened with.
+    #[must_use]
+    pub fn paths(&self) -> &SessionPaths {
+        &self.inner.paths
+    }
+
+    /// The engine knobs in force.
+    #[must_use]
+    pub fn options(&self) -> &SessionOptions {
+        &self.inner.options
+    }
+
+    /// The limits the session was opened with.
+    #[must_use]
+    pub fn limits(&self) -> &Arc<Limits> {
+        &self.inner.limits
+    }
+
+    /// The platform seam.
+    #[must_use]
+    pub fn env(&self) -> &Arc<dyn Env> {
+        &self.inner.env
+    }
+
+    /// The directory service (the pane calls `page` through `page_dir`; the service is exposed for the
+    /// steps that need its caches directly).
+    #[must_use]
+    pub fn dirs(&self) -> &Arc<DirService> {
+        &self.inner.dirs
+    }
+
+    /// The index intent sink every mutating service holds instead of a connection.
+    #[must_use]
+    pub fn intent(&self) -> &Arc<dyn IndexIntent> {
+        &self.inner.intent
+    }
+
+    /// Hand one intent to a service (plan §5.3's rename row: the service holds this, never a `Connection`).
+    pub fn note_index(&self, op: IndexOp) {
+        self.inner.intent.note(op);
+    }
+
+    /// The config the session booted with. Mutation of it is step 14's settings dialog, not step 6's.
+    #[must_use]
+    pub fn config(&self) -> ZenConfig {
+        self.inner
+            .config
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Run `f` with the single connection.
+    ///
+    /// This — not a stored `Connection` — is what plan §5.4's "the DB is a private field" correction
+    /// means in practice: the session keeps ownership (one connection, one owner, Go's
+    /// `SetMaxOpenConns(1)`), and step 12's index code borrows it for the duration of one call. The lock
+    /// is held across `f`, which is the point: two rebuilds cannot interleave on one connection.
+    ///
+    /// # Errors
+    /// [`CoreError::Sql`] when the session booted without a database ([`StartupNote::DatabaseDisabled`]).
+    pub fn with_db<R>(&self, f: impl FnOnce(&rusqlite::Connection) -> R) -> Result<R, CoreError> {
+        let guard = self
+            .inner
+            .db
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match &*guard {
+            Some(conn) => Ok(f(conn)),
+            None => Err(CoreError::Sql {
+                msg: self
+                    .database_disabled()
+                    .unwrap_or_else(|| "no database".to_string()),
+            }),
+        }
+    }
+
+    /// The database is unavailable, and why (`None` when it is up).
+    #[must_use]
+    pub fn database_disabled(&self) -> Option<String> {
+        self.inner
+            .db_disabled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Allocate the correlation token for the next request (plan §4.3: the UI owns the `OriginAlloc`).
+    #[must_use]
+    pub fn next_origin(&self) -> Origin {
+        self.inner.origins.next()
+    }
+
+    // ------------------------------------------------------------------------------------ the reads
+
+    /// `/api/props`, exactly: `{platform, symlink_supported}` (`main.go:99-119`, `props-dir.json`).
+    ///
+    /// The answer is cached in the session's [`std::sync::RwLock<Option<bool>>`] (plan F21). The first
+    /// call measures through [`Env::supports_symlink`] — which is itself a cached read for
+    /// [`crate::platform::Linux`], whose actual scratch-directory probe is
+    /// [`crate::platform::linux::Linux::probe_symlinks`] and belongs to the binary because that is the
+    /// crate holding the concrete type. Every later call is a lock read and performs no I/O at all, so a
+    /// properties dialog open across a repaint storm costs nothing.
+    ///
+    /// Use [`Self::prime_props`] from a job when even the first measurement must not land on the UI
+    /// thread (plan §7 step 7's startup job list).
+    #[must_use]
+    pub fn props(&self) -> ProbeReport {
+        ProbeReport {
+            os: self.inner.env.os().as_str(),
+            symlink_supported: self.symlink_support(),
+        }
+    }
+
+    /// The cached symlink answer, measuring it if this is the first call.
+    pub fn symlink_support(&self) -> bool {
+        if let Some(cached) = self.read_probe_cache() {
+            return cached;
+        }
+        let answer = self.inner.env.supports_symlink().unwrap_or_else(|e| {
+            // A probe that *errors* (an unreadable scratch root) is not "no symlinks" — but the
+            // wire type has only a boolean, so the safe answer is `false` and the reason goes to the
+            // event queue as a notice.
+            self.push(EngineEvent::Notice {
+                level: crate::events::NoticeLevel::Warn,
+                message: format!("symlink probe: {}", e.user_message()),
+            });
+            false
+        });
+        self.write_probe_cache(answer);
+        answer
+    }
+
+    /// Warm the probe cache without returning anything: the job-runner form of the first `props()`.
+    pub fn prime_props(&self) {
+        let _ = self.symlink_support();
+    }
+
+    fn read_probe_cache(&self) -> Option<bool> {
+        *self
+            .inner
+            .probe
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn write_probe_cache(&self, value: bool) {
+        let mut guard = self
+            .inner
+            .probe
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard.is_none() {
+            *guard = Some(value);
+        }
+    }
+
+    /// One page of a directory listing, with the origin story attached (plan §4.1's `page_dir`).
+    ///
+    /// Step 6 answers `Done` on every path it can serve: a single `readdir` is the plan's definition of
+    /// a read that may run on the caller's thread. The `Running` half is real and used by
+    /// [`Self::dir_size`]; step 9's flat walk and step 13's archive-manifest build return `Running` from
+    /// this same function, which is why the signature is a [`Receipt`] already.
+    ///
+    /// # Errors
+    /// The listing's own errors (see [`DirService::page`]), and only for the synchronous answer.
+    pub fn page_dir(
+        &self,
+        req: &ListDir,
+        origin: Origin,
+    ) -> Result<Receipt<Arc<DirPage>>, CoreError> {
+        let _ = origin;
+        Ok(Receipt::Done(self.inner.dirs.page(req)?))
+    }
+
+    /// The recursive size of one directory: cached when it can be, a job when it cannot (plan §4.1's
+    /// `dir_size`, §6.1 F1 — the walk that froze Go's request thread is exactly what must not freeze a
+    /// window).
+    ///
+    /// The walk is uncapped by default (see [`DirSizeOpts`]); cancellation is at item boundaries
+    /// ([`CancelToken::check`]) and a cancelled walk emits its one terminal event like any other job.
+    #[must_use]
+    pub fn dir_size(&self, path: &AbsPath, origin: Origin) -> Receipt<DirSizeStat> {
+        if let Some(cached) = self
+            .inner
+            .dirs
+            .cached_sizes(std::slice::from_ref(path))
+            .into_iter()
+            .next()
+            .flatten()
+        {
+            return Receipt::Done(cached);
+        }
+        let dirs = Arc::clone(&self.inner.dirs);
+        let path = path.clone();
+        let label = format!("Size of {path}");
+        let spec = JobSpec::new(self.inner.jobs.next_id(), JobKind::DirSize, label, origin);
+        let id = spec.id;
+        self.inner.jobs.attach(spec, move |cancel, progress| {
+            let stat = dirs.dir_size(&path, &DirSizeOpts::default(), cancel, progress)?;
+            Ok(JobResult::done(
+                stat.clone(),
+                format!("{} file(s), {} B", stat.files_count, stat.bytes),
+            ))
+        });
+        Receipt::Running { job: id, origin }
+    }
+
+    /// The synchronous form of the size walk: no cache, no job, and the caller's own cancel token and
+    /// progress sink. This is what a job body calls, and what `dir_size_matches_go` compares against the
+    /// frozen payloads.
+    ///
+    /// # Errors
+    /// See [`DirService::dir_size`].
+    pub fn dir_size_walk(
+        &self,
+        path: &AbsPath,
+        opts: &DirSizeOpts,
+        cancel: &CancelToken,
+        progress: &dyn DirSizeSink,
+    ) -> Result<DirSizeStat, CoreError> {
+        self.inner.dirs.dir_size(path, opts, cancel, progress)
+    }
+
+    /// The size of a path, in bytes, plus the file count — the `/api/dir/size` pair. Cached answers
+    /// only (this is what a listing's `files_count` column asks before deciding to show `--`).
+    #[must_use]
+    pub fn cached_dir_sizes(&self, dirs: &[AbsPath]) -> Vec<Option<DirSizeStat>> {
+        self.inner.dirs.cached_sizes(dirs)
+    }
+
+    /// The most recent undo-log records, bounded by [`SessionOptions::history_limit`] when the caller
+    /// does not name a limit. Synchronous: the log is memory-indexed at open.
+    ///
+    /// # Errors
+    /// The store's read errors (a file that changed under us mid-read).
+    pub fn log_recent(&self, limit: Option<usize>) -> Result<ActionLog, CoreError> {
+        let want = limit.or(self.inner.options.history_limit).unwrap_or(100);
+        let guard = self
+            .inner
+            .log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.query_recent(want)
+    }
+
+    /// One undo-log record by id.
+    ///
+    /// # Errors
+    /// [`CoreError::NotFound`]-shaped store errors for an unknown id.
+    pub fn log_record(&self, id: LogId) -> Result<crate::history::codec::ActionRecord, CoreError> {
+        let guard = self
+            .inner
+            .log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.get(id).map(|(record, _offset)| record)
+    }
+
+    // ------------------------------------------------------------------------------------ job plumbing
+
+    /// Ask a running job to stop. `false` when there is nothing running under that id — including the
+    /// case that matters, a job that has just completed (plan §7 step 6).
+    pub fn cancel(&self, id: JobId) -> bool {
+        self.inner.jobs.cancel(id)
+    }
+
+    /// Cancel everything a widget (a closed tab) owns (plan §5.6 `cancel_origin`).
+    pub fn cancel_origin(&self, origin: Origin) -> usize {
+        self.inner.jobs.cancel_origin(origin)
+    }
+
+    /// The jobs pane's rows.
+    #[must_use]
+    pub fn jobs(&self) -> Vec<JobInfo> {
+        self.inner.jobs.list()
+    }
+
+    /// Any job still running?
+    #[must_use]
+    pub fn has_live_jobs(&self) -> bool {
+        self.inner.jobs.has_live()
+    }
+
+    /// The repaint nudge plan F14 asks for: `Some(16 ms)` while anything is running, `None` when the UI
+    /// may sleep until the next event.
+    #[must_use]
+    pub fn wants_repaint(&self) -> Option<Duration> {
+        if self.inner.jobs.has_live()
+            || !self.events_are_queued()
+            || self.inner.dirs.has_pending_invalidations()
+        {
+            Some(Duration::from_millis(16))
+        } else {
+            None
+        }
+    }
+
+    /// Drain the engine's event queue: the job table's coalesced events, the invalidations the
+    /// directory service has been holding, and anything the session itself pushed (notices, the size
+    /// answers a finished walk produced).
+    ///
+    /// Non-blocking by construction — see `JobRegistry::poll_at`.
+    pub fn poll(&mut self) -> Vec<EngineEvent> {
+        let mut out = self.inner.jobs.poll();
+        // The broadcast half, collected first so the loop below is not mutating what it is reading:
+        // every row showing this directory gets the number, not only the widget that asked
+        // (plan §4.1's `DirSizeReady`).
+        let sizes: Vec<EngineEvent> = out
+            .iter()
+            .filter_map(|ev| match ev {
+                EngineEvent::JobFinished {
+                    payload: crate::events::JobPayload::DirSize(stat),
+                    ..
+                } => Some(EngineEvent::DirSizeReady {
+                    path: stat.path.clone(),
+                    stat: stat.clone(),
+                }),
+                _ => None,
+            })
+            .collect();
+        out.extend(sizes);
+        out.extend(self.inner.dirs.take_invalidations());
+        let mut guard = self
+            .inner
+            .events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        out.extend(guard.drain(..));
+        drop(guard);
+        out
+    }
+
+    /// Say that a listing went stale, queueing the coalesced [`EngineEvent::DirChanged`].
+    ///
+    /// Every mutating op ends with this call (plan F13); the coalescing is what stops a 2 000-file paste
+    /// from being 2 000 invalidation events.
+    pub fn invalidate(&self, path: &crate::path::FsPath, cause: ChangeCause) {
+        self.inner.dirs.invalidate(path, cause, None);
+    }
+
+    /// As [`Self::invalidate`], tagging the event with the origin that caused it (plan §4.3: a tab that
+    /// did not ask refreshes quietly, keeping scroll and selection).
+    pub fn invalidate_from(&self, path: &crate::path::FsPath, cause: ChangeCause, origin: Origin) {
+        self.inner.dirs.invalidate(path, cause, Some(origin));
+    }
+
+    /// Push an event the session produced on its own (a degraded startup, a warning a job collected).
+    pub fn push(&self, event: EngineEvent) {
+        let mut guard = self
+            .inner
+            .events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.push_back(event);
+    }
+
+    fn events_are_queued(&self) -> bool {
+        self.inner
+            .events
+            .lock()
+            .map(|g| g.is_empty())
+            .unwrap_or(false)
+    }
+
+    /// Ask every running job to stop and wait a bounded time for its thread to land.
+    ///
+    /// A job that ignores its cancel token is *not* waited for: the plan's shutdown rule is that the
+    /// user's own action ends the session, so the thread is left detached and the process exit reaps it.
+    pub fn close(&self) {
+        let asked = self.inner.jobs.cancel_all();
+        if asked == 0 {
+            self.inner.jobs.reap_finished();
+            return;
+        }
+        let deadline = std::time::Instant::now() + Duration::from_millis(200);
+        while self.inner.jobs.has_live() && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        self.inner.jobs.reap_finished();
+    }
+
+    /// The filesystem source the directory service reads through (a test substitutes it before any
+    /// listing happens).
+    #[must_use]
+    pub fn fs_source(&self) -> Arc<dyn FsSource> {
+        self.inner.dirs.source().clone()
+    }
+
+    /// Detach the job table's records: for a test that wants to assert on nothing being left.
+    pub fn clear_finished_jobs(&self) -> Vec<JobId> {
+        self.inner.jobs.clear_finished()
+    }
+
+    /// The raw job ids the table still holds.
+    #[must_use]
+    pub fn job_ids(&self) -> Vec<JobId> {
+        self.inner.jobs.ids()
+    }
+
+    /// A job's metadata, for the "did my job finish" check a widget does outside of `poll`.
+    #[must_use]
+    pub fn job_info(&self, id: JobId) -> Option<JobInfo> {
+        self.inner.jobs.info(id)
+    }
+
+    /// Forget a job record now (its thread is not waited for).
+    pub fn forget_job(&self, id: JobId) -> bool {
+        self.inner.jobs.forget(id)
+    }
+
+    /// Acknowledge a job's terminal event so its record can be reaped.
+    pub fn note_job_completion(&self, id: JobId) -> bool {
+        self.inner.jobs.note_completion(id)
+    }
+
+    /// Spawn a job the session does not itself own: the seam every later `Session::paste`/`delete`/
+    /// `search_live`/`extract` goes through, so the *table* stays the only place threads are born.
+    ///
+    /// `label` is the user-visible jobs-pane line, `budget` the watchdog limit (plan §5.6), and `f` gets
+    /// the cancel token and the progress sink — the only two channels out of a worker.
+    pub fn spawn_job<F, T>(
+        &self,
+        kind: JobKind,
+        label: impl Into<String>,
+        budget: Option<Duration>,
+        f: F,
+    ) -> JobId
+    where
+        F: FnOnce(&CancelToken, &crate::jobs::Progress) -> Result<JobResult<T>, CoreError>
+            + Send
+            + 'static,
+        T: Into<crate::events::JobPayload> + Send + 'static,
+    {
+        let origin = self.next_origin();
+        let mut spec = JobSpec::new(self.inner.jobs.next_id(), kind, label, origin);
+        spec.budget = budget;
+        self.inner.jobs.attach(spec, f)
+    }
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        // The `Session` handle is a cloneable Arc, so the *last* one dropping is the session ending.
+        // `close` is the polite path; this is the backstop (it cannot block, so it does not wait).
+        self.jobs.cancel_all();
+    }
+}
+
+/// Check `config.json`: parseable, absent (first run), or garbage — in which case its bytes are copied
+/// to `<name>.corrupt` and the note says so.
+///
+/// The copy uses `std::fs::copy` for the same reason `store/legacy.rs:403` does: this is the boot-time
+/// settings file, not a user file, and there is no `Env` method for it (`Env::copy_paths` copies *items
+/// into a directory* and logs an undo record — the opposite of what a backup of an unreadable file
+/// needs).
+fn check_config_file(path: &Path) -> Result<Option<StartupNote>, CoreError> {
+    match ZenConfig::load(path) {
+        Ok(_) | Err(CoreError::NotFound { .. }) => Ok(None),
+        Err(e) if !matches!(e, CoreError::Config { .. }) => Err(e),
+        Err(e) => {
+            let mut name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "config.json".to_string());
+            name.push_str(".corrupt");
+            let copied = path.with_file_name(name);
+            std::fs::copy(path, &copied)
+                .map_err(|io| CoreError::io(copied.display().to_string(), io))?;
+            let _ = e;
+            Ok(Some(StartupNote::ConfigReset {
+                path: path.to_path_buf(),
+                copied_to: copied,
+            }))
+        }
+    }
+}
+
+/// `Session`'s convenience: the intent sink every service holds (plan §5.3's no-connection rule).
+#[must_use]
+pub fn noop_intent() -> Arc<dyn IndexIntent> {
+    crate::index::intent::noop_intent()
+}
+
+/// The type alias the plan's §4.3 `Arc<OriginAlloc>` line refers to, spelled through the session.
+pub type OriginHandle = Arc<OriginAlloc>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::path::FsPath;
+    use crate::platform::stub::Unsupported;
+    use crate::store::config::ZenConfig;
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "zenman-session-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    /// Remove the files a session created, then the directory. `std::fs::remove_dir_all` is banned
+    /// workspace-wide (`clippy.toml`), and the tree here is two levels at most.
+    fn cleanup(dir: &Path) {
+        for entry in fs::read_dir(dir).expect("temp dir reads") {
+            let entry = entry.expect("entry");
+            if entry.path().is_dir() {
+                let _ = fs::remove_dir(entry.path());
+            } else {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+        let _ = fs::remove_dir(dir);
+    }
+
+    /// A copy of the frozen undo log with one body byte of its second frame flipped, which is the state
+    /// plan F4 says the port must survive. Same edit shape `contract_history` uses on frame 5 (a byte
+    /// inside `dest`, so the frame still parses but the CRC no longer matches); here it lands early so
+    /// `open` sees damage and `resync` has a long readable tail to discard.
+    fn damaged_log(dir: &Path) -> PathBuf {
+        use crate::history::codec::{self, HEADER_FIXED};
+        let golden = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden/action.log");
+        let mut bytes = fs::read(&golden).expect("the frozen undo log is in the repository");
+        let first = codec::decode_at(&bytes, 0).expect("frame 0 of the golden log");
+        let off1 = first.consumed;
+        let second =
+            codec::decode_at(&bytes[off1..], off1 as u64).expect("frame 1 of the golden log");
+        let at = off1 + HEADER_FIXED + 1;
+        assert!(
+            at < off1 + second.consumed,
+            "frame 1 has a body to damage (consumed {})",
+            second.consumed
+        );
+        bytes[at] ^= 0xff;
+        let path = dir.join("action.log");
+        fs::write(&path, &bytes).expect("write the damaged log");
+        path
+    }
+
+    fn paths(dir: &Path) -> SessionPaths {
+        SessionPaths::new(
+            dir.join("config.json"),
+            dir.join("action.log"),
+            Some(dir.join("zen-man.db")),
+            dir.join("probe"),
+        )
+        .with_db_open(1, Duration::ZERO)
+    }
+
+    #[test]
+    fn open_survives_a_corrupt_log_a_locked_db_and_a_garbage_config() {
+        // Plan §7 step 6 acceptance (a), and §5.6's row: all three damaged files at once, three notes
+        // back, and a working session. Go aborted on the second of the three.
+        let dir = temp_dir("triple");
+        fs::create_dir_all(dir.join("probe")).expect("probe dir");
+        let log = damaged_log(&dir);
+        let db_path = dir.join("zen-man.db");
+        let holder = rusqlite::Connection::open(&db_path).expect("holder opens");
+        holder
+            .execute_batch("BEGIN IMMEDIATE; CREATE TABLE IF NOT EXISTS lock_marker (x);")
+            .expect("write lock held");
+        fs::write(dir.join("config.json"), br#"{"bookmarks": [ unterminated"#)
+            .expect("garbage config");
+
+        let mut p = paths(&dir);
+        p.db_open = DbOpenBudget {
+            attempts: 1,
+            backoff: Duration::ZERO,
+        };
+        let (session, notes) = Session::open(
+            p,
+            ZenConfig::default(),
+            Arc::new(Unsupported::new()),
+            Limits::default(),
+        )
+        .expect("F1: open never fails on damaged user files");
+        drop(holder);
+
+        let kinds: Vec<String> = notes.iter().map(|n| n.message()).collect();
+        assert_eq!(
+            notes.len(),
+            3,
+            "three damaged inputs, three notes: {kinds:?}"
+        );
+        let log_note = notes
+            .iter()
+            .find_map(|n| match n {
+                StartupNote::LogRepaired {
+                    kept,
+                    dropped,
+                    bytes,
+                } => Some((*kept, *dropped, *bytes)),
+                _ => None,
+            })
+            .expect("a LogRepaired note");
+        // Frame 0 survives, frame 1 is the damage, everything after it is discarded.
+        assert_eq!(
+            log_note.0, 1,
+            "exactly the good prefix was kept: {log_note:?}"
+        );
+        assert!(
+            log_note.1 >= 10,
+            "the readable tail was discarded: {log_note:?}"
+        );
+        assert!(log_note.2 > 0, "bytes were removed: {log_note:?}");
+        assert!(notes.iter().any(|n| matches!(
+            n,
+            StartupNote::DatabaseDisabled { reason } if !reason.is_empty()
+        )));
+        let reset = notes
+            .iter()
+            .find_map(|n| match n {
+                StartupNote::ConfigReset { path, copied_to } => {
+                    Some((path.clone(), copied_to.clone()))
+                }
+                _ => None,
+            })
+            .expect("a ConfigReset note");
+        assert!(reset.1.exists(), "the garbage bytes were kept, not dropped");
+        assert_eq!(reset.0, dir.join("config.json"));
+        // And the session is usable: the database is honestly reported as absent, and the log reads.
+        assert!(session.database_disabled().is_some());
+        let records = session.log_recent(None).expect("the repaired log reads");
+        assert!(!records.is_empty(), "the kept records answer the query");
+        session.close();
+        let _ = fs::remove_file(log);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn open_reports_only_the_note_that_applies() {
+        // The same code path with a healthy directory: no notes at all — a test that would pass
+        // vacuously if `open` always reported three.
+        let dir = temp_dir("clean");
+        fs::create_dir_all(dir.join("probe")).expect("probe dir");
+        let (session, notes) = Session::open(
+            paths(&dir),
+            ZenConfig::default(),
+            Arc::new(Unsupported::new()),
+            Limits::default(),
+        )
+        .expect("open");
+        assert_eq!(notes, vec![], "a fresh data directory is not damaged");
+        assert!(session.database_disabled().is_none(), "the db opened");
+        assert!(session.job_ids().is_empty());
+        session.close();
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn origin_round_trips_through_receipt_running() {
+        // Plan §7 step 6 acceptance (c): the origin a caller passes in comes back on the `Receipt`, on
+        // `JobStarted`, and on the single `JobFinished` — which is the only reason a finished job can
+        // find its way back to the widget that asked (plan §4.3).
+        let dir = temp_dir("origin");
+        fs::create_dir_all(dir.join("probe")).expect("probe dir");
+        let (mut session, _notes) = Session::open(
+            paths(&dir),
+            ZenConfig::default(),
+            Arc::new(Unsupported::new()),
+            Limits::default(),
+        )
+        .expect("open");
+
+        let origin = session.next_origin();
+        // A walk over a directory that does not exist cannot reach the worker; use a real one with a
+        // file in it so the job runs and finishes with a typed size.
+        let target = dir.join("walk");
+        fs::create_dir_all(&target).expect("walk dir");
+        fs::write(target.join("a.txt"), b"12345").expect("a file of five bytes");
+        let abs = AbsPath::try_from(target.as_path()).expect("absolute");
+        let receipt = session.dir_size(&abs, origin);
+        assert!(receipt.is_running(), "{receipt:?}");
+        assert_eq!(
+            receipt.origin(),
+            Some(origin),
+            "the origin comes back on the receipt"
+        );
+        let job = receipt.job().expect("a job id");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut finished = None;
+        let mut started = None;
+        let mut ready = 0;
+        while std::time::Instant::now() < deadline {
+            for ev in session.poll() {
+                match ev {
+                    EngineEvent::JobStarted { id, origin: o, .. } => {
+                        assert_eq!(o, origin, "JobStarted carries the caller's origin");
+                        started = Some(id);
+                    }
+                    EngineEvent::JobFinished {
+                        id,
+                        origin: o,
+                        payload,
+                        outcome,
+                        ..
+                    } => {
+                        assert_eq!(o, origin, "the terminal event returns the origin");
+                        let stat = payload.dir_size().expect("a typed DirSize payload");
+                        assert_eq!(
+                            stat.bytes, 5,
+                            "the walk counted the file, not the directory"
+                        );
+                        assert_eq!(stat.files_count, 1);
+                        assert!(outcome.succeeded(), "{outcome:?}");
+                        finished = Some(id);
+                    }
+                    EngineEvent::JobProgress {
+                        id,
+                        origin: o,
+                        progress,
+                    } => {
+                        assert_eq!(o, origin, "progress carries the same origin");
+                        assert_eq!(id, job);
+                        assert!(
+                            progress.total_bytes.is_none(),
+                            "a walk cannot know its total up front"
+                        );
+                    }
+                    EngineEvent::DirSizeReady { path, stat } => {
+                        // The broadcast half plan §4.1 names: every row showing the directory gets the
+                        // number, not only the widget that asked.
+                        assert_eq!(path, abs, "the ready event names the walked directory");
+                        assert_eq!(stat.bytes, 5);
+                        ready += 1;
+                    }
+                    other => {
+                        panic!("unexpected event for the size job: {other:?}");
+                    }
+                }
+            }
+            if finished.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(started, Some(job), "the same job announced itself");
+        assert_eq!(finished, Some(job), "and finished exactly once");
+        assert_eq!(
+            ready, 1,
+            "one DirSizeReady broadcast for the one finished walk"
+        );
+        assert!(
+            !session.cancel(job),
+            "a completed job is never reclassified as cancelled"
+        );
+        // The size is now cached, so the second ask answers synchronously.
+        let again = session.dir_size(&abs, session.next_origin());
+        assert!(again.is_done(), "{again:?}: the cache answered");
+        session.close();
+        cleanup(&target);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn props_answers_from_the_cache_and_never_probes_twice() {
+        // Plan §7 step 6 acceptance (props half) and plan F21: the probe runs once, and every later
+        // `props()` — the properties dialog asks on every repaint — is a lock read.
+        #[derive(Debug)]
+        struct CountingEnv {
+            inner: Unsupported,
+            calls: AtomicU64,
+        }
+
+        impl CountingEnv {
+            fn new() -> Self {
+                Self {
+                    inner: Unsupported::new(),
+                    calls: AtomicU64::new(0),
+                }
+            }
+        }
+
+        impl Env for CountingEnv {
+            fn os(&self) -> crate::platform::Os {
+                self.inner.os()
+            }
+            fn caps(&self) -> crate::platform::PlatformCaps {
+                self.inner.caps()
+            }
+            fn open_with(
+                &self,
+                path: &AbsPath,
+            ) -> crate::platform::PlatformFuture<'_, Result<(), CoreError>> {
+                self.inner.open_with(path)
+            }
+            fn copy_paths(
+                &self,
+                items: &[crate::platform::CopyItem],
+            ) -> crate::platform::PlatformFuture<'_, Result<crate::platform::CopyReport, CoreError>>
+            {
+                self.inner.copy_paths(items)
+            }
+            fn paste_link(
+                &self,
+                items: &[crate::platform::LinkItem],
+            ) -> crate::platform::PlatformFuture<'_, Result<(), CoreError>> {
+                self.inner.paste_link(items)
+            }
+            fn supports_symlink(&self) -> Result<bool, CoreError> {
+                let _ = self.calls.fetch_add(1, Ordering::AcqRel);
+                self.inner.supports_symlink()
+            }
+            fn chmod(
+                &self,
+                targets: &[AbsPath],
+                mode: crate::mode::ModeBits,
+            ) -> crate::platform::PlatformFuture<'_, Result<(), CoreError>> {
+                self.inner.chmod(targets, mode)
+            }
+            fn can_trash(&self, path: &AbsPath) -> bool {
+                self.inner.can_trash(path)
+            }
+            fn trash(&self, path: &AbsPath) -> Result<bool, CoreError> {
+                self.inner.trash(path)
+            }
+            fn create_shortcut(
+                &self,
+                shortcut: &crate::platform::Shortcut,
+            ) -> Result<(), CoreError> {
+                self.inner.create_shortcut(shortcut)
+            }
+            fn disk_space(&self, path: &AbsPath) -> Result<crate::platform::DiskSpace, CoreError> {
+                self.inner.disk_space(path)
+            }
+            fn mount_entries(&self) -> Result<crate::platform::MountTable, CoreError> {
+                self.inner.mount_entries()
+            }
+            fn exec_program(
+                &self,
+                req: crate::platform::ExecRequest,
+            ) -> crate::platform::PlatformFuture<'_, Result<crate::platform::ExecOutput, CoreError>>
+            {
+                self.inner.exec_program(req)
+            }
+        }
+
+        let dir = temp_dir("props");
+        fs::create_dir_all(dir.join("probe")).expect("probe dir");
+        let env = Arc::new(CountingEnv::new());
+        let shared: Arc<dyn Env> = env.clone();
+        let (session, _notes) =
+            Session::open(paths(&dir), ZenConfig::default(), shared, Limits::default())
+                .expect("open");
+
+        let first = session.props();
+        let again = session.props();
+        let third = session.props();
+        assert_eq!(first, again, "the report is stable");
+        assert_eq!(third.symlink_supported, first.symlink_supported);
+        assert_eq!(
+            env.calls.load(Ordering::Acquire),
+            1,
+            "the measurement ran once and every later call was the cache (plan F21)"
+        );
+        // `/api/props` body: exactly these two keys, in this order (`props-dir.json`).
+        let json = serde_json::to_value(first).expect("the report serialises");
+        assert_eq!(
+            json.as_object()
+                .expect("an object")
+                .keys()
+                .collect::<Vec<_>>(),
+            vec!["platform", "symlink_supported"]
+        );
+        session.close();
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn page_dir_answers_done_with_the_list_it_read() {
+        // Step 6's `page_dir` is the synchronous half of the `Receipt` story (plan §4.1: a read that
+        // never blocks longer than one directory). The `Running` half is `dir_size`'s, tested above.
+        let dir = temp_dir("pagedir");
+        fs::create_dir_all(dir.join("probe")).expect("probe dir");
+        let listing = dir.join("listed");
+        fs::create_dir_all(&listing).expect("listed dir");
+        fs::write(listing.join("only.txt"), b"x").expect("one file");
+        let (session, _notes) = Session::open(
+            paths(&dir),
+            ZenConfig::default(),
+            Arc::new(Unsupported::new()),
+            Limits::default(),
+        )
+        .expect("open");
+        let req = ListDir::first(FsPath::from_abs(
+            AbsPath::try_from(listing.as_path()).expect("absolute"),
+        ));
+        let origin = session.next_origin();
+        let receipt = session.page_dir(&req, origin).expect("listing");
+        let page = receipt.done().expect("step 6 lists synchronously");
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].name, "only.txt");
+        assert_eq!(page.total_count, 1);
+        // And the second ask is served from the cache, not from a second readdir.
+        let again = session.page_dir(&req, origin).expect("cached listing");
+        assert!(Arc::ptr_eq(again.done().expect("done"), page));
+        session.close();
+        cleanup(&listing);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn a_config_that_cannot_be_parsed_is_copied_aside() {
+        let dir = temp_dir("cfgreset");
+        let cfg = dir.join("config.json");
+        fs::write(&cfg, b"not json at all").expect("write garbage");
+        let note = check_config_file(&cfg).expect("no error").expect("a note");
+        match note {
+            StartupNote::ConfigReset { path, copied_to } => {
+                assert_eq!(path, cfg);
+                assert_eq!(
+                    fs::read_to_string(&copied_to).expect("backup"),
+                    "not json at all"
+                );
+            }
+            other => panic!("expected ConfigReset, got {other:?}"),
+        }
+        // A missing file is a first run, not damage.
+        assert!(
+            check_config_file(&dir.join("absent.json"))
+                .expect("no error")
+                .is_none()
+        );
+        // And a good file says nothing.
+        fs::write(
+            &cfg,
+            serde_json::to_vec(&ZenConfig::default()).expect("json"),
+        )
+        .expect("write a good config");
+        assert!(check_config_file(&cfg).expect("no error").is_none());
+        cleanup(&dir);
+    }
+}
