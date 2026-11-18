@@ -44,7 +44,7 @@ use std::time::Duration;
 use clap::Parser;
 
 /// The plan step this binary implements; echoed in the window title area (see `app::ZenApp::show`).
-pub const PLAN_STEP: u32 = 4;
+pub const PLAN_STEP: u32 = 7;
 
 /// App id and window title (plan §5.9 `main.rs` row).
 const APP_ID: &str = "ZenMan";
@@ -401,6 +401,36 @@ fn run_with_context(cli: &Cli, paths: &app_dirs::AppPaths) -> Result<u8, BootErr
         );
     }
 
+    // 2b. the engine session (plan §4.1): the single owner of the log, the database, the job
+    // table and the directory cache. It opens *after* the instance claim, because those are the
+    // shared files the claim protects (plan F5). A failure here is a boot failure — the log could
+    // not be opened at all — and the honest answer is exit 1 with the reason, not a window that
+    // cannot undo.
+    let session_paths = zenman_core::session::SessionPaths::new(
+        config_boot::config_path(paths),
+        paths.data.join("action.log"),
+        (context.config.store_mode != zenman_core::store::config::StoreMode::Ephemeral)
+            .then(|| paths.data.join("zen-man.db")),
+        paths.data.clone(),
+    );
+    let (session, startup_notes) = match zenman_core::session::Session::open(
+        session_paths,
+        context.config.clone(),
+        zenman_core::platform::default_env(),
+        context.config.limits(),
+    ) {
+        Ok(opened) => opened,
+        Err(e) => {
+            return Err(BootError::new(
+                EXIT_RUNTIME,
+                format!("the engine could not start: {}", e.user_message()),
+            ));
+        }
+    };
+    for note in &startup_notes {
+        println!("startup note: {}", note.message());
+    }
+
     let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_app_id(APP_ID)
@@ -426,9 +456,20 @@ fn run_with_context(cli: &Cli, paths: &app_dirs::AppPaths) -> Result<u8, BootErr
         APP_TITLE,
         options,
         Box::new(move |cc: &eframe::CreationContext<'_>| {
-            // Image loaders are part of plan §5.9's boot list; the SVG registry that needs them is step 7.
+            // Image loaders are part of plan §5.9's boot list; the SVG registry that needs them
+            // landed with step 7 (`zenman_ui::icons`).
             egui_extras::install_image_loaders(&cc.egui_ctx);
-            Ok(Box::new(app::ZenApp::new(app_paths, boot, smoke)))
+            // Fonts (plan §10 R9: egui defaults + system fallback, no vendored Outfit) and the
+            // persisted theme, before the first frame draws anything.
+            zenman_ui::theme::fonts::install(&cc.egui_ctx);
+            zenman_ui::theme::apply(&cc.egui_ctx, session.config().theme);
+            Ok(Box::new(app::ShellApp::new(
+                &app_paths,
+                boot,
+                smoke,
+                session,
+                &startup_notes,
+            )))
         }),
     ) {
         Ok(()) => {

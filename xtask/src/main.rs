@@ -1,9 +1,12 @@
 //! `cargo xtask <task>` — the in-repo gates (plan §5.1 `xtask/src/main.rs` row, §7 step 1).
 //!
-//! `ci` is the gate a reviewer trusts; `deps` and `licenses` are the two custom linters it ends with.
-//! `snapshots`/`parity` are honest stubs that print the step that lands them, because the plan
-//! sequences the `egui_kittest` harness (step 7) and the human parity review (step 15) after this
-//! commit. `contracts` is real since step 2: it guards the frozen Go golden capture in
+//! `ci` is the gate a reviewer trusts; `deps` and `licenses` are the two custom linters it ends
+//! with, and since step 7 it opens with two more: the colour guard (`Color32::` literals only in
+//! `zenman-ui/src/theme.rs`) and the IO guard (`std::fs::` nowhere in `zenman-ui/src` outside
+//! `#[cfg(test)]` tails). `snapshots` is real since step 7 (the kittest/wgpu render of
+//! `crates/zenman-ui/tests/snapshots/01-empty.png`, or a printed skip reason when no adapter
+//! exists); `parity` is the one remaining stub, landing with the human review in step 15.
+//! `contracts` is real since step 2: it guards the frozen Go golden capture in
 //! `tests/golden/` (`xtask/src/contracts.rs`), and since step 2 it also runs the two completeness
 //! gates: `golden-index` (every file in `tests/golden/` is accounted for in `INDEX.json`) and
 //! `fixture-tree` (`scripts/make-fixtures.py` still produces the tree `MANIFEST.md` promises).
@@ -40,11 +43,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         "ci" => ci(),
         "deps" => deps(),
         "licenses" => licenses(),
-        "snapshots" => stub(
-            "snapshots",
-            7,
-            "`egui_kittest` baselines from the CI software rasteriser (plan §7 step 7, §5.10)",
-        ),
+        "snapshots" => snapshots(),
         "parity" => stub(
             "parity",
             15,
@@ -74,6 +73,8 @@ fn stub(name: &str, step: u32, why: &str) -> Result<(), Box<dyn Error>> {
 /// The full gate: format, lints, tests, then the two provenance/licence linters.
 fn ci() -> Result<(), Box<dyn Error>> {
     step("cargo fmt --all -- --check")?;
+    colour_guard()?;
+    io_guard()?;
     step("cargo clippy --workspace --all-targets -- -D warnings")?;
     step("cargo test --workspace")?;
     contracts::contracts()?;
@@ -81,6 +82,152 @@ fn ci() -> Result<(), Box<dyn Error>> {
     licenses()?;
     println!("xtask ci: all gates green");
     Ok(())
+}
+
+/// Plan §5.7 `theme.rs` row: "no colour literal appears anywhere else in the crate". The literals
+/// themselves are `Color32::<anything>` — associated constructors (`from_rgb`, named colours) — and
+/// `theme.rs` is their one home. A test module inside a file is fine to use them only when the
+/// file *is* `theme.rs`; anywhere else, even a test literal would drift silently, so the rule is
+/// absolute outside `theme.rs`.
+fn colour_guard() -> Result<(), Box<dyn Error>> {
+    let root = workspace_root()?;
+    let ui_src = root.join("crates/zenman-ui/src");
+    let offenders = scan_rust_files(&ui_src, &["Color32::"], &["theme.rs"])?;
+    if !offenders.is_empty() {
+        return Err(format!(
+            "xtask ci: colour literals outside `theme.rs` (plan §5.7: the theme owns every colour):\n  {}",
+            offenders.join("\n  ")
+        )
+        .into());
+    }
+    println!(
+        "xtask ci: colour guard — `Color32::` appears only in `crates/zenman-ui/src/theme.rs`"
+    );
+    Ok(())
+}
+
+/// Rule 7 (and plan §5.1's `grep -rn "std::fs::" crates/zenman-ui/src`): the UI crate does no IO;
+/// `zenman-core` and `craft-settings` own every file operation. `#[cfg(test)]` tails are exempt —
+/// a test may build the temp directories the *engine* opens — and the exemption is positional:
+/// everything from the first `#[cfg(test)]` line on is test code (every module in this crate puts
+/// its tests last, which `io_guard` also relies on and the tree keeps true).
+fn io_guard() -> Result<(), Box<dyn Error>> {
+    let root = workspace_root()?;
+    let ui_src = root.join("crates/zenman-ui/src");
+    let mut offenders = Vec::new();
+    let mut files = Vec::new();
+    collect_rs(&ui_src, &mut files)?;
+    files.sort();
+    for file in files {
+        let text = std::fs::read_to_string(&file)?;
+        let mut in_tests = false;
+        for (n, line) in text.lines().enumerate() {
+            if line.trim_start().starts_with("#[cfg(test)]") {
+                in_tests = true;
+            }
+            if !in_tests && line.contains("std::fs::") {
+                offenders.push(format!(
+                    "{}:{}: {}",
+                    file.strip_prefix(&root).unwrap_or(file.as_path()).display(),
+                    n + 1,
+                    line.trim()
+                ));
+            }
+        }
+    }
+    if !offenders.is_empty() {
+        return Err(format!(
+            "xtask ci: `std::fs::` in `zenman-ui` outside test code (rule 7: IO goes through zenman-core/craft-settings):\n  {}",
+            offenders.join("\n  ")
+        )
+        .into());
+    }
+    println!("xtask ci: IO guard — `zenman-ui/src` opens no files outside `#[cfg(test)]` tails");
+    Ok(())
+}
+
+/// Grep a directory tree of `.rs` files for needles, skipping files whose name is exempt.
+fn scan_rust_files(
+    dir: &Path,
+    needles: &[&str],
+    exempt_names: &[&str],
+) -> Result<Vec<String>, Box<dyn Error>> {
+    let root = workspace_root()?;
+    let mut files = Vec::new();
+    collect_rs(dir, &mut files)?;
+    files.sort();
+    let mut hits = Vec::new();
+    for file in files {
+        if file
+            .file_name()
+            .is_some_and(|n| exempt_names.contains(&n.to_string_lossy().as_ref()))
+        {
+            continue;
+        }
+        let text = std::fs::read_to_string(&file)?;
+        for (n, line) in text.lines().enumerate() {
+            if needles.iter().any(|needle| line.contains(needle)) {
+                hits.push(format!(
+                    "{}:{}: {}",
+                    file.strip_prefix(&root).unwrap_or(&file).display(),
+                    n + 1,
+                    line.trim()
+                ));
+            }
+        }
+    }
+    Ok(hits)
+}
+
+fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), Box<dyn Error>> {
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            collect_rs(&path, out)?;
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+/// Plan §7 step 7: write `crates/zenman-ui/tests/snapshots/01-empty.png` from the kittest+wgpu
+/// rasteriser, or skip with the reason the test printed. This box has Vulkan (AMD integrated) and
+/// GL and no lavapipe (plan OQ3), so the real path is the hardware adapter head-lessly — which is
+/// also what `xvfb-run -a cargo xtask snapshots` exercises on CI images.
+fn snapshots() -> Result<(), Box<dyn Error>> {
+    let root = workspace_root()?;
+    println!("$ cargo test -p zenman-ui --test snapshots -- --nocapture (ZENMAN_SNAPSHOT_WRITE=1)");
+    let status = Command::new(cargo_bin())
+        .current_dir(&root)
+        .args([
+            "test",
+            "-p",
+            "zenman-ui",
+            "--test",
+            "snapshots",
+            "--",
+            "--nocapture",
+        ])
+        .env("ZENMAN_SNAPSHOT_WRITE", "1")
+        .status()?;
+    if !status.success() {
+        return Err("`cargo xtask snapshots`: the snapshot test failed (above)".into());
+    }
+    let png = root.join("crates/zenman-ui/tests/snapshots/01-empty.png");
+    if png.is_file() {
+        let bytes = std::fs::metadata(&png)?.len();
+        println!(
+            "xtask snapshots: wrote {} ({bytes} bytes) — human review against `docs/parity/` is step 15's gate, never a pixel diff",
+            png.display()
+        );
+        Ok(())
+    } else {
+        println!(
+            "xtask snapshots: no PNG written — the test printed its skip reason above (no adapter).              That is the plan §7 acceptance path for a machine without a rasteriser."
+        );
+        Ok(())
+    }
 }
 
 fn step(args: &str) -> Result<(), Box<dyn Error>> {

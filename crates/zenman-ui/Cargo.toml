@@ -23,8 +23,25 @@ dbg_macro = "warn"
 todo = "warn"
 
 [dependencies]
-# The framework this crate is written against. Nothing in plan §5.1's step-1 row needs them yet, but
-# they are declared now so `cargo tree -i egui` and `cargo xtask licenses` see the real graph from the
-# first commit, and so the crate boundary (UI = egui, core = headless) is fixed by a manifest.
+# The framework this crate is written against (plan §5.1: declared up front so the crate boundary
+# UI = egui, core = headless is fixed by a manifest, and `xtask deps`/`licenses` see the real graph).
 craft-ui = { workspace = true }
 egui = { workspace = true }
+zenman-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# `persist.rs` (plan §5.7): the settings store is the crate's only IO route besides `zenman-core`.
+craft-settings = { workspace = true }
+
+[dev-dependencies]
+# Step 7 makes the four step-1 "later step" patches live (plan §9.1 row 4): the kittest harness
+# drives `ZenApp` head-fully, and `snapshot`+`wgpu` give `xtask snapshots` its rasterised PNG.
+egui_kittest = { workspace = true, features = ["snapshot", "wgpu"] }
+egui_extras = { workspace = true }
+# The rasteriser probe in `tests/snapshots.rs` must *see* the adapters before it renders (kittest's
+# own renderer panics with no adapter — plan §9.2 step-7 row), hence the direct wgpu/pollster/image
+# dev-deps at the versions the egui fork's workspace already pins.
+wgpu = { workspace = true }
+pollster = { workspace = true }
+image = { workspace = true }
+

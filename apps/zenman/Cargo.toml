@@ -25,6 +25,7 @@ todo = "warn"
 zenman-core = { workspace = true }
 zenman-ui = { workspace = true }
 craft-ui = { workspace = true }
+craft-settings = { workspace = true }
 eframe = { workspace = true }
 egui = { workspace = true }
 # `install_image_loaders` (plan §5.9 main.rs row) is step 7's job, when the SVG registry lands; the

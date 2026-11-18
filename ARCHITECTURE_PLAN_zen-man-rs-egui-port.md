@@ -526,6 +526,18 @@ Legend for the table: **Depends** = other rows (by file) *and* build steps (§7 
 | `crates/zenman-ui/src/persist.rs` | create | `pub struct Persisted { pub settings: Arc<craft_settings::SettingsStore<ZenConfig>> }`; `pub fn autosave(app:&mut ZenApp, ctx:&egui::Context, now:Instant)` (1.5 s debounce — parity with `workspace.js`; **plus** a `session_watcher` that writes on `DirChanged`-driven layout changes); `pub fn save_dock(app:&mut ZenApp) -> Result<(),CoreError>` (atomic, `config.json.dock.tmp` → rename; refuses to overwrite a file from a newer version) | `store/config.rs`,`dock.rs` | kill -9 during save leaves the previous `config.json` valid (`craft-atomic` guarantee, asserted by a test that injects a rename failure) |
 | `crates/zenman-ui/src/keymap.rs` | create | `pub struct Chord { pub key:egui::Key, pub ctrl:bool, pub alt:bool, pub shift:bool, pub super_:bool }` + `impl Chord { pub fn parse(raw:&str) -> Result<Chord,ChordParseError>, pub fn display(&self)->String /*"Alt+Shift+C"*/ }`; `pub struct KeyMap(Vec<(Chord, CommandId)>)`; `pub fn build() -> KeyMap` (the §2.3 registry, one place, feeding both dispatch and the context-menu accelerator text — Go had the registry but 4 hard-coded chords bypassed it); `pub enum FocusContext { FileList, QuickFind, SearchManager, BatchRename, Modal, None }`; `pub fn dispatch(ctx:&egui::Context, focus:FocusContext, on_command:&mut dyn FnMut(CommandId)) -> Consumed` — evaluated on **`KeyDown`** (not `KeyUp`, fixing Go), with `if typing_window(ctx).is_some() { return }` and an explicit `FocusContext` switch instead of `activeElement.tagName==='INPUT'`; `pub fn is_editable(ctx:&egui::Context) -> bool` | `state.rs` | table test: every registered chord resolves to exactly one command in `FileList`; `Shift+Tab` latches MRU and commits on release; `Ctrl+Tab` cycles; `H` is suppressed in any text field; `F5` refresh, arrows/Home/End/PageUp/PageDown, `Backspace` = up, `~` = home, `/` = address bar, `Esc` = clear selection/close (the missing keys, §2.3) |
 
+
+> **Step-7 as-built corrections to this table** (measured, see §9.2 step-7 entry for the full list):
+> `craft_ui` has no `eframe` re-export and no `App` trait — `eframe::App` is implemented by
+> `apps/zenman::ShellApp` around `ZenApp::{logic, ui}`; `state.rs` re-uses core's
+> `PaneSlot/LayoutMode/ViewMode/GroupColor` (no `Quad` in `LayoutMode` — the quad grid is derived
+> shell state; `ViewMode::Flat` is the plan's `FlatMode`); `DockId` hashes manually because core's
+> `PaneSlot` is not `Hash`; `persist.rs` stores a shell-side `ShellSettings` (orphan rule blocks
+> `SettingsStore<ZenConfig>`) with the dock snapshot as JSON *text* (TOML cannot carry
+> `serde_json::Value`); `Tab.error` is `Option<Arc<CoreError>>`; `DockOutput::focused` is
+> `Option<&P>`; panels are the fork's `egui::Panel::{top,bottom,left,right}`, not
+> `TopBottomPanel`/`SidePanel`.
+
 ### 5.8 `zenman-ui` — widgets, panels, dialogs, menus
 
 | File | Action | Concrete signature / schema | Depends on | Done when |
@@ -724,7 +736,7 @@ The grill-me interview was skipped on instruction. These are the points where I 
 
 | # | Question | Why it could not be resolved here |
 |---|---|---|
-| OQ1 | Actual rendering fidelity of `egui` vs the CSS spec on this GPU/driver combination (font metrics, `rgba` selection tint, tab ellipsis, no Outfit). | Needs the first `egui_kittest` snapshot run, which only exists after step 7. Mitigation: `xtask snapshots` baselines + `xtask parity` human gate in step 15, and R9 records the font compromise explicitly. |
+| OQ1 | Actual rendering fidelity of `egui` vs the CSS spec on this GPU/driver combination (font metrics, `rgba` selection tint, tab ellipsis, no Outfit). | **Step 7 update:** the first `egui_kittest` snapshot now exists — `cargo xtask snapshots` renders `crates/zenman-ui/tests/snapshots/01-empty.png` on this box through the Vulkan adapter (headless, no Xvfb needed; adapter enumeration is display-independent per OQ3) and the shell's own `Tokens`/`DockStyle`/icon registry all draw. What still needs the human eye (font metrics, `rgba` tints, tab ellipsis fidelity vs `docs/parity/*.png`) is the step-15 `xtask parity` review — the PNG is a *reference*, never pixel-diffed. |
 | OQ2 | Whether `trash` on this user's desktop (Mint/Cinnamon) resolves a trash directory for `/media/…` removable volumes. | Needs a runtime probe on the target machine; `platform::Env::can_trash` is where the answer is recorded, and `delete.rs` falls back per R/D6. |
 | ~~OQ3~~ **ANSWERED in step 1** | Which `wgpu` adapters exist here, and whether the app can boot headless. | `[VERIFIED]` `cargo run -p zenman -- --print-adapters`, native and under `xvfb-run -a`, produced byte-identical output (adapter enumeration is display-independent): `Backends(VULKAN | GL)`; `Vulkan | IntegratedGpu | AMD Ryzen 7 9700X (RADV RAPHAEL_MENDOCINO)`; `Gl | Other | AMD … (radeonsi, raphael_mendocino, ACO, DRM 3.64)`. **No lavapipe installed** ⇒ no pure-CPU Vulkan rasteriser on this box, but the **GL rung boots and self-closes under Xvfb** (`--safe-gpu --smoke 1` → exit 0, MESA DRI3 warnings ⇒ llvmpipe-backed GL). Consequence for step 7: snapshot tests target the **GL backend under Xvfb** here, and still skip-with-reason on an image without Mesa. |
 | OQ4 | Whether `craft-libs` at a rev newer than `6e03f65` changes the `DockArea`/`Permissions` behaviour that D3 and R8 depend on (a per-group strip-suppression flag, a top-edge dock, a shared modal/toast helper — §2.2 confirms the last is absent today). | The local clones are pinned snapshots; answering needs upstream history. Mitigation: pin `6e03f65` (what photocraft v0.23.1 ships) in step 1 and re-read `docs/ui-docking.md` at step 7. |
@@ -761,3 +773,55 @@ Two process findings to carry forward: a green `cargo check` proves nothing unti
 * The symlink probe deliberately **does not** call `mount(2)`: a successful overlayfs mount inside the probe would need a privileged unmount to clean up. It is therefore weaker than Go's check, and says so in its doc comment.
 
 **Step 5 completed** — `history/{codec,store}`, `store/sql`, `index/schema`, `tests/contract_history.rs` (18 cases). `zenman-core` 124 → 158 tests, workspace 158+18+24+3, `cargo xtask ci` exit 0. Byte-identity: **all 19 golden records re-encode exactly**, and our CRC re-seal reproduces the revert the capture performed. `resync` was exercised on a truncated copy (18 kept, 54 B dropped) and a flipped-CRC copy (6 kept, 12 dropped, file byte-equal to the prefix) — and it is a **port-side repair, not Go behaviour**: Go's `rebuildIndex` skips a bad frame and never truncates, so `iter_after`/`record_count` are the parity path and `resync` is additive. `journal_mode = DELETE` is asserted (WAL would leave `-wal`/`-shm` the Go app cannot fold away), the Go-written `zen-man.db` opens with `integrity_check = ok` and zero schema issues, and a trigram `files_fts MATCH` query returns hits, which clears the bundled-SQLite gate that `rusqlite` replaced `modernc` with. Two measured traps for whoever writes the schema check: `folder_sizes.path` and `schema_meta.key` report `notnull = 0` despite being `TEXT PRIMARY KEY` (only `INTEGER PRIMARY KEY` aliases the rowid), and `docs/contracts.md`'s framing table mislabelled `recLen` as the CRC field — both corrected in place.
+
+**Step 7 completed (shell skeleton)** — `zenman-ui` went from a 0-test scaffold to the real shell:
+`theme.rs` (every §2.3 colour/geometry token; the crate's only colour-literal home, enforced by two
+new `xtask ci` greps — colour guard + IO guard), `icons.rs` (+40 original SVGs in `assets/icons/`,
+`ATTRIBUTION.md` in the same commit), `dock.rs`, `dock_content.rs`, `state.rs`, `app.rs`,
+`jobs_ui.rs`, `persist.rs`, `widgets/{toast,disk_meter}.rs`, `tests/{shell.rs,snapshots.rs}`; the
+binary boots the real shell (`xvfb-run -a … --safe-gpu --smoke 1` → exit 0, GPU ladder untouched).
+`zenman-ui` 0 → 46 tests, workspace 241 → 287, `cargo xtask ci` exit 0. Measured surprises, every
+one caught by compiling, all of them binding for step 8+:
+
+* **`craft_ui::eframe` does not exist** in the pinned rev — §9.1's claim ("re-exports the `eframe`
+  module", `crates/ui/src/lib.rs:138`) is wrong: `crates/ui/src/lib.rs` is 27 lines and exports only
+  `combo::ComboBox`; there is no `App` trait either. `eframe::App` is implemented in **`apps/zenman`**
+  (`ShellApp`) around `ZenApp::{logic, ui}` plain methods in the UI crate.
+* **`egui_kittest::Harness` has no logic+ui pair constructor** (`builder.rs:275 build_ui_state` is the
+  closest); the shell's `logic` is driven from inside the ui closure via `app.logic(&ui.ctx())`.
+* **`harness.snapshot()` compares against a committed baseline and fails when missing**
+  (`snapshot.rs:774`), and the lazy `WgpuTestRenderer` **panics** `expect("Failed to create render
+  state")` on the first render with no adapter (`egui_kittest/src/wgpu.rs:75`). `xtask snapshots`
+  therefore enumerates adapters itself first (the real skip path, printed reason, test passes), then
+  uses `harness.render()` + `image.save` — no pixel diff anywhere, per §7's human-gate rule.
+* **The forked egui 0.37 renamed the panel/ID/area surface** versus upstream: `TopBottomPanel`/
+  `SidePanel` are gone — one `egui::Panel::{top,bottom,left,right}` with `.exact_size()` and `.show`
+  (`show_inside` deprecated); `Id::new` deprecated → `Id::unique` (deterministic hash);
+  `ctx.style()/style_mut` → `global_style()/global_style_mut` (+ `style_of(Theme)` for the fork's
+  multi-theme support); `Area::h_align/v_align` → `.anchor(Align2, offset)`; `Image`'s builder lost
+  `selectable/show_loading/show_broken` (it has `show_loading_spinner`); `Context::run` is gone, so
+  in-crate tests cannot draw and draw-assertions moved to the kittest integration tests.
+  `Color32::from_rgb/_rgba_unmultiplied` are **not `const`** here — `Tokens::dark()` is a `fn`.
+* **`craft_ui::docking::DockOutput::focused` is `Option<&P>`**, not `Option<P>` as §2.2 writes
+  (`surface.rs:296`), and `DockContent` is a ~30-method trait — the plan's six are all present with
+  defaults, plus `column_rect`/`custom_group`/`group_header`/… step 8 will use.
+* **Core `PaneSlot` is not `Hash`**, so `DockId` cannot derive it (manual impl in `dock.rs`).
+* **§5.7 `state.rs` types are core's, not the UI's**: `PaneSlot/LayoutMode/ViewMode/GroupColor` are
+  re-exported from `store::config` (step 4 shipped them; `LayoutMode` has **no Quad** — the four-pane
+  grid is shell state derived from the pane map, `AppModel::quad()`; `ViewMode::Flat` subsumes the
+  plan's `FlatMode`; `GroupColor` is `A..E` with `Option<&str>` colours, the five §2.3 hexes live in
+  `theme::Tokens::group_color`). `Tab.error` is `Option<Arc<CoreError>>` (`CoreError` is not `Clone`).
+  `ZenApp` holds `Session` by value (it is already an `Arc` handle and `poll` needs `&mut self`);
+  `origins`/`dialogs`/`menus`/`keymap` fields deferred to their steps.
+* **`SettingsStore<ZenConfig>` is impossible** (orphan rule: `Settings` is craft-settings',
+  `ZenConfig` core's): `persist.rs` types the store with a shell-side `ShellSettings`, and **TOML
+  cannot carry `serde_json::Value`** (`Failed(Serialize("unsupported unit type"))` — measured), so the
+  dock snapshot persists as JSON *text*.
+* `craft_ui::buttons::IconButton::show`'s paint closure takes `&Ui`, which cannot host an
+  `egui::Image` (image loading needs `&mut Ui`), so the header buttons paint their own frame with
+  `ButtonVisuals` types; step 8 should do the same or route icons through `paint_icon`-style painters.
+
+`xtask snapshots` is real: it renders `01-empty.png` here (Vulkan, `Vulkan | 5056` + `Gl | 0`
+adapters) in ~0.1 s and prints the skip reason on a machine without one. The remaining
+`[patch.crates-io]` warnings are `egui_inspection`, `egui_demo_lib`, `egui_system_font_provider`
+(`egui_kittest` is now live, as step 7 intended).

@@ -36,6 +36,15 @@ craft-i18n = { git = "https://github.com/storytold/craft-libs", rev = "6e03f65bf
 egui = { version = "0.37", default-features = false, features = ["default_fonts"] }
 eframe = { version = "0.37", default-features = false, features = ["wgpu", "accesskit", "wayland", "x11", "clipboard", "persistence"] }
 egui_extras = { version = "0.37", default-features = false, features = ["svg"] }
+# The kittest harness (plan §7 step 7: `xtask snapshots` and the widget-tree asserts). The
+# `[patch.crates-io]` entry below is what makes this the *fork's* kittest, same rev as egui itself.
+egui_kittest = { version = "0.37" }
+# The snapshot test enumerates wgpu adapters itself before handing the harness a renderer (kittest's
+# default renderer panics with "No adapter found"; the skip-with-reason path needs the probe first).
+# Versions/features match the egui fork's own workspace table so feature unification adds nothing.
+wgpu = { version = "30", default-features = false, features = ["std"] }
+pollster = "1"
+image = { version = "0.25", default-features = false, features = ["png"] }
 # --- external -----------------------------------------------------------------------------------
 clap = { version = "4", features = ["derive", "env"] }
 directories = "6"
