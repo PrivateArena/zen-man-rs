@@ -2,11 +2,11 @@
 //!
 //! `scripts/make-fixtures.py` is the source of truth for `tests/fixtures/tree/`, and that directory
 //! is deliberately untracked (`.gitignore` step-2 block: git can only store modes 100644 / 100755 /
-//! 120000, so a `chmod 000` file cannot survive a checkout). `MANIFEST.md` is the checked-in promise
+//! 120000, so a `chmod 000` file cannot survive a checkout). `docs/fixtures.md` is the checked-in promise
 //! about what the generator produces, and this gate is the only thing that keeps that promise honest.
 //!
 //! It regenerates the tree into a throwaway directory and compares **entry count + kind + octal mode +
-//! name** against the `fixture-tree/1` block of `MANIFEST.md`. The comparison is on hex-encoded names
+//! name** against the `fixture-tree/1` block of `docs/fixtures.md`. The comparison is on hex-encoded names
 //! because the tree contains `weird\rname.txt` (a carriage return inside a file name), a backslash, a
 //! `#`, a `'`, and two `café.txt` names that differ only in Unicode normalisation form; hex is the
 //! only spelling of those names that survives copy/paste, markdown rendering and a diff.
@@ -16,7 +16,7 @@
 //! * The scratch tree lives under `target/fixture-tree-gate/` and is **not** deleted: `clippy.toml`
 //!   bans `std::fs::remove_dir_all` workspace-wide (deletion goes through the trash-first op, which a
 //!   build gate must not smuggle), and `cargo clean` owns `target/` anyway. The path is printed.
-//! * A missing `python3` or a missing `MANIFEST.md` is an explicit, printed **skip** — never a silent
+//! * A missing `python3` or a missing `docs/fixtures.md` is an explicit, printed **skip** — never a silent
 //!   pass. `tests/fixtures/` is ignored, so a fresh clone legitimately has no manifest to check.
 
 use std::collections::BTreeMap;
@@ -31,11 +31,11 @@ use serde_json::Value;
 
 use crate::workspace_root;
 
-/// Opens the machine-readable block inside `MANIFEST.md`.
+/// Opens the machine-readable block inside `docs/fixtures.md`.
 const FENCE: &str = "```fixture-tree/1";
 
 /// Relative path of the manifest: inside the ignored `tests/fixtures/`, hence optional.
-const MANIFEST: &str = "tests/fixtures/tree/MANIFEST.md";
+const MANIFEST: &str = "docs/fixtures.md";
 
 /// `name hex -> (kind, octal mode)`.
 type Tree = BTreeMap<String, (String, String)>;
