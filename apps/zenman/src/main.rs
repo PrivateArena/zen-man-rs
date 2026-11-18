@@ -31,8 +31,11 @@
 
 mod app;
 mod app_dirs;
+mod config_boot;
 mod crash_guard;
 mod gpu_startup;
+mod i18n;
+mod single_instance;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -41,7 +44,7 @@ use std::time::Duration;
 use clap::Parser;
 
 /// The plan step this binary implements; echoed in the window title area (see `app::ZenApp::show`).
-pub const PLAN_STEP: u32 = 1;
+pub const PLAN_STEP: u32 = 4;
 
 /// App id and window title (plan §5.9 `main.rs` row).
 const APP_ID: &str = "ZenMan";
@@ -83,6 +86,28 @@ struct Cli {
     #[arg(long, value_name = "SECONDS")]
     smoke: Option<f64>,
 
+    /// Report what importing the Go app's `~/.config/zen-man` would do, and exit. Dry run unless
+    /// `--apply` is given (plan §5.4 `store/legacy.rs`).
+    #[arg(long)]
+    migrate_config: bool,
+
+    /// With `--migrate-config`: actually write the `config.json.bak` backup and import the data.
+    #[arg(long, requires = "migrate_config")]
+    apply: bool,
+
+    /// Do not claim the single-instance socket: run a second, independent copy (plan §5.9).
+    #[arg(long)]
+    no_daemon: bool,
+
+    /// Synonym of `--no-daemon`, spelled the way the plan's flag is (plan §5.9 `single_instance` row).
+    #[arg(long)]
+    new_instance: bool,
+
+    /// Suffix this instance's identity, and therefore its single-instance socket, for parallel dev
+    /// and test runs (`--app-variant=steptest`).
+    #[arg(long, value_name = "VARIANT", default_value = "")]
+    app_variant: String,
+
     /// Do not use a hardware GPU: try only the last-resort (software-capable) profile.
     #[arg(long)]
     disable_gpu: bool,
@@ -119,6 +144,22 @@ struct Cli {
 }
 
 impl Cli {
+    /// The instance identity: `ZenMan`, or `ZenMan-<variant>` (plan §5.9: the socket name must follow the
+    /// variant so two runs do not steal each other's claim).
+    fn app_id(&self) -> String {
+        if self.app_variant.is_empty() {
+            APP_ID.to_string()
+        } else {
+            format!("{APP_ID}-{}", self.app_variant)
+        }
+    }
+
+    /// Either spelling of the bypass flag (plan §5.9 names `--new-instance`; the step-4 brief names
+    /// `--no-daemon`).
+    fn claims_nothing(&self) -> bool {
+        self.no_daemon || self.new_instance
+    }
+
     fn path_overrides(&self) -> app_dirs::Overrides {
         app_dirs::Overrides {
             data_dir: self.data_dir.clone(),
@@ -159,13 +200,14 @@ impl Cli {
 }
 
 /// A boot failure with the exit code that describes it.
-struct BootError {
-    code: u8,
-    message: String,
+#[derive(Debug)]
+pub(crate) struct BootError {
+    pub(crate) code: u8,
+    pub(crate) message: String,
 }
 
 impl BootError {
-    fn new(code: u8, message: impl Into<String>) -> Self {
+    pub(crate) fn new(code: u8, message: impl Into<String>) -> Self {
         Self {
             code,
             message: message.into(),
@@ -197,7 +239,22 @@ fn main() -> ExitCode {
 
     crash_guard::install_hook(&paths.data.join("crashes"));
 
-    match crash_guard::guard("startup", || run(&cli, &paths)) {
+    // The migration runs before any window work and never opens one: it is the one boot operation that
+    // touches a file the port does not own, so it is a command, not a side effect (`--apply` opts in).
+    if cli.migrate_config {
+        return match config_boot::migrate(&paths, cli.apply) {
+            Ok(report) => {
+                println!("{report}");
+                ExitCode::from(EXIT_OK)
+            }
+            Err(BootError { code, message }) => {
+                eprintln!("zenman: {message}");
+                ExitCode::from(code)
+            }
+        };
+    }
+
+    match crash_guard::guard("startup", || run_with_context(&cli, &paths)) {
         Ok(Ok(code)) => ExitCode::from(code),
         Ok(Err(BootError { code, message })) => {
             eprintln!("zenman: {message}");
@@ -210,9 +267,12 @@ fn main() -> ExitCode {
     }
 }
 
-/// Everything after argument parsing. The nested `Ok` from [`crash_guard::guard`] carries a code that
-/// is not 0 for the planned early exits (`--print-adapters` is handled in `main` before this runs).
-fn run(cli: &Cli, paths: &app_dirs::AppPaths) -> Result<u8, BootError> {
+/// Everything after argument parsing, in plan §5.9's order: **`AppPaths` → `SystemInfo` → config →
+/// single instance → GPU ladder → window.** The first three are [`config_boot`]'s job and are kept out of
+/// this function so the boot order stays readable; the nested `Ok` from [`crash_guard::guard`] carries a
+/// code that is not 0 for the planned early exits (`--print-adapters` is handled in `main` before this
+/// runs).
+fn run_with_context(cli: &Cli, paths: &app_dirs::AppPaths) -> Result<u8, BootError> {
     let smoke = match cli.smoke {
         Some(seconds) if !seconds.is_finite() || seconds < 0.0 => {
             return Err(BootError::new(
@@ -224,16 +284,49 @@ fn run(cli: &Cli, paths: &app_dirs::AppPaths) -> Result<u8, BootError> {
         None => None,
     };
 
-    // First-run migration is step 4's job (plan §5.4 `store/legacy.rs`), but noticing the Go app's file
-    // is step 1's: a user who sees this line knows the port will bring the bookmarks/workspaces across
-    // (and that nothing has been copied yet, because nothing has been).
-    if let Some(legacy) = paths.zenman_go_legacy_config()
-        && legacy.is_file()
-    {
-        println!(
-            "zenman: found the Go app's config at {}; its one-time import is step 4 (plan §5.4) — nothing was copied",
-            legacy.display()
-        );
+    // 1. SystemInfo, then the settings — validating them here is what makes the `limits.*` caps real
+    // before any directory is walked (plan §5.4).
+    let context = config_boot::boot(paths)?;
+    for line in context.report_lines() {
+        println!("{line}");
+    }
+    // The one read of the Go app's directory, and it is a read: the import itself is `--migrate-config`.
+    if let Some(note) = config_boot::legacy_preview_note(paths) {
+        println!("boot note: {note}");
+    }
+
+    // 2. one instance per data directory. The undo log and the SQLite index are shared files, so a
+    // second window is a corruption bug rather than a convenience: focus the first and exit 0.
+    // `_instance` is held for the whole run and releases the socket on the way out.
+    let app_id = cli.app_id();
+    let _instance = match single_instance::claim_or_focus(&app_id, paths, cli.claims_nothing()) {
+        Ok(single_instance::Claim::AlreadyRunning { socket }) => {
+            println!(
+                "zenman: another instance owns this data directory ({}); asked it to focus and exiting",
+                socket.display()
+            );
+            return Ok(EXIT_OK);
+        }
+        Ok(single_instance::Claim::First(guard)) => {
+            if let Some(path) = guard.socket_path() {
+                println!("zenman: instance socket {}", path.display());
+            } else {
+                println!("zenman: --no-daemon/--new-instance: no instance socket was claimed");
+            }
+            guard
+        }
+        Err(e) => {
+            return Err(BootError::new(
+                EXIT_RUNTIME,
+                format!("could not take the single-instance claim: {e}"),
+            ));
+        }
+    };
+    // Drain whatever arrived between binding and here — the window does not exist yet, so the most this
+    // can do is report it. The per-frame drain is step 7's, when `ZenApp` owns the viewport handle
+    // (plan §5.9: "a second invocation focuses the first").
+    if _instance.take_focus_requests() > 0 {
+        println!("zenman: a second invocation asked this one to focus during startup");
     }
 
     let mut ladder = gpu_startup::select_ladder(cli.safe_gpu, cli.gl, cli.disable_gpu);

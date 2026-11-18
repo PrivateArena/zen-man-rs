@@ -26,6 +26,9 @@ repository = "https://github.com/storytold/zen-man-rs"
 craft-ui = { git = "https://github.com/storytold/craft-libs", rev = "6e03f65bf45181db77ba6229716e6624db9eb25b", features = ["serde"] }
 craft-atomic = { git = "https://github.com/storytold/craft-libs", rev = "6e03f65bf45181db77ba6229716e6624db9eb25b" }
 craft-settings = { git = "https://github.com/storytold/craft-libs", rev = "6e03f65bf45181db77ba6229716e6624db9eb25b" }
+# The i18n catalogs (`apps/zenman/build.rs`, step 4). Same rev as above — `xtask deps` fails a mixed-rev
+# graph — and it is already in the lock as `craft-ui`'s own dependency, so this adds no new package.
+craft-i18n = { git = "https://github.com/storytold/craft-libs", rev = "6e03f65bf45181db77ba6229716e6624db9eb25b" }
 # --- egui family 0.37, patched to the fork below ------------------------------------------------
 # `default_fonts` is added over plan §5.1's feature set: photocraft ships its own deflated fonts in
 # `crates/ui-egui` and so omits it, and this step-1 scaffold ships none (plan R9 defers font

@@ -4867,12 +4867,15 @@ name = "zenman"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "craft-i18n",
  "craft-ui",
  "directories",
  "eframe",
  "egui",
  "egui_extras",
  "log",
+ "rustix 1.1.6",
+ "serde_json",
  "zenman-core",
  "zenman-ui",
 ]

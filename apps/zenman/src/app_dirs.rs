@@ -100,6 +100,15 @@ impl AppPaths {
         self.data.join("gpu")
     }
 
+    /// `…/data/run`, the directory of the single-instance socket (plan §5.9 `single_instance.rs`).
+    ///
+    /// Under the *data* directory rather than a fixed `/tmp` name so a `--data-dir`/`--app-variant`
+    /// change moves the instance claim with it — which is what lets two instances (and two test runs)
+    /// coexist.
+    pub fn run_dir(&self) -> PathBuf {
+        self.data.join("run")
+    }
+
     /// The Go app's hard-coded `~/.config/zen-man/config.json`, read-only (plan §5.4 step 4).
     ///
     /// Built without `ProjectDirs` on purpose: the Go program ignored XDG (plan §5.1 "Go's hard-coded

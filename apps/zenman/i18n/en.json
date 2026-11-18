@@ -1,0 +1,14 @@
+{
+  "_note": [
+    "The English source-of-truth document for the zen-man UI (plan §5.4/§5.9, apps/zenman/build.rs).",
+    "craft-i18n looks up English source text and returns it unchanged when there is no translation",
+    "(craft_i18n::Lang::EN), so this file is NOT embedded: build.rs parses it to prove it is well",
+    "formed and then skips it. Rows arrive with the panels that need them, in step 7 (plan §5.8);",
+    "until then the honest content of a source-language catalog is two empty maps.",
+    "Shape: { locale, shared: { context: { Source text: translation } }, app: { … } } where `app` is",
+    "zen-man's own catalog and `shared` the craft-i18n rows it overrides."
+  ],
+  "locale": "en",
+  "shared": {},
+  "app": {}
+}

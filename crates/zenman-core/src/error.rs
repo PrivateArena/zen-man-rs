@@ -181,6 +181,14 @@ pub enum CoreError {
     #[error("too many {what}: the limit is {limit}")]
     CapacityExceeded { what: &'static str, limit: usize },
 
+    /// A settings-file failure: a schema this build cannot read, or a `limits.*` override outside
+    /// what the engine will walk. Plan §5.4's `store/config.rs` row requires both `validate()` and
+    /// `migrate()` to *refuse* rather than clamp — silently accepting a newer schema is how the Go app
+    /// would have lost the file — so the refusal needs its own typed variant. Go had none: a broken
+    /// `config.json` was discarded without a word (`docs/contracts.md` → *Config and session files*).
+    #[error("configuration error: {msg}")]
+    Config { msg: String },
+
     /// The operation needs a platform service this build does not have — `platform::stub`, and the
     /// reason the stub can answer every [`crate::platform::Env`] method without panicking.
     ///
@@ -216,6 +224,7 @@ impl CoreError {
             Self::Shell { .. } => "shell_error",
             Self::Watcher { .. } => "watcher_error",
             Self::CapacityExceeded { .. } => "capacity_exceeded",
+            Self::Config { .. } => "config_error",
             Self::Unsupported { .. } => "unsupported",
         }
     }
@@ -258,6 +267,10 @@ impl CoreError {
             Self::Shell { .. } => 500,
             Self::Watcher { .. } => 500,
             Self::CapacityExceeded { .. } => 507,
+            // Go answered a bad request body with 400 (`err-chmod-octaltext.json`); a rejected config
+            // is the same class of input error, and there is no Go status for it because Go never had
+            // a config error at all.
+            Self::Config { .. } => 400,
             Self::Unsupported { .. } => 501,
         }
     }
