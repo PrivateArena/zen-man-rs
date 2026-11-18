@@ -1043,7 +1043,7 @@ fn require_local(path: &FsPath) -> Result<AbsPath, CoreError> {
 /// at all and a page boundary could show the same file twice), and reversing for `descending` reverses
 /// **within** each class so the dirs-first invariant survives both directions
 /// (`dir-sort-date-desc.json`).
-fn sort_rows(rows: &mut Vec<Row>, sort: SortSpec) {
+fn sort_rows(rows: &mut [Row], sort: SortSpec) {
     crate::services::sort::sort_by(rows, sort);
 }
 

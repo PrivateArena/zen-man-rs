@@ -13,6 +13,10 @@ use crate::theme::Tokens;
 /// How many selected names the tooltip lists before it says "and N more" (`file-list.js:578`).
 pub const DISPLAY_CAP: usize = 10;
 
+/// Percent per unit fraction: the job line reports a whole-number percentage of an
+/// `f32` progress fraction, and the geometry guard wants that number named.
+const PERCENT_PER_FRACTION: f32 = 100.0;
+
 /// What the bar's left cell is saying.
 #[derive(Clone, Debug, PartialEq)]
 pub enum StatusInfo {
@@ -84,7 +88,7 @@ pub fn show(ui: &mut Ui, m: &StatusModel<'_>, tokens: &Tokens) {
         StatusInfo::Running { label, frac } => match frac {
             Some(frac) => format!(
                 "{left} · {label} {}%",
-                (frac.clamp(0.0, 1.0) * 100.0).round()
+                (frac.clamp(0.0, 1.0) * PERCENT_PER_FRACTION).round()
             ),
             None => format!("{left} · {label}"),
         },

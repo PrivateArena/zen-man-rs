@@ -57,7 +57,7 @@ impl SortRow for FileEntry {
 }
 
 /// Sort `rows` into the listing order `spec` names.
-pub fn sort_by<T: SortRow>(rows: &mut Vec<T>, spec: SortSpec) {
+pub fn sort_by<T: SortRow>(rows: &mut [T], spec: SortSpec) {
     rows.sort_by(|a, b| {
         a.is_dir()
             .cmp(&b.is_dir())
@@ -90,7 +90,7 @@ pub fn sort_by<T: SortRow>(rows: &mut Vec<T>, spec: SortSpec) {
 }
 
 /// The listing order of wire rows — what the pane calls when a header is clicked.
-pub fn sort_entries(entries: &mut Vec<FileEntry>, spec: SortSpec) {
+pub fn sort_entries(entries: &mut [FileEntry], spec: SortSpec) {
     sort_by(entries, spec);
 }
 

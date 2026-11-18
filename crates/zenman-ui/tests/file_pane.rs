@@ -90,7 +90,7 @@ fn shown<'h>(harness: &'h Harness<'static, ZenApp>) -> &'h Tab {
     shown_in(harness.state())
 }
 
-fn shown_in<'s>(state: &'s ZenApp) -> &'s Tab {
+fn shown_in(state: &ZenApp) -> &Tab {
     state
         .model
         .panes

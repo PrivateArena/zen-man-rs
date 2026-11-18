@@ -413,7 +413,6 @@ fn header_row(ui: &mut Ui, model: &PaneModel<'_>, tokens: &Tokens, out: &mut Vec
                     max_rows: 1,
                     break_anywhere: true,
                     overflow_character: Some('…'),
-                    ..Default::default()
                 };
                 let galley = ui.painter().layout_job(job);
                 ui.painter().galley(
