@@ -1,0 +1,16 @@
+# Plan §5.1 root file. `cargo xtask <task>` is the gate runner (plan §5.1, xtask row).
+[alias]
+xtask = "run -p xtask --"
+
+# Why nothing else is here. The task brief points at `apps/photocraft/.cargo/config.toml:1-20` for a
+# documented `#[path]` fallback hack; that file does not exist in the reference checkout. Photocraft
+# v0.23.1 has exactly one cargo config, the workspace-root `/tmp/artcraft-src/.cargo/config.toml`, and
+# its whole content is the two-line `[alias]` table above (verified with
+# `find /tmp/artcraft-src -path '*/.cargo/*' -name config.toml`). In both reference repos `#[path = …]`
+# appears only in `#[cfg(test)]` module declarations (e.g. `crates/ui/src/docking/group_tests.rs:9`),
+# i.e. a source-level include, not something a cargo config sets.
+#
+# We do not need it: `apps/zenman/tests/gpu_fallback.rs` is a real integration test that drives the
+# compiled binary through `env!("CARGO_BIN_EXE_zenman")`, so no module is included from an unusual
+# location. No `paths` / `target-dir` / `net` override is set either — a machine-local path in a
+# checked-in config is what the plan's provenance rules (F10) are there to prevent.

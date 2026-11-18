@@ -1,0 +1,80 @@
+# Licence/provenance gate data for `cargo xtask licenses` (plan §5.1, §7 step 1).
+#
+# `cargo-deny` is not installed on this machine (`command -v cargo-deny` prints nothing, exit status
+# 1), so the gate is in-repo Rust over `cargo metadata --format-version 1` and this file is its data,
+# exactly as plan §9 disposition 17 decided. The shape is cargo-deny's own so that a later
+# `cargo deny check` can read it unchanged.
+#
+# Base list: plan §5.1, cross-checked against the Craft house-rule allowlist
+# (`/tmp/craft-libs/AGENTS.md:36-49`) and the allow table of the one deny.toml in the framework
+# lineage (`egui` fork rev 6d518fc `deny.toml:[licenses]`). Entries that the egui/photocraft lineage
+# pulls in and that the house list does not name are called out below with their reason, so a
+# reviewer sees an explicit waiver rather than a silent widening of the list.
+
+[licenses]
+version = 2
+private = { ignore = true }
+confidence-threshold = 0.93
+allow = [
+  "Apache-2.0",                                  # plan §5.1; Craft allowlist
+  "Apache-2.0 WITH LLVM-exception",              # LLVM's own clarification of Apache-2.0 (egui fork allow table)
+  "BSD-2-Clause",                                # plan §5.1; Craft allowlist
+  "BSD-3-Clause",                                # plan §5.1; Craft allowlist
+  "BSL-1.0",                                     # Boost licence; pulled by the egui/winit tree (egui fork allow table)
+  "CC0-1.0",                                     # plan §5.1; Craft allowlist
+  "CC-BY-4.0",                                   # Craft allowlist (assets)
+  "CC-BY-SA-4.0",                                # Craft allowlist (assets)
+  "ISC",                                         # plan §5.1; Craft allowlist
+  "LicenseRef-Public-Domain",                    # Craft allowlist
+  "MIT",                                         # plan §5.1; Craft allowlist
+  "MIT-0",                                       # attribution-free MIT (egui fork allow table)
+  "MPL-2.0",                                     # plan §5.1 (webpki-roots on Linux)
+  "OFL-1.1",                                     # plan §5.1; Craft allowlist (fonts)
+  "Ubuntu-font-1.0",                             # plan §5.1; Craft allowlist (fonts)
+  "Unicode-3.0",                                 # plan §5.1 waiver: `unicode-*` data tables pulled by the idna/ICU chain
+  "Unicode-DFS-2016",                            # same family, the DFS licence variant (egui fork allow table)
+  "Unlicense",                                     # plan §5.1 waiver: public-domain equivalent (Craft allowlist has LicenseRef-Public-Domain); pulled by `walkdir`/`same-file` as "Unlicense/MIT"
+  "Zlib",                                        # plan §5.1 zlib waiver: `zlib-rs` (flate2's `zlib-rs` feature, photocraft Cargo.toml:[workspace.dependencies]) and `miniz_*`
+  "Bitstream-Vera",                              # Craft allowlist (fonts)
+  "OpenSSL",                                     # ring/webpki on Linux (egui fork allow table)
+]
+
+# Crates whose declared expression is allowed by explicit decision, with the reason recorded where
+# the gate prints it. `xtask licenses` matches `package` against the cargo metadata package name.
+[[licenses.waiver]]
+package = "rar"
+expression = "MIT"
+reason = "wrapper licence only: the bundled UnRAR source is not on the Craft allowlist, hence the [bans] entry below (plan §5.1, §10 R/D3). Not a dependency of the default build."
+
+[[licenses.waiver]]
+package = "unrar"
+expression = "MIT"
+reason = "as `rar` above: the wrapper declares MIT, the vendored UnRAR code does not. Banned below; RAR support is `#[cfg(feature = \"rar\")]` and external-binary based (plan §10 R/D3)."
+
+# `web-time` is MIT OR Apache-2.0 and needs no licence waiver; it is named here because the plan's
+# step-1 licence review called it out: it exists to give wasm a monotonic clock, and is a no-op
+# dependency for a native-only build (plan decision D5).
+[[licenses.waiver]]
+package = "web-time"
+expression = "MIT OR Apache-2.0"
+reason = "monotonic clock shim for wasm targets; native-only today (plan D5), kept allow-listed so a later web target does not trip the gate"
+
+# Unmaintained but licence-clean crates pulled in transitively are tracked here so `xtask licenses`
+# reports them; the advisories database itself is unreachable without `cargo-deny`/the network.
+[advisories]
+version = 2
+ignore = []
+
+[bans]
+multiple-versions = "allow" # duplicate-version auditing is `xtask deps`' job until cargo-deny exists here
+wildcards = "deny"
+deny = [
+  { name = "openssl-sys", reason = "use Rust TLS (egui fork deny table)" },
+  { name = "openssl", reason = "use Rust TLS (egui fork deny table)" },
+  { name = "rar", reason = "bundles the UnRAR source, whose licence is outside the Craft allowlist even though the wrapper declares MIT: RAR stays behind `#[cfg(feature = \"rar\")]` with an external binary (plan §5.1, §10 R/D3)" },
+  { name = "unrar", reason = "same bundled UnRAR licence issue as `rar` (plan §5.1, §10 R/D3)" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "allow" # craft-libs/egui/winit are git dependencies pinned by full rev; `xtask deps` is the gate that checks the revs

@@ -1,0 +1,9 @@
+# Plan §5.1 asked for `channel = "1.95.0"` (the craft-libs `rust-version` / MSRV). That toolchain is
+# not installed here — `rustup toolchain list` reports exactly one entry, `stable-x86_64-unknown-linux-gnu`,
+# and rustc for it is 1.100.0. Pinning an absent channel would make every `cargo` invocation in this
+# repo try to download a toolchain, so the pin is the channel that is actually installed; the MSRV is
+# declared as `rust-version = "1.95"` in the workspace `[workspace.package]` instead, which is what
+# cargo enforces for feature selection. See the step-1 report ("toolchain findings").
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
