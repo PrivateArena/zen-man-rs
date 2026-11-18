@@ -244,6 +244,7 @@ mod tests {
         assert_eq!(l.extract_done_ttl, EXTRACT_DONE_TTL);
         assert_eq!(l.live_job_ttl, LIVE_JOB_TTL);
         assert_eq!(l.dir_cache_ttls, DIR_CACHE_TTLS);
+        assert_eq!(l.sync_each_write, SYNC_EACH_WRITE);
     }
 
     #[test]

@@ -320,14 +320,14 @@ pub fn verify(conn: &Connection) -> Result<Vec<SchemaIssue>, CoreError> {
                         None => issues.push(SchemaIssue::Column {
                             table: table.to_string(),
                             column: (*name).to_string(),
-                            expected: describe(*ty, *notnull, *pk),
+                            expected: describe(ty, *notnull, *pk),
                             found: "absent".to_string(),
                         }),
-                        Some(col) if col.mismatch(*ty, *notnull, *pk) => {
+                        Some(col) if col.mismatch(ty, *notnull, *pk) => {
                             issues.push(SchemaIssue::Column {
                                 table: table.to_string(),
                                 column: (*name).to_string(),
-                                expected: describe(*ty, *notnull, *pk),
+                                expected: describe(ty, *notnull, *pk),
                                 found: describe(&col.declared_type, col.notnull, col.pk),
                             });
                         }

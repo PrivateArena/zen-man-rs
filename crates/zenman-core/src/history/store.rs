@@ -268,6 +268,7 @@ impl ActionLogStore {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(path)
         {
             Ok(f) => f,
@@ -397,9 +398,9 @@ impl ActionLogStore {
             return Err(CoreError::io(display_path(&self.path), e));
         }
         if self.limits.sync_each_write {
-            if let Err(e) = self.file.sync_all() {
-                return Err(CoreError::io(display_path(&self.path), e));
-            }
+            self.file
+                .sync_all()
+                .map_err(|e| CoreError::io(display_path(&self.path), e))?;
         }
         let mut end = start;
         for (record, len) in appended {
@@ -517,10 +518,14 @@ impl ActionLogStore {
         let mut out = Vec::new();
         if let Some(offsets) = self.by_path.get(path) {
             for offset in offsets.iter().rev().take(limit) {
-                if let Some(frame) = self.frames.iter().find(|f| f.offset == *offset) {
-                    if let Ok(record) = self.frame_at(*frame) {
-                        out.push(record);
-                    }
+                let found = self
+                    .frames
+                    .iter()
+                    .find(|f| f.offset == *offset)
+                    .copied()
+                    .and_then(|f| self.frame_at(f).ok());
+                if let Some(record) = found {
+                    out.push(record);
                 }
             }
         }
@@ -600,9 +605,9 @@ impl ActionLogStore {
             return Err(CoreError::io(path, e));
         }
         if self.limits.sync_each_write {
-            if let Err(e) = self.file.sync_all() {
-                return Err(CoreError::io(path, e));
-            }
+            self.file
+                .sync_all()
+                .map_err(|e| CoreError::io(path.clone(), e))?;
         }
         // F4: read it back and confirm. A torn write is reported, never silently accepted.
         let reread = self.read_bytes(frame.offset, frame.end())?;
@@ -949,10 +954,11 @@ fn note_damage(damage: &mut Option<LogDamage>, offset: u64, reason: &str, size: 
 }
 
 fn prepare_parent(path: &Path) -> Result<(), CoreError> {
-    if let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        if let Err(e) = std::fs::create_dir_all(dir) {
-            return Err(CoreError::io(display_path(dir), e));
-        }
+    let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) else {
+        return Ok(());
+    };
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        return Err(CoreError::io(display_path(dir), e));
     }
     Ok(())
 }
@@ -963,7 +969,7 @@ fn open_options(options: &LogOpenOptions) -> OpenOptions {
     // explicit `Seek(0, End)` so the same handle can also write status bytes in place.
     o.read(true).write(!options.read_only);
     if options.create {
-        o.create(true);
+        o.create(true).truncate(false);
     }
     o
 }
@@ -1114,14 +1120,16 @@ mod tests {
         );
         assert!(store.is_clean());
         drop(store);
-        std::fs::remove_dir_all(dir.join("nested")).ok();
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir(dir.join("nested/deeper")).ok();
+        std::fs::remove_dir(dir.join("nested")).ok();
         std::fs::remove_dir(&dir).ok();
     }
 
     #[test]
     fn append_then_reopen_matches_the_encoded_frames() {
         let dir = tmp_dir("append");
-        let (path, mut store) = mk(&dir, "action.log", 3);
+        let (path, store) = mk(&dir, "action.log", 3);
         let range = LogRecordRange {
             start: 0,
             end: store.len().expect("len"),
@@ -1213,7 +1221,7 @@ mod tests {
     #[test]
     fn resync_truncates_a_partial_tail_frame() {
         let dir = tmp_dir("trunc");
-        let (path, mut store) = mk(&dir, "action.log", 3);
+        let (path, store) = mk(&dir, "action.log", 3);
         let whole = std::fs::read(&path).expect("read");
         let boundary = 2 * frame_len();
         assert_eq!(frame_len(), 49, "the documented frame size, checked once");
@@ -1240,7 +1248,7 @@ mod tests {
     #[test]
     fn resync_stops_at_a_flipped_crc() {
         let dir = tmp_dir("badcrc");
-        let (path, mut store) = mk(&dir, "action.log", 5);
+        let (path, store) = mk(&dir, "action.log", 5);
         let mut bytes = std::fs::read(&path).expect("read");
         // Third frame's `dest` bytes: damage at frame index 2, so the prefix is ids 1 and 2.
         bytes[2 * frame_len() + 30] ^= 0xFF;

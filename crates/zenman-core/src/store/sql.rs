@@ -210,9 +210,7 @@ fn try_open(path: &Path, mode: StoreMode) -> Result<Connection, DbOpenError> {
 
     // Go's single-connection pool (`api/db.go:49`), kept: it is the reason Go's locking was tolerable
     // at all, and rusqlite gives us exactly one connection anyway.
-    if let Err(e) = apply_pragmas(&conn, &shown, mode) {
-        return Err(e);
-    }
+    apply_pragmas(&conn, &shown, mode)?;
     integrity_check(&conn, &shown)?;
     // The plan §5.4 "schema created by Go satisfies version_of == CURRENT_VERSION" gate: apply (a no-op
     // on a Go file) then verify (strict about it).
@@ -395,7 +393,10 @@ mod tests {
             !side.exists(),
             "no WAL sidecar was created next to a Go-format file"
         );
-        std::fs::remove_dir_all(&dir).ok();
+        for f in std::fs::read_dir(&dir).expect("dir") {
+            std::fs::remove_file(f.expect("entry").path()).ok();
+        }
+        std::fs::remove_dir(&dir).ok();
     }
 
     #[test]
@@ -457,7 +458,10 @@ mod tests {
         let conn = connect_with_retry(&path, StoreMode::Full, 4, Duration::from_millis(1))
             .expect("unlocks");
         assert!(schema::verify(&conn).expect("verify").is_empty());
-        std::fs::remove_dir_all(&dir).ok();
+        for f in std::fs::read_dir(&dir).expect("dir") {
+            std::fs::remove_file(f.expect("entry").path()).ok();
+        }
+        std::fs::remove_dir(&dir).ok();
     }
 
     #[test]
@@ -484,6 +488,9 @@ mod tests {
             !matches!(e, Err(DbOpenError::Locked { .. })),
             "a non-database file must not look like a lock: {e:?}"
         );
-        std::fs::remove_dir_all(&dir).ok();
+        for f in std::fs::read_dir(&dir).expect("dir") {
+            std::fs::remove_file(f.expect("entry").path()).ok();
+        }
+        std::fs::remove_dir(&dir).ok();
     }
 }

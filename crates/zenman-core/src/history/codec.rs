@@ -38,7 +38,7 @@
 //!   substitutions in [`Decoded::lossy_fields`]. A log containing such a path therefore cannot
 //!   round-trip byte-identically; that is a Rust representation limit, recorded rather than hidden.
 //! * Timestamps carry no zone. `api/log.go:526` rebuilds `time.Unix(0, tsNano)`, which adopts the
-//! *reading* process's local zone, and `log.json` renders `+07:00` only because that was the capture
+//!   *reading* process's local zone, and `log.json` renders `+07:00` only because that was the capture
 //!   host's zone. [`ActionRecord::to_json`] therefore emits the same instant in UTC with a `Z` suffix;
 //!   the nanoseconds are identical, and that is the only zone-free comparison the format permits.
 //! * Unknown `action`/`status` bytes are preserved verbatim: [`ActionType`] and [`LogStatus`] are
@@ -332,7 +332,7 @@ impl std::fmt::Display for GoNano<'_> {
         }
         let mut frac = nanos;
         let mut digits = 9;
-        while frac % 10 == 0 {
+        while frac.is_multiple_of(10) {
             frac /= 10;
             digits -= 1;
         }
@@ -438,22 +438,12 @@ impl ActionEntry {
 
 /// Byte length of a body: `numSrc + Σ(2+len) + (2+dest) + (2+name)`.
 fn body_len_of(sources: &[String], dest: &str, name: &str) -> usize {
-    2 + sources
-        .iter()
-        .map(|s| 2 + s.as_bytes().len())
-        .sum::<usize>()
-        + 2
-        + dest.as_bytes().len()
-        + 2
-        + name.as_bytes().len()
+    2 + sources.iter().map(|s| 2 + s.len()).sum::<usize>() + 2 + dest.len() + 2 + name.len()
 }
 
 fn check_field(what: &'static str, bytes: usize, max: usize) -> Result<(), CoreError> {
     if bytes > max {
-        return Err(CoreError::CapacityExceeded {
-            what: what.into(),
-            limit: max,
-        });
+        return Err(CoreError::CapacityExceeded { what, limit: max });
     }
     Ok(())
 }
@@ -586,7 +576,7 @@ pub fn decode_at(bytes: &[u8], offset: u64) -> Result<Decoded, CoreError> {
         return Err(corrupt(&format!("implausible recLen {rec_len}")));
     }
     let body_len = rec_len - HEADER_FIXED;
-    if body_len < 2 || body_len > MAX_BODY {
+    if !(2..=MAX_BODY).contains(&body_len) {
         return Err(corrupt(&format!(
             "implausible recLen {rec_len} (bodyLen {body_len})"
         )));
