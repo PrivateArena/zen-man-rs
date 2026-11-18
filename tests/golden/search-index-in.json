@@ -1,0 +1,32 @@
+{
+  "capped": false,
+  "entries": [
+    {
+      "name": "b",
+      "is_dir": true,
+      "size": 60,
+      "mod_time": 1767225600,
+      "mode": "",
+      "rel_path": "${FIXTURE_ROOT}/tree/subdir/b"
+    },
+    {
+      "name": "a.txt",
+      "is_dir": false,
+      "size": 2,
+      "mod_time": 1767225600,
+      "mode": "",
+      "rel_path": "${FIXTURE_ROOT}/tree/subdir/a.txt"
+    },
+    {
+      "name": "c.txt",
+      "is_dir": false,
+      "size": 2,
+      "mod_time": 1767225600,
+      "mode": "",
+      "rel_path": "${FIXTURE_ROOT}/tree/subdir/b/c.txt"
+    }
+  ],
+  "index_dirty": false,
+  "last_indexed_unix": 1794991943,
+  "total_matched": 3
+}

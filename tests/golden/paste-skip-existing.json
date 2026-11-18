@@ -1,0 +1,17 @@
+{
+  "entries": [
+    {
+      "name": "one.txt",
+      "is_dir": false,
+      "size": 14,
+      "mod_time": 1794991944,
+      "mode": "-rw-r--r--"
+    }
+  ],
+  "operation": "copy",
+  "reload_required": false,
+  "sources": [
+    "${FIXTURE_ROOT}/ops/src/one.txt"
+  ],
+  "status": "success"
+}

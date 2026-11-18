@@ -1,0 +1,3 @@
+{
+  "error": "Failed to read archive manifest: open ${FIXTURE_ROOT}/archives/nope.zip: no such file or directory"
+}

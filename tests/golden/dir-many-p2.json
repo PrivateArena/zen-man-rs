@@ -1,0 +1,1409 @@
+{
+  "path": "${FIXTURE_ROOT}/tree/many",
+  "entries": [
+    {
+      "name": "f0201.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0202.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0203.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0204.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0205.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0206.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0207.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0208.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0209.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0210.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0211.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0212.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0213.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0214.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0215.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0216.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0217.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0218.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0219.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0220.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0221.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0222.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0223.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0224.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0225.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0226.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0227.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0228.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0229.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0230.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0231.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0232.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0233.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0234.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0235.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0236.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0237.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0238.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0239.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0240.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0241.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0242.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0243.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0244.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0245.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0246.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0247.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0248.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0249.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0250.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0251.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0252.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0253.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0254.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0255.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0256.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0257.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0258.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0259.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0260.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0261.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0262.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0263.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0264.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0265.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0266.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0267.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0268.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0269.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0270.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0271.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0272.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0273.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0274.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0275.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0276.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0277.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0278.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0279.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0280.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0281.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0282.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0283.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0284.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0285.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0286.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0287.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0288.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0289.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0290.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0291.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0292.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0293.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0294.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0295.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0296.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0297.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0298.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0299.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0300.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0301.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0302.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0303.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0304.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0305.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0306.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0307.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0308.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0309.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0310.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0311.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0312.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0313.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0314.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0315.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0316.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0317.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0318.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0319.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0320.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0321.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0322.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0323.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0324.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0325.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0326.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0327.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0328.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0329.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0330.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0331.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0332.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0333.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0334.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0335.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0336.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0337.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0338.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0339.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0340.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0341.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0342.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0343.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0344.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0345.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0346.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0347.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0348.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0349.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0350.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0351.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0352.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0353.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0354.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0355.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0356.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0357.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0358.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0359.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0360.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0361.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0362.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0363.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0364.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0365.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0366.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0367.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0368.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0369.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0370.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0371.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0372.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0373.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0374.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0375.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0376.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0377.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0378.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0379.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0380.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0381.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0382.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0383.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0384.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0385.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0386.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0387.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0388.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0389.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0390.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0391.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0392.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0393.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0394.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0395.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0396.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0397.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0398.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0399.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0400.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    }
+  ],
+  "cursor": "400",
+  "has_more": true,
+  "total_count": 1200,
+  "loaded_so_far": 400
+}

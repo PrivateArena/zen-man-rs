@@ -1,0 +1,17 @@
+{
+  "entries": [
+    {
+      "name": "mergedir",
+      "is_dir": true,
+      "size": 60,
+      "mod_time": 1794991944,
+      "mode": "drwxr-xr-x"
+    }
+  ],
+  "operation": "copy",
+  "reload_required": false,
+  "sources": [
+    "${FIXTURE_ROOT}/ops/src/mergedir"
+  ],
+  "status": "success"
+}

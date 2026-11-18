@@ -1,0 +1,22 @@
+{
+  "entries": [
+    {
+      "name": "a10.txt",
+      "is_dir": false,
+      "size": 4,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--",
+      "rel_path": "a10.txt"
+    },
+    {
+      "name": "a9.txt",
+      "is_dir": false,
+      "size": 3,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--",
+      "rel_path": "a9.txt"
+    }
+  ],
+  "total_matched": 2,
+  "capped": false
+}

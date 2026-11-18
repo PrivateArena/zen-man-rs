@@ -1,0 +1,42 @@
+{
+  "bookmarks": [],
+  "workspaces": {
+    "default": {
+      "left_tabs": [
+        {
+          "id": "tab_1794479063471_19hja",
+          "path": "${CAPTURE_MEDIA}/home/Deve/zen-man",
+          "name": "zen-man",
+          "group": "",
+          "color": ""
+        },
+        {
+          "id": "tab_1794498966484_l1nx1",
+          "path": "${CAPTURE_MEDIA}/home/Deve",
+          "name": "Deve",
+          "group": "",
+          "color": ""
+        },
+        {
+          "id": "tab_1794499524218_juwo2",
+          "path": "${CAPTURE_MEDIA}/home/Deve/zen-mcp/resources/prompts-pi",
+          "name": "prompts-pi",
+          "group": "",
+          "color": ""
+        },
+        {
+          "id": "tab_1794499574177_5zac4",
+          "path": "${HOME_ROOT}/.pi",
+          "name": ".pi",
+          "group": "",
+          "color": ""
+        }
+      ],
+      "left_active": "tab_1794499574177_5zac4",
+      "right_tabs": [],
+      "right_active": "",
+      "split": false
+    }
+  },
+  "custom_actions": []
+}

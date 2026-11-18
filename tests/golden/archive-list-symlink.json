@@ -1,0 +1,23 @@
+{
+  "archive": "${FIXTURE_ROOT}/archives/symlink.zip",
+  "entries": [
+    {
+      "name": "link.txt",
+      "is_dir": false,
+      "size": 8,
+      "mod_time": 1767225600,
+      "mode": "-r--r--r--",
+      "rel_path": "link.txt"
+    },
+    {
+      "name": "real.txt",
+      "is_dir": false,
+      "size": 15,
+      "mod_time": 1767225600,
+      "mode": "-r--r--r--",
+      "rel_path": "real.txt"
+    }
+  ],
+  "nested": "",
+  "path": ""
+}

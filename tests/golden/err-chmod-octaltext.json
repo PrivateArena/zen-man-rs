@@ -1,0 +1,1 @@
+{"error": "Invalid permission mode: strconv.ParseUint: parsing "0o755": invalid syntax"}

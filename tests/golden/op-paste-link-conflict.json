@@ -1,0 +1,6 @@
+{
+  "conflicts": [
+    "renamed-one.txt"
+  ],
+  "status": "conflict"
+}

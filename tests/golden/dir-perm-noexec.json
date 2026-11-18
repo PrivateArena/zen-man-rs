@@ -1,0 +1,16 @@
+{
+  "path": "${FIXTURE_ROOT}/tree/noexec-dir",
+  "entries": [
+    {
+      "name": "inner.txt",
+      "is_dir": false,
+      "size": 0,
+      "mod_time": -62135596800,
+      "mode": "unknown"
+    }
+  ],
+  "cursor": "",
+  "has_more": false,
+  "total_count": 1,
+  "loaded_so_far": 1
+}

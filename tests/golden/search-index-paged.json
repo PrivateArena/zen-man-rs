@@ -1,0 +1,32 @@
+{
+  "capped": true,
+  "entries": [
+    {
+      "name": "a9.txt",
+      "is_dir": false,
+      "size": 3,
+      "mod_time": 1767225600,
+      "mode": "",
+      "rel_path": "${FIXTURE_ROOT}/tree/a9.txt"
+    },
+    {
+      "name": "B.txt",
+      "is_dir": false,
+      "size": 2,
+      "mod_time": 1767225600,
+      "mode": "",
+      "rel_path": "${FIXTURE_ROOT}/tree/SortCase/B.txt"
+    },
+    {
+      "name": "back\\slash.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "",
+      "rel_path": "${FIXTURE_ROOT}/tree/back\\slash.txt"
+    }
+  ],
+  "index_dirty": false,
+  "last_indexed_unix": 1794991943,
+  "total_matched": 1223
+}

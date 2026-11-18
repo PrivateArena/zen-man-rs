@@ -1,0 +1,4 @@
+{
+  "error": "vfs_readonly",
+  "message": "Write operations not supported inside archives"
+}

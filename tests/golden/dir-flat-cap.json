@@ -1,0 +1,49 @@
+{
+  "path": "${FIXTURE_ROOT}/tree/flatcap",
+  "entries": [
+    {
+      "name": "g00000.txt",
+      "is_dir": false,
+      "size": 1,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--",
+      "rel_path": "g00000.txt"
+    },
+    {
+      "name": "g00001.txt",
+      "is_dir": false,
+      "size": 1,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--",
+      "rel_path": "g00001.txt"
+    },
+    {
+      "name": "g00002.txt",
+      "is_dir": false,
+      "size": 1,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--",
+      "rel_path": "g00002.txt"
+    },
+    {
+      "name": "g00003.txt",
+      "is_dir": false,
+      "size": 1,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--",
+      "rel_path": "g00003.txt"
+    },
+    {
+      "name": "g00004.txt",
+      "is_dir": false,
+      "size": 1,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--",
+      "rel_path": "g00004.txt"
+    }
+  ],
+  "cursor": "5",
+  "has_more": true,
+  "total_count": 10000,
+  "loaded_so_far": 5
+}

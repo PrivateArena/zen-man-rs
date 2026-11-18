@@ -1,0 +1,22 @@
+{
+  "entries": [
+    {
+      "name": "a.txt",
+      "is_dir": false,
+      "size": 2,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--",
+      "rel_path": "a.txt"
+    },
+    {
+      "name": "b",
+      "is_dir": true,
+      "size": 60,
+      "mod_time": 1767225600,
+      "mode": "drwxr-xr-x",
+      "rel_path": "b"
+    }
+  ],
+  "total_matched": 2,
+  "capped": false
+}

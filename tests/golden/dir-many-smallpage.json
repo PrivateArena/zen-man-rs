@@ -1,0 +1,30 @@
+{
+  "path": "${FIXTURE_ROOT}/tree/many",
+  "entries": [
+    {
+      "name": "f1198.txt",
+      "is_dir": false,
+      "size": 11,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f1199.txt",
+      "is_dir": false,
+      "size": 11,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f1200.txt",
+      "is_dir": false,
+      "size": 11,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    }
+  ],
+  "cursor": "",
+  "has_more": false,
+  "total_count": 1200,
+  "loaded_so_far": 1200
+}

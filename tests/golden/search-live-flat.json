@@ -1,0 +1,142 @@
+{
+  "entries": [
+    {
+      "name": "a10.txt",
+      "is_dir": false,
+      "size": 4,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--",
+      "rel_path": "a10.txt"
+    },
+    {
+      "name": "a9.txt",
+      "is_dir": false,
+      "size": 3,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--",
+      "rel_path": "a9.txt"
+    },
+    {
+      "name": "back\\slash.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--",
+      "rel_path": "back\\slash.txt"
+    },
+    {
+      "name": "café.txt",
+      "is_dir": false,
+      "size": 16,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--",
+      "rel_path": "café.txt"
+    },
+    {
+      "name": "café.txt",
+      "is_dir": false,
+      "size": 12,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--",
+      "rel_path": "café.txt"
+    },
+    {
+      "name": "future.txt",
+      "is_dir": false,
+      "size": 16,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--",
+      "rel_path": "future.txt"
+    },
+    {
+      "name": "hard1.txt",
+      "is_dir": false,
+      "size": 12,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--",
+      "rel_path": "hard1.txt"
+    },
+    {
+      "name": "hard2.txt",
+      "is_dir": false,
+      "size": 12,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--",
+      "rel_path": "hard2.txt"
+    },
+    {
+      "name": "hash#name.txt",
+      "is_dir": false,
+      "size": 5,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--",
+      "rel_path": "hash#name.txt"
+    },
+    {
+      "name": "link-chain.txt",
+      "is_dir": false,
+      "size": 16,
+      "mod_time": 1767225600,
+      "mode": "Lrwxrwxrwx",
+      "rel_path": "link-chain.txt"
+    },
+    {
+      "name": "link-to-file.txt",
+      "is_dir": false,
+      "size": 10,
+      "mod_time": 1767225600,
+      "mode": "Lrwxrwxrwx",
+      "rel_path": "link-to-file.txt"
+    },
+    {
+      "name": "normal.txt",
+      "is_dir": false,
+      "size": 14,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--",
+      "rel_path": "normal.txt"
+    },
+    {
+      "name": "quote'name.txt",
+      "is_dir": false,
+      "size": 6,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--",
+      "rel_path": "quote'name.txt"
+    },
+    {
+      "name": "space name.txt",
+      "is_dir": false,
+      "size": 6,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--",
+      "rel_path": "space name.txt"
+    },
+    {
+      "name": "very-long-name-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.txt",
+      "is_dir": false,
+      "size": 5,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--",
+      "rel_path": "very-long-name-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.txt"
+    },
+    {
+      "name": "weird\rname.txt",
+      "is_dir": false,
+      "size": 13,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--",
+      "rel_path": "weird\rname.txt"
+    },
+    {
+      "name": "日本.txt",
+      "is_dir": false,
+      "size": 6,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--",
+      "rel_path": "日本.txt"
+    }
+  ],
+  "total_matched": 17,
+  "capped": false
+}

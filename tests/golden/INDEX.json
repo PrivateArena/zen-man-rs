@@ -1,0 +1,859 @@
+{
+  "captures": [
+    {
+      "name": "dir-root",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/dir?path=%24%7BFIXTURE_ROOT%7D%2Ftree",
+      "file": "tests/golden/dir-root.json"
+    },
+    {
+      "name": "dir-subdir",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/dir?path=%24%7BFIXTURE_ROOT%7D%2Ftree%2Fsubdir",
+      "file": "tests/golden/dir-subdir.json"
+    },
+    {
+      "name": "dir-empty",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/dir?path=%24%7BFIXTURE_ROOT%7D%2Ftree%2Fempty-dir",
+      "file": "tests/golden/dir-empty.json"
+    },
+    {
+      "name": "dir-deep",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/dir?path=%24%7BFIXTURE_ROOT%7D%2Ftree%2Fdeep%2Fd0%2Fd1%2Fd2%2Fd3%2Fd4%2Fd5%2Fd6%2Fd7%2Fd8%2Fd9%2Fd10%2Fd11%2Fd12%2Fd13%2Fd14%2Fd15%2Fd16%2Fd17%2Fd18%2Fd19",
+      "file": "tests/golden/dir-deep.json"
+    },
+    {
+      "name": "dir-sortcase-asc",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/dir?path=%24%7BFIXTURE_ROOT%7D%2Ftree%2FSortCase&order=asc",
+      "file": "tests/golden/dir-sortcase-asc.json"
+    },
+    {
+      "name": "dir-sortcase-desc",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/dir?path=%24%7BFIXTURE_ROOT%7D%2Ftree%2FSortCase&order=desc",
+      "file": "tests/golden/dir-sortcase-desc.json"
+    },
+    {
+      "name": "dir-sort-size",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/dir?path=%24%7BFIXTURE_ROOT%7D%2Ftree&sort=size",
+      "file": "tests/golden/dir-sort-size.json"
+    },
+    {
+      "name": "dir-sort-date",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/dir?path=%24%7BFIXTURE_ROOT%7D%2Ftree&sort=date",
+      "file": "tests/golden/dir-sort-date.json"
+    },
+    {
+      "name": "dir-sort-date-desc",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/dir?path=%24%7BFIXTURE_ROOT%7D%2Ftree&sort=date&order=desc",
+      "file": "tests/golden/dir-sort-date-desc.json"
+    },
+    {
+      "name": "dir-many-p1",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/dir?path=%24%7BFIXTURE_ROOT%7D%2Ftree%2Fmany&limit=200&cursor=0",
+      "file": "tests/golden/dir-many-p1.json"
+    },
+    {
+      "name": "dir-many-p2",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/dir?path=%24%7BFIXTURE_ROOT%7D%2Ftree%2Fmany&limit=200&cursor=200",
+      "file": "tests/golden/dir-many-p2.json"
+    },
+    {
+      "name": "dir-many-last",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/dir?path=%24%7BFIXTURE_ROOT%7D%2Ftree%2Fmany&limit=200&cursor=1000",
+      "file": "tests/golden/dir-many-last.json"
+    },
+    {
+      "name": "dir-many-smallpage",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/dir?path=%24%7BFIXTURE_ROOT%7D%2Ftree%2Fmany&limit=7&cursor=1197",
+      "file": "tests/golden/dir-many-smallpage.json"
+    },
+    {
+      "name": "dir-flat-subdir",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/dir?path=%24%7BFIXTURE_ROOT%7D%2Ftree%2Fsubdir&flat=true",
+      "file": "tests/golden/dir-flat-subdir.json"
+    },
+    {
+      "name": "dir-flat-deep",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/dir?path=%24%7BFIXTURE_ROOT%7D%2Ftree%2Fdeep&flat=true",
+      "file": "tests/golden/dir-flat-deep.json"
+    },
+    {
+      "name": "dir-flat-nofolders",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/dir?path=%24%7BFIXTURE_ROOT%7D%2Ftree%2Fsubdir&flat=true&no_folders=true",
+      "file": "tests/golden/dir-flat-nofolders.json"
+    },
+    {
+      "name": "dir-flat-cap",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/dir?path=%24%7BFIXTURE_ROOT%7D%2Ftree%2Fflatcap&flat=true&limit=5",
+      "file": "tests/golden/dir-flat-cap.json"
+    },
+    {
+      "name": "err-nonexistent",
+      "http_status": 404,
+      "content_type": "text/plain; charset=utf-8",
+      "request": "/api/dir?path=%24%7BFIXTURE_ROOT%7D%2Fdoes-not-exist",
+      "file": "tests/golden/err-nonexistent.json"
+    },
+    {
+      "name": "err-not-a-directory",
+      "http_status": 400,
+      "content_type": "text/plain; charset=utf-8",
+      "request": "/api/dir?path=%24%7BFIXTURE_ROOT%7D%2Ftree%2Fnormal.txt",
+      "file": "tests/golden/err-not-a-directory.json"
+    },
+    {
+      "name": "err-perm-denied-dir",
+      "http_status": 500,
+      "content_type": "text/plain; charset=utf-8",
+      "request": "/api/dir?path=%24%7BFIXTURE_ROOT%7D%2Ftree%2Fnoread-dir",
+      "file": "tests/golden/err-perm-denied-dir.json"
+    },
+    {
+      "name": "dir-perm-noexec",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/dir?path=%24%7BFIXTURE_ROOT%7D%2Ftree%2Fnoexec-dir",
+      "file": "tests/golden/dir-perm-noexec.json"
+    },
+    {
+      "name": "dir-post-returns-listing",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/dir?path=%24%7BFIXTURE_ROOT%7D%2Ftree",
+      "file": "tests/golden/dir-post-returns-listing.json"
+    },
+    {
+      "name": "dir-size-subdir",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/dir/size?path=%24%7BFIXTURE_ROOT%7D%2Ftree%2Fsubdir",
+      "file": "tests/golden/dir-size-subdir.json"
+    },
+    {
+      "name": "dir-size-root",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/dir/size?path=%24%7BFIXTURE_ROOT%7D%2Ftree",
+      "file": "tests/golden/dir-size-root.json"
+    },
+    {
+      "name": "dir-size-many",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/dir/size?path=%24%7BFIXTURE_ROOT%7D%2Ftree%2Fmany",
+      "file": "tests/golden/dir-size-many.json"
+    },
+    {
+      "name": "err-dir-size-nonexistent",
+      "http_status": 404,
+      "content_type": "text/plain; charset=utf-8",
+      "request": "/api/dir/size?path=%24%7BFIXTURE_ROOT%7D%2Fdoes-not-exist",
+      "file": "tests/golden/err-dir-size-nonexistent.json"
+    },
+    {
+      "name": "search-live-flat",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/search?path=%24%7BFIXTURE_ROOT%7D%2Ftree&q=.txt",
+      "file": "tests/golden/search-live-flat.json"
+    },
+    {
+      "name": "search-live-recursive",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/search?path=%24%7BFIXTURE_ROOT%7D%2Ftree&q=leaf",
+      "file": "tests/golden/search-live-recursive.json"
+    },
+    {
+      "name": "search-live-regex",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/search?path=%24%7BFIXTURE_ROOT%7D%2Ftree&q=%5Ea&regex=true",
+      "file": "tests/golden/search-live-regex.json"
+    },
+    {
+      "name": "search-live-multi",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/search?path=%24%7BFIXTURE_ROOT%7D%2Ftree%2Fsubdir&q=b&c",
+      "file": "tests/golden/search-live-multi.json"
+    },
+    {
+      "name": "search-live-capped",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/search?path=%24%7BFIXTURE_ROOT%7D%2Ftree%2Fmany&q=f&limit=3",
+      "file": "tests/golden/search-live-capped.json"
+    },
+    {
+      "name": "search-live-crlf",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/search?path=%24%7BFIXTURE_ROOT%7D%2Ftree&q=weird",
+      "file": "tests/golden/search-live-crlf.json"
+    },
+    {
+      "name": "search-live-empty-q",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/search?path=%24%7BFIXTURE_ROOT%7D%2Ftree%2Fsubdir&q=",
+      "file": "tests/golden/search-live-empty-q.json"
+    },
+    {
+      "name": "err-search-bad-regex",
+      "http_status": 400,
+      "content_type": "text/plain; charset=utf-8",
+      "request": "/api/search?path=%24%7BFIXTURE_ROOT%7D%2Ftree&q=%5B&regex=true",
+      "file": "tests/golden/err-search-bad-regex.json"
+    },
+    {
+      "name": "err-search-nonexistent",
+      "http_status": 404,
+      "content_type": "text/plain; charset=utf-8",
+      "request": "/api/search?path=%24%7BFIXTURE_ROOT%7D%2Fnope&q=x",
+      "file": "tests/golden/err-search-nonexistent.json"
+    },
+    {
+      "name": "index-config-apply",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/index/config",
+      "file": "tests/golden/index-config-apply.json"
+    },
+    {
+      "name": "index-status-idle",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/index/status",
+      "file": "tests/golden/index-status-idle.json"
+    },
+    {
+      "name": "index-rebuild",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/index/rebuild",
+      "file": "tests/golden/index-rebuild.json"
+    },
+    {
+      "name": "index-status",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/index/status",
+      "file": "tests/golden/index-status.json"
+    },
+    {
+      "name": "search-index-word",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/index/search?q=leaf",
+      "file": "tests/golden/search-index-word.json"
+    },
+    {
+      "name": "search-index-ext",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/index/search?q=ext%3Ash",
+      "file": "tests/golden/search-index-ext.json"
+    },
+    {
+      "name": "search-index-type-dir",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/index/search?q=type%3Adir",
+      "file": "tests/golden/search-index-type-dir.json"
+    },
+    {
+      "name": "search-index-in",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/index/search?q=in%3A%24%7BFIXTURE_ROOT%7D%2Ftree%2Fsubdir",
+      "file": "tests/golden/search-index-in.json"
+    },
+    {
+      "name": "search-index-paged",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/index/search?q=.txt&limit=3&offset=3",
+      "file": "tests/golden/search-index-paged.json"
+    },
+    {
+      "name": "search-index-empty",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/index/search?q=zzzznope",
+      "file": "tests/golden/search-index-empty.json"
+    },
+    {
+      "name": "index-cancel",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/index/cancel",
+      "file": "tests/golden/index-cancel.json"
+    },
+    {
+      "name": "props-file",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/props?path=%24%7BFIXTURE_ROOT%7D%2Ftree%2Fnormal.txt",
+      "file": "tests/golden/props-file.json"
+    },
+    {
+      "name": "props-dir",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/props?path=%24%7BFIXTURE_ROOT%7D%2Ftree%2Fsubdir",
+      "file": "tests/golden/props-dir.json"
+    },
+    {
+      "name": "props-symlink",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/props?path=%24%7BFIXTURE_ROOT%7D%2Ftree%2Flink-to-dir",
+      "file": "tests/golden/props-symlink.json"
+    },
+    {
+      "name": "props-crlf-name",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/props?path=%24%7BFIXTURE_ROOT%7D%2Ftree%2Fweird%24%27%5Cr%27name.txt",
+      "file": "tests/golden/props-crlf-name.json"
+    },
+    {
+      "name": "diskspace",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/diskspace?path=%24%7BFIXTURE_ROOT%7D",
+      "file": "tests/golden/diskspace.json"
+    },
+    {
+      "name": "err-diskspace-badpath",
+      "http_status": 500,
+      "content_type": "text/plain; charset=utf-8",
+      "request": "/api/diskspace?path=%24%7BFIXTURE_ROOT%7D%2Fnope",
+      "file": "tests/golden/err-diskspace-badpath.json"
+    },
+    {
+      "name": "places-initial",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/places",
+      "file": "tests/golden/places-initial.json"
+    },
+    {
+      "name": "places-add",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/places",
+      "file": "tests/golden/places-add.json"
+    },
+    {
+      "name": "places-add-dup",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/places",
+      "file": "tests/golden/places-add-dup.json"
+    },
+    {
+      "name": "places",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/places",
+      "file": "tests/golden/places.json"
+    },
+    {
+      "name": "places-remove",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/places",
+      "file": "tests/golden/places-remove.json"
+    },
+    {
+      "name": "workspaces-save",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/workspaces",
+      "file": "tests/golden/workspaces-save.json"
+    },
+    {
+      "name": "workspaces",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/workspaces",
+      "file": "tests/golden/workspaces.json"
+    },
+    {
+      "name": "workspaces-restore",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/workspaces",
+      "file": "tests/golden/workspaces-restore.json"
+    },
+    {
+      "name": "err-workspaces-restore-missing",
+      "http_status": 404,
+      "content_type": "text/plain; charset=utf-8",
+      "request": "/api/workspaces",
+      "file": "tests/golden/err-workspaces-restore-missing.json"
+    },
+    {
+      "name": "actions-create",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/actions",
+      "file": "tests/golden/actions-create.json"
+    },
+    {
+      "name": "actions",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/actions",
+      "file": "tests/golden/actions.json"
+    },
+    {
+      "name": "action-exec",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/action/exec",
+      "file": "tests/golden/action-exec.json"
+    },
+    {
+      "name": "err-action-exec-unknown",
+      "http_status": 404,
+      "content_type": "text/plain; charset=utf-8",
+      "request": "/api/action/exec",
+      "file": "tests/golden/err-action-exec-unknown.json"
+    },
+    {
+      "name": "actions-delete",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/actions",
+      "file": "tests/golden/actions-delete.json"
+    },
+    {
+      "name": "op-mkdir",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/op",
+      "file": "tests/golden/op-mkdir.json"
+    },
+    {
+      "name": "op-rename",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/op",
+      "file": "tests/golden/op-rename.json"
+    },
+    {
+      "name": "op-copy",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/op",
+      "file": "tests/golden/op-copy.json"
+    },
+    {
+      "name": "op-paste-copy",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/op",
+      "file": "tests/golden/op-paste-copy.json"
+    },
+    {
+      "name": "op-cut",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/op",
+      "file": "tests/golden/op-cut.json"
+    },
+    {
+      "name": "op-paste-move",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/op",
+      "file": "tests/golden/op-paste-move.json"
+    },
+    {
+      "name": "op-delete-file",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/op",
+      "file": "tests/golden/op-delete-file.json"
+    },
+    {
+      "name": "op-delete-dir",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/op",
+      "file": "tests/golden/op-delete-dir.json"
+    },
+    {
+      "name": "op-chmod",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/op",
+      "file": "tests/golden/op-chmod.json"
+    },
+    {
+      "name": "op-chmod-leading-zero",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/op",
+      "file": "tests/golden/op-chmod-leading-zero.json"
+    },
+    {
+      "name": "err-chmod-octaltext",
+      "http_status": 400,
+      "content_type": "text/plain; charset=utf-8",
+      "request": "/api/op",
+      "file": "tests/golden/err-chmod-octaltext.json"
+    },
+    {
+      "name": "err-op-unknown",
+      "http_status": 400,
+      "content_type": "text/plain; charset=utf-8",
+      "request": "/api/op",
+      "file": "tests/golden/err-op-unknown.json"
+    },
+    {
+      "name": "err-op-bad-json",
+      "http_status": 400,
+      "content_type": "text/plain; charset=utf-8",
+      "request": "/api/op",
+      "file": "tests/golden/err-op-bad-json.json"
+    },
+    {
+      "name": "op-delete-empty-sources",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/op",
+      "file": "tests/golden/op-delete-empty-sources.json"
+    },
+    {
+      "name": "err-vfs-readonly",
+      "http_status": 405,
+      "content_type": "text/plain; charset=utf-8",
+      "request": "/api/op",
+      "file": "tests/golden/err-vfs-readonly.json"
+    },
+    {
+      "name": "paste-conflict",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/op",
+      "file": "tests/golden/paste-conflict.json"
+    },
+    {
+      "name": "paste-conflict-merge",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/op",
+      "file": "tests/golden/paste-conflict-merge.json"
+    },
+    {
+      "name": "paste-skip-existing",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/op",
+      "file": "tests/golden/paste-skip-existing.json"
+    },
+    {
+      "name": "op-cut-collision",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/op",
+      "file": "tests/golden/op-cut-collision.json"
+    },
+    {
+      "name": "err-paste-move-collision",
+      "http_status": 500,
+      "content_type": "text/plain; charset=utf-8",
+      "request": "/api/op",
+      "file": "tests/golden/err-paste-move-collision.json"
+    },
+    {
+      "name": "op-batch-rename",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/op",
+      "file": "tests/golden/op-batch-rename.json"
+    },
+    {
+      "name": "op-single-rename-json-name",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/op",
+      "file": "tests/golden/op-single-rename-json-name.json"
+    },
+    {
+      "name": "op-copy-bulk",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/op",
+      "file": "tests/golden/op-copy-bulk.json"
+    },
+    {
+      "name": "op-paste-bulk",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/op",
+      "file": "tests/golden/op-paste-bulk.json"
+    },
+    {
+      "name": "op-copy-link",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/op",
+      "file": "tests/golden/op-copy-link.json"
+    },
+    {
+      "name": "op-paste-link",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/op",
+      "file": "tests/golden/op-paste-link.json"
+    },
+    {
+      "name": "op-paste-link-conflict",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/op",
+      "file": "tests/golden/op-paste-link-conflict.json"
+    },
+    {
+      "name": "op-clear",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/op",
+      "file": "tests/golden/op-clear.json"
+    },
+    {
+      "name": "log",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/log?limit=500",
+      "file": "tests/golden/log.json"
+    },
+    {
+      "name": "log-path-filtered",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/log?path=%24%7BFIXTURE_ROOT%7D%2Fops%2Fdest%2Ftwo.txt&limit=10",
+      "file": "tests/golden/log-path-filtered.json"
+    },
+    {
+      "name": "log-limit1",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/log?limit=1",
+      "file": "tests/golden/log-limit1.json"
+    },
+    {
+      "name": "log-revert-mkdir",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/log/revert",
+      "file": "tests/golden/log-revert-mkdir.json"
+    },
+    {
+      "name": "err-log-revert-twice",
+      "http_status": 409,
+      "content_type": "text/plain; charset=utf-8",
+      "request": "/api/log/revert",
+      "file": "tests/golden/err-log-revert-twice.json"
+    },
+    {
+      "name": "err-log-revert-nonreversible",
+      "http_status": 422,
+      "content_type": "text/plain; charset=utf-8",
+      "request": "/api/log/revert",
+      "file": "tests/golden/err-log-revert-nonreversible.json"
+    },
+    {
+      "name": "err-log-revert-unknown",
+      "http_status": 404,
+      "content_type": "text/plain; charset=utf-8",
+      "request": "/api/log/revert",
+      "file": "tests/golden/err-log-revert-unknown.json"
+    },
+    {
+      "name": "log-after-revert",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/log?limit=500",
+      "file": "tests/golden/log-after-revert.json"
+    },
+    {
+      "name": "archive-list-plain",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/archive/dir?archive=%24%7BFIXTURE_ROOT%7D%2Farchives%2Fplain.zip",
+      "file": "tests/golden/archive-list-plain.json"
+    },
+    {
+      "name": "archive-list-plain-sub",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/archive/dir?archive=%24%7BFIXTURE_ROOT%7D%2Farchives%2Fplain.zip&path=docs%2Fnested",
+      "file": "tests/golden/archive-list-plain-sub.json"
+    },
+    {
+      "name": "archive-list-nested",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/archive/dir?archive=%24%7BFIXTURE_ROOT%7D%2Farchives%2Fnested.zip",
+      "file": "tests/golden/archive-list-nested.json"
+    },
+    {
+      "name": "archive-nested-inner",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/archive/dir?archive=%24%7BFIXTURE_ROOT%7D%2Farchives%2Fnested.zip&nested=inner.zip",
+      "file": "tests/golden/archive-nested-inner.json"
+    },
+    {
+      "name": "archive-list-zipslip",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/archive/dir?archive=%24%7BFIXTURE_ROOT%7D%2Farchives%2Fzipslip.zip",
+      "file": "tests/golden/archive-list-zipslip.json"
+    },
+    {
+      "name": "archive-list-symlink",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/archive/dir?archive=%24%7BFIXTURE_ROOT%7D%2Farchives%2Fsymlink.zip",
+      "file": "tests/golden/archive-list-symlink.json"
+    },
+    {
+      "name": "err-archive-missing",
+      "http_status": 400,
+      "content_type": "text/plain; charset=utf-8",
+      "request": "/api/archive/dir?path=x",
+      "file": "tests/golden/err-archive-missing.json"
+    },
+    {
+      "name": "err-archive-notfound",
+      "http_status": 500,
+      "content_type": "text/plain; charset=utf-8",
+      "request": "/api/archive/dir?archive=%24%7BFIXTURE_ROOT%7D%2Farchives%2Fnope.zip",
+      "file": "tests/golden/err-archive-notfound.json"
+    },
+    {
+      "name": "err-archive-baddir",
+      "http_status": 404,
+      "content_type": "text/plain; charset=utf-8",
+      "request": "/api/archive/dir?archive=%24%7BFIXTURE_ROOT%7D%2Farchives%2Fplain.zip&path=no-such-dir",
+      "file": "tests/golden/err-archive-baddir.json"
+    },
+    {
+      "name": "err-archive-stream-missing",
+      "http_status": 404,
+      "content_type": "text/plain; charset=utf-8",
+      "request": "/api/archive/stream?archive=%24%7BFIXTURE_ROOT%7D%2Farchives%2Fplain.zip&path=nope.txt",
+      "file": "tests/golden/err-archive-stream-missing.json"
+    },
+    {
+      "name": "archive-extract-one",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/archive/extract",
+      "file": "tests/golden/archive-extract-one.json"
+    },
+    {
+      "name": "archive-extract-one-status",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/archive/extract/status?job_id=632ecfe7-0e08-485f-99f6-5e7c59a377ab",
+      "file": "tests/golden/archive-extract-one-status.json"
+    },
+    {
+      "name": "err-archive-status-noparam",
+      "http_status": 400,
+      "content_type": "text/plain; charset=utf-8",
+      "request": "/api/archive/extract/status",
+      "file": "tests/golden/err-archive-status-noparam.json"
+    },
+    {
+      "name": "archive-extract-zipslip",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/archive/extract",
+      "file": "tests/golden/archive-extract-zipslip.json"
+    },
+    {
+      "name": "archive-extract-zipslip-status",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/archive/extract/status?job_id=30a8cdaf-03f4-4664-99fb-b2be31661b56",
+      "file": "tests/golden/archive-extract-zipslip-status.json"
+    },
+    {
+      "name": "err-archive-status-unknown",
+      "http_status": 404,
+      "content_type": "text/plain; charset=utf-8",
+      "request": "/api/archive/extract/status?job_id=deadbeef",
+      "file": "tests/golden/err-archive-status-unknown.json"
+    },
+    {
+      "name": "archive-extract-relative-dest",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/archive/extract",
+      "file": "tests/golden/archive-extract-relative-dest.json"
+    },
+    {
+      "name": "archive-extract-dotdot-falsepositive",
+      "http_status": 403,
+      "content_type": "text/plain; charset=utf-8",
+      "request": "/api/archive/extract",
+      "file": "tests/golden/archive-extract-dotdot-falsepositive.json"
+    },
+    {
+      "name": "archive-extracted-tree",
+      "http_status": 200,
+      "content_type": "application/json",
+      "request": "/api/dir?path=%24%7BFIXTURE_ROOT%7D%2Fops%2Fex-one",
+      "file": "tests/golden/archive-extracted-tree.json"
+    },
+    {
+      "name": "archive-modified-409",
+      "http_status": 409,
+      "content_type": "text/plain; charset=utf-8",
+      "request": "/api/archive/dir?archive=%24%7BFIXTURE_ROOT%7D%2Farchives%2Fsymlink.zip",
+      "file": "tests/golden/archive-modified-409.json"
+    }
+  ],
+  "count": 122
+}

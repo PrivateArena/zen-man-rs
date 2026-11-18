@@ -1,0 +1,17 @@
+{
+  "entries": [
+    {
+      "name": "renamed-one.txt",
+      "is_dir": false,
+      "is_symlink": true,
+      "size": 36,
+      "mod_time": 1794991944,
+      "mode": "Lrwxrwxrwx"
+    }
+  ],
+  "operation": "link",
+  "sources": [
+    "${FIXTURE_ROOT}/ops/dest/renamed-one.txt"
+  ],
+  "status": "success"
+}

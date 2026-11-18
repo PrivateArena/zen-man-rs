@@ -1,0 +1,27 @@
+{
+  "bookmarks": [
+    "${FIXTURE_ROOT}/tree"
+  ],
+  "mounts": [
+    {
+      "name": "free",
+      "path": "${CAPTURE_MEDIA}/free"
+    },
+    {
+      "name": "home",
+      "path": "${CAPTURE_MEDIA}/home"
+    },
+    {
+      "name": "mint",
+      "path": "${CAPTURE_MEDIA}/mint"
+    },
+    {
+      "name": "seeder",
+      "path": "${CAPTURE_MEDIA}/seeder"
+    },
+    {
+      "name": "ss512a",
+      "path": "${CAPTURE_MEDIA}/ss512a"
+    }
+  ]
+}

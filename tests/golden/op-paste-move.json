@@ -1,0 +1,17 @@
+{
+  "entries": [
+    {
+      "name": "victim.txt",
+      "is_dir": false,
+      "size": 7,
+      "mod_time": 1794991944,
+      "mode": "-rw-r--r--"
+    }
+  ],
+  "operation": "cut",
+  "reload_required": false,
+  "sources": [
+    "${FIXTURE_ROOT}/ops/src/victim.txt"
+  ],
+  "status": "success"
+}

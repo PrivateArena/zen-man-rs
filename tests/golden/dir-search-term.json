@@ -1,0 +1,23 @@
+{
+  "path": "${FIXTURE_ROOT}/tree/many",
+  "entries": [
+    {
+      "name": "f0001.txt",
+      "is_dir": false,
+      "size": 8,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "f0002.txt",
+      "is_dir": false,
+      "size": 8,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    }
+  ],
+  "cursor": "2",
+  "has_more": true,
+  "total_count": 1200,
+  "loaded_so_far": 2
+}

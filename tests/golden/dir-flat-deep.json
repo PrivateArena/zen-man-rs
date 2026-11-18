@@ -1,0 +1,197 @@
+{
+  "path": "${FIXTURE_ROOT}/tree/deep",
+  "entries": [
+    {
+      "name": "d0",
+      "is_dir": true,
+      "size": 60,
+      "mod_time": 1767225600,
+      "mode": "drwxr-xr-x",
+      "rel_path": "d0"
+    },
+    {
+      "name": "d1",
+      "is_dir": true,
+      "size": 60,
+      "mod_time": 1767225600,
+      "mode": "drwxr-xr-x",
+      "rel_path": "d0/d1",
+      "depth": 1
+    },
+    {
+      "name": "d10",
+      "is_dir": true,
+      "size": 60,
+      "mod_time": 1767225600,
+      "mode": "drwxr-xr-x",
+      "rel_path": "d0/d1/d2/d3/d4/d5/d6/d7/d8/d9/d10",
+      "depth": 10
+    },
+    {
+      "name": "d11",
+      "is_dir": true,
+      "size": 60,
+      "mod_time": 1767225600,
+      "mode": "drwxr-xr-x",
+      "rel_path": "d0/d1/d2/d3/d4/d5/d6/d7/d8/d9/d10/d11",
+      "depth": 11
+    },
+    {
+      "name": "d12",
+      "is_dir": true,
+      "size": 60,
+      "mod_time": 1767225600,
+      "mode": "drwxr-xr-x",
+      "rel_path": "d0/d1/d2/d3/d4/d5/d6/d7/d8/d9/d10/d11/d12",
+      "depth": 12
+    },
+    {
+      "name": "d13",
+      "is_dir": true,
+      "size": 60,
+      "mod_time": 1767225600,
+      "mode": "drwxr-xr-x",
+      "rel_path": "d0/d1/d2/d3/d4/d5/d6/d7/d8/d9/d10/d11/d12/d13",
+      "depth": 13
+    },
+    {
+      "name": "d14",
+      "is_dir": true,
+      "size": 60,
+      "mod_time": 1767225600,
+      "mode": "drwxr-xr-x",
+      "rel_path": "d0/d1/d2/d3/d4/d5/d6/d7/d8/d9/d10/d11/d12/d13/d14",
+      "depth": 14
+    },
+    {
+      "name": "d15",
+      "is_dir": true,
+      "size": 60,
+      "mod_time": 1767225600,
+      "mode": "drwxr-xr-x",
+      "rel_path": "d0/d1/d2/d3/d4/d5/d6/d7/d8/d9/d10/d11/d12/d13/d14/d15",
+      "depth": 15
+    },
+    {
+      "name": "d16",
+      "is_dir": true,
+      "size": 60,
+      "mod_time": 1767225600,
+      "mode": "drwxr-xr-x",
+      "rel_path": "d0/d1/d2/d3/d4/d5/d6/d7/d8/d9/d10/d11/d12/d13/d14/d15/d16",
+      "depth": 16
+    },
+    {
+      "name": "d17",
+      "is_dir": true,
+      "size": 60,
+      "mod_time": 1767225600,
+      "mode": "drwxr-xr-x",
+      "rel_path": "d0/d1/d2/d3/d4/d5/d6/d7/d8/d9/d10/d11/d12/d13/d14/d15/d16/d17",
+      "depth": 17
+    },
+    {
+      "name": "d18",
+      "is_dir": true,
+      "size": 60,
+      "mod_time": 1767225600,
+      "mode": "drwxr-xr-x",
+      "rel_path": "d0/d1/d2/d3/d4/d5/d6/d7/d8/d9/d10/d11/d12/d13/d14/d15/d16/d17/d18",
+      "depth": 18
+    },
+    {
+      "name": "d19",
+      "is_dir": true,
+      "size": 60,
+      "mod_time": 1767225600,
+      "mode": "drwxr-xr-x",
+      "rel_path": "d0/d1/d2/d3/d4/d5/d6/d7/d8/d9/d10/d11/d12/d13/d14/d15/d16/d17/d18/d19",
+      "depth": 19
+    },
+    {
+      "name": "d2",
+      "is_dir": true,
+      "size": 60,
+      "mod_time": 1767225600,
+      "mode": "drwxr-xr-x",
+      "rel_path": "d0/d1/d2",
+      "depth": 2
+    },
+    {
+      "name": "d3",
+      "is_dir": true,
+      "size": 60,
+      "mod_time": 1767225600,
+      "mode": "drwxr-xr-x",
+      "rel_path": "d0/d1/d2/d3",
+      "depth": 3
+    },
+    {
+      "name": "d4",
+      "is_dir": true,
+      "size": 60,
+      "mod_time": 1767225600,
+      "mode": "drwxr-xr-x",
+      "rel_path": "d0/d1/d2/d3/d4",
+      "depth": 4
+    },
+    {
+      "name": "d5",
+      "is_dir": true,
+      "size": 60,
+      "mod_time": 1767225600,
+      "mode": "drwxr-xr-x",
+      "rel_path": "d0/d1/d2/d3/d4/d5",
+      "depth": 5
+    },
+    {
+      "name": "d6",
+      "is_dir": true,
+      "size": 60,
+      "mod_time": 1767225600,
+      "mode": "drwxr-xr-x",
+      "rel_path": "d0/d1/d2/d3/d4/d5/d6",
+      "depth": 6
+    },
+    {
+      "name": "d7",
+      "is_dir": true,
+      "size": 60,
+      "mod_time": 1767225600,
+      "mode": "drwxr-xr-x",
+      "rel_path": "d0/d1/d2/d3/d4/d5/d6/d7",
+      "depth": 7
+    },
+    {
+      "name": "d8",
+      "is_dir": true,
+      "size": 60,
+      "mod_time": 1767225600,
+      "mode": "drwxr-xr-x",
+      "rel_path": "d0/d1/d2/d3/d4/d5/d6/d7/d8",
+      "depth": 8
+    },
+    {
+      "name": "d9",
+      "is_dir": true,
+      "size": 60,
+      "mod_time": 1767225600,
+      "mode": "drwxr-xr-x",
+      "rel_path": "d0/d1/d2/d3/d4/d5/d6/d7/d8/d9",
+      "depth": 9
+    },
+    {
+      "name": "leaf.txt",
+      "is_dir": false,
+      "size": 9,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--",
+      "rel_path": "d0/d1/d2/d3/d4/d5/d6/d7/d8/d9/d10/d11/d12/d13/d14/d15/d16/d17/d18/d19/leaf.txt",
+      "depth": 20
+    }
+  ],
+  "cursor": "",
+  "has_more": false,
+  "total_count": 21,
+  "loaded_so_far": 21
+}

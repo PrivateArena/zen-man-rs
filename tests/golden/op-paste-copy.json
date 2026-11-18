@@ -1,0 +1,17 @@
+{
+  "entries": [
+    {
+      "name": "two.txt",
+      "is_dir": false,
+      "size": 12,
+      "mod_time": 1794991944,
+      "mode": "-rw-r--r--"
+    }
+  ],
+  "operation": "copy",
+  "reload_required": false,
+  "sources": [
+    "${FIXTURE_ROOT}/ops/src/two.txt"
+  ],
+  "status": "success"
+}

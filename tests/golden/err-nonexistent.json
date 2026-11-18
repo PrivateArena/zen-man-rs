@@ -1,0 +1,3 @@
+{
+  "error": "Path not found: stat ${FIXTURE_ROOT}/does-not-exist: no such file or directory"
+}

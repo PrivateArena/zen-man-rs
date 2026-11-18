@@ -1,0 +1,21 @@
+{
+  "bookmarks": [],
+  "workspaces": {
+    "fixture": {
+      "left_tabs": [
+        {
+          "id": "t1",
+          "path": "${FIXTURE_ROOT}/tree",
+          "name": "Fixtures",
+          "group": "A",
+          "color": "#ff4a4a"
+        }
+      ],
+      "left_active": "t1",
+      "right_tabs": [],
+      "right_active": "",
+      "split": true
+    }
+  },
+  "custom_actions": []
+}

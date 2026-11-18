@@ -1,0 +1,23 @@
+{
+  "path": "${FIXTURE_ROOT}/tree/SortCase",
+  "entries": [
+    {
+      "name": "a.txt",
+      "is_dir": false,
+      "size": 2,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    },
+    {
+      "name": "B.txt",
+      "is_dir": false,
+      "size": 2,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--"
+    }
+  ],
+  "cursor": "",
+  "has_more": false,
+  "total_count": 2,
+  "loaded_so_far": 2
+}

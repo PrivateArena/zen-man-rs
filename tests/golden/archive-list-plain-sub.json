@@ -1,0 +1,15 @@
+{
+  "archive": "${FIXTURE_ROOT}/archives/plain.zip",
+  "entries": [
+    {
+      "name": "deep.txt",
+      "is_dir": false,
+      "size": 5,
+      "mod_time": 1767225600,
+      "mode": "-r--r--r--",
+      "rel_path": "docs/nested/deep.txt"
+    }
+  ],
+  "nested": "",
+  "path": "docs/nested"
+}

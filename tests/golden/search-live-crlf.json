@@ -1,0 +1,14 @@
+{
+  "entries": [
+    {
+      "name": "weird\rname.txt",
+      "is_dir": false,
+      "size": 13,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--",
+      "rel_path": "weird\rname.txt"
+    }
+  ],
+  "total_matched": 1,
+  "capped": false
+}

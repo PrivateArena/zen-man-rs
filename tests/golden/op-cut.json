@@ -1,0 +1,12 @@
+{
+  "items": [
+    {
+      "isDir": false,
+      "name": "victim.txt",
+      "path": "${FIXTURE_ROOT}/ops/src/victim.txt",
+      "size": 7
+    }
+  ],
+  "op": "cut",
+  "status": "success"
+}

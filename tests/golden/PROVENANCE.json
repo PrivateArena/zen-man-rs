@@ -1,0 +1,13 @@
+{
+  "go_repo": "${CAPTURE_MEDIA}/home/Deve/zen-man",
+  "go_commit": "d5cd1a542167c56f06f2f585f0fd0cab26d719fc",
+  "go_binary_sha256": "c4b68d7a086f290e011edfbb3221263e0089767642ee07b8b1e1705ce9e44e94",
+  "base_url": "http://127.0.0.1:7891",
+  "server_args": "-port 7891 -dev=false",
+  "disposable_home": "${HOME_ROOT}",
+  "fixture_root": "${FIXTURE_ROOT}",
+  "captured_at_utc": "2026-11-18T08:52:22Z",
+  "capture_machine_user": "jang",
+  "platform": "Linux 7.3.3-1-cachyos",
+  "normalised": true
+}

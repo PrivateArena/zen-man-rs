@@ -1,0 +1,23 @@
+{
+  "archive": "${FIXTURE_ROOT}/archives/plain.zip",
+  "entries": [
+    {
+      "name": "docs",
+      "is_dir": true,
+      "size": 0,
+      "mod_time": 1767225600,
+      "mode": "-r--r--r--",
+      "rel_path": "docs"
+    },
+    {
+      "name": "top.txt",
+      "is_dir": false,
+      "size": 15,
+      "mod_time": 1767225600,
+      "mode": "-r--r--r--",
+      "rel_path": "top.txt"
+    }
+  ],
+  "nested": "",
+  "path": ""
+}

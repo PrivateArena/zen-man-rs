@@ -1,0 +1,19 @@
+{
+  "count": 1,
+  "records": [
+    {
+      "id": 19,
+      "timestamp": "2026-11-18T15:52:24.482358366+07:00",
+      "action": 8,
+      "action_str": "paste-link",
+      "status": 0,
+      "status_str": "done",
+      "sources": [
+        "${FIXTURE_ROOT}/ops/dest/renamed-one.txt"
+      ],
+      "dest": "${FIXTURE_ROOT}/ops/dest",
+      "name": "",
+      "reversible": true
+    }
+  ]
+}

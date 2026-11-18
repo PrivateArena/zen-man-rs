@@ -1,0 +1,248 @@
+{
+  "capped": false,
+  "entries": [
+    {
+      "name": "b",
+      "is_dir": true,
+      "size": 60,
+      "mod_time": 1767225600,
+      "mode": "",
+      "rel_path": "${FIXTURE_ROOT}/tree/subdir/b"
+    },
+    {
+      "name": "d0",
+      "is_dir": true,
+      "size": 60,
+      "mod_time": 1767225600,
+      "mode": "",
+      "rel_path": "${FIXTURE_ROOT}/tree/deep/d0"
+    },
+    {
+      "name": "d1",
+      "is_dir": true,
+      "size": 60,
+      "mod_time": 1767225600,
+      "mode": "",
+      "rel_path": "${FIXTURE_ROOT}/tree/deep/d0/d1"
+    },
+    {
+      "name": "d10",
+      "is_dir": true,
+      "size": 60,
+      "mod_time": 1767225600,
+      "mode": "",
+      "rel_path": "${FIXTURE_ROOT}/tree/deep/d0/d1/d2/d3/d4/d5/d6/d7/d8/d9/d10"
+    },
+    {
+      "name": "d11",
+      "is_dir": true,
+      "size": 60,
+      "mod_time": 1767225600,
+      "mode": "",
+      "rel_path": "${FIXTURE_ROOT}/tree/deep/d0/d1/d2/d3/d4/d5/d6/d7/d8/d9/d10/d11"
+    },
+    {
+      "name": "d12",
+      "is_dir": true,
+      "size": 60,
+      "mod_time": 1767225600,
+      "mode": "",
+      "rel_path": "${FIXTURE_ROOT}/tree/deep/d0/d1/d2/d3/d4/d5/d6/d7/d8/d9/d10/d11/d12"
+    },
+    {
+      "name": "d13",
+      "is_dir": true,
+      "size": 60,
+      "mod_time": 1767225600,
+      "mode": "",
+      "rel_path": "${FIXTURE_ROOT}/tree/deep/d0/d1/d2/d3/d4/d5/d6/d7/d8/d9/d10/d11/d12/d13"
+    },
+    {
+      "name": "d14",
+      "is_dir": true,
+      "size": 60,
+      "mod_time": 1767225600,
+      "mode": "",
+      "rel_path": "${FIXTURE_ROOT}/tree/deep/d0/d1/d2/d3/d4/d5/d6/d7/d8/d9/d10/d11/d12/d13/d14"
+    },
+    {
+      "name": "d15",
+      "is_dir": true,
+      "size": 60,
+      "mod_time": 1767225600,
+      "mode": "",
+      "rel_path": "${FIXTURE_ROOT}/tree/deep/d0/d1/d2/d3/d4/d5/d6/d7/d8/d9/d10/d11/d12/d13/d14/d15"
+    },
+    {
+      "name": "d16",
+      "is_dir": true,
+      "size": 60,
+      "mod_time": 1767225600,
+      "mode": "",
+      "rel_path": "${FIXTURE_ROOT}/tree/deep/d0/d1/d2/d3/d4/d5/d6/d7/d8/d9/d10/d11/d12/d13/d14/d15/d16"
+    },
+    {
+      "name": "d17",
+      "is_dir": true,
+      "size": 60,
+      "mod_time": 1767225600,
+      "mode": "",
+      "rel_path": "${FIXTURE_ROOT}/tree/deep/d0/d1/d2/d3/d4/d5/d6/d7/d8/d9/d10/d11/d12/d13/d14/d15/d16/d17"
+    },
+    {
+      "name": "d18",
+      "is_dir": true,
+      "size": 60,
+      "mod_time": 1767225600,
+      "mode": "",
+      "rel_path": "${FIXTURE_ROOT}/tree/deep/d0/d1/d2/d3/d4/d5/d6/d7/d8/d9/d10/d11/d12/d13/d14/d15/d16/d17/d18"
+    },
+    {
+      "name": "d19",
+      "is_dir": true,
+      "size": 60,
+      "mod_time": 1767225600,
+      "mode": "",
+      "rel_path": "${FIXTURE_ROOT}/tree/deep/d0/d1/d2/d3/d4/d5/d6/d7/d8/d9/d10/d11/d12/d13/d14/d15/d16/d17/d18/d19"
+    },
+    {
+      "name": "d2",
+      "is_dir": true,
+      "size": 60,
+      "mod_time": 1767225600,
+      "mode": "",
+      "rel_path": "${FIXTURE_ROOT}/tree/deep/d0/d1/d2"
+    },
+    {
+      "name": "d3",
+      "is_dir": true,
+      "size": 60,
+      "mod_time": 1767225600,
+      "mode": "",
+      "rel_path": "${FIXTURE_ROOT}/tree/deep/d0/d1/d2/d3"
+    },
+    {
+      "name": "d4",
+      "is_dir": true,
+      "size": 60,
+      "mod_time": 1767225600,
+      "mode": "",
+      "rel_path": "${FIXTURE_ROOT}/tree/deep/d0/d1/d2/d3/d4"
+    },
+    {
+      "name": "d5",
+      "is_dir": true,
+      "size": 60,
+      "mod_time": 1767225600,
+      "mode": "",
+      "rel_path": "${FIXTURE_ROOT}/tree/deep/d0/d1/d2/d3/d4/d5"
+    },
+    {
+      "name": "d6",
+      "is_dir": true,
+      "size": 60,
+      "mod_time": 1767225600,
+      "mode": "",
+      "rel_path": "${FIXTURE_ROOT}/tree/deep/d0/d1/d2/d3/d4/d5/d6"
+    },
+    {
+      "name": "d7",
+      "is_dir": true,
+      "size": 60,
+      "mod_time": 1767225600,
+      "mode": "",
+      "rel_path": "${FIXTURE_ROOT}/tree/deep/d0/d1/d2/d3/d4/d5/d6/d7"
+    },
+    {
+      "name": "d8",
+      "is_dir": true,
+      "size": 60,
+      "mod_time": 1767225600,
+      "mode": "",
+      "rel_path": "${FIXTURE_ROOT}/tree/deep/d0/d1/d2/d3/d4/d5/d6/d7/d8"
+    },
+    {
+      "name": "d9",
+      "is_dir": true,
+      "size": 60,
+      "mod_time": 1767225600,
+      "mode": "",
+      "rel_path": "${FIXTURE_ROOT}/tree/deep/d0/d1/d2/d3/d4/d5/d6/d7/d8/d9"
+    },
+    {
+      "name": "deep",
+      "is_dir": true,
+      "size": 60,
+      "mod_time": 1767225600,
+      "mode": "",
+      "rel_path": "${FIXTURE_ROOT}/tree/deep"
+    },
+    {
+      "name": "empty-dir",
+      "is_dir": true,
+      "size": 40,
+      "mod_time": 1767225600,
+      "mode": "",
+      "rel_path": "${FIXTURE_ROOT}/tree/empty-dir"
+    },
+    {
+      "name": "fake.zip",
+      "is_dir": true,
+      "size": 60,
+      "mod_time": 1767225600,
+      "mode": "",
+      "rel_path": "${FIXTURE_ROOT}/tree/fake.zip"
+    },
+    {
+      "name": "many",
+      "is_dir": true,
+      "size": 24040,
+      "mod_time": 1767225600,
+      "mode": "",
+      "rel_path": "${FIXTURE_ROOT}/tree/many"
+    },
+    {
+      "name": "noexec-dir",
+      "is_dir": true,
+      "size": 60,
+      "mod_time": 1767225600,
+      "mode": "",
+      "rel_path": "${FIXTURE_ROOT}/tree/noexec-dir"
+    },
+    {
+      "name": "noread-dir",
+      "is_dir": true,
+      "size": 60,
+      "mod_time": 1767225600,
+      "mode": "",
+      "rel_path": "${FIXTURE_ROOT}/tree/noread-dir"
+    },
+    {
+      "name": "SortCase",
+      "is_dir": true,
+      "size": 80,
+      "mod_time": 1767225600,
+      "mode": "",
+      "rel_path": "${FIXTURE_ROOT}/tree/SortCase"
+    },
+    {
+      "name": "subdir",
+      "is_dir": true,
+      "size": 80,
+      "mod_time": 1767225600,
+      "mode": "",
+      "rel_path": "${FIXTURE_ROOT}/tree/subdir"
+    },
+    {
+      "name": "tree",
+      "is_dir": true,
+      "size": 700,
+      "mod_time": 1794991942,
+      "mode": "",
+      "rel_path": "${FIXTURE_ROOT}/tree"
+    }
+  ],
+  "index_dirty": false,
+  "last_indexed_unix": 1794991943,
+  "total_matched": 30
+}

@@ -1,0 +1,10 @@
+{
+  "entry": {
+    "name": "renamed-dir",
+    "is_dir": true,
+    "size": 40,
+    "mod_time": 1794991944,
+    "mode": "drwxr-xr-x"
+  },
+  "status": "success"
+}

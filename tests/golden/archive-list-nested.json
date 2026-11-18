@@ -1,0 +1,31 @@
+{
+  "archive": "${FIXTURE_ROOT}/archives/nested.zip",
+  "entries": [
+    {
+      "name": "inner.7z",
+      "is_dir": false,
+      "size": 26,
+      "mod_time": 1767225600,
+      "mode": "-r--r--r--",
+      "rel_path": "inner.7z"
+    },
+    {
+      "name": "inner.zip",
+      "is_dir": false,
+      "size": 145,
+      "mod_time": 1767225600,
+      "mode": "-r--r--r--",
+      "rel_path": "inner.zip"
+    },
+    {
+      "name": "outer.txt",
+      "is_dir": false,
+      "size": 11,
+      "mod_time": 1767225600,
+      "mode": "-r--r--r--",
+      "rel_path": "outer.txt"
+    }
+  ],
+  "nested": "",
+  "path": ""
+}

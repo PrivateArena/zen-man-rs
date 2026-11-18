@@ -1,0 +1,11 @@
+[
+  {
+    "id": "e6f7c823c3f57bb9",
+    "name": "Fixture echo",
+    "icon": "terminal",
+    "command": "printf %s {name}",
+    "role": "files",
+    "patterns": "*.txt",
+    "show_output": true
+  }
+]

@@ -1,0 +1,14 @@
+{
+  "entries": [
+    {
+      "name": "b",
+      "is_dir": true,
+      "size": 60,
+      "mod_time": 1767225600,
+      "mode": "drwxr-xr-x",
+      "rel_path": "b"
+    }
+  ],
+  "total_matched": 1,
+  "capped": false
+}

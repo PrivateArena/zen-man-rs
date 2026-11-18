@@ -1,0 +1,12 @@
+{
+  "items": [
+    {
+      "isDir": false,
+      "name": "renamed-one.txt",
+      "path": "${FIXTURE_ROOT}/ops/dest/renamed-one.txt",
+      "size": 0
+    }
+  ],
+  "op": "copy",
+  "status": "success"
+}

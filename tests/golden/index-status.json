@@ -1,0 +1,26 @@
+{
+  "config": {
+    "auto_index": false,
+    "excludes": [
+      "/proc",
+      "/sys",
+      "/dev",
+      "**/.git",
+      "**/node_modules",
+      "**/__pycache__",
+      "**/flatcap"
+    ],
+    "follow_symlinks": false,
+    "roots": [
+      "${FIXTURE_ROOT}/tree"
+    ],
+    "worker_count": 2
+  },
+  "is_dirty": false,
+  "is_indexing": false,
+  "last_indexed": 1794991943,
+  "progress": {
+    "indexed": 1260
+  },
+  "total_files": 1260
+}

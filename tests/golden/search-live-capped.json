@@ -1,0 +1,30 @@
+{
+  "entries": [
+    {
+      "name": "f0001.txt",
+      "is_dir": false,
+      "size": 8,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--",
+      "rel_path": "f0001.txt"
+    },
+    {
+      "name": "f0002.txt",
+      "is_dir": false,
+      "size": 8,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--",
+      "rel_path": "f0002.txt"
+    },
+    {
+      "name": "f0003.txt",
+      "is_dir": false,
+      "size": 8,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--",
+      "rel_path": "f0003.txt"
+    }
+  ],
+  "total_matched": 3,
+  "capped": true
+}

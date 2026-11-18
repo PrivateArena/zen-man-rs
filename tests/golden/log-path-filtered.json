@@ -1,0 +1,62 @@
+{
+  "count": 4,
+  "records": [
+    {
+      "id": 14,
+      "timestamp": "2026-11-18T15:52:24.447842164+07:00",
+      "action": 5,
+      "action_str": "rename",
+      "status": 0,
+      "status_str": "done",
+      "sources": [
+        "${FIXTURE_ROOT}/ops/dest/one.txt",
+        "${FIXTURE_ROOT}/ops/dest/two.txt"
+      ],
+      "dest": "",
+      "name": "[\"renamed-one.txt\",\"renamed-two.txt\"]",
+      "reversible": true
+    },
+    {
+      "id": 10,
+      "timestamp": "2026-11-18T15:52:24.404474826+07:00",
+      "action": 7,
+      "action_str": "chmod",
+      "status": 0,
+      "status_str": "done",
+      "sources": [
+        "${FIXTURE_ROOT}/ops/dest/two.txt"
+      ],
+      "dest": "",
+      "name": "0644",
+      "reversible": false
+    },
+    {
+      "id": 9,
+      "timestamp": "2026-11-18T15:52:24.400813054+07:00",
+      "action": 7,
+      "action_str": "chmod",
+      "status": 0,
+      "status_str": "done",
+      "sources": [
+        "${FIXTURE_ROOT}/ops/dest/two.txt"
+      ],
+      "dest": "",
+      "name": "600",
+      "reversible": false
+    },
+    {
+      "id": 4,
+      "timestamp": "2026-11-18T15:52:24.381259922+07:00",
+      "action": 2,
+      "action_str": "paste-copy",
+      "status": 0,
+      "status_str": "done",
+      "sources": [
+        "${FIXTURE_ROOT}/ops/src/two.txt"
+      ],
+      "dest": "${FIXTURE_ROOT}/ops/dest",
+      "name": "",
+      "reversible": true
+    }
+  ]
+}

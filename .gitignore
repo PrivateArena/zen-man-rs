@@ -12,16 +12,6 @@
 # with them and had to be re-committed clean).
 /target/
 
-# The pre-existing template ignores every `*.zip` / `*.tar` / `*.gz` to keep binaries out of the repo.
-# The archive fixtures are the one place where that rule is wrong for this repo: they are the golden
-# inputs of the archive contract tests (plan §7 step 2) and are all under 100 KB, produced by
-# `scripts/make-fixtures.py`. Scoped negations only — the rule elsewhere is untouched.
-!tests/fixtures/archives/*.zip
-!tests/fixtures/archives/*.tar
-!tests/fixtures/archives/*.tar.gz
-!tests/fixtures/archives/*.7z
-!tests/golden/*
-!docs/parity/*.png
 
 *.zip
 *.gz
@@ -80,5 +70,15 @@ patches/
 pkg/sfizz/lib/libsfizz.so_no_optimization
 pkg/sfizz/lib/libsfizz.so.1.2.3_no_optimization
 pkg/sfizz/lib/libsfizz.so.1_no_optimization
-tests/golden/
+# --- zen-man-rs (plan §7 step 2) ---------------------------------------------------------------
+# The fixture TREE stays generated and untracked on purpose: git can only record modes 100644 /
+# 100755 / 120000, so the `chmod 000` file, the unreadable directory and the FIFO cannot survive a
+# commit/checkout cycle. `scripts/make-fixtures.py` is the source of truth and `cargo xtask
+# contracts` regenerates the tree and compares it against tests/fixtures/tree/MANIFEST.md.
 tests/fixtures/
+# The GOLDENS are the opposite case: they are the frozen wire contract, and the plan's step-2
+# acceptance criterion is "the Go server can be shut down forever and the suite still passes".
+# They therefore must be committed even though the template above ignores `*.txt`, `*.log`, `*.json`.
+# Negation rules must come last: git uses last-match-wins.
+!tests/golden/
+!tests/golden/**

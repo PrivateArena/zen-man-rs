@@ -1,0 +1,8 @@
+{
+  "path": "${FIXTURE_ROOT}/tree/empty-dir",
+  "entries": [],
+  "cursor": "",
+  "has_more": false,
+  "total_count": 0,
+  "loaded_so_far": 0
+}

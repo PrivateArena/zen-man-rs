@@ -1,0 +1,16 @@
+{
+  "path": "${FIXTURE_ROOT}/ops/ex-one",
+  "entries": [
+    {
+      "name": "top.txt",
+      "is_dir": false,
+      "size": 15,
+      "mod_time": 1794991944,
+      "mode": "-rw-r--r--"
+    }
+  ],
+  "cursor": "",
+  "has_more": false,
+  "total_count": 1,
+  "loaded_so_far": 1
+}

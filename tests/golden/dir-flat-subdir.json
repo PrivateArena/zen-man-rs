@@ -1,0 +1,34 @@
+{
+  "path": "${FIXTURE_ROOT}/tree/subdir",
+  "entries": [
+    {
+      "name": "b",
+      "is_dir": true,
+      "size": 60,
+      "mod_time": 1767225600,
+      "mode": "drwxr-xr-x",
+      "rel_path": "b"
+    },
+    {
+      "name": "a.txt",
+      "is_dir": false,
+      "size": 2,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--",
+      "rel_path": "a.txt"
+    },
+    {
+      "name": "c.txt",
+      "is_dir": false,
+      "size": 2,
+      "mod_time": 1767225600,
+      "mode": "-rw-r--r--",
+      "rel_path": "b/c.txt",
+      "depth": 1
+    }
+  ],
+  "cursor": "",
+  "has_more": false,
+  "total_count": 3,
+  "loaded_so_far": 3
+}

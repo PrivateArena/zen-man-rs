@@ -1,0 +1,16 @@
+{
+  "capped": false,
+  "entries": [
+    {
+      "name": "executable.sh",
+      "is_dir": false,
+      "size": 18,
+      "mod_time": 1767225600,
+      "mode": "",
+      "rel_path": "${FIXTURE_ROOT}/tree/executable.sh"
+    }
+  ],
+  "index_dirty": false,
+  "last_indexed_unix": 1794991943,
+  "total_matched": 1
+}

@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "roots": [
+    "${FIXTURE_ROOT}/tree"
+  ],
+  "excludes": [
+    "/proc",
+    "/sys",
+    "/dev",
+    "**/.git",
+    "**/node_modules",
+    "**/__pycache__",
+    "**/flatcap"
+  ],
+  "auto_index": false,
+  "index_on_startup": false,
+  "max_depth": 0,
+  "follow_symlinks": false,
+  "worker_count": 2,
+  "index_state": {
+    "last_indexed_unix": 1794991430,
+    "total_files": 1260,
+    "is_dirty": false
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "archive": "${FIXTURE_ROOT}/archives/nested.zip",
+  "entries": [
+    {
+      "name": "inner-file.txt",
+      "is_dir": false,
+      "size": 17,
+      "mod_time": 1767225600,
+      "mode": "-r--r--r--",
+      "rel_path": "inner-file.txt"
+    }
+  ],
+  "nested": "inner.zip",
+  "path": ""
+}

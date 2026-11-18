@@ -1,0 +1,630 @@
+{
+  "items": [
+    {
+      "isDir": false,
+      "name": "b10.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b10.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b100.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b100.txt",
+      "size": 5
+    },
+    {
+      "isDir": false,
+      "name": "b101.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b101.txt",
+      "size": 5
+    },
+    {
+      "isDir": false,
+      "name": "b102.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b102.txt",
+      "size": 5
+    },
+    {
+      "isDir": false,
+      "name": "b103.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b103.txt",
+      "size": 5
+    },
+    {
+      "isDir": false,
+      "name": "b104.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b104.txt",
+      "size": 5
+    },
+    {
+      "isDir": false,
+      "name": "b105.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b105.txt",
+      "size": 5
+    },
+    {
+      "isDir": false,
+      "name": "b11.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b11.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b12.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b12.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b13.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b13.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b14.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b14.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b15.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b15.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b16.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b16.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b17.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b17.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b18.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b18.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b19.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b19.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b2.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b2.txt",
+      "size": 3
+    },
+    {
+      "isDir": false,
+      "name": "b20.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b20.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b21.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b21.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b22.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b22.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b23.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b23.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b24.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b24.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b25.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b25.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b26.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b26.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b27.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b27.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b28.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b28.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b29.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b29.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b3.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b3.txt",
+      "size": 3
+    },
+    {
+      "isDir": false,
+      "name": "b30.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b30.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b31.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b31.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b32.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b32.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b33.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b33.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b34.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b34.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b35.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b35.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b36.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b36.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b37.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b37.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b38.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b38.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b39.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b39.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b4.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b4.txt",
+      "size": 3
+    },
+    {
+      "isDir": false,
+      "name": "b40.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b40.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b41.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b41.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b42.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b42.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b43.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b43.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b44.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b44.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b45.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b45.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b46.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b46.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b47.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b47.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b48.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b48.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b49.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b49.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b5.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b5.txt",
+      "size": 3
+    },
+    {
+      "isDir": false,
+      "name": "b50.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b50.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b51.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b51.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b52.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b52.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b53.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b53.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b54.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b54.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b55.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b55.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b56.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b56.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b57.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b57.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b58.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b58.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b59.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b59.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b6.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b6.txt",
+      "size": 3
+    },
+    {
+      "isDir": false,
+      "name": "b60.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b60.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b61.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b61.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b62.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b62.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b63.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b63.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b64.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b64.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b65.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b65.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b66.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b66.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b67.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b67.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b68.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b68.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b69.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b69.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b7.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b7.txt",
+      "size": 3
+    },
+    {
+      "isDir": false,
+      "name": "b70.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b70.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b71.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b71.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b72.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b72.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b73.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b73.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b74.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b74.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b75.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b75.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b76.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b76.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b77.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b77.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b78.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b78.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b79.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b79.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b8.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b8.txt",
+      "size": 3
+    },
+    {
+      "isDir": false,
+      "name": "b80.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b80.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b81.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b81.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b82.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b82.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b83.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b83.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b84.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b84.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b85.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b85.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b86.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b86.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b87.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b87.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b88.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b88.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b89.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b89.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b9.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b9.txt",
+      "size": 3
+    },
+    {
+      "isDir": false,
+      "name": "b90.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b90.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b91.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b91.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b92.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b92.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b93.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b93.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b94.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b94.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b95.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b95.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b96.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b96.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b97.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b97.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b98.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b98.txt",
+      "size": 4
+    },
+    {
+      "isDir": false,
+      "name": "b99.txt",
+      "path": "${FIXTURE_ROOT}/ops/bulk/b99.txt",
+      "size": 4
+    }
+  ],
+  "op": "copy",
+  "status": "success"
+}

@@ -1,0 +1,31 @@
+{
+  "archive": "${FIXTURE_ROOT}/archives/zipslip.zip",
+  "entries": [
+    {
+      "name": "..",
+      "is_dir": true,
+      "size": 0,
+      "mod_time": 1767225600,
+      "mode": "-r--r--r--",
+      "rel_path": ".."
+    },
+    {
+      "name": "tmp",
+      "is_dir": true,
+      "size": 0,
+      "mod_time": 1767225600,
+      "mode": "-r--r--r--",
+      "rel_path": "tmp"
+    },
+    {
+      "name": "safe.txt",
+      "is_dir": false,
+      "size": 5,
+      "mod_time": 1767225600,
+      "mode": "-r--r--r--",
+      "rel_path": "safe.txt"
+    }
+  ],
+  "nested": "",
+  "path": ""
+}
