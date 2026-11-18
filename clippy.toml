@@ -1,0 +1,19 @@
+# Plan §5.1 root file, mirroring `/tmp/artcraft-src/clippy.toml` and `/tmp/craft-libs/clippy.toml`.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true
+cognitive-complexity-threshold = 30
+
+disallowed-types = [
+    { path = "egui::ComboBox", reason = "use craft_ui::ComboBox: egui's combo box menu can't grow back while open (egui#5225)" },
+]
+
+# Plan §5.1: the two calls whose absence is a fidelity/safety property of the port. `remove_dir_all`
+# is banned because deletion goes through `trash` with an explicit, logged escalation (§6.1 delete
+# row, §6.2 D6); `Command::output` is banned so every spawn goes through the one argv-vector,
+# output-capped, cancellable executor (F10).
+disallowed-methods = [
+    { path = "std::fs::remove_dir_all", reason = "deletion must go through zenman_core::ops::delete (trash-first, cancellable, logged): plan §5.1/§6.1" },
+    { path = "std::process::Command::output", reason = "custom actions execute through zenman_core::services::actions::exec (argv vector, output cap, cancellation): plan F10" },
+]

@@ -1,0 +1,17 @@
+[package]
+name = "zenman-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "zen-man headless engine: files, archives, index, undo log, jobs (plan §5.2-§5.6)"
+
+# `unsafe_code = "forbid"` is inherited from `[workspace.lints.rust]` (plan §5.1); the crate also
+# states it in source with `#![forbid(unsafe_code)]` (plan §5.1 lib.rs row).
+[lints]
+workspace = true
+
+[dependencies]
+# Step 1: intentionally empty. `cargo xtask deps` proves this crate stays free of
+# egui/eframe/craft-ui, and plan §5.2-§5.6 add thiserror/serde/rusqlite/… in the steps that need them.

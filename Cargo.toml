@@ -1,0 +1,107 @@
+# zen-man-rs workspace — step 1 of ARCHITECTURE_PLAN_zen-man-rs-egui-port.md (§5.1, §7 step 1).
+#
+# Provenance of the `[patch.crates-io]` block below: it is the egui-family + winit table of
+# `storytold/photocraft` v0.23.1 (`Cargo.toml:197-217` of that checkout), copied entry for entry
+# including the full 40-character revs, and cross-checked against the scratch workspace that is
+# proven to `cargo check` with this exact linkage. The photocraft table's four `hayro*` entries are
+# deliberately NOT copied: they patch the craft-pdf vendored trees, which this workspace does not
+# depend on (an unused patch entry is a warning and a lie about the dependency graph).
+#
+# The `craft-libs` revision is the one photocraft v0.23.1 ships (plan §2.1); do not "refresh" it
+# without re-reading plan §2.2 (open question OQ4).
+
+[workspace]
+resolver = "3"
+members = ["apps/zenman", "crates/zenman-core", "crates/zenman-ui", "xtask"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.95"
+repository = "https://github.com/storytold/zen-man-rs"
+
+[workspace.dependencies]
+# --- framework (rev-pinned; the revs live here and nowhere else, plan §5.1) --------------------
+craft-ui = { git = "https://github.com/storytold/craft-libs", rev = "6e03f65bf45181db77ba6229716e6624db9eb25b", features = ["serde"] }
+craft-atomic = { git = "https://github.com/storytold/craft-libs", rev = "6e03f65bf45181db77ba6229716e6624db9eb25b" }
+craft-settings = { git = "https://github.com/storytold/craft-libs", rev = "6e03f65bf45181db77ba6229716e6624db9eb25b" }
+# --- egui family 0.37, patched to the fork below ------------------------------------------------
+# `default_fonts` is added over plan §5.1's feature set: photocraft ships its own deflated fonts in
+# `crates/ui-egui` and so omits it, and this step-1 scaffold ships none (plan R9 defers font
+# bundling to step 7), so egui's built-in fonts are what the stub window can draw with.
+egui = { version = "0.37", default-features = false, features = ["default_fonts"] }
+eframe = { version = "0.37", default-features = false, features = ["wgpu", "accesskit", "wayland", "x11", "clipboard", "persistence"] }
+egui_extras = { version = "0.37", default-features = false, features = ["svg"] }
+# --- external -----------------------------------------------------------------------------------
+clap = { version = "4", features = ["derive", "env"] }
+directories = "6"
+log = "0.4"
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+# --- internal (domain-named crates only; plan §5 layout bans `misc`/`core`/`utils`/`common`) -----
+zenman-core = { path = "crates/zenman-core" }
+zenman-ui = { path = "crates/zenman-ui" }
+
+# Structure copied from `storytold/photocraft` v0.23.1 `Cargo.toml:190-203`.
+# `unsafe_code` is `forbid` for the whole workspace (plan §5.1); the two crates that photocraft's
+# precedent lets relax it (`apps/zenman`, `zenman-ui`) declare their own `[lints]` table instead of
+# inheriting, so the exception is visible in their manifests (see `crates/tablet/Cargo.toml:10-16`
+# upstream for the same mechanism).
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+cognitive_complexity = "deny"
+too_many_arguments = "deny"
+wildcard_imports = "deny"
+dbg_macro = "warn"
+todo = "warn"
+
+# --- profiles, adapted from photocraft v0.23.1 `[profile.*]` --------------------------------------
+# Dependencies carry no debug info: their frames in a backtrace lose file:line, and the target dir
+# and link times shrink. The test profile inherits both settings.
+[profile.dev.package."*"]
+opt-level = 2
+debug = false
+
+[profile.dev]
+opt-level = 1
+# Line tables keep file:line in panic backtraces but drop variable info, which roughly halves link
+# time for the test binaries.
+debug = "line-tables-only"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+# `panic = "unwind"` per AGENTS.md's Never-crash rule: `crash_guard::guard` turns a stray panic
+# into a reported error instead of aborting the process (plan §5.9 crash_guard row).
+
+# The `wasm-release` family of photocraft is not copied: this port is native-only (decision D5).
+
+[patch.crates-io]
+ecolor = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
+emath = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
+epaint = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
+epaint_default_fonts = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
+egui = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
+egui-winit = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
+egui-wgpu = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
+egui_extras = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
+egui_glow = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
+egui_kittest = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
+egui_inspection = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
+egui_demo_lib = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
+egui_system_font_provider = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
+eframe = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
+winit = { git = "https://github.com/storytold/winit.git", rev = "a517b3846ee8457d84ee4975110bfda6797c44dc" }
+
+# Cargo's own lint table (separate from the `rust`/`clippy`/`rustdoc` tables). These two fire on a
+# step-1 scaffold by design: `[workspace.dependencies]` is plan §5.1's dependency table written up
+# front, so entries whose first consumer is a later step (`craft-atomic`/`craft-settings` in steps 4/5,
+# `serde` in step 3) are declared before they are imported. The rev/licence gates (`xtask deps`,
+# `xtask licenses`) still see them, which is the point of declaring them now.
+[workspace.lints.cargo]
+unused_dependencies = "allow"
+unused_workspace_dependencies = "allow"

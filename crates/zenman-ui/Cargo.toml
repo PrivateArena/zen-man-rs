@@ -1,0 +1,30 @@
+[package]
+name = "zenman-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "zen-man egui shell built on craft-ui primitives: dock, panes, tabs, dialogs (plan §5.7-§5.8)"
+
+# Plan §5.1 keeps the workspace's `unsafe_code = "forbid"`; this crate declares its own lint table
+# with `deny` (the photocraft precedent for a non-`forbid` crate is `crates/tablet/Cargo.toml:10-16`,
+# which replaces the inherited table rather than doubling it), and states `#![deny(unsafe_code)]` in
+# source. No `unsafe` is planned here; the downgrade exists only so a future platform shim can be a
+# reviewed, crate-local exception instead of a workspace-wide one.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+cognitive_complexity = "deny"
+too_many_arguments = "deny"
+wildcard_imports = "deny"
+dbg_macro = "warn"
+todo = "warn"
+
+[dependencies]
+# The framework this crate is written against. Nothing in plan §5.1's step-1 row needs them yet, but
+# they are declared now so `cargo tree -i egui` and `cargo xtask licenses` see the real graph from the
+# first commit, and so the crate boundary (UI = egui, core = headless) is fixed by a manifest.
+craft-ui = { workspace = true }
+egui = { workspace = true }

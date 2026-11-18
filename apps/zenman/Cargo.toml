@@ -1,0 +1,39 @@
+[package]
+name = "zenman"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "zen-man: a native egui file manager (plan §5.9); step 1 is a GPU-safe scaffold"
+
+# Plan §5.1/§5.9 and rule R4 of the step-1 brief: the binary may declare `deny` where the workspace
+# says `forbid`, so a future platform shim is a crate-local, reviewable exception. Mechanism copied
+# from photocraft's exception crate (`crates/tablet/Cargo.toml:10-16`), which replaces the inherited
+# `[lints]` table instead of adding to it.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+cognitive_complexity = "deny"
+too_many_arguments = "deny"
+wildcard_imports = "deny"
+dbg_macro = "warn"
+todo = "warn"
+
+[dependencies]
+zenman-core = { workspace = true }
+zenman-ui = { workspace = true }
+craft-ui = { workspace = true }
+eframe = { workspace = true }
+egui = { workspace = true }
+# `install_image_loaders` (plan §5.9 main.rs row) is step 7's job, when the SVG registry lands; the
+# dependency is declared now because it is part of the forked-egui graph `xtask deps` audits.
+egui_extras = { workspace = true }
+clap = { workspace = true }
+directories = { workspace = true }
+log = { workspace = true }
+
+[dev-dependencies]
+# `apps/zenman/tests/gpu_fallback.rs` drives the compiled binary through the smoke path.
+# (No harness dependency: the test only needs `std::process::Command`.)
