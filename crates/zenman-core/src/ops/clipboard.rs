@@ -413,13 +413,19 @@ pub fn publish_system(env: &dyn Env, clip: Option<&Clipboard>) -> Result<(), Cor
     let body = uri_list(&paths);
     let req = match detect_tool(env) {
         SystemClipTool::Wayland => {
-            ExecRequest::argv(WL_COPY, ["-t", URI_LIST_MIME]).with_stdin(body)
+            ExecRequest::argv(WL_COPY, ["-t", URI_LIST_MIME])
+                .with_stdin(body)
+                // `wl-copy` hands the payload to the compositor and leaves a helper behind; waiting for its
+                // pipes is waiting for a process that is not the one we started (step 9b, plan F1).
+                .detached()
         }
         SystemClipTool::Xclip => ExecRequest::argv(
             XCLIP,
             ["-i", "-selection", "clipboard", "-t", URI_LIST_MIME],
         )
-        .with_stdin(body),
+        .with_stdin(body)
+        // As above: `xclip -i` forks the selection owner, which inherits the output pipes.
+        .detached(),
         SystemClipTool::None => return Ok(()),
     };
     // Output discarded on purpose — see the doc above. Both layers of the `Result` count: the outer is

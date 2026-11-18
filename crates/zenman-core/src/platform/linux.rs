@@ -312,8 +312,16 @@ pub fn exec_program(req: &ExecRequest) -> Result<ExecOutput, CoreError> {
         } else {
             Stdio::null()
         })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(if req.detached {
+            Stdio::null()
+        } else {
+            Stdio::piped()
+        })
+        .stderr(if req.detached {
+            Stdio::null()
+        } else {
+            Stdio::piped()
+        })
         .spawn()
         .map_err(|e| CoreError::Shell {
             cmd: req.program.clone(),
@@ -321,7 +329,7 @@ pub fn exec_program(req: &ExecRequest) -> Result<ExecOutput, CoreError> {
             stderr: e.to_string(),
         })?;
 
-    let output = write_stdin_and_wait(child, req.stdin.as_deref(), &req.program)?;
+    let output = write_stdin_and_wait(child, req.stdin.as_deref(), &req.program, req.detached)?;
 
     let (stdout, out_cut) = cap_text(String::from_utf8_lossy(&output.stdout).into_owned(), cap);
     let (stderr, err_cut) = cap_text(String::from_utf8_lossy(&output.stderr).into_owned(), cap);
@@ -347,11 +355,29 @@ fn write_stdin_and_wait(
     mut child: std::process::Child,
     stdin: Option<&str>,
     program: &str,
+    detached: bool,
 ) -> Result<std::process::Output, CoreError> {
     if let (Some(data), Some(mut pipe)) = (stdin, child.stdin.take()) {
         let _ = pipe.write_all(data.as_bytes()).and_then(|()| pipe.flush());
         // `drop` is the EOF the child is waiting for; it happens at the end of this block either way.
         drop(pipe);
+    }
+    if detached {
+        // Reap *the process we started* and nothing else. `wait_with_output` would additionally read both
+        // pipes to EOF, and a daemonising child (`xclip -i`) keeps them open in the background process it
+        // forked — so the caller would wait for a program that has already finished its work (measured in
+        // step 9b, where the cut paste's clipboard clear hung a job thread forever). The empty vectors are
+        // the honest payload: there was nothing to capture.
+        let status = child.wait().map_err(|e| CoreError::Shell {
+            cmd: program.to_string(),
+            code: None,
+            stderr: e.to_string(),
+        })?;
+        return Ok(std::process::Output {
+            status,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        });
     }
     child.wait_with_output().map_err(|e| CoreError::Shell {
         cmd: program.to_string(),
@@ -1095,6 +1121,7 @@ mod tests {
             env: Vec::new(),
             output_cap: 100,
             stdin: None,
+            detached: false,
         })
         .expect("a shell is available on every unix host in this suite");
         assert!(out.succeeded(), "stderr: {}", out.stderr);

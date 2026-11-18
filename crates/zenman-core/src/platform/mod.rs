@@ -271,6 +271,15 @@ pub struct ExecRequest {
     /// *different* answer: an immediately-closed empty stdin, which is how the clipboard clear publishes
     /// an empty `text/uri-list` (`api/ops.go:575` wrote an empty reader, not `/dev/null`).
     pub stdin: Option<String>,
+    /// Do not capture the child's output: its stdout/stderr are `/dev/null`, and the answer is its exit
+    /// status alone.
+    ///
+    /// Not an optimisation — the only way to spawn a **daemonising** program without blocking. Measured in
+    /// step 9b: `xclip -i -selection clipboard` forks a background process that owns the selection and
+    /// *inherits the output pipes*, so `wait_with_output` never sees EOF and the caller — a job thread
+    /// clearing the clipboard after a cut, in the capture above — waited forever. A detached spawn reaps
+    /// the process the caller actually started and hands the daemon `/dev/null`.
+    pub detached: bool,
 }
 
 impl ExecRequest {
@@ -288,6 +297,7 @@ impl ExecRequest {
             env: Vec::new(),
             output_cap: Self::DEFAULT_OUTPUT_CAP,
             stdin: None,
+            detached: false,
         }
     }
 
@@ -306,6 +316,7 @@ impl ExecRequest {
             env: Vec::new(),
             output_cap: Self::DEFAULT_OUTPUT_CAP,
             stdin: None,
+            detached: false,
         }
     }
 
@@ -313,6 +324,15 @@ impl ExecRequest {
     #[must_use]
     pub fn with_stdin(mut self, text: impl Into<String>) -> Self {
         self.stdin = Some(text.into());
+        self
+    }
+
+    /// Run without capturing output: [`Env::exec_program`](Env::exec_program) then answers only the exit
+    /// status. Required for a child that outlives its own parent — see [`ExecRequest::detached`] (the
+    /// clipboard publisher, which is what step 9b's cut paste clears).
+    #[must_use]
+    pub fn detached(mut self) -> Self {
+        self.detached = true;
         self
     }
 }

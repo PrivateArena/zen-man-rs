@@ -23,6 +23,7 @@ use crate::error::CoreError;
 use crate::history::store::LogId;
 use crate::jobs::{JobId, JobKind, JobOutcome, JobProgress};
 use crate::ops::clipboard::Clipboard;
+use crate::ops::paste::PasteReport;
 use crate::path::AbsPath;
 use crate::services::dirs::DirSizeStat;
 use crate::session::Origin;
@@ -185,6 +186,8 @@ pub enum ChangeCause {
 pub enum JobPayload {
     /// A directory page (`JobKind::List`).
     DirPage(Arc<DirPage>),
+    /// A completed paste (`JobKind::Paste`).
+    Paste(PasteReport),
     /// A completed size walk (`JobKind::DirSize`).
     DirSize(DirSizeStat),
     /// Live search hits (`JobKind::SearchLive`).
@@ -214,6 +217,21 @@ impl JobPayload {
             Self::DirSize(s) => Some(s),
             _ => None,
         }
+    }
+
+    /// The `PasteReport` payload, when that is what this is.
+    #[must_use]
+    pub fn paste(&self) -> Option<&PasteReport> {
+        match self {
+            Self::Paste(r) => Some(r),
+            _ => None,
+        }
+    }
+}
+
+impl From<PasteReport> for JobPayload {
+    fn from(value: PasteReport) -> Self {
+        Self::Paste(value)
     }
 }
 

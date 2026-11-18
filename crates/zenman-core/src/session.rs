@@ -39,6 +39,9 @@ use crate::index::intent::{IndexIntent, IndexOp};
 use crate::jobs::{CancelToken, JobId, JobInfo, JobKind, JobRegistry, JobResult, JobSpec};
 use crate::limits::Limits;
 use crate::ops::clipboard::{self, Clipboard, ClipboardStore};
+use crate::ops::r#move::{MoveFs, OsMoveFs};
+use crate::ops::paste::{self, PasteMode, PasteReport, PasteReq};
+use crate::ops::{ConflictPolicy, guard};
 use crate::path::{AbsPath, FsPath};
 use crate::platform::Env;
 use crate::platform::env_probe::ProbeReport;
@@ -737,6 +740,142 @@ impl Session {
         self.inner.dirs.cached_sizes(dirs)
     }
 
+    // ------------------------------------------------------------------------------------- the write path
+
+    /// Paste `req` into `req.dest` (plan §4.1's `paste`, §5.3's `ops/paste.rs`, Go's `handlePaste`/
+    /// `handlePasteLink`).
+    ///
+    /// Everything that can be answered without touching a byte runs **synchronously**, so the caller learns
+    /// about a refused selection on its own call rather than through a job event five frames later: the
+    /// VFS write guard, the writability probe, and the containment guard ([`guard::guard_sources`] +
+    /// [`guard::ensure_guarded`], which is what turns `cp dir dir/sub` into
+    /// [`CoreError::DestInsideSource`] instead of Go's silent no-op). What follows is a
+    /// [`JobKind::Paste`] job — the copy itself can be terabytes, and plan F1 is exactly this call blocking
+    /// a window.
+    ///
+    /// The job appends the Go-parity undo-log record (`ActionPasteCopy`/`ActionPasteMove`/`ActionPasteLink`,
+    /// `(placed sources, dest, "")`) **after** the walk, invalidates the destination and every affected
+    /// source directory (⇒ [`EngineEvent::DirChanged`](crate::events::EngineEvent::DirChanged) with this
+    /// `origin`), clears the session clipboard when a cut finished cleanly, and reports the per-source
+    /// outcomes as [`JobPayload::Paste`](crate::events::JobPayload::Paste).
+    ///
+    /// # Errors
+    /// [`CoreError::Empty`] for an empty selection, [`CoreError::VfsReadOnly`] for an archive source or
+    /// destination, [`CoreError::DestInsideSource`] when *every* source is refused, and the destination's
+    /// own [`CoreError::PermissionDenied`]/[`CoreError::NotFound`]. A partial paste is **not** an error: it
+    /// is a report.
+    pub fn paste(&self, req: &PasteReq, origin: Origin) -> Result<Receipt<PasteReport>, CoreError> {
+        // 1. the archive read-only rule, on sources and destination alike (`api/ops.go:73,227`).
+        let src_paths: Vec<FsPath> = req
+            .sources
+            .iter()
+            .map(|p| FsPath::from_abs(p.clone()))
+            .collect();
+        let mut refs: Vec<&FsPath> = src_paths.iter().collect();
+        let dest_path = FsPath::from_abs(req.dest.clone());
+        refs.push(&dest_path);
+        guard::vfs_write_guard(&refs)?;
+        guard::dest_guard(&dest_path)?;
+        // 2. "the OS agrees we may write here", before a worker has been born (`api/ops.go:227-229`).
+        guard::ensure_writable(self.inner.env.as_ref(), &req.dest)?;
+        // 3. containment, once, so the executor and the report cannot disagree about the target names.
+        let guarded = guard::guard_sources(&req.sources, &req.dest)?;
+        guard::ensure_guarded(&guarded, &req.dest)?;
+
+        let label = format!(
+            "{} {} item(s)",
+            match req.mode {
+                PasteMode::Copy => "Paste",
+                PasteMode::Cut => "Move",
+                PasteMode::Link => "Link",
+            },
+            guarded.allowed.len()
+        );
+        let spec = JobSpec::new(self.inner.jobs.next_id(), JobKind::Paste, label, origin);
+        let id = spec.id;
+        let env = Arc::clone(&self.inner.env);
+        let fs: Arc<dyn MoveFs> = Arc::new(OsMoveFs);
+        let sess = self.clone();
+        let req = req.clone();
+        self.inner.jobs.attach(spec, move |cancel, progress| {
+            let mut report =
+                paste::paste(env.as_ref(), fs.as_ref(), &req, &guarded, cancel, progress)?;
+            if let Some(entry) = report.log_entry() {
+                match sess.append_log(&entry) {
+                    Ok(id) => report.log_id = Some(id),
+                    // A log failure does not undo the paste; it does have to be said out loud, because a
+                    // paste the history pane does not know about cannot be reverted (plan F4's sibling).
+                    Err(e) => sess.push(EngineEvent::Notice {
+                        level: crate::events::NoticeLevel::Warn,
+                        message: format!("paste log: {}", e.user_message()),
+                    }),
+                }
+            }
+            // Every directory the walk changed: the destination, and the parent of each source that moved
+            // away (plan F13 — an in-process cache that is not invalidated here shows a file in two places).
+            sess.invalidate_from(
+                &FsPath::from_abs(report.dest.clone()),
+                ChangeCause::LocalJob,
+                origin,
+            );
+            let mut parents: Vec<AbsPath> = Vec::new();
+            if req.mode != PasteMode::Copy {
+                for (source, _) in report.placed() {
+                    if let Some(parent) = source.parent()
+                        && !parents.contains(&parent)
+                    {
+                        parents.push(parent);
+                    }
+                }
+            }
+            for parent in parents {
+                sess.invalidate_from(&FsPath::from_abs(parent), ChangeCause::LocalJob, origin);
+            }
+            // Go clears the clipboard only after a cut that met no error (`api/ops.go:339-344`): a partial
+            // cut keeps the selection so the remainder can be retried.
+            if req.mode == PasteMode::Cut && report.placed_any() && report.failed().is_empty() {
+                sess.clipboard_clear();
+            }
+            Ok(JobResult::done(report.clone(), report.summary()))
+        });
+        Ok(Receipt::Running { job: id, origin })
+    }
+
+    /// Paste what the session clipboard holds into `dest` — the call behind Ctrl+V (§5.3's
+    /// `clipboard` → paste path, Go's `handlePaste` reading `currentClipboard`, `api/ops.go:246-254`).
+    ///
+    /// A `cut` clipboard pastes as [`PasteMode::Cut`], which moves the sources and clears the clipboard on
+    /// success; a `copy` clipboard leaves them in place. Go's fallback to the *system* clipboard
+    /// (`api/ops.go:233-248`) is [`crate::ops::clipboard::read_system`], a synchronous process spawn: it is
+    /// step 10's job to decide when a paste asks the OS instead of the session, and calling it from here
+    /// would make Ctrl+V spawn `wl-paste` on every keypress.
+    ///
+    /// # Errors
+    /// [`CoreError::Empty`] when nothing is queued, then as [`Self::paste`].
+    pub fn paste_clipboard(
+        &self,
+        dest: AbsPath,
+        policy: ConflictPolicy,
+        origin: Origin,
+    ) -> Result<Receipt<PasteReport>, CoreError> {
+        let clip = self
+            .clipboard()
+            .ok_or(CoreError::Empty { what: "clipboard" })?;
+        if clip.is_empty() {
+            return Err(CoreError::Empty { what: "clipboard" });
+        }
+        let req = PasteReq {
+            sources: clip.paths(),
+            dest,
+            mode: match clip.op {
+                crate::ops::clipboard::ClipOp::Copy => PasteMode::Copy,
+                crate::ops::clipboard::ClipOp::Cut => PasteMode::Cut,
+            },
+            policy,
+        };
+        self.paste(&req, origin)
+    }
+
     // ------------------------------------------------------------------------------------ the clipboard
 
     /// The queued selection, `None` when there is none (plan §5.3's `ops/clipboard.rs`).
@@ -799,7 +938,7 @@ impl Session {
 
     /// The Go-parity undo-log append, shared by every mutating op: write the frame, then announce its id
     /// so the history pane refreshes (plan §4.1's `LogAppended`).
-    fn append_log(&self, entry: &ActionEntry) -> Result<LogId, CoreError> {
+    pub(crate) fn append_log(&self, entry: &ActionEntry) -> Result<LogId, CoreError> {
         let mut store = lock(&self.inner.log);
         let id = store.append_entry(entry)?.0;
         self.push(EngineEvent::LogAppended { id });
@@ -926,6 +1065,24 @@ impl Session {
             })
             .collect();
         out.extend(pages);
+        // A paste that did not do everything it was asked is the one job result the core insists the UI
+        // show: Go returned the skipped list in the response body and the browser dropped it on the floor
+        // (ledger #9, plan F12). It arrives as a notice so the toast exists even when nobody kept the
+        // `Receipt`.
+        let warnings: Vec<EngineEvent> = out
+            .iter()
+            .filter_map(|ev| match ev {
+                EngineEvent::JobFinished {
+                    payload: crate::events::JobPayload::Paste(report),
+                    ..
+                } if report.incomplete() => Some(EngineEvent::Notice {
+                    level: crate::events::NoticeLevel::Warn,
+                    message: format!("Paste into {}: {}", report.dest, report.summary()),
+                }),
+                _ => None,
+            })
+            .collect();
+        out.extend(warnings);
         out.extend(self.inner.dirs.take_invalidations());
         let mut guard = self
             .inner
