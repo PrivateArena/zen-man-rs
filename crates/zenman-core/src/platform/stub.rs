@@ -123,6 +123,16 @@ impl Env for Unsupported {
         let _ = req;
         ready(Err(self.unsupported()))
     }
+
+    fn has_program(&self, _name: &str) -> Result<bool, CoreError> {
+        // The trait's default body already refuses; this override only makes the refusal *this* stub's,
+        // which is what `every_trait_method_is_answered_with_a_typed_error` checks the label of.
+        Err(self.unsupported())
+    }
+
+    fn is_writable(&self, _path: &AbsPath) -> Result<bool, CoreError> {
+        Err(self.unsupported())
+    }
 }
 
 /// The one place the "is this path mounted/removable" question is answered without a mount table: an empty
@@ -185,6 +195,8 @@ mod tests {
             ("disk_space", env.disk_space(path).map(|_| ())),
             ("mount_entries", env.mount_entries().map(|_| ())),
             ("exec_program", poll_once(env.exec_program(req)).map(|_| ())),
+            ("has_program", env.has_program("sh").map(|_| ())),
+            ("is_writable", env.is_writable(path).map(|_| ())),
         ];
 
         let mut table: Vec<(&'static str, String)> = rows
@@ -210,7 +222,7 @@ mod tests {
         let path = AbsPath::from_path(std::env::temp_dir()).expect("the temp dir is absolute");
         let rows = outcomes(&env, &path);
 
-        // The trait has exactly these twelve methods; a thirteenth would have to be added here to compile.
+        // The trait has exactly these fourteen methods; a fifteenth would have to be added here to compile.
         let names: Vec<&str> = rows.iter().map(|(name, _)| *name).collect();
         assert_eq!(
             names,
@@ -225,6 +237,8 @@ mod tests {
                 "disk_space",
                 "mount_entries",
                 "exec_program",
+                "has_program",
+                "is_writable",
                 "can_trash"
             ]
         );

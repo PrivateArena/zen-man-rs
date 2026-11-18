@@ -21,6 +21,7 @@
 //! populated filesystem look empty).
 
 use std::io;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, RwLock};
@@ -182,6 +183,14 @@ impl Env for Linux {
     fn exec_program(&self, req: ExecRequest) -> PlatformFuture<'_, Result<ExecOutput, CoreError>> {
         ready(self::exec_program(&req))
     }
+
+    fn has_program(&self, name: &str) -> Result<bool, CoreError> {
+        self::has_program(name)
+    }
+
+    fn is_writable(&self, path: &AbsPath) -> Result<bool, CoreError> {
+        self::is_writable(path)
+    }
 }
 
 // --------------------------------------------------------------------------- the actions
@@ -296,7 +305,13 @@ pub fn exec_program(req: &ExecRequest) -> Result<ExecOutput, CoreError> {
     };
 
     let child = cmd
-        .stdin(Stdio::null())
+        // `stdin` when the caller has bytes to feed (the clipboard publisher), `/dev/null` otherwise —
+        // the pre-step-9 behaviour, and the reason a custom action can never inherit the UI's terminal.
+        .stdin(if req.stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -306,11 +321,7 @@ pub fn exec_program(req: &ExecRequest) -> Result<ExecOutput, CoreError> {
             stderr: e.to_string(),
         })?;
 
-    let output = child.wait_with_output().map_err(|e| CoreError::Shell {
-        cmd: req.program.clone(),
-        code: None,
-        stderr: e.to_string(),
-    })?;
+    let output = write_stdin_and_wait(child, req.stdin.as_deref(), &req.program)?;
 
     let (stdout, out_cut) = cap_text(String::from_utf8_lossy(&output.stdout).into_owned(), cap);
     let (stderr, err_cut) = cap_text(String::from_utf8_lossy(&output.stderr).into_owned(), cap);
@@ -322,6 +333,84 @@ pub fn exec_program(req: &ExecRequest) -> Result<ExecOutput, CoreError> {
         stderr,
         truncated: out_cut || err_cut,
     })
+}
+
+/// Feed [`ExecRequest::stdin`] and collect the child. The pipe is written **and dropped before** the wait,
+/// so a program that reads its stdin to EOF (`wl-copy`, `xclip -i`) sees the end of input instead of
+/// blocking forever on a pipe whose writer we are still holding.
+///
+/// A child that fills its *output* pipes while we are still writing this one could deadlock; the payloads
+/// here are a URI list, and the alternative — a writer thread per spawn — is not worth a core that is
+/// otherwise thread-free (plan §9.1). A failed write is not reported: the child hung up first, and its exit
+/// status is the honest answer (Go ignored the copy error the same way, `_ = cmd.Run()`).
+fn write_stdin_and_wait(
+    mut child: std::process::Child,
+    stdin: Option<&str>,
+    program: &str,
+) -> Result<std::process::Output, CoreError> {
+    if let (Some(data), Some(mut pipe)) = (stdin, child.stdin.take()) {
+        let _ = pipe.write_all(data.as_bytes()).and_then(|()| pipe.flush());
+        // `drop` is the EOF the child is waiting for; it happens at the end of this block either way.
+        drop(pipe);
+    }
+    child.wait_with_output().map_err(|e| CoreError::Shell {
+        cmd: program.to_string(),
+        code: None,
+        stderr: e.to_string(),
+    })
+}
+
+/// `exec.LookPath` (`api/ops.go:563,569,578,592`): a PATH scan, never a spawn. A name with a separator in
+/// it is a *path*, checked as given — the Go rule, and the reason `/bin/sh` is found with an empty `PATH`.
+pub fn has_program(name: &str) -> Result<bool, CoreError> {
+    if name.is_empty() || name.contains('\0') {
+        return Ok(false);
+    }
+    let direct = name.contains('/');
+    if direct {
+        return Ok(is_executable(Path::new(name)));
+    }
+    let Some(path) = std::env::var_os("PATH") else {
+        return Ok(false);
+    };
+    Ok(std::env::split_paths(&path)
+        .any(|dir| !dir.as_os_str().is_empty() && is_executable(&dir.join(name))))
+}
+
+/// `S_IXUSR|S_IXGRP|S_IXOTH` — what `execve`/`access(X_OK)`-style lookups accept; Go's `LookPath` uses the
+/// same "any execute bit" test for a non-root caller, and the difference for root does not matter to a
+/// capability probe whose only caller is the clipboard.
+#[cfg(unix)]
+fn is_executable(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    meta.is_file() && (std::os::unix::fs::PermissionsExt::mode(&meta.permissions()) & 0o111) != 0
+}
+
+#[cfg(not(unix))]
+fn is_executable(path: &Path) -> bool {
+    Path::new(path).is_file()
+}
+
+/// `access(2)` with `W_OK` — "could this process write here now", which the mode bits alone cannot answer
+/// (ACLs, read-only mounts, root). `rustix` is already a direct dependency for `statvfs` (plan §5.2).
+///
+/// Any refusal — `EACCES`, `EPERM`, `EROFS`, and also `ENOENT` (there is nothing here to write *to*) — is
+/// `false`: the question is a capability, not an error report.
+pub fn is_writable(path: &AbsPath) -> Result<bool, CoreError> {
+    #[cfg(unix)]
+    {
+        use rustix::fs::{Access, AtFlags, CWD, accessat};
+        Ok(accessat(CWD, path.as_path(), Access::WRITE_OK, AtFlags::empty()).is_ok())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Err(CoreError::Unsupported {
+            what: "write-permission probe (`access(2)` has no Windows equivalent here; step 16)",
+        })
+    }
 }
 
 /// Plan F10: `sh -c` is the Unix custom-action form only.
@@ -1005,6 +1094,7 @@ mod tests {
             cwd: None,
             env: Vec::new(),
             output_cap: 100,
+            stdin: None,
         })
         .expect("a shell is available on every unix host in this suite");
         assert!(out.succeeded(), "stderr: {}", out.stderr);
@@ -1028,6 +1118,74 @@ mod tests {
         let missing = exec_program(&ExecRequest::argv("/nonexistent-program-42", ["--version"]))
             .expect_err("a missing program is an error");
         assert_eq!(missing.kind(), "shell_error");
+    }
+
+    #[test]
+    fn exec_program_feeds_stdin_and_closes_it() {
+        // `wl-copy`'s shape: the child reads to EOF, so the pipe must be dropped before the wait or this
+        // deadlocks (`cat` with a held pipe would hang the suite, which is the real assertion here).
+        let out = exec_program(
+            &ExecRequest::argv("cat", Vec::<String>::new())
+                .with_stdin("file:///a/b\nfile:///c/d\n"),
+        )
+        .expect("cat exists on every unix host in this suite");
+        assert!(out.succeeded(), "stderr: {}", out.stderr);
+        assert_eq!(out.stdout, "file:///a/b\nfile:///c/d\n");
+
+        // `None` is `/dev/null` (a read returns EOF at once), `Some("")` is an empty but *real* pipe;
+        // both must terminate, and `wc -c` distinguishes them from a hang.
+        let empty = exec_program(
+            &ExecRequest::argv("sh", ["-c", "printf %s \"$(cat)\" | wc -c"]).with_stdin(""),
+        )
+        .expect("sh exists");
+        assert!(empty.succeeded(), "stderr: {}", empty.stderr);
+        assert_eq!(empty.stdout.trim(), "0");
+
+        // A child that ignores its stdin and exits early must not turn the broken pipe into an error.
+        let hung_up = exec_program(
+            &ExecRequest::argv("sh", ["-c", "exit 3"]).with_stdin("x".repeat(1 << 16)),
+        )
+        .expect("the write failure is swallowed; the exit status is the answer");
+        assert_eq!(hung_up.code, Some(3));
+    }
+
+    #[test]
+    fn has_program_scans_path_and_never_spawns() {
+        assert!(
+            has_program("sh").expect("a PATH scan cannot fail here"),
+            "`sh` is on PATH on every host in this suite"
+        );
+        assert!(
+            has_program("/bin/sh").expect("an absolute name is checked as given"),
+            "a name with a separator is a path, not a PATH lookup"
+        );
+        assert!(
+            !has_program("zenman-definitely-not-a-program")
+                .expect("a missing name is a plain false"),
+            "a missing program is `false`, not an error"
+        );
+        assert!(!has_program("").expect("the empty name is false"));
+    }
+
+    #[test]
+    fn is_writable_answers_the_real_permission() {
+        let dir = std::env::temp_dir().join(format!("zenman-writable-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let abs = AbsPath::from_path(&dir).expect("absolute");
+        assert!(is_writable(&abs).expect("a fresh temp dir is writable"));
+        // `access(2)` knows what the mode bits do not: a 0o444 file is not writable by us.
+        let file = dir.join("read-only");
+        std::fs::write(&file, b"x").expect("write");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o444)).expect("chmod");
+        let file_abs = AbsPath::from_path(&file).expect("absolute");
+        assert!(
+            !is_writable(&file_abs).expect("a 0444 file is not writable"),
+            "W_OK must reflect the mode"
+        );
+        // A path that is not there is not writable either — there is nothing to write *to*.
+        let gone = AbsPath::from_path(dir.join("nope")).expect("absolute");
+        assert!(!is_writable(&gone).expect("a missing path answers false, not an error"));
+        remove_probe_root(&dir);
     }
 
     #[test]

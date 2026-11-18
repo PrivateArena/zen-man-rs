@@ -92,6 +92,33 @@ pub enum CoreError {
     #[error("Invalid permission mode: {raw}")]
     InvalidMode { raw: String },
 
+    /// Nothing to work on. Go had two prose messages for this and no sentinel: `"No files selected"`
+    /// (`api/ops.go:146`, HTTP 400) and `"folder is empty, nothing to copy/cut"` (`api/ops.go:207`,
+    /// 500 via the error return). One variant with a `what` noun covers both, and the display text is
+    /// the *actionable* half of Go's wording rather than either exact sentence.
+    #[error("{what} is empty")]
+    Empty {
+        /// What was empty — `"selection"`, `"folder"` … (a fixed noun, never a path).
+        what: &'static str,
+    },
+
+    /// A copy/cut whose destination lands inside its own source (`api/ops.go:309`
+    /// `src == dst || (isSourceDir(src) && isSubdir(src, dst))`). Go did not report this at all — it
+    /// `continue`d, and the paste then looked like a successful no-op; plan §6.2 makes it typed. Not
+    /// [`CoreError::Conflict`], which is a *resolvable* name collision the user can answer; this one is
+    /// a geometric impossibility, so it has no `SkipExisting`/`Overwrite` remedy.
+    #[error("cannot place {dest} inside its own source {src}")]
+    DestInsideSource {
+        /// The source that would swallow the destination.
+        ///
+        /// Named `src`, not `source`: thiserror 2 treats any field named `source` as the error's
+        /// `#[source]` unconditionally (and, unlike 1.x, offers no `not(source)` opt-out), and a path is
+        /// not an error.
+        src: String,
+        /// The destination that lives under it.
+        dest: String,
+    },
+
     /// Paste/extract collision. Go answered **200** with `{"status":"conflict","conflicts":[…]}`
     /// (`api/ops.go`, `paste-conflict.json`); plan §6.2 makes it typed, so the 200 is kept only as
     /// legacy metadata in [`CoreError::status_code`].
@@ -216,6 +243,8 @@ impl CoreError {
             Self::VfsReadOnly { .. } => "vfs_readonly",
             Self::InvalidPath { .. } => "invalid_path",
             Self::InvalidMode { .. } => "invalid_mode",
+            Self::Empty { .. } => "empty",
+            Self::DestInsideSource { .. } => "dest_inside_source",
             Self::Conflict { .. } => "conflict",
             Self::NotADir { .. } => "not_a_directory",
             Self::AlreadyExists { .. } => "already_exists",
@@ -260,6 +289,11 @@ impl CoreError {
             Self::VfsReadOnly { .. } => 405,
             Self::InvalidPath { .. } => 400,
             Self::InvalidMode { .. } => 400,
+            // Both new variants are request-shape rejections, i.e. Go's 400 class. `Empty` was literally
+            // a 400 for the "No files selected" branch (`api/ops.go:146`); the "folder is empty" branch
+            // rode the error return to a 500, which was never the intent of the message.
+            Self::Empty { .. } => 400,
+            Self::DestInsideSource { .. } => 400,
             Self::Conflict { .. } => 200,
             Self::NotADir { .. } => 400,
             Self::AlreadyExists { .. } => 500,
@@ -296,7 +330,13 @@ impl CoreError {
     #[must_use]
     pub fn is_expected(&self) -> bool {
         match self {
-            Self::Cancelled
+            // Both new variants are the user's request being impossible, not the machine failing: the
+            // UI records them (Go showed them as a red browser toast, which is the alarm this predicate
+            // exists to avoid). `Conflict` stays *not* expected below because it is the one rejection
+            // that says something about the data on disk and demands an answer.
+            Self::Empty { .. }
+            | Self::DestInsideSource { .. }
+            | Self::Cancelled
             | Self::IndexNotReady
             | Self::ArchiveModified { .. }
             | Self::NotFound { .. } => true,
@@ -641,5 +681,40 @@ mod tests {
         let s = serde_json::to_string(&nasty).unwrap();
         let back: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(back["message"], serde_json::json!(nasty.user_message()));
+    }
+
+    #[test]
+    fn empty_is_a_400_the_ui_records() {
+        // `api/ops.go:146` `{"error": "No files selected"}` (400) and `:207`
+        // "folder is empty, nothing to copy/cut" — one variant, one class of answer.
+        let e = CoreError::Empty { what: "selection" };
+        assert_eq!(e.to_string(), "selection is empty");
+        assert_eq!(e.kind(), "empty");
+        assert_eq!(e.status_code(), 400);
+        assert!(
+            e.is_expected(),
+            "an empty selection is the user's, not a fault"
+        );
+    }
+
+    #[test]
+    fn dest_inside_source_is_not_a_conflict() {
+        let e = CoreError::DestInsideSource {
+            src: "/tree/a".into(),
+            dest: "/tree/a/b".into(),
+        };
+        assert_eq!(e.kind(), "dest_inside_source");
+        assert_eq!(e.status_code(), 400);
+        assert!(e.is_expected());
+        // `Conflict` is the resolvable name collision (`docs/contracts.md`, `paste-conflict.json`);
+        // this rejection has no conflict policy that would answer it, so the kinds must stay apart.
+        assert_ne!(
+            e.kind(),
+            CoreError::Conflict {
+                conflicts: vec![],
+                dest: "/tree/a/b".into()
+            }
+            .kind()
+        );
     }
 }

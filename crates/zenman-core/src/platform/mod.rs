@@ -266,6 +266,11 @@ pub struct ExecRequest {
     pub env: Vec<(String, String)>,
     /// Cap on captured output; the excess sets [`ExecOutput::truncated`] (plan F10).
     pub output_cap: usize,
+    /// Bytes to feed the child's stdin, then close. `None` — the default — hands it `/dev/null`, which is
+    /// what every pre-step-9 spawn did (`api/actions.go:245` had no stdin at all). `Some("")` is a
+    /// *different* answer: an immediately-closed empty stdin, which is how the clipboard clear publishes
+    /// an empty `text/uri-list` (`api/ops.go:575` wrote an empty reader, not `/dev/null`).
+    pub stdin: Option<String>,
 }
 
 impl ExecRequest {
@@ -282,6 +287,7 @@ impl ExecRequest {
             cwd,
             env: Vec::new(),
             output_cap: Self::DEFAULT_OUTPUT_CAP,
+            stdin: None,
         }
     }
 
@@ -299,7 +305,15 @@ impl ExecRequest {
             cwd: None,
             env: Vec::new(),
             output_cap: Self::DEFAULT_OUTPUT_CAP,
+            stdin: None,
         }
+    }
+
+    /// Feed `text` to the child's stdin and close it (`wl-copy -t text/uri-list`, `api/ops.go:563-566`).
+    #[must_use]
+    pub fn with_stdin(mut self, text: impl Into<String>) -> Self {
+        self.stdin = Some(text.into());
+        self
     }
 }
 
@@ -416,6 +430,31 @@ pub trait Env: Send + Sync {
 
     /// Run one program, capturing capped output (plan F10's single spawn site).
     fn exec_program(&self, req: ExecRequest) -> PlatformFuture<'_, Result<ExecOutput, CoreError>>;
+
+    /// Is `name` a program this platform could run — `exec.LookPath` (`api/ops.go:563,569,578,592`), i.e.
+    /// a PATH scan and **never** a spawn.
+    ///
+    /// Default body: [`CoreError::Unsupported`], so a platform that has not implemented the lookup is
+    /// answered by its callers falling back (the clipboard degrades to "no system tool", plan §5.3) rather
+    /// than by a wrong `false`.
+    fn has_program(&self, name: &str) -> Result<bool, CoreError> {
+        let _ = name;
+        Err(CoreError::Unsupported {
+            what: "program lookup (`Env::has_program` is not implemented on this platform)",
+        })
+    }
+
+    /// Could this process write to `path` *now* — `access(2)`/`W_OK`, not "is the mode bit set" (which a
+    /// caller would have to re-derive for ACLs, read-only mounts and the superuser).
+    ///
+    /// Default body as for [`Env::has_program`]; [`crate::ops::guard::ensure_writable`] treats that answer
+    /// as "unknown, let the write itself fail".
+    fn is_writable(&self, path: &AbsPath) -> Result<bool, CoreError> {
+        let _ = path;
+        Err(CoreError::Unsupported {
+            what: "write-permission probe (`Env::is_writable` is not implemented on this platform)",
+        })
+    }
 }
 
 impl dyn Env {

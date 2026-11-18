@@ -49,6 +49,7 @@ pub mod jobs;
 pub mod limits;
 pub mod metrics;
 pub mod mode;
+pub mod ops;
 pub mod path;
 pub mod platform;
 pub mod services;
