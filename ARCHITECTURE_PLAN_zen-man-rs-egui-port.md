@@ -143,7 +143,7 @@ pub struct ComboBox<'a>; pub struct Menu<'a>;   // clippy.toml: use these instea
 
 ### 2.4 Wire-contract deltas measured in step 2 `[VERIFIED]` — supersedes anything above that disagrees
 
-Captured from a disposable Go instance (`HOME=/tmp/zm-go-home`, port 7891, commit `d5cd1a5`) into `tests/golden/` (139 artefacts, `PROVENANCE.json` names the SHA). Every line below was observed in captured bytes, not inferred from the handlers. **Implementers: when §2.3/§5 and this table disagree, this table wins.**
+Captured from a disposable Go instance (`HOME=/tmp/zm-go-home`, port 7891, commit `d5cd1a5`) into `tests/golden/` — **134 files** (122 HTTP captures + 12 on-disk artefacts; `tests/golden/INDEX.json` lists 138 records because 5 are `superseded-by:` tombstones). The full per-endpoint reference, the deviation ledger, the mode-string inventory, the ZMLG offset table, the SQLite dump and the test-gap list are in **`docs/contracts.md`**, which supersedes this table wherever it is more specific. `PROVENANCE.json` names the Go SHA. Every line below was observed in captured bytes, not inferred from the handlers. **Implementers: when §2.3/§5 and this table disagree, this table wins.**
 
 | Area | Planning-time belief | Measured reality (golden / `file:line`) | Consequence for the port |
 |---|---|---|---|
