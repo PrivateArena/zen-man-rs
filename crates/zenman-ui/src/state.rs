@@ -79,6 +79,25 @@ impl FlatMode {
     pub const fn is_flat(self) -> bool {
         !matches!(self, Self::Off)
     }
+
+    /// The **engine's** spelling of this mode — the value that goes into
+    /// [`ListDir::flat`](zenman_core::services::dirs::ListDir::flat), and into
+    /// [`DirCacheKey`](zenman_core::services::dirs::DirCacheKey) with it.
+    ///
+    /// `Grouped` maps to core's `Mixed`, not to its `Grouped`: Go asked for the two with *the same
+    /// request* (`navigation.js:92-97`, where `mixed` and `grouped` both produce `flat=true`), the
+    /// walk is identical, and the grouping is a shell-side render over `rel_path` — which is what
+    /// [`crate::panels::file_pane::RowOrder`] does with it. Sharing the mode therefore shares the
+    /// cache entry, which is the parity answer: two panes, one walk. (Core's own `Grouped` arm
+    /// behaves the same way; the shell simply never needs to name it.)
+    #[must_use]
+    pub const fn to_core(self) -> zenman_core::services::dirs::FlatMode {
+        match self {
+            Self::Off => zenman_core::services::dirs::FlatMode::Off,
+            Self::Mixed | Self::Grouped => zenman_core::services::dirs::FlatMode::Mixed,
+            Self::MixedNoFolders => zenman_core::services::dirs::FlatMode::MixedNoFolders,
+        }
+    }
 }
 
 /// A tab's selection (plan §4.3 `sel` + `anchor`, §5.8's `PaneModel::sel`).
@@ -474,6 +493,21 @@ impl Tab {
         self.scroll.reset_load_more();
     }
 
+    /// Replace the page *and* keep the selection honest (plan F21's second half): every key the new
+    /// listing still has survives the swap — a reload, or a switch to a flat mode whose root rows
+    /// carry the same keys — and the rows that vanished drop out. Scroll is not touched.
+    pub fn set_page_keeping_selection(&mut self, page: Arc<DirPage>) {
+        self.set_page(page);
+        self.prune_selection();
+    }
+
+    /// Forget the selected rows this listing does not have. Called on a page *replacement*, never on
+    /// an append, and keyed by row path — so a re-sort cannot prune anything (plan F21).
+    pub fn prune_selection(&mut self) {
+        let keys: Vec<&str> = self.entries.entries.iter().map(Self::row_key).collect();
+        self.sel.retain(keys.len(), |ix| keys.get(ix).copied());
+    }
+
     /// Append a `load-more` page (Go's `tab.loadedEntries.concat(data.entries)`).
     ///
     /// The one place a listing is copied, and it is copied on a page boundary, never per frame.
@@ -558,6 +592,10 @@ pub struct AppModel {
     pub right_drawer: DrawerState,
     /// Action-log slide-in (step 14's `panels/action_log.rs`).
     pub log_panel: bool,
+    /// The tabs a [`DirChanged`](zenman_core::events::EngineEvent::DirChanged) invalidated and that
+    /// have not been re-listed yet (see [`AppModel::mark_stale`]). A *set* — that is what coalesces
+    /// ten events of one paste into one reload per tab.
+    pub stale: BTreeSet<TabId>,
     /// Tab-id allocator (see [`AppModel::next_tab_id`]).
     next_tab: u64,
 }
@@ -571,6 +609,7 @@ impl Default for AppModel {
             left_drawer: DrawerState::default(),
             right_drawer: DrawerState::default(),
             log_panel: false,
+            stale: BTreeSet::new(),
             next_tab: 1,
         }
     }
@@ -680,6 +719,32 @@ impl AppModel {
         })
     }
 
+    /// Mark every tab that lists `path` **or something inside it** for a reload (plan §4.3's "explicit
+    /// invalidation on every `DirChanged` touching the path or an ancestor"), answering with how many
+    /// tabs it caught.
+    ///
+    /// The answer is the coalescing rule's other half: the queue is a set of tab ids, so N events in
+    /// one frame — a paste that touched a directory and its parent, a watcher burst — reload each
+    /// tab exactly once, in [`AppModel::take_stale`]'s single pass.
+    pub fn mark_stale(&mut self, path: &FsPath) -> usize {
+        let hits: Vec<TabId> = self
+            .panes
+            .iter()
+            .flat_map(|(_, pane)| pane.tabs.iter())
+            .filter(|tab| tab.path.starts_with(path))
+            .map(|tab| tab.id)
+            .collect();
+        let count = hits.len();
+        self.stale.extend(hits);
+        count
+    }
+
+    /// Drain the reload queue (empty afterwards, so an event that arrives *during* the reload pass is
+    /// queued for the next one instead of being lost or double-run).
+    pub fn take_stale(&mut self) -> Vec<TabId> {
+        std::mem::take(&mut self.stale).into_iter().collect()
+    }
+
     /// Allocate the next tab id.
     pub fn next_tab_id(&mut self) -> TabId {
         let id = TabId(self.next_tab);
@@ -785,6 +850,85 @@ mod tests {
         assert_eq!(pane.mru.len(), MRU_CAP);
         assert_eq!(pane.mru.front(), Some(&TabId(8)), "most recent first");
         assert!(pane.mru.iter().all(|id| id.0 >= 4));
+    }
+
+    #[test]
+    fn a_change_to_a_directory_marks_itself_and_everything_below_it_once() {
+        use zenman_core::path::AbsPath;
+
+        let mut model = AppModel::new(LayoutMode::Split);
+        let here = model.next_tab_id();
+        let inside = model.next_tab_id();
+        let elsewhere = model.next_tab_id();
+        let root = AbsPath::try_from(std::path::Path::new("/watched"))
+            .unwrap_or_else(|e| panic!("a fixture path parses: {e}"));
+        let root = FsPath::from_abs(root);
+        model
+            .pane_mut(PaneSlot::Left)
+            .tabs
+            .push(Tab::new(here, root.clone(), "watched"));
+        model.pane_mut(PaneSlot::Left).tabs.push(Tab::new(
+            inside,
+            root.join("sub").unwrap_or(root.clone()),
+            "sub",
+        ));
+        let other = FsPath::from_abs(
+            AbsPath::try_from(std::path::Path::new("/other")).unwrap_or_else(|e| panic!("{e}")),
+        );
+        model
+            .pane_mut(PaneSlot::Right)
+            .tabs
+            .push(Tab::new(elsewhere, other, "other"));
+        // The directory itself and the tab deep inside it are stale; the unrelated pane is not.
+        assert_eq!(model.mark_stale(&root), 2, "the path and its descendants");
+        // Twice more, however many events arrive: the queue is a set, one reload per tab.
+        assert_eq!(model.mark_stale(&root), 2);
+        assert_eq!(model.mark_stale(&root), 2);
+        let queued = model.take_stale();
+        assert_eq!(queued.len(), 2, "three events, one reload each");
+        assert!(!queued.contains(&elsewhere), "and never the unrelated tab");
+        assert!(model.take_stale().is_empty(), "the queue drained");
+    }
+
+    #[test]
+    fn a_flat_mode_maps_to_the_engine_mode_that_walks_the_same_way() {
+        use zenman_core::services::dirs::FlatMode as Core;
+
+        assert_eq!(FlatMode::Off.to_core(), Core::Off);
+        assert_eq!(FlatMode::Mixed.to_core(), Core::Mixed);
+        assert_eq!(
+            FlatMode::Grouped.to_core(),
+            Core::Mixed,
+            "grouped walks like mixed: the grouping is the pane's render over `rel_path`"
+        );
+        assert_eq!(FlatMode::MixedNoFolders.to_core(), Core::MixedNoFolders);
+        // The one question the engine answers differently — rows, not recursion.
+        assert!(!Core::MixedNoFolders.includes_dirs());
+        assert!(Core::MixedNoFolders.is_flat());
+    }
+
+    #[test]
+    fn a_reload_keeps_the_selection_exactly_as_far_as_the_rows_do() {
+        // The unit behind [`Tab::prune_selection`], which a page swap calls: plan F21's second half.
+        let keys = |ix: usize| match ix {
+            0 => Some("kept"),
+            1 => Some("gone"),
+            _ => None,
+        };
+        let mut sel = Selection::new();
+        sel.apply(SelKind::Single, 0, 2, keys);
+        sel.apply(SelKind::RangeAdd, 1, 2, keys);
+        assert_eq!(sel.len(), 2);
+        // The reloaded listing holds `kept` and `new`; `gone` was deleted out from under the tab.
+        sel.retain(2, |ix| match ix {
+            0 => Some("kept"),
+            _ => Some("new"),
+        });
+        assert!(
+            sel.contains("kept") && !sel.contains("gone"),
+            "the selection survives exactly as far as the rows do"
+        );
+        assert_eq!(sel.origin(), Some("kept"), "and so does the anchor");
     }
 
     #[test]

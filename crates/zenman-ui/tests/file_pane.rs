@@ -413,36 +413,405 @@ fn the_selection_survives_a_re_sort_and_a_page_append() {
 }
 
 #[test]
-fn the_flat_listing_buttons_are_disabled_and_say_why() {
-    // Step 8's one honest deferral (plan §9.2 step-8 row): `ListDir` has no `flat` field until
-    // step 9, so a recursive listing cannot be fetched. The buttons are *visible* and *disabled*,
-    // not silently inert — and the mode itself is real view state, which the second half of this
-    // test proves on the rows the pane already has.
-    let mut harness = pane_harness("flat");
-    let flat_labels = ["Mixed", "No folders", "Grouped"];
-    let is_flat_button = |node: &AccessKitNode<'_>| {
-        node.label()
-            .is_some_and(|label| flat_labels.contains(&label.as_str()))
-    };
-    let painted = harness.query_all_by(is_flat_button).count();
-    let disabled = harness
-        .query_all_by(|node| is_flat_button(node) && node.is_disabled())
-        .count();
-    assert_eq!(painted, 3, "all three flat buttons are in the toolbar");
-    assert_eq!(disabled, 3, "and all three are marked unavailable");
-    assert_eq!(shown(&harness).flat, FlatMode::Off, "nothing was fetched");
+fn clicking_mixed_lists_the_recursive_rows() {
+    // Step 9d: the flat buttons fetch. The tab starts on the plain three-row listing; one click on
+    // *Mixed* must produce the engine's recursive page, `rel_path` and all, through `page_dir`.
+    let mut harness = nested_harness("flatmix");
+    assert_eq!(
+        rel_rows(shown(&harness)),
+        vec![
+            ("alpha".into(), true),
+            ("beta".into(), true),
+            ("top.txt".into(), false)
+        ]
+    );
+    assert_eq!(shown(&harness).flat, FlatMode::Off);
+    harness.get_by_label("Mixed").click();
+    // The flat page is a real worker-thread job (`page_dir` turns a flat miss into `JobKind::List`)
+    // and kittest's fake time never advances it — wait on the wall clock until every job is done and
+    // the tab's own pending set has drained (see `common::settle_until`).
+    common::settle_until(&mut harness, "the mixed walk finishes", |h| {
+        h.state().jobs.live_count() == 0 && shown(h).pending.is_empty()
+    });
+    let tab = shown(&harness);
+    assert_eq!(
+        tab.flat,
+        FlatMode::Mixed,
+        "the toolbar's click reached the state"
+    );
+    assert_eq!(
+        rel_rows(tab),
+        common::nested_flat_rows(),
+        "the recursive page, in the engine's own order: dirs first, then files, both by base name"
+    );
+    // The depth a `rel_path` carries is the grouping key and the rel-path column's text: `b2.txt`
+    // is two levels down, and the pane shows it (`entry_row` paints `rel_path` in the flat columns).
+    let deep = tab
+        .entries
+        .entries
+        .iter()
+        .find(|entry| entry.name == "b2.txt")
+        .expect("the nested file is in the flat page");
+    assert_eq!(deep.rel_path, "beta/inner/b2.txt");
+    assert_eq!(
+        deep.rel_path.matches('/').count() + 1,
+        3,
+        "three levels deep"
+    );
+    assert_eq!(
+        deep.depth, 2,
+        "Go's `depth` is the *separator* count of the rel path (`api/dir.go:153-160`), not the level count"
+    );
+    // The nested row is addressable, i.e. it was really painted.
+    harness.get_by_label("b2.txt");
+    // The flat column table is in use (the rel-path cell exists, and is not a zero-width one).
+    assert!(
+        zenman_ui::panels::file_pane::columns_of(FlatMode::Mixed).rel > 0.0,
+        "a flat listing has a rel-path column"
+    );
+    // The fetch was a *job* (`page_dir` turns a flat miss into `JobKind::List`), and its origin was
+    // bound to this pane and this tab — `JobsUi::track(info, pane, tab)`, plan §4.3's correlation rule.
+    let id = tab.id;
+    let tracked = harness
+        .state()
+        .jobs
+        .foreground
+        .iter()
+        .any(|job| job.kind == zenman_core::jobs::JobKind::List && job.tab == Some(id));
+    assert!(tracked, "the flat walk's origin is bound to the asking tab");
+    assert!(
+        tab.pending.is_empty(),
+        "and resolved by the time the page landed"
+    );
+}
 
-    // The *grouped* view over the rows that are loaded is live: one group, the listing root.
-    let tab = harness.state_mut();
-    tab.run_command(PaneSlot::Left, PaneCommand::SetFlat(FlatMode::Grouped));
+#[test]
+fn no_folders_drops_the_folder_rows_and_still_shows_the_nested_files() {
+    // `flat=true&no_folders=true` (`api/dir.go:141-143`): the *rows* go, the recursion stays.
+    // Going Mixed → No folders also pins the re-fetch: the mode is part of the engine's cache key, so
+    // the second click cannot be served the first mode's page.
+    let mut harness = nested_harness("flatomit");
+    harness.get_by_label("Mixed").click();
+    common::settle_until(&mut harness, "the mixed walk finishes", |h| {
+        h.state().jobs.live_count() == 0 && shown(h).pending.is_empty()
+    });
+    assert_eq!(
+        shown(&harness).entries.entries.len(),
+        8,
+        "mixed keeps the folders"
+    );
+    harness.get_by_label("No folders").click();
+    // The mode is part of the engine's cache key, so this is a *second* real walk, not a re-paint.
+    common::settle_until(&mut harness, "the no-folders walk finishes", |h| {
+        h.state().jobs.live_count() == 0 && shown(h).pending.is_empty()
+    });
+    let tab = shown(&harness);
+    assert_eq!(tab.flat, FlatMode::MixedNoFolders);
+    assert_eq!(
+        rel_rows(tab),
+        common::nested_flat_file_rows(),
+        "a fresh page without the folder rows — not the mixed page re-painted"
+    );
+    assert!(
+        !rel_rows(tab).iter().any(|(_, is_dir)| *is_dir),
+        "no directory rows at all"
+    );
+    assert!(
+        rel_rows(tab)
+            .iter()
+            .any(|(rel, _)| rel == "beta/inner/b2.txt"),
+        "and the walk still went through `beta/inner`"
+    );
+    assert_eq!(
+        harness.query_all_by_label("alpha").count(),
+        0,
+        "the suppressed folder is not painted anywhere"
+    );
+}
+
+#[test]
+fn grouped_walks_like_mixed_and_collapse_hides_a_group() {
+    // Go asks for `grouped` and `mixed` with the *same* request (`navigation.js:92-97`); the grouping
+    // is the pane's render over `rel_path`. So Mixed → Grouped must keep the same rows — and change
+    // only the visual order.
+    let mut harness = nested_harness("flatgrp");
+    harness.get_by_label("Mixed").click();
+    common::settle_until(&mut harness, "the mixed walk finishes", |h| {
+        h.state().jobs.live_count() == 0 && shown(h).pending.is_empty()
+    });
+    let mixed = rel_rows(shown(&harness));
+    harness.get_by_label("Grouped").click();
+    // Grouped is the *same request* as Mixed (`navigation.js:92-97`), so no second walk: a frame
+    // settle is enough here.
     settle(&mut harness);
     let tab = shown(&harness);
     assert_eq!(tab.flat, FlatMode::Grouped);
-    assert!(
-        tab.scroll.painted > 0,
-        "the grouped order still paints rows: {:?}",
-        tab.scroll
+    assert_eq!(
+        rel_rows(tab),
+        mixed,
+        "the same walk: grouping is a render, not a second fetch"
     );
+    // The visual order now interleaves headers — the order *measured* from this fixture (the runs
+    // are Go's: a header opens each contiguous run of one group, so a group whose rows are
+    // interrupted by another's gets its header repeated). `""` is the listing root (Go's `.`, headed
+    // `Root`); its count is the whole group — 3 rows (`alpha`, `beta`, `top.txt`) — even though its
+    // two runs hold 2 and 1. `[beta:2]` appears twice because `group_of("beta/inner") == "beta"`: the
+    // inner directory belongs to `beta`'s group, and the header reports the group, not the run.
+    let order = visual_rows(tab);
+    assert_eq!(
+        order,
+        vec![
+            "[:3]",
+            "alpha",
+            "beta",
+            "[beta:2]",
+            "beta/inner",
+            "[alpha:2]",
+            "alpha/a1.txt",
+            "alpha/a2.txt",
+            "[beta:2]",
+            "beta/b1.txt",
+            "[beta/inner:1]",
+            "beta/inner/b2.txt",
+            "[:3]",
+            "top.txt",
+        ],
+        "the grouped order, headers included (the count is the group's, the runs are Go's)"
+    );
+    // The header's count really is the whole group's: `beta`'s group is `beta/inner` + `beta/b1.txt`.
+    let inner = tab
+        .entries
+        .entries
+        .iter()
+        .find(|entry| entry.rel_path == "beta/inner")
+        .expect("the nested directory is in the flat page");
+    assert_eq!(
+        zenman_ui::panels::file_pane::group_of(inner),
+        "beta",
+        "the nested directory is keyed into its top-level group"
+    );
+    // Collapse: the group header is paint-only decoration with one interaction rect (rule 10), so it
+    // has no a11y node of its own — the click is driven at the position the rows around it pin down.
+    let header = group_header_pos(&harness, "a1.txt");
+    click_at(&mut harness, header);
+    let tab = shown(&harness);
+    assert!(
+        tab.collapsed_groups.contains("alpha"),
+        "the header's click toggled its group: {:?}",
+        tab.collapsed_groups
+    );
+    assert_eq!(
+        visual_rows(tab),
+        vec![
+            "[:3]",
+            "alpha",
+            "beta",
+            "[beta:2]",
+            "beta/inner",
+            "[alpha:2]",
+            "[beta:2]",
+            "beta/b1.txt",
+            "[beta/inner:1]",
+            "beta/inner/b2.txt",
+            "[:3]",
+            "top.txt",
+        ],
+        "the collapsed group's rows left the visual order, its header stayed with the whole count"
+    );
+    assert_eq!(
+        harness.query_all_by_label("a1.txt").count(),
+        0,
+        "and they are not painted either"
+    );
+    // The header did not move (a collapse removes rows *below* it), so the same point expands again.
+    click_at(&mut harness, header);
+    assert!(
+        shown(&harness).collapsed_groups.is_empty(),
+        "and the second click expands"
+    );
+    harness.get_by_label("a1.txt");
+}
+
+#[test]
+fn a_directory_change_reloads_the_tab_that_shows_it() {
+    // Plan §4.1/F2 end to end in the UI: the op is the engine's real `mkdir` (step 9b/9c), the event
+    // is its `DirChanged`, and the pane reloads — keeping the selection of a row that still exists.
+    let tree = common::listing_tree("dirchange");
+    // Sweep a leftover from an earlier run: the fixture tree lives in cargo's scratch directory and
+    // persists, so a `made-dir` from a previous run would answer `AlreadyExists` and mis-count.
+    let _ = std::fs::remove_dir(tree.join("made-dir"));
+    let mut harness = pane_harness_at("dirchange", &tree, egui::vec2(1200.0, 800.0));
+    harness.get_by_label("docs").click();
+    settle(&mut harness);
+    let before = shown(&harness).entries.entries.len();
+    let scroll = shown(&harness).scroll.y;
+    assert_eq!(shown(&harness).total, common::ROW_COUNT);
+    let session = &harness.state().session;
+    let dest = AbsPath::try_from(tree.as_path()).unwrap_or_else(|e| panic!("{tree:?}: {e}"));
+    session
+        .mkdir(
+            &zenman_core::ops::mkdir::MkdirReq::new(dest, "made-dir"),
+            session.next_origin(),
+        )
+        .unwrap_or_else(|e| panic!("mkdir: {}", e.user_message()));
+    // One frame drains the event queue: both the invalidation and the reload it asked for — but the
+    // invalidation itself is coalesced on a *wall-clock* window and the reload is a job, so frames
+    // alone never get there (`common::settle_until`).
+    harness.run();
+    common::settle_until(
+        &mut harness,
+        "the reload lands (total grows by the mkdir)",
+        |h| h.state().jobs.live_count() == 0 && shown(h).total == common::ROW_COUNT + 1,
+    );
+    let tab = shown(&harness);
+    assert_eq!(tab.entries.entries.len(), before, "same page size");
+    assert_eq!(
+        tab.total,
+        common::ROW_COUNT + 1,
+        "and one more row in the listing"
+    );
+    assert!(
+        names(tab).contains(&"made-dir".to_string()),
+        "the new directory is in the reloaded page: {:?}",
+        names(tab).into_iter().take(4).collect::<Vec<_>>()
+    );
+    assert!(
+        tab.sel.contains("docs"),
+        "the reload kept the selection of a row that still exists (plan F21)"
+    );
+    assert_eq!(tab.scroll.y, scroll, "and kept the scroll position");
+    harness.get_by_label("made-dir");
+    assert!(
+        harness.state().model.stale.is_empty(),
+        "the reload queue is drained, so a tab is not re-listed every frame"
+    );
+}
+
+#[test]
+fn several_changes_in_one_frame_reload_a_tab_once() {
+    // The coalescing half, end to end: two ops, both events pending when the frame runs, and one
+    // reload that shows both. `model.stale` is a set of tab ids, which is what makes it one.
+    let tree = common::listing_tree("dirburst");
+    // Same sweep as the single-change test — both directories persist across runs otherwise.
+    let _ = std::fs::remove_dir(tree.join("first-dir"));
+    let _ = std::fs::remove_dir(tree.join("second-dir"));
+    let mut harness = pane_harness_at("dirburst", &tree, egui::vec2(1200.0, 800.0));
+    let session = &harness.state().session;
+    let dest = AbsPath::try_from(tree.as_path()).unwrap_or_else(|e| panic!("{tree:?}: {e}"));
+    for name in ["first-dir", "second-dir"] {
+        session
+            .mkdir(
+                &zenman_core::ops::mkdir::MkdirReq::new(dest.clone(), name),
+                session.next_origin(),
+            )
+            .unwrap_or_else(|e| panic!("mkdir {name}: {}", e.user_message()));
+    }
+    // The real "not yet reloaded" check: `mkdir` is synchronous and only *queues* its
+    // `DirChanged`, and nothing has polled since — so the tab still shows the pre-mutation listing.
+    assert_eq!(
+        shown(&harness).total,
+        common::ROW_COUNT,
+        "no reload has run yet: the events are still queued"
+    );
+    assert!(
+        names(shown(&harness))
+            .iter()
+            .all(|n| n != "first-dir" && n != "second-dir"),
+        "and neither new directory is in the page yet"
+    );
+    harness.run();
+    // Both coalesced events and the one reload they trigger run on the wall clock / a worker thread.
+    common::settle_until(
+        &mut harness,
+        "the single reload lands (total grows by two)",
+        |h| h.state().jobs.live_count() == 0 && shown(h).total == common::ROW_COUNT + 2,
+    );
+    let tab = shown(&harness);
+    assert_eq!(tab.total, common::ROW_COUNT + 2, "both directories landed");
+    assert!(harness.state().model.stale.is_empty());
+    for name in ["first-dir", "second-dir"] {
+        assert!(
+            names(tab).contains(&name.to_string()),
+            "{name} is in the reloaded page"
+        );
+    }
+}
+
+/// A single-pane shell on [`common::nested_tree`] — the flat-mode fixture.
+fn nested_harness(tag: &str) -> Harness<'static, ZenApp> {
+    pane_harness_at(tag, &common::nested_tree(tag), egui::vec2(1200.0, 800.0))
+}
+
+/// The pane's rows as `(listing-relative path, is_dir)` — the flat page's real payload, since
+/// `rel_path` is what the flat modes add (`api/dir.go:141-149`).
+fn rel_rows(tab: &Tab) -> Vec<(String, bool)> {
+    tab.entries
+        .entries
+        .iter()
+        .map(|entry| {
+            (
+                if entry.rel_path.is_empty() {
+                    entry.name.clone()
+                } else {
+                    entry.rel_path.clone()
+                },
+                entry.is_dir,
+            )
+        })
+        .collect()
+}
+
+/// The pane's visual order: `"[key:count]"` for a group header, the row key for an entry. Headers are
+/// paint-only, so this — not the widget tree — is where they are visible.
+fn visual_rows(tab: &Tab) -> Vec<String> {
+    let order = zenman_ui::panels::file_pane::RowOrder::build(tab);
+    (0..order.len())
+        .map(|ix| match order.get(ix) {
+            Some(zenman_ui::panels::file_pane::VisualRowRef::Group { key, count }) => {
+                format!("[{key}:{count}]")
+            }
+            _ => order.key_at(ix).unwrap_or("<unknown>").to_string(),
+        })
+        .collect()
+}
+
+/// Where a group header sits, derived from the rows pinned around it: the header of the group above
+/// the row named `label`, one row pitch up. (The pitch is measured from two painted rows, never
+/// hardcoded — it is the pane's geometry, not the test's.)
+fn group_header_pos(harness: &Harness<'static, ZenApp>, label: &str) -> egui::Pos2 {
+    let row = node_rect(harness, label);
+    let below = node_rect(harness, next_row_label(label).unwrap_or(label));
+    let pitch = (below.min.y - row.min.y).abs();
+    let centre = row.min.y - pitch / 2.0;
+    egui::pos2(row.center().x, centre)
+}
+
+/// The row after `label` in [`common::nested_flat_rows`] — the pitch's second measurement.
+fn next_row_label(label: &str) -> Option<&'static str> {
+    match label {
+        "a1.txt" => Some("a2.txt"),
+        "b1.txt" => Some("b2.txt"),
+        _ => None,
+    }
+}
+
+fn node_rect(harness: &Harness<'static, ZenApp>, label: &str) -> egui::Rect {
+    harness
+        .query_all_by_label(label)
+        .next()
+        .map(|node| node.rect())
+        .unwrap_or_else(|| panic!("no painted row {label:?}"))
+}
+
+/// A real press-and-release at a position — the path a click on paint-only decoration takes, given
+/// that such a row has no accessible node to click through.
+fn click_at(harness: &mut Harness<'static, ZenApp>, pos: egui::Pos2) {
+    harness.hover_at(pos);
+    harness.run();
+    harness.drag_at(pos);
+    harness.run();
+    harness.drop_at(pos);
+    settle(harness);
 }
 
 /// Every accessible label in the tree, sorted — the pinning aid for "which chips survive the

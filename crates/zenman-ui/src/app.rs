@@ -17,7 +17,7 @@ use egui::{CentralPanel, Panel, Ui};
 use std::sync::Arc;
 
 use zenman_core::path::{AbsPath, FsPath};
-use zenman_core::services::dirs::{FlatMode, ListDir};
+use zenman_core::services::dirs::ListDir;
 use zenman_core::session::{Receipt, Session, StartupNote};
 use zenman_core::store::config::{LayoutMode, PaneSlot, ThemeMode};
 
@@ -149,12 +149,22 @@ impl ZenApp {
     /// it and `Running` when it must be read (plan §4.1); either way the frame that asked is the
     /// frame that paints, because nothing here waits.
     pub fn list(&mut self, slot: PaneSlot, append: bool, all: bool) {
-        let Some(tab) = self
+        let Some(ix) = self
             .model
             .panes
-            .get_mut(&slot)
-            .and_then(|p| p.active_tab_mut())
+            .get(&slot)
+            .map(|pane| pane.active.min(pane.tabs.len().saturating_sub(1)))
         else {
+            return;
+        };
+        self.list_at(slot, ix, append, all);
+    }
+
+    /// [`Self::list`] addressed to **one tab** rather than to the pane's shown one. Step 9d needs it:
+    /// a `DirChanged` invalidates every tab that lists the changed directory, including the ones the
+    /// user is not looking at (plan §4.3's correlation rule — a tab, not a pane, owns a listing).
+    pub fn list_at(&mut self, slot: PaneSlot, ix: usize, append: bool, all: bool) {
+        let Some(tab) = self.model.tab_at_mut((slot, ix)) else {
             return;
         };
         let origin = self.session.next_origin();
@@ -173,51 +183,42 @@ impl ZenApp {
             cursor,
             limit,
             sort: tab.sort,
-            // The flat buttons are still disabled (step 9d wires them to `FlatMode::Mixed`); a plain
-            // listing is what a pane asks for today.
-            flat: FlatMode::Off,
+            // Step 9d: the tab's own flat mode, mapped to the engine's (`Grouped` walks `Mixed`).
+            flat: tab.flat.to_core(),
         };
         tab.loading_more = append;
         let receipt = self.session.page_dir(&req, origin);
         match receipt {
             Ok(Receipt::Done(page)) => {
-                let Some(tab) = self.tab_mut_of(slot) else {
+                let Some(tab) = self.model.tab_at_mut((slot, ix)) else {
                     return;
                 };
                 if append {
                     tab.append_page(page);
                 } else {
-                    tab.set_page(page);
+                    tab.set_page_keeping_selection(page);
                 }
                 tab.loading_more = false;
             }
             Ok(Receipt::Running { job, origin }) => {
                 if let Some(info) = self.session.job_info(job) {
-                    let tab_id = self.tab_id_of(slot);
+                    let tab_id = self.model.tab_at((slot, ix)).map(|tab| tab.id);
                     self.jobs.track(info, Some(slot), tab_id);
                 }
-                if let Some(pane) = self.model.panes.get_mut(&slot) {
+                if let Some(pane) = self.model.panes.get_mut(&slot)
+                    && let Some(tab) = pane.tabs.get_mut(ix)
+                {
                     pane.loading.insert(origin);
-                    if let Some(tab) = pane.active_tab_mut() {
-                        tab.pending.insert(origin);
-                    }
+                    tab.pending.insert(origin);
                 }
             }
             Err(e) => {
-                if let Some(tab) = self.tab_mut_of(slot) {
+                if let Some(tab) = self.model.tab_at_mut((slot, ix)) {
                     tab.error = Some(Arc::new(e));
                     tab.loading_more = false;
                 }
             }
         }
-    }
-
-    fn tab_id_of(&self, slot: PaneSlot) -> Option<crate::state::TabId> {
-        self.model
-            .panes
-            .get(&slot)
-            .and_then(|p| p.active_tab())
-            .map(|t| t.id)
     }
 
     fn tab_mut_of(&mut self, slot: PaneSlot) -> Option<&mut crate::state::Tab> {
@@ -341,9 +342,18 @@ impl ZenApp {
                 }
             }
             PaneCommand::SetFlat(flat) => {
+                // The mode is *listing* state, not just paint state: it changes which rows the engine
+                // walks (`ListDir::flat`) and which cache entry answers (`DirCacheKey::flat`), so the
+                // click re-lists instead of re-painting. Go's toolbar did the same — the dropdown
+                // called `loadDirectory` again (`navigation.js:92-97`).
                 if let Some(tab) = self.tab_mut_of(slot) {
                     tab.flat = flat;
+                    // The rows the new mode still has keep their selection (keys are listing-relative
+                    // paths, and a root row's rel path *is* its name); [`Tab::set_page_keeping_selection`]
+                    // prunes the rest when the page lands.
+                    tab.collapsed_groups.clear();
                 }
+                self.list(slot, false, false);
             }
             PaneCommand::LoadMore => self.list(slot, true, false),
             PaneCommand::LoadAll => self.list(slot, true, true),
@@ -426,11 +436,30 @@ impl ZenApp {
     /// correction, see the step-7 §9.2 row).
     pub fn logic(&mut self, ctx: &egui::Context) {
         JobsUi::tick(self, ctx);
+        self.reload_stale();
         let now = Instant::now();
         self.last_frame = now;
         if dock::persist_pending(ctx, now) {
             let snap = self.snapshot();
             self.persist.autosave(&snap, now);
+        }
+    }
+
+    /// Re-list the tabs the engine's `DirChanged` events invalidated (plan §4.1/F2: coalesced by
+    /// core into one event per directory, coalesced *here* into one reload per tab).
+    ///
+    /// The queue is drained before the first reload runs, so an event that lands while a reload is in
+    /// flight is carried to the next pass instead of doubling up. Nothing here resets scroll or the
+    /// selection: the reload replaces the page, the selection is path-keyed (step 8), and only the
+    /// rows that genuinely vanished leave it — which is the "quietly" half of plan §4.1's note, and
+    /// why every [`ChangeCause`](zenman_core::events::ChangeCause) takes the same path.
+    fn reload_stale(&mut self) {
+        for id in self.model.take_stale() {
+            // A tab closed between the event and this pass simply is not there to reload.
+            let Some((slot, ix)) = self.model.tab_index(id) else {
+                continue;
+            };
+            self.list_at(slot, ix, false, false);
         }
     }
 

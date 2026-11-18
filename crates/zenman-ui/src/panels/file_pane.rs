@@ -18,10 +18,10 @@
 //! | Selection | path-keyed set + `anchorPath` (`:475-516`) | [`Selection`], with the anchor kept by key (origin-preserving) |
 //! | Pagination | a banner at the end of the list with two buttons (`:179-190`) | the same, *and* scrolling onto it fires `LoadMore` once |
 //! | Grid | `minmax(110px,1fr)` tiles, `gap:15px` | the same rule, virtualised by tile row |
-//! | Groups | `grouped` flat view with `▶`/`▼` and counts (`:71-96`) | the same |
+//! | Groups | `grouped` flat view with `▶`/`▼` and counts (`:71-96`) | the same, live since step 9d |
 //! | Empty | `Directory is empty` (`:104`) | the same |
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use egui::{Id, Pos2, Ui};
@@ -98,7 +98,7 @@ pub enum VisualRow {
     Group {
         /// The group's key (its listing-relative directory, `""` for the listing root).
         key: String,
-        /// Rows under the header.
+        /// Every loaded row of this group, wherever it sorts (Go's count, `file-list.js:79-86`).
         count: usize,
     },
 }
@@ -233,22 +233,33 @@ pub enum VisualRowRef<'a> {
 }
 
 /// The group index of a flat listing.
+///
+/// The emission is *run-based*, exactly like Go's (`file-list.js:71-97` compares each row's parent
+/// against `currentGroup`): the engine sorts a flat listing by base name, so one directory's rows
+/// are **not** contiguous and a group can get more than one header. The count, as in Go, is the whole
+/// group's — every loaded row of that key, wherever it sorts — not the run's.
 fn group_index(entries: &[FileEntry], collapsed: &BTreeSet<String>) -> Vec<VisualRow> {
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for entry in entries {
+        *counts.entry(group_of(entry)).or_insert(0) += 1;
+    }
     let mut rows = Vec::new();
     let mut index = 0usize;
     while index < entries.len() {
         let key = group_of(&entries[index]);
-        let mut count = 0usize;
+        let start = index;
         while index < entries.len() && group_of(&entries[index]) == key {
-            count += 1;
             index += 1;
         }
         let is_collapsed = collapsed.contains(&key);
-        rows.push(VisualRow::Group { key, count });
+        rows.push(VisualRow::Group {
+            count: counts.get(&key).copied().unwrap_or(index - start),
+            key,
+        });
         if is_collapsed {
             continue;
         }
-        rows.extend((index - count..index).map(VisualRow::Entry));
+        rows.extend((start..index).map(VisualRow::Entry));
     }
     rows
 }
@@ -347,7 +358,7 @@ fn toolbar(ui: &mut Ui, model: &PaneModel<'_>, tokens: &Tokens, out: &mut Vec<Pa
         if tool_icon(ui, tokens, "refresh", "Re-read the directory (F5)").clicked() {
             out.push(PaneCommand::Refresh);
         }
-        flat_buttons(ui, flat, out, tokens);
+        flat_buttons(ui, flat, out);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui
                 .button("Select none")
@@ -471,27 +482,40 @@ fn tool_icon(ui: &mut Ui, tokens: &Tokens, icon: &str, tooltip: &str) -> egui::R
 /// The recursive-listing buttons, in Go's own words (`main.js`'s flat-view dropdown: *mixed*,
 /// *mixed_no_folders*, *grouped*).
 ///
-/// They are **disabled**, and the tooltip says why: the walk is the engine's, and `ListDir` has no
-/// `flat` field until step 9, so a click here could only pretend to fetch. Everything *downstream*
-/// of the fetch is live and tested — [`FlatMode`], the group index in [`RowOrder`], the `FLAT`
-/// column table. Recorded in plan §9.2's step-8 row as the one §7-row-8 sub-item that step 9
-/// finishes.
-fn flat_buttons(ui: &mut Ui, flat: FlatMode, out: &mut Vec<PaneCommand>, tokens: &Tokens) {
-    let _ = (out, tokens);
-    let reason = "the recursive listing needs the engine's flat walk, which lands with the step-9 \
-                  write path (`ListDir::flat`); the view state, grouping and columns are live now";
-    for (mode, label) in [
-        (FlatMode::Mixed, "Mixed"),
-        (FlatMode::MixedNoFolders, "No folders"),
-        (FlatMode::Grouped, "Grouped"),
+/// **Live since step 9d.** A click sets the tab's mode and the shell re-lists with it —
+/// [`PaneCommand::SetFlat`] → `ZenApp::run_command` → `ListDir { flat }` → `Session::page_dir`, whose
+/// flat miss is a `JobKind::List` job answering as `DirPageReady` (plan §4.1). The mode is part of the
+/// engine's cache key, so a mode switch cannot be served the previous mode's page — except
+/// *Grouped*, which shares *Mixed*'s key on purpose because the walk is the same request Go sent
+/// (`navigation.js:92-97`); see [`FlatMode::to_core`]. The chosen one is drawn as current, which is
+/// Go's toolbar behaviour (`toolbar.css`'s `.active` state on the flat-view control).
+fn flat_buttons(ui: &mut Ui, flat: FlatMode, out: &mut Vec<PaneCommand>) {
+    for (mode, label, tip) in [
+        (
+            FlatMode::Mixed,
+            "Mixed",
+            "List every entry under this directory, folders among them",
+        ),
+        (
+            FlatMode::MixedNoFolders,
+            "No folders",
+            "List every file under this directory, without the folder rows",
+        ),
+        (
+            FlatMode::Grouped,
+            "Grouped",
+            "The recursive listing, grouped by its own folder",
+        ),
     ] {
-        // Disabled, and worded: `flat` is *view* state the pane can hold (and the group index and
-        // the `FLAT` column table follow it), but no listing can be *fetched* in this mode until
-        // step 9 gives `ListDir` its `flat` field.
-        let selected = flat == mode;
-        ui.add_enabled_ui(false, |ui| {
-            let _ = ui.selectable_label(selected, label).on_hover_text(reason);
-        });
+        // `selectable_label` is the "visibly current" part: the chosen mode carries the accent
+        // selection visuals, the others the plain button's — Go's `.active` class, same meaning.
+        if ui
+            .selectable_label(flat == mode, label)
+            .on_hover_text(tip)
+            .clicked()
+        {
+            out.push(PaneCommand::SetFlat(mode));
+        }
     }
 }
 

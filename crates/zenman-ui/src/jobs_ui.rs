@@ -145,9 +145,21 @@ pub fn route(jobs: &mut JobsUi, model: &mut AppModel, event: EngineEvent) -> Rou
                 .and_then(|s| s.tab)
                 .and_then(|id| find_tab_mut(model, id))
             {
-                tab.total = page.total_count;
-                tab.has_more = page.has_more;
-                tab.entries = page;
+                // A flat listing is *always* this event (`page_dir` turns a flat miss into a
+                // `JobKind::List` job), including its `LoadMore` pages — so the append that
+                // `ZenApp::list_at` does synchronously for a cached page has to happen here too.
+                // `loaded_so_far > entries.len()` is the data-side test for "this is page two or
+                // later" (a first page's `loaded_so_far` is its own length).
+                if tab.loading_more && page.loaded_so_far > page.entries.len() {
+                    tab.append_page(page);
+                    tab.loading_more = false;
+                } else {
+                    tab.total = page.total_count;
+                    tab.has_more = page.has_more;
+                    tab.entries = page;
+                    // The reload keeps what still exists (plan F21); keys are listing-relative paths.
+                    tab.prune_selection();
+                }
                 tab.pending.remove(&origin);
                 if tab.path != path {
                     // A page for another path is a race the correlation rule exists to ignore —
@@ -173,11 +185,18 @@ pub fn route(jobs: &mut JobsUi, model: &mut AppModel, event: EngineEvent) -> Rou
             payload: _,
             error,
         } => {
+            // `by_origin` and `foreground` hold *copies* of the slot, so the terminal event must
+            // mark both: `live_count()` and the status strip read `foreground`, and a route that
+            // only flipped the correlation-table copy left every tracked job spinning forever.
             let slot = jobs.by_origin.get_mut(&origin).map(|s| {
                 s.live = false;
                 s.frac = 1.0;
                 (s.pane, s.tab)
             });
+            for fg in jobs.foreground.iter_mut().filter(|s| s.origin == origin) {
+                fg.live = false;
+                fg.frac = 1.0;
+            }
             match outcome.status {
                 JobStatus::Done => {
                     notices.push((toast::Level::Success, outcome.summary));
@@ -219,13 +238,29 @@ pub fn route(jobs: &mut JobsUi, model: &mut AppModel, event: EngineEvent) -> Rou
             notices.push((mapped, message));
         }
         EngineEvent::DirSizeReady { .. }
-        | EngineEvent::DirChanged { .. }
         | EngineEvent::IndexChanged { .. }
-        | EngineEvent::LogAppended { .. }
-        | EngineEvent::ClipboardChanged { .. } => {
-            // Disk sizes paint from the cache (step 8+); DirChanged invalidation is core-side
-            // (`Session::invalidate`) and the panes re-page. The clipboard badge is step 10's UI, so
-            // there is nothing to route here yet.
+        | EngineEvent::LogAppended { .. } => {
+            // Disk sizes paint from the cache (step 8+); the index's shape is step 12's UI; the log
+            // panel is step 14's.
+        }
+        EngineEvent::DirChanged {
+            path,
+            cause,
+            origin,
+        } => {
+            // The reload queue, not a reload: `ZenApp::reload_stale` drains it once per frame, so ten
+            // of these (a paste through a subtree, a watcher burst) cost one re-list per tab. Every
+            // tab listing `path` *or anything inside it* is marked (plan §4.3's invalidation rule).
+            //
+            // `cause` does not change the answer here, and that is a deliberate deviation from plan
+            // §4.1's "resets or refreshes quietly": a reload already keeps scroll and the path-keyed
+            // selection, so the quiet form *is* the only form. The origin still matters to the
+            // spinner, and `Tab::pending` is the tab's own record of it.
+            let _ = (cause, origin);
+            model.mark_stale(&path);
+        }
+        EngineEvent::ClipboardChanged { .. } => {
+            // The clipboard badge is step 10's UI, so there is nothing to route here yet.
         }
     }
     notices
@@ -370,6 +405,33 @@ mod tests {
         let tab = model.tab_at((PaneSlot::Left, 0)).expect("tab");
         assert!(tab.error.is_some(), "the asking tab carries the error");
         assert!(!jobs.by_origin[&origin].live);
+    }
+
+    #[test]
+    fn a_dir_change_queues_one_reload_per_tab() {
+        // The coalescing rule, at the routing seam: the event marks, it does not reload, and the mark
+        // is a set — a watcher burst of three costs one re-list.
+        let (mut model, id, _origin) = model_with_tab();
+        let mut jobs = JobsUi::default();
+        for _ in 0..3 {
+            let notices = route(
+                &mut jobs,
+                &mut model,
+                EngineEvent::DirChanged {
+                    path: FsPath::ROOT,
+                    cause: zenman_core::events::ChangeCause::Watcher,
+                    origin: None,
+                },
+            );
+            assert!(notices.is_empty(), "a reload is not a toast");
+        }
+        assert_eq!(model.stale.len(), 1, "three events, one queued reload");
+        assert!(model.stale.contains(&id));
+        assert_eq!(model.take_stale(), vec![id]);
+        assert!(
+            model.stale.is_empty(),
+            "and the queue is drained in one pass"
+        );
     }
 
     #[test]

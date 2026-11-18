@@ -18,8 +18,10 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+use egui_kittest::Harness;
 use zenman_core::session::{Session, SessionPaths};
 use zenman_core::store::config::ZenConfig;
+use zenman_ui::app::ZenApp;
 
 /// Where every fixture of this test binary lives: cargo's own per-integration-test scratch
 /// directory (`CARGO_TARGET_TMPDIR`, i.e. `<workspace>/target/tmp`) under `zenman-ui-fixtures`.
@@ -202,6 +204,95 @@ pub fn loaded_by_date_ascending(loaded: &[String]) -> Vec<String> {
 #[must_use]
 pub fn loaded_by_date_descending(loaded: &[String]) -> Vec<String> {
     loaded_by_date(loaded, true)
+}
+
+/// A small two-level tree, for the flat (recursive) listing modes — [`listing_tree`] cannot show a
+/// group of more than one row, and step 9d's grouped view needs exactly that.
+///
+/// ```text
+/// <scratch>/zenman-ui-fixture-<tag>/nested/
+///   alpha/          a1.txt  a2.txt
+///   beta/           b1.txt
+///     inner/        b2.txt
+///   top.txt
+/// ```
+///
+/// Eight rows recursively, three in the plain listing.
+#[must_use]
+pub fn nested_tree(tag: &str) -> PathBuf {
+    let root = fixture_base().join(format!("zenman-ui-fixture-{tag}"));
+    let nested = root.join("nested");
+    std::fs::create_dir_all(nested.join("alpha")).expect("fixture directory");
+    std::fs::create_dir_all(nested.join("beta").join("inner")).expect("fixture directory");
+    write(&nested.join("alpha/a1.txt"), b"a1\n");
+    write(&nested.join("alpha/a2.txt"), b"a2\n");
+    write(&nested.join("beta/b1.txt"), b"b1\n");
+    write(&nested.join("beta/inner/b2.txt"), b"b2\n");
+    write(&nested.join("top.txt"), b"top\n");
+    nested
+}
+
+/// The **flat** rows of [`nested_tree`] in the order the engine produces them: directories first
+/// (`alpha`, `beta`, `inner` — sorted by *base* name, `api/dir.go:315`), then the files, also by base
+/// name. Each row is `(rel_path, is_dir)`.
+///
+/// Note what that order is *not*: grouped. `top.txt` sorts after `b2.txt`, so the listing root's group
+/// is interrupted and gets a second header — which is what Go's run-based grouping does too
+/// (`file-list.js:71-97`), and why a header's count is the whole group's, not the run's.
+#[must_use]
+pub fn nested_flat_rows() -> Vec<(String, bool)> {
+    [
+        ("alpha", true),
+        ("beta", true),
+        ("beta/inner", true),
+        ("alpha/a1.txt", false),
+        ("alpha/a2.txt", false),
+        ("beta/b1.txt", false),
+        ("beta/inner/b2.txt", false),
+        ("top.txt", false),
+    ]
+    .into_iter()
+    .map(|(rel, is_dir)| (rel.to_string(), is_dir))
+    .collect()
+}
+
+/// The same rows with the folder rows suppressed — [`nested_flat_rows`] minus its three `is_dir`
+/// entries, because `no_folders` suppresses *rows*, never the recursion (`api/dir.go:141-143`).
+#[must_use]
+pub fn nested_flat_file_rows() -> Vec<(String, bool)> {
+    nested_flat_rows()
+        .into_iter()
+        .filter(|(_, is_dir)| !is_dir)
+        .collect()
+}
+
+// --------------------------------------------------------------------------- wall-clock settling
+
+/// Run a frame, then sleep 5 ms of **real** time, and repeat until `pred` answers `true` — failing
+/// with a clear message once a 2 s wall-clock deadline passes instead of hanging.
+///
+/// Why frame-count settling is not enough for the flat modes and the `DirChanged` reload: core
+/// **coalesces** `DirChanged` on a wall-clock window (`DirService::inner.coalesce =
+/// PROGRESS_THROTTLE`, `services/dirs.rs:583`, gated on `Instant::now()`), and a flat page is a
+/// real worker-thread job. kittest's fake time advances neither the coalesce gate nor the worker,
+/// so a `harness.run()`-only loop spins against a clock that never moves. Sleeping is the only
+/// way past both — and the deadline turns a missing event into a named failure, not a hang.
+pub fn settle_until(
+    harness: &mut Harness<'static, ZenApp>,
+    what: &str,
+    mut pred: impl FnMut(&Harness<'static, ZenApp>) -> bool,
+) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        harness.run();
+        if pred(harness) {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("settle_until({what:?}): timed out after 2 s of wall clock waiting for it");
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 fn write(path: &Path, bytes: &[u8]) {
