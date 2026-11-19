@@ -47,6 +47,7 @@ pub mod dock_content;
 pub mod icons;
 pub mod jobs_ui;
 pub mod keymap;
+pub mod menus;
 pub mod panels;
 pub mod persist;
 pub mod state;

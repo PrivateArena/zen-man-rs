@@ -177,6 +177,36 @@ pub struct Tokens {
     pub drawer_icon_size: f32,
     /// How much narrower a header icon button is than the 48 px header it lives in.
     pub header_button_inset: f32,
+    // ---- menus (step 10b; `frontend/css/context-menu.css`) --------------------------------------
+    /// `min-width: 180px` (`context-menu.css:8`); the frame grows to fit the widest label + chord.
+    pub menu_min_width: f32,
+    /// `border-radius: 6px` (`:7`).
+    pub menu_corner_radius: u8,
+    /// `padding: 5px 0` (`:9`) — the vertical inner margin of the frame.
+    pub menu_frame_pad_y: u8,
+    /// `padding: 8px 15px` (`:14`) — a row's horizontal padding. The row's own height is
+    /// [`Self::menu_item_height`], the same padding plus the label's line box.
+    pub menu_item_pad_x: f32,
+    /// One menu row's height (`8px 15px` around a 13 px line, rounded to the 4 px grid).
+    pub menu_item_height: f32,
+    /// The icon column (`Self::row_icon_size` is its width); Go's menu has none — plan §5.8's
+    /// `MenuSpec::icon` is the port's own.
+    pub menu_icon_gap: f32,
+    /// Smallest gap between a label and its chord hint (CSS uses `justify-content: space-between`,
+    /// which is a *minimum* separation once the row is wide enough).
+    pub menu_hint_gap: f32,
+    /// `.context-menu-shortcut { font-size: 0.75rem }` (`:35-38`), on our 13 px base.
+    pub menu_hint_font_size: f32,
+    /// `.context-menu-separator { margin: 5px 0 }` (`:29-33`), on each side of the 1 px rule.
+    pub menu_separator_gap: u8,
+    /// Widest a menu may grow: Go's box was content-sized and unbounded, so an action with a long
+    /// name pushed the whole frame off-screen; here the label wraps instead.
+    pub menu_max_width: f32,
+    /// `box-shadow: 0 10px 25px rgba(0,0,0,.5)` (`:10`) — the blur and the y-offset; the colour is
+    /// [`Self::menu_shadow`].
+    pub menu_shadow_blur: u8,
+    /// …and its vertical offset.
+    pub menu_shadow_offset_y: i8,
     // ---- file-list geometry (step 8; `frontend/css/file-list.css`) ------------------------------
     /// Horizontal padding inside a file row: the `20px` of `padding: 8px 20px` (`file-list.css:33`).
     pub row_pad_x: f32,
@@ -274,6 +304,18 @@ impl Tokens {
             drawer_section_gap: 4.0,
             drawer_icon_size: 16.0,
             header_button_inset: 16.0,
+            menu_min_width: 180.0,
+            menu_max_width: 420.0,
+            menu_corner_radius: 6,
+            menu_frame_pad_y: 5,
+            menu_item_pad_x: 15.0,
+            menu_item_height: 26.0,
+            menu_icon_gap: 10.0,
+            menu_hint_gap: 24.0,
+            menu_hint_font_size: 11.0,
+            menu_separator_gap: 5,
+            menu_shadow_blur: 25,
+            menu_shadow_offset_y: 10,
             row_pad_x: 20.0,
             row_pad_y: 8.0,
             cell_padding: 8.0,

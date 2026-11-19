@@ -32,6 +32,7 @@ use zenman_core::store::config::{LayoutMode, PaneSlot, ThemeMode};
 use crate::dock::{self, Dock};
 use crate::jobs_ui::JobsUi;
 use crate::keymap::{Command, KeyMap};
+use crate::menus::{self, MenuAction, MenuContext, MenuSpec, MenuTarget};
 use crate::panels::{
     self,
     file_pane::{PaneCommand, RowOrder},
@@ -40,6 +41,25 @@ use crate::persist::Persisted;
 use crate::state::{AppModel, Tab, TabId, panes_for, quad_slots};
 use crate::theme::{self, Tokens};
 use crate::widgets::{disk_meter, toast};
+
+/// The context menu a pane asked for, and the state that keeps it open across frames.
+///
+/// The plan's `menus::Registry` seam, as one option: at most one menu is open at a time (Go had one
+/// `#context-menu` div, `index.html:623`), and it records *where* it was opened, not what it shows —
+/// the rows are rebuilt from live state every frame, which is what lets a greyed `Paste` light up the
+/// moment a `Copy` is clicked elsewhere in the same menu.
+#[derive(Clone, Debug)]
+pub struct OpenMenu {
+    /// The pane it belongs to; the menu closes when that pane is gone (plan §4.3's ownership rule).
+    pub slot: PaneSlot,
+    /// Row or background, and for a row whether it was a directory (Go's `isDir`).
+    pub target: MenuTarget,
+    /// Where its top-left was asked to sit, in screen points.
+    pub at: egui::Pos2,
+    /// A fresh `Id` per opening: an `Area` remembers the position of a known id, so reusing one would
+    /// redraw the second right-click at the first one's spot.
+    pub id: egui::Id,
+}
 
 /// The whole shell.
 pub struct ZenApp {
@@ -63,6 +83,8 @@ pub struct ZenApp {
     pub boot_lines: Vec<String>,
     /// The context menu the panes asked for, waiting for step 10's `menus::Registry` to draw it.
     pub context_request: Option<(PaneSlot, Option<usize>, egui::Pos2)>,
+    /// The menu that is open *now* — the drawn half of `context_request` (step 10b).
+    pub menu: Option<OpenMenu>,
     /// The keymap — **the** single source of truth for dispatch and for the menu hints 10b draws
     /// (plan D7).
     pub keys: KeyMap,
@@ -94,6 +116,7 @@ impl ZenApp {
             tokens: Tokens::default(),
             boot_lines,
             context_request: None,
+            menu: None,
             keys: KeyMap::default(),
             new_folder_request: None,
             persist_at: None,
@@ -117,6 +140,7 @@ impl ZenApp {
             tokens: Tokens::default(),
             boot_lines,
             context_request: None,
+            menu: None,
             keys: KeyMap::default(),
             new_folder_request: None,
             persist_at: None,
@@ -502,6 +526,7 @@ impl ZenApp {
     /// Per-frame drawing: header, drawers, dock, toasts.
     pub fn ui(&mut self, ui: &mut Ui) {
         let tokens = self.tokens;
+        self.open_requested_menu();
         let header_height = tokens.header_height;
         let mut toggle = DrawerToggle::default();
         Panel::top("zenman-header")
@@ -543,6 +568,10 @@ impl ZenApp {
         });
         self.apply_toggles(&toggle);
         self.notices.show(ui.ctx(), &self.tokens);
+        // **Last**, on the foreground layer: in this egui fork the last-allocated overlapping rect
+        // wins hover and click (plan §9.2 step 8), so the menu is drawn after every panel, the dock
+        // and the toast stack, and nothing can steal its rows.
+        self.draw_menu(ui.ctx());
     }
 
     /// The 48 px header (plan §2.2: an `egui::TopBottomPanel`, *not* a dock panel — `Side` has no
@@ -771,6 +800,140 @@ impl ZenApp {
         }
         if toggle.log {
             self.model.log_panel = !self.model.log_panel;
+        }
+    }
+
+    // ---------------------------------------------------------------------------- menus (step 10b)
+
+    /// Adopt a recorded [`PaneCommand::Context`](crate::panels::file_pane::PaneCommand::Context) as
+    /// the open menu. Runs at the top of the draw, because the request arrives at the *end* of the
+    /// previous frame (the panes' commands run after the dock, [`crate::dock_content::show`]) — which
+    /// is also what keeps the opening right-click from being the click-away that closes it.
+    fn open_requested_menu(&mut self) {
+        let Some((slot, ix, at)) = self.context_request.take() else {
+            return;
+        };
+        let target = match ix {
+            Some(ix) => {
+                let on_dir = self
+                    .model
+                    .panes
+                    .get(&slot)
+                    .and_then(|pane| pane.active_tab())
+                    .and_then(|tab| tab.entries.entries.get(ix))
+                    .is_some_and(|entry| entry.is_dir);
+                MenuTarget::Row { on_dir }
+            }
+            None => MenuTarget::Background,
+        };
+        self.menu = Some(OpenMenu {
+            slot,
+            target,
+            at,
+            id: egui::Id::unique("zenman-menu"),
+        });
+    }
+
+    /// What the open menu shows, as data — the same call [`Self::draw_menu`] makes, so a test can read
+    /// the exact labels, chords and enabled states without scraping a frame.
+    #[must_use]
+    pub fn menu_specs(&self) -> Vec<Vec<MenuSpec>> {
+        let Some(open) = &self.menu else {
+            return Vec::new();
+        };
+        let ctx = self.menu_context(open.slot, open.target);
+        let actions = self.session.config().custom_actions;
+        menus::file_menu(&ctx, &actions)
+    }
+
+    /// The context the builders ask about, derived from live state field by field — the plan row's
+    /// "a `MenuContext` field that cannot be populated yet is a documented gap, not a hardcoded
+    /// `true`".
+    #[must_use]
+    pub fn menu_context(&self, slot: PaneSlot, target: MenuTarget) -> MenuContext {
+        let tab = self
+            .model
+            .panes
+            .get(&slot)
+            .and_then(|pane| pane.active_tab());
+        let has_selection = tab.is_some_and(|tab| !tab.sel.is_empty());
+        // Go's `copy_inside`/`cut_inside` queue a directory's *children*, so they are offered only
+        // when every selected row can answer for a directory (`api/ops.go`'s `copyInside`).
+        let all_dirs = tab.is_some_and(|tab| {
+            let mut any = false;
+            let mut all = true;
+            for entry in &tab.entries.entries {
+                if tab.sel.contains(crate::state::Tab::row_key(entry)) {
+                    any = true;
+                    all &= entry.is_dir;
+                }
+            }
+            any && all
+        });
+        let clip = self.session.clipboard();
+        let on_archive = tab.is_some_and(|tab| tab.path.is_archive_file());
+        MenuContext {
+            has_selection,
+            all_dirs,
+            has_clipboard: clip.as_ref().is_some_and(|clip| !clip.is_empty()),
+            clip_is_cut: clip.as_ref().is_some_and(|clip| clip.op == ClipOp::Cut),
+            // `is_archive_file` is core's own read-only-store predicate (plan §4.2); it counts a real
+            // directory named `fake.zip`, which is Go's `dir-root.json` parity case, not a bug here.
+            on_archive,
+            // The probed capability (`platform::Env::supports_symlink`, plan F21: a lock read, so this
+            // is called while a menu is open and never per frame). An unprobed environment is `false`:
+            // no capability we cannot confirm is one we will not offer.
+            can_symlink: self.session.env().supports_symlink().is_ok_and(|ok| ok),
+            // Step 14's batch-rename state does not exist yet, so nothing can be mid-batch; the
+            // builder's `in_batch` arm (the "Rename batch" row) is reachable only from a test.
+            in_batch: false,
+            target,
+        }
+    }
+
+    /// Draw the open menu (if any) and route what was clicked through [`Self::dispatch`] — the same
+    /// function the chord runs (plan **D7**), so a menu item cannot behave differently from its key.
+    fn draw_menu(&mut self, ctx: &egui::Context) {
+        // A menu must not outlive the pane it was opened in.
+        if self.menu.as_ref().is_some_and(|open| {
+            !self
+                .model
+                .panes
+                .get(&open.slot)
+                .is_some_and(|pane| pane.active_tab().is_some())
+        }) {
+            self.menu = None;
+        }
+        let Some(open) = self.menu.clone() else {
+            return;
+        };
+        let groups = self.menu_specs();
+        let menu_ctx = self.menu_context(open.slot, open.target);
+        let mut clicked = Vec::new();
+        let outcome = menus::show(
+            ctx,
+            open.id,
+            open.at,
+            &menu_ctx,
+            &groups,
+            menus::MenuStyle {
+                keys: &self.keys,
+                tokens: &self.tokens,
+            },
+            &mut clicked,
+        );
+        if outcome.close {
+            self.menu = None;
+        }
+        for action in clicked {
+            self.menu = None;
+            match action {
+                MenuAction::Command(command) => self.dispatch(open.slot, command, ctx),
+                MenuAction::Custom(action) => self.notices.post(
+                    toast::Level::Info,
+                    format!("{} runs with step 14's action executor", action.name),
+                ),
+            }
         }
     }
 
@@ -1090,6 +1253,11 @@ impl ZenApp {
             return;
         }
         if self.context_request.take().is_some() {
+            return;
+        }
+        if self.menu.take().is_some() {
+            // The menu is the thing that is open, and Go spent Escape on exactly that
+            // (`keyboard.js:158`, `action-log.js:231`) — it does not also clear the selection.
             return;
         }
         if self.model.log_panel {

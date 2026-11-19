@@ -1,0 +1,552 @@
+//! The step-10b menus, driven through the same harness the pane and keymap tests use: a real
+//! `Session`, a real directory, real `Event::PointerButton`s.
+//!
+//! What this file owns (plan §7 row 10's menu half):
+//!
+//! * a right-click on a row opens the **row** menu, a right-click on the empty space below the rows
+//!   opens the **background** one — with Go's items, in Go's order, and each row's hint spelled the
+//!   way [`KeyMap`] spells its chord;
+//! * the menu closes on a click elsewhere, on <kbd>Escape</kbd> and on the pane going away, and a
+//!   greyed row fires nothing;
+//! * a click routes through [`ZenApp::dispatch`] — asserted for `Copy` (the clipboard really holds the
+//!   row afterwards) and for the **danger** row, which is the same D6 ladder
+//!   `tests/keymap.rs::del_answers_the_d6_ladder_for_this_volume` walks from the keyboard.
+//!
+//! The pure cross-product over `MenuContext` is `src/menus/mod.rs`'s own test module; this file is
+//! the "does the shell actually draw and route it" half.
+
+mod common;
+
+use std::path::{Path, PathBuf};
+
+use egui::{Event, Modifiers, PointerButton, Pos2, Vec2};
+use egui_kittest::Harness;
+use egui_kittest::kittest::Queryable;
+
+use zenman_core::path::{AbsPath, FsPath};
+use zenman_core::store::config::{LayoutMode, PaneSlot};
+use zenman_ui::app::ZenApp;
+use zenman_ui::keymap::{Chord, KeyMap};
+use zenman_ui::state::{Tab, panes_for};
+
+/// Frames to let the shell settle after a non-job action.
+const SETTLE: usize = 6;
+
+// --------------------------------------------------------------------- harness plumbing
+
+/// A fixture directory under cargo's per-test scratch with only the named files (leftovers from a
+/// previous run of the same target are removed — the trees persist, plan §9.2 step 9).
+fn tree(tag: &str, files: &[&str]) -> PathBuf {
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join("zenman-ui-fixtures")
+        .join(format!("zenman-ui-fixture-{tag}"));
+    std::fs::create_dir_all(&root).expect("fixture directory");
+    let wanted: std::collections::BTreeSet<String> =
+        files.iter().map(|f| (*f).to_string()).collect();
+    for entry in std::fs::read_dir(&root).expect("fixture directory is readable") {
+        let entry = entry.expect("a readable directory entry");
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !wanted.contains(&name) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    for name in files {
+        std::fs::write(root.join(name), b"menu fixture\n").expect("fixture file");
+    }
+    root
+}
+
+fn fixture_path(path: &Path) -> FsPath {
+    FsPath::from_abs(AbsPath::try_from(path).unwrap_or_else(|e| panic!("{}: {e}", path.display())))
+}
+
+fn build_harness(app: ZenApp, size: Vec2) -> Harness<'static, ZenApp> {
+    let mut harness = Harness::builder()
+        .with_size(size)
+        // The menu is opened by a command that ran at the *end* of the previous frame, and jobs plus
+        // the coalesced `DirChanged` window stretch the frame loop: 10a found the builder's default too
+        // tight, and 10b agrees.
+        .with_max_steps(64)
+        .with_context_setup(|ctx| {
+            egui_extras::install_image_loaders(ctx);
+            zenman_ui::theme::fonts::install(ctx);
+            zenman_ui::theme::apply(ctx, zenman_core::store::config::ThemeMode::Dark);
+        })
+        .build_ui_state(
+            |ui, app| {
+                app.logic(ui.ctx());
+                app.ui(ui);
+            },
+            app,
+        );
+    settle(&mut harness);
+    harness
+}
+
+/// A single-pane shell listing `dir`.
+fn pane_harness(tag: &str, dir: &Path) -> Harness<'static, ZenApp> {
+    let session = common::session(tag);
+    let mut app = ZenApp::new(session, Vec::new());
+    app.set_layout(panes_for(LayoutMode::Single));
+    app.open_tab(PaneSlot::Left, fixture_path(dir));
+    build_harness(app, egui::vec2(1200.0, 800.0))
+}
+
+/// A two-pane shell, for the "a menu must not outlive its pane" assertion.
+fn split_harness(tag: &str, left: &Path, right: &Path) -> Harness<'static, ZenApp> {
+    let session = common::session(tag);
+    let mut app = ZenApp::new(session, Vec::new());
+    app.set_layout(panes_for(LayoutMode::Split));
+    app.open_tab(PaneSlot::Left, fixture_path(left));
+    app.open_tab(PaneSlot::Right, fixture_path(right));
+    build_harness(app, egui::vec2(1600.0, 800.0))
+}
+
+fn settle(harness: &mut Harness<'static, ZenApp>) {
+    for _ in 0..SETTLE {
+        harness.run();
+    }
+}
+
+fn shown<'h>(harness: &'h Harness<'static, ZenApp>, slot: PaneSlot) -> &'h Tab {
+    harness
+        .state()
+        .model
+        .panes
+        .get(&slot)
+        .and_then(|p| p.active_tab())
+        .unwrap_or_else(|| panic!("the harness has a shown tab in {slot:?}"))
+}
+
+fn names(tab: &Tab) -> Vec<String> {
+    tab.entries
+        .entries
+        .iter()
+        .map(|entry| entry.name.clone())
+        .collect()
+}
+
+fn notices(harness: &Harness<'static, ZenApp>) -> Vec<String> {
+    harness
+        .state()
+        .notices
+        .queued()
+        .iter()
+        .map(|notice| notice.text.clone())
+        .collect()
+}
+
+fn any_notice(harness: &Harness<'static, ZenApp>, needle: &str) -> bool {
+    notices(harness).iter().any(|text| text.contains(needle))
+}
+
+// --------------------------------------------------------------------- the driving primitives
+
+/// Right-click the row labelled `name` — the same event a mouse produces, and the same one the pane
+/// tests' `Queryable::click` sends, only with the other button.
+fn right_click(harness: &mut Harness<'static, ZenApp>, name: &str) {
+    harness.get_by_label(name).click_secondary();
+    // The pane's commands run after the draw, so the menu exists on the *second* frame.
+    harness.run();
+    harness.run();
+}
+
+/// A raw pointer press+release at one point — for the space that is not a row.
+fn click_at(harness: &mut Harness<'static, ZenApp>, at: Pos2, button: PointerButton) {
+    for pressed in [true, false] {
+        harness.input_mut().events.push(Event::PointerButton {
+            pos: at,
+            button,
+            pressed,
+            modifiers: Modifiers::default(),
+        });
+    }
+    harness.run();
+    harness.run();
+}
+
+/// Right-click the empty band below the last row of `slot`'s listing.
+fn right_click_background(harness: &mut Harness<'static, ZenApp>) {
+    let wanted = if harness.query_all_by_label("c.md").count() > 0 {
+        "c.md"
+    } else {
+        "a.txt"
+    };
+    let last = harness.get_by_label(wanted).rect().max;
+    click_at(
+        harness,
+        Pos2::new(last.x - 60.0, last.y + 60.0),
+        PointerButton::Secondary,
+    );
+}
+
+/// The open menu as data: `(label, enabled, hint)` in menu order, straight out of the shell's own
+/// [`ZenApp::menu_specs`] — the same call the renderer makes.
+fn rows(harness: &Harness<'static, ZenApp>) -> Vec<(String, bool, Option<String>)> {
+    let state = harness.state();
+    let Some(open) = state.menu.clone() else {
+        return Vec::new();
+    };
+    let ctx = state.menu_context(open.slot, open.target);
+    let keys = KeyMap::default();
+    state
+        .menu_specs()
+        .iter()
+        .flatten()
+        .map(|spec| {
+            (
+                spec.label.clone(),
+                spec.enabled(&ctx),
+                spec.hint(&keys).or_else(|| spec.icon.map(str::to_string)),
+            )
+        })
+        .collect()
+}
+
+fn labels(harness: &Harness<'static, ZenApp>) -> Vec<String> {
+    rows(harness)
+        .into_iter()
+        .map(|(label, _, _)| label)
+        .collect()
+}
+
+fn is_open(harness: &Harness<'static, ZenApp>) -> bool {
+    harness.state().menu.is_some()
+}
+
+/// The menu rows the shell actually *drew*, read back out of the accessibility tree — a painted menu
+/// with no nodes is a menu nobody can click.
+fn drawn_nodes(harness: &Harness<'static, ZenApp>, label: &str) -> usize {
+    harness.query_all_by_label(label).count()
+}
+
+// ------------------------------------------------------------------------------- the tests
+
+#[test]
+fn right_clicking_a_row_opens_go_row_menu_with_the_keymaps_hints() {
+    let dir = tree("menus-row", &["a.txt", "b.txt", "c.md"]);
+    let mut harness = pane_harness("menus-row", &dir);
+    right_click(&mut harness, "a.txt");
+    assert!(is_open(&harness), "the right-click opened nothing");
+
+    let rows = rows(&harness);
+    let enabled: Vec<&str> = rows
+        .iter()
+        .filter(|(_, on, _)| *on)
+        .map(|(label, _, _)| label.as_str())
+        .collect();
+    // The right-click selected the row (Go's `handlePaneContextMenu:19-27`), so its own commands are
+    // live; the clipboard ones are not, and the directory block is absent for a file row.
+    assert_eq!(
+        labels(&harness),
+        [
+            "Open",
+            "Cut",
+            "Copy",
+            "Copy path",
+            "Copy name",
+            "Rename",
+            "Move to trash",
+            "Delete permanently",
+        ],
+        "the file row's menu, in `context-menu.js:71-107`'s order"
+    );
+    assert_eq!(
+        enabled,
+        [
+            "Open",
+            "Cut",
+            "Copy",
+            "Copy path",
+            "Copy name",
+            "Rename",
+            "Move to trash",
+            "Delete permanently"
+        ],
+        "a plain filesystem row enables everything"
+    );
+    // The hint cell is the keymap's own spelling (plan D7), not a second table.
+    let hint = |label: &str| {
+        rows.iter()
+            .find(|(candidate, _, _)| candidate == label)
+            .and_then(|(_, _, hint)| hint.clone())
+    };
+    assert_eq!(hint("Copy").as_deref(), Some("Ctrl+C"));
+    assert_eq!(hint("Move to trash").as_deref(), Some("Delete"));
+    assert_eq!(hint("Delete permanently").as_deref(), Some("Shift+Delete"));
+    assert_eq!(hint("Rename").as_deref(), Some("F2"));
+
+    // …and the rows really are on screen, as nodes: the menu paints its text, so its a11y nodes are
+    // the only thing a test (or a screen reader) can grab.
+    for label in ["Copy", "Move to trash"] {
+        assert_eq!(drawn_nodes(&harness, label), 1, "{label} was not drawn");
+    }
+}
+
+#[test]
+fn right_clicking_a_directory_row_adds_go_directory_block() {
+    // `nested_tree` gives real directory rows (`alpha`, `beta`) — the `isDir` half of Go's branch.
+    let listing = common::nested_tree("menus-dir");
+    let mut harness = pane_harness("menus-dir", &listing);
+    right_click(&mut harness, "alpha");
+    assert_eq!(
+        labels(&harness),
+        [
+            "Open in new tab",
+            "Copy inside",
+            "Cut inside",
+            "Paste inside",
+            "Open",
+            "Cut",
+            "Copy",
+            "Copy path",
+            "Copy name",
+            "Rename",
+            "Move to trash",
+            "Delete permanently",
+        ],
+        "`context-menu.js:46-70`'s block sits above Open"
+    );
+    let rows = rows(&harness);
+    let disabled: Vec<&str> = rows
+        .iter()
+        .filter(|(_, on, _)| !*on)
+        .map(|(label, _, _)| label.as_str())
+        .collect();
+    assert_eq!(
+        disabled,
+        ["Paste inside"],
+        "only the clipboard row is greyed, and only because nothing is queued"
+    );
+}
+
+#[test]
+fn right_clicking_the_empty_space_opens_the_background_menu() {
+    let dir = tree("menus-bg", &["a.txt", "b.txt", "c.md"]);
+    let mut harness = pane_harness("menus-bg", &dir);
+    right_click_background(&mut harness);
+    assert!(
+        is_open(&harness),
+        "no background menu; notices {:?}",
+        notices(&harness)
+    );
+    assert_eq!(
+        labels(&harness),
+        ["Paste", "Paste link", "New folder"],
+        "Go's empty-space menu (`context-menu.js:108-124`)"
+    );
+    let rows = rows(&harness);
+    assert_eq!(
+        rows.iter()
+            .filter(|(_, on, _)| *on)
+            .map(|(label, _, _)| label.as_str())
+            .collect::<Vec<_>>(),
+        ["New folder"],
+        "an empty clipboard greys both paste rows, it does not hide them"
+    );
+    assert_eq!(drawn_nodes(&harness, "Paste"), 1, "the menu is drawn");
+}
+
+#[test]
+fn a_click_elsewhere_closes_the_menu() {
+    let dir = tree("menus-away", &["a.txt", "b.txt", "c.md"]);
+    let mut harness = pane_harness("menus-away", &dir);
+    right_click(&mut harness, "a.txt");
+    assert!(is_open(&harness));
+    // The header's empty middle: no pane, no menu, nothing to fire.
+    click_at(&mut harness, Pos2::new(400.0, 10.0), PointerButton::Primary);
+    assert!(
+        !is_open(&harness),
+        "the menu survived a click outside its frame"
+    );
+    assert_eq!(
+        drawn_nodes(&harness, "Copy"),
+        0,
+        "a closed menu must not keep its nodes in the tree"
+    );
+}
+
+#[test]
+fn escape_closes_the_menu_and_keeps_the_selection() {
+    let dir = tree("menus-esc", &["a.txt", "b.txt", "c.md"]);
+    let mut harness = pane_harness("menus-esc", &dir);
+    right_click(&mut harness, "a.txt");
+    assert!(is_open(&harness));
+    assert_eq!(shown(&harness, PaneSlot::Left).sel.len(), 1);
+    harness
+        .input_mut()
+        .events
+        .push(Chord::key(egui::Key::Escape).event());
+    harness.run();
+    assert!(!is_open(&harness), "Escape closed nothing");
+    assert_eq!(
+        shown(&harness, PaneSlot::Left).sel.len(),
+        1,
+        "Escape is spent on the menu — Go's own order (`app.js:276`, `action-log.js:231`)"
+    );
+    // …and a second Escape now does the file list's own thing.
+    harness
+        .input_mut()
+        .events
+        .push(Chord::key(egui::Key::Escape).event());
+    harness.run();
+    assert!(shown(&harness, PaneSlot::Left).sel.is_empty());
+}
+
+#[test]
+fn a_greyed_item_fires_nothing() {
+    let dir = tree("menus-grey", &["a.txt", "b.txt", "c.md"]);
+    let mut harness = pane_harness("menus-grey", &dir);
+    right_click_background(&mut harness);
+    assert!(is_open(&harness));
+    assert!(!harness.state().session.clipboard().is_some());
+    // `Paste` is drawn and greyed: clicking it must not paste, must not toast, must not close.
+    harness.get_by_label("Paste").click();
+    harness.run();
+    assert!(
+        !any_notice(&harness, "the clipboard is empty"),
+        "a disabled row reached `dispatch`: {:?}",
+        notices(&harness)
+    );
+    assert!(
+        is_open(&harness),
+        "a disabled click still dismissed the menu"
+    );
+    assert!(!harness.state().session.clipboard().is_some());
+}
+
+#[test]
+fn copy_from_the_menu_leaves_the_clipboard_set_after_it_closes() {
+    let dir = tree("menus-copy", &["a.txt", "b.txt", "c.md"]);
+    let mut harness = pane_harness("menus-copy", &dir);
+    right_click(&mut harness, "a.txt");
+    harness.get_by_label("Copy").click();
+    harness.run();
+    assert!(!is_open(&harness), "a chosen item always closes the menu");
+    let clip = harness
+        .state()
+        .session
+        .clipboard()
+        .expect("the menu's Copy queued the row");
+    assert_eq!(clip.items.len(), 1, "exactly the right-clicked row");
+    assert!(
+        clip.paths()
+            .first()
+            .is_some_and(|path| path.as_path().to_string_lossy().ends_with("a.txt")),
+        "the clipboard holds {:?}",
+        clip.paths()
+    );
+    // And the *same* dispatch the chord runs: the menu now says Paste, because the state says so.
+    right_click_background(&mut harness);
+    let rows = rows(&harness);
+    assert!(
+        rows.iter().any(|(label, on, _)| label == "Paste" && *on),
+        "the rebuilt menu did not notice the clipboard: {rows:?}"
+    );
+}
+
+#[test]
+fn the_danger_item_routes_through_the_same_dispatch_as_delete() {
+    // Plan **D6**, from the mouse: the menu's red row is the very command `Delete` runs, so it answers
+    // for the volume it is on — the trash branch when the fsid has one, a said-out-loud refusal when
+    // it does not. Branch-and-print, exactly like `tests/keymap.rs`'s keyboard version.
+    let dir = tree("menus-danger", &["one.txt", "two.txt"]);
+    let one = dir.join("one.txt");
+    let can_trash =
+        zenman_core::platform::default_env().can_trash(&AbsPath::try_from(one.as_path()).unwrap());
+    println!(
+        "menu D6 branch: can_trash({}) = {can_trash} — {}",
+        one.display(),
+        if can_trash {
+            "TRASHED branch: this volume has a trash location"
+        } else {
+            "REFUSED branch: no trash root, permanent_fallback == false"
+        }
+    );
+    let mut harness = pane_harness("menus-danger", &dir);
+    right_click(&mut harness, "one.txt");
+    assert!(
+        harness.query_all_by_label("Move to trash").count().eq(&1),
+        "the danger row is labelled by `Command::Delete`'s own text"
+    );
+    harness.get_by_label("Move to trash").click();
+    common::settle_until(&mut harness, "the delete job's summary toast", |h| {
+        any_notice(h, "trashed") || any_notice(h, "failed")
+    });
+    assert!(!is_open(&harness), "the chosen item left the menu open");
+    if can_trash {
+        assert!(
+            !one.exists(),
+            "the trash branch moved the file off the disk"
+        );
+        common::settle_until(&mut harness, "the row to disappear", |h| {
+            !names(shown(h, PaneSlot::Left)).contains(&"one.txt".to_string())
+        });
+    } else {
+        assert!(one.exists(), "the refused branch must not touch the bytes");
+        assert!(
+            any_notice(&harness, "0 trashed, 0 deleted, 1 failed"),
+            "the refusal is said out loud: {:?}",
+            notices(&harness)
+        );
+    }
+}
+
+#[test]
+fn a_menu_does_not_outlive_its_pane() {
+    let left = tree("menus-left", &["a.txt"]);
+    let right = tree("menus-right", &["b.txt"]);
+    let mut harness = split_harness("menus-pane", &left, &right);
+    // The *right* pane: collapsing to one pane must remove the slot the menu belongs to, not the
+    // other one.
+    right_click(&mut harness, "b.txt");
+    assert_eq!(
+        harness.state().menu.as_ref().map(|open| open.slot),
+        Some(PaneSlot::Right),
+        "the menu was opened in the wrong pane"
+    );
+    harness
+        .state_mut()
+        .set_layout(panes_for(LayoutMode::Single));
+    harness.run();
+    assert!(
+        !is_open(&harness),
+        "a menu survived the pane it was opened in"
+    );
+}
+
+#[test]
+fn the_open_menu_context_is_read_from_the_engine_not_invented() {
+    // Every field of `MenuContext` the shell can answer for, answered here: the clipboard pair from
+    // `Session::clipboard`, the store kind from the tab's `FsPath`, the symlink capability from the
+    // `Session`'s `Env`. `in_batch` is the documented gap (step 14).
+    let listing = common::nested_tree("menus-ctx");
+    let mut harness = pane_harness("menus-ctx", &listing);
+    let ctx = harness.state().menu_context(
+        PaneSlot::Left,
+        zenman_ui::menus::MenuTarget::Row { on_dir: false },
+    );
+    assert!(!ctx.has_selection, "nothing has been clicked yet");
+    assert!(!ctx.on_archive, "a plain directory is writable");
+    assert!(!ctx.in_batch, "step 14's batch state does not exist yet");
+    assert_eq!(
+        ctx.can_symlink,
+        zenman_core::platform::default_env()
+            .supports_symlink()
+            .unwrap_or(false),
+        "the menu asks the platform, not a constant"
+    );
+    right_click(&mut harness, "alpha");
+    let open = harness.state().menu.clone().expect("the dir row's menu");
+    let ctx = harness.state().menu_context(open.slot, open.target);
+    assert!(ctx.has_selection, "the right-click selected the row");
+    assert!(ctx.all_dirs, "the only selected row is a directory");
+    assert!(!ctx.has_clipboard);
+    assert_eq!(
+        harness
+            .state()
+            .menu_context(PaneSlot::Left, zenman_ui::menus::MenuTarget::Background)
+            .target,
+        zenman_ui::menus::MenuTarget::Background
+    );
+}

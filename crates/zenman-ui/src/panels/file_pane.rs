@@ -24,7 +24,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use egui::{Id, Pos2, Ui};
+use egui::{Id, Pos2, Rect, Sense, Ui};
 
 use zenman_core::entry::{DirPage, FileEntry};
 use zenman_core::metrics::FileSizes;
@@ -305,8 +305,20 @@ pub fn show(
     if let Some(error) = &model.tab.error {
         error_row(ui, tokens, &error.user_message());
     }
+    // The pane's own background: a secondary click on the empty space of the listing is the menu's
+    // *background* variant (Go cleared the selection there and showed Paste / New Folder,
+    // `context-menu.js:108-124`). See the band computation under [`PaneCommand::Context`].
+    let bg_rect = ui.available_rect_before_wrap();
     if model.tab.entries.entries.is_empty() {
         empty_row(ui, tokens, model.loading);
+        // Nothing else in the body is interactive, so all of it is the background — allocated after
+        // the placeholder's own labels, so exactly one rect owns the pointer (see below).
+        let background = ui.interact(
+            bg_rect,
+            ui.scope_id().with("pane-background"),
+            Sense::click(),
+        );
+        push_background_context(&background, bg_rect, &mut out);
         return out;
     }
     let order = RowOrder::build(model.tab);
@@ -321,21 +333,72 @@ pub fn show(
     };
     let list_height = (ui.available_height() - reserve).max(tokens.row_height);
     let is_grid = model.tab.view == ViewMode::Grid;
-    let events = ui
-        .allocate_ui(egui::vec2(ui.available_width(), list_height), |ui| {
-            if is_grid {
-                grid(ui, model, tokens)
-            } else {
-                list(ui, model, tokens)
-            }
-        })
-        .inner;
+    let list = ui.allocate_ui(egui::vec2(ui.available_width(), list_height), |ui| {
+        if is_grid {
+            grid(ui, model, tokens)
+        } else {
+            list(ui, model, tokens)
+        }
+    });
+    let events = list.inner;
+    // The background is the band **below the rows**, never a rect stacked over them: an interactive
+    // rect that overlaps the rows' own `ui.interact` rects does not merely lose the click to them,
+    // it makes two hover claims disagree every frame and the pane never stops repainting (measured in
+    // step 10b: the file-pane tests' `Harness::run` stopped settling inside its `max_steps`). A
+    // listing that fills its viewport therefore has no background band — which is the space Go's
+    // `.file-list` container leaves over anyway.
+    let rows_tall = order.len() as f32 * tokens.row_height;
+    let free_top = if is_grid || rows_tall >= list.response.rect.height() {
+        list.response.rect.max.y
+    } else {
+        list.response.rect.min.y + rows_tall
+    };
+    // The reserved band at the bottom *is* the pagination banner when there is one, and its buttons
+    // must stay clickable, so the background never reaches past the scroller's own bottom there.
+    let bg_bottom = if reserve > 0.0 {
+        list.response.rect.max.y
+    } else {
+        bg_rect.max.y
+    };
+    let bg = Rect::from_min_max(
+        Pos2::new(bg_rect.min.x, free_top),
+        Pos2::new(bg_rect.max.x, bg_bottom.max(free_top)),
+    );
     model.visible_rows = order.len();
     apply_events(model, events, &order, &mut out);
     if model.tab.has_more {
         banner(ui, model, tokens, &mut out);
     }
+    // Allocated **last**: the banner's buttons came earlier and are narrower, so the band cannot eat
+    // them, and every row rect is above `bg`'s top edge by construction.
+    let background = ui.interact(bg, ui.scope_id().with("pane-background"), Sense::click());
+    // A row's own right-click (if there was one) already produced the request; the background only
+    // answers when nothing under the cursor did.
+    push_background_context(&background, bg, &mut out);
     out
+}
+
+/// The background variant of [`PaneCommand::Context`], once per frame at most.
+fn push_background_context(
+    background: &egui::Response,
+    bg_rect: egui::Rect,
+    out: &mut Vec<PaneCommand>,
+) {
+    if !background.secondary_clicked() {
+        return;
+    }
+    if out
+        .iter()
+        .any(|command| matches!(command, PaneCommand::Context { .. }))
+    {
+        return;
+    }
+    out.push(PaneCommand::Context {
+        ix: None,
+        at: background
+            .interact_pointer_pos()
+            .unwrap_or(Pos2::new(bg_rect.min.x, bg_rect.min.y)),
+    });
 }
 
 /// The pane toolbar: view, flat mode, refresh, select-all / select-none.
