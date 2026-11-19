@@ -1869,3 +1869,61 @@ either proven by a named test in this file or corrected in the ledger.
   parity` green, `xvfb-run -a cargo run -p zenman -- --safe-gpu --smoke 1` exit 0. No `todo!`/
   `unimplemented!` anywhere (row 16's rule). `README.md` records the step table, the deviations
   users will notice, and the gap list above.
+
+**Step 4 completed (boot plumbing)** — commit `c95defa`: `apps/zenman/{build.rs,i18n.rs,config_boot.rs,single_instance.rs,app_dirs.rs}`, `store/{config,legacy}.rs`, `platform/system.rs`. What
+proves §7 row 4's Done-when, one named test per criterion:
+
+* **`cargo check` with and without `CRAFT_I18N_DIR`** — `apps/zenman/src/i18n.rs:57 a_default_build_reports_no_extra_locales_and_no_build_dir_leak`: without it (the default build, every gate) the
+  embedded locale count is zero and the list empty; with it (`--features i18n`) `en` is never in the
+  embedded table and the count equals the locale list. `build.rs` turns an unreadable `CRAFT_I18N_DIR`
+  into a warning, not an error — unset is "ship English", photocraft's own rule, so both halves of the
+  criterion compile and one test pins both halves' invariants.
+* **the Go `config.json` fixture imports to the expected `ZenConfig` and leaves a `.bak`** —
+  `crates/zenman-core/src/store/legacy.rs:610 the_real_go_config_imports_to_the_expected_zen_config` (the `docs/contracts.md` migration table applied to `tests/golden/legacy-config-real.json`; a Go file
+  is version 0 until `migrate` stamps it), `:786 applying_leaves_a_backup_beside_the_source_and_keeps_the_source`, `:819 a_second_migration_keeps_the_first_backup` (the row's "second run is a no-op"),
+  `:761 a_dry_run_writes_absolutely_nothing`; the boot-side half is `apps/zenman/src/config_boot.rs:401 a_corrupt_config_is_preserved_before_the_defaults_replace_it` + `:443 migrate_reports_and_backs_up_only_when_told_to`.
+* **a second process exits 0 after focusing the first** — `apps/zenman/src/single_instance.rs:466 the_first_claim_wins_and_the_second_focuses_it`, backed by `:556 a_socket_left_by_a_dead_owner_is_removed_and_taken_over`, `:581 a_live_owner_is_never_displaced`, `:537 the_listener_socket_is_cloexec`.
+
+Measured framework facts, each binding on later steps: `UnixListener::bind` is **not** `SOCK_CLOEXEC`
+at the libc level — std sets `FD_CLOEXEC` with a *second* call, leaving a `fork`+`exec` window in which a
+spawned `xdg-open` could inherit the listener and keep the "instance alive" signal true after exit — so
+the listener is set cloexec explicitly with `rustix::io::fcntl_setfd` and read back (`:537`). The
+craft-i18n convention is pinned at its source (photocraft `crates/ui-egui/build.rs:36-41`, both revs
+recorded as 40-char); English is **not embedded at all** — `craft_i18n::Lang::EN` returns source text
+unchanged, so `en.json` is the source-of-truth document, not a catalog, and the app catalog
+(`zenman.json`) is source-controlled rather than living inside somebody else's checkout. Plan
+corrections the step forced: §5.4's `legacy::import(env)` sketch became an as-built dry-run/apply
+split, `plan_migration(&LegacySource) -> (ZenConfig, MigrationReport)` (`legacy.rs:273`); the Go wire
+names are camelCase **except** `custom_actions`, pinned by `store/config.rs:892`; a corrupt config is
+copied aside before defaults replace it (Go silently discarded), `config_boot.rs:401`.
+
+**Step 6 completed (jobs + Session + IndexIntent)** — commits `e0ba717` (6a, `index/intent.rs`),
+`18bd5b0` (6b, `jobs`, `events`, `services/dirs`, `session`), `fdc8845` (6c, the `rel_path` fix),
+`8790d4b` (6d, `tests/contract_dirs.rs`, 7 cases). What proves §7 row 6's Done-when:
+
+* **`Session::open` against a corrupt-log / locked-db / garbage-config directory returns 3
+  `StartupNote`s** — `crates/zenman-core/src/session.rs:2823 open_survives_a_corrupt_log_a_locked_db_and_a_garbage_config`: all three damaged at once, three notes back, a working session (Go
+  `log.Fatalf`'d on the second of the three), with `:2903 open_reports_only_the_note_that_applies`
+  keeping a healthy directory silent.
+* **`page_dir` matches `contract_dirs::dir_listing_matches_go`** —
+  `crates/zenman-core/tests/contract_dirs.rs:297 dir_listing_matches_go` (the listing gate against the frozen captures; `:417 dir_size_matches_go` is its size twin), and the job-path half is
+  `session.rs:3303 page_dir_answers_done_with_the_list_it_read`.
+* **`Origin` round-trips through `Receipt::Running`** — `session.rs:2923 origin_round_trips_through_receipt_running`; the table half is `jobs.rs:1364 cancel_origin_takes_only_its_own_jobs` and the hung-job
+  watchdog `jobs.rs:1344 watchdog_turns_a_hung_job_into_a_terminal_timeout`.
+
+Corrections to the plan this step produced: `Session::open` as built takes `(SessionPaths, ZenConfig,
+Arc<dyn Env>, Limits)`, not §5.6's single `SessionConfig`, and has exactly **one** hard failure — an
+undo log that cannot be opened (no log means no undo; silently losing the next `paste-move` record is
+the only startup condition not worth surviving); `IndexOp` is not §5.5's `{Upsert,Delete,PruneSubtree}`
+but `{Created,Deleted,Renamed,Moved,Pruned,Refreshed}` with `subject()`/`merged()` — the coalescing law
+written down before step 12 implements it — re-homed to `index/intent.rs`, and `IndexIntent` gained a
+`note_all` batch hook, with `NoopIntent` counting what it drops until step 12 swaps it; `DirChanged`
+names an `FsPath`, never an `AbsPath` — archive rows have no absolute path to name (`events.rs`). 6c
+is a capture-driven fix worth repeating for step 9: a **non-flat** listing leaves `rel_path` empty —
+`api/dir.go:141-149` fills it only inside the `flat=true` branch, and none of `dir-root.json`'s 33 rows
+carries the key — where `DirService` had been passing the listing root as `rel_base`; `rel_base` is now
+the row itself, so `skip_serializing_if` reproduces the capture, and only the flat walk passes the root.
+
+*Back-fill note:* both entries above were written after the fact during the step-16 final review —
+steps 4 and 6 had landed and been verified at the time (`cargo xtask ci` exit 0 at each commit), but
+no §9.2 entry was written then; the sweep closed that gap so the log is complete for every step 1–16.
