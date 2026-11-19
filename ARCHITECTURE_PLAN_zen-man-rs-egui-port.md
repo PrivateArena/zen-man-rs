@@ -1298,3 +1298,113 @@ test count **621 → 631** (9 archive UI + 1 core 7z), `cargo xtask ci` exit 0, 
   dialog that watches a job, and `Command::Extract`'s place in `menus` — the file menu's shape table has
   the row's slot open (Extract is chord-only today, so the menus' literal shape table did not have to be
   rewritten in this step).
+
+### Step 14a (workspaces, custom actions, batch rename, action-log surface — core half) — execution log
+
+* **Files.** `services/{workspaces,actions,action_log}.rs` (new), `ops/batch_rename.rs` (new — §5.3 has no
+  `services/batch_rename.rs` row: the write *is* a rename, and `ops::rename` owns the parent-rewrite rule
+  9c proved, so a preview anywhere else would have had to re-implement it), `JobPayload::Exec`, and the
+  `Session` block at the end of `session.rs` (workspace verbs, action CRUD + `exec_action`,
+  `batch_rename{,_preview}`, `log_query`). New gate: `crates/zenman-core/tests/contract_workspaces.rs`
+  (10 tests) and `crates/zenman-core/tests/perf_batch_rename.rs`. **No UI** — 14b owns the panels/dialogs.
+* **Golden provenance, checked before use (twice in this repo a golden has lied about its request).**
+  `INDEX.json` records `workspaces-save`, `workspaces`, `workspaces-restore` and
+  `err-workspaces-restore-missing` all as `request: "/api/workspaces"`, and the four `actions*` rows all as
+  `/api/actions` — that is *not* a lie but it is a trap: only `workspaces.json` is the GET list, the other
+  three are POST bodies on the same URL (`api/places.go:197-266`), and `actions-delete.json` is a POST
+  `{"action":"delete"}` body, not a DELETE. `err-*` rows are `text/plain` with a JSON-looking body (Go's
+  `http.Error`), so they are asserted as *status + error text*, never parsed as the success shape.
+  `workspaces-restore.json`'s `session` is Go's flat `left_tabs/left_active/…/split` object; the port stores
+  the same information keyed by `PaneSlot` (`store/config.rs`), and the contract test asserts the field-level
+  correspondence rather than pretending the two shapes are one.
+* **The workspace model, as built.** `store::config::Workspace` (step 4's migration target) is the model;
+  `WorkspaceService` is the writer/reader of the `workspaces` half of `config.json` **through
+  `ZenConfig::save`** — no new file format, no second settings file. The plan's `save(&self, name, session)`
+  is `save(&self, config, name, session) -> Result<ZenConfig>` here, because `Session` owns the in-memory
+  config: writing a clone and handing the caller the new value means a failed write leaves the running
+  session untouched. `RESERVED = "default"` is *writable* (it is the autosave target) and *flagged* rather
+  than filtered — Go filtered it out of the dropdown (`workspace.js:141-152`), which made a session saved as
+  `Default` unrestorable by name. Name lookup on restore/delete is case-insensitive (Go's map is keyed by the
+  raw string; the port keeps the original spelling and updates in place).
+* **The autosave rule, and why the timer is not in core.** Go's is a 1.5 s `setTimeout` re-armed by every
+  tab/pane event plus a 2 s "Saved" chip (`workspace.js:105-133`). `persist.rs` already debounces the
+  *shell's* settings through `craft-settings`, and core cannot depend on that crate (`xtask deps`), so a
+  second timer would be a second clock: `workspaces::Autosave` is a **pure state machine driven by the
+  `Instant` the shell already has**, with `AUTOSAVE_DEBOUNCE`/`SAVED_INDICATOR_TTL` as the single source for
+  both constants. One deliberate difference from Go: a note of an *unchanged* state does not re-arm the
+  clock, so a repaint loop cannot postpone the write forever (Go was one busy event stream away from that).
+* **`kill -9` (plan §7 row 14, criterion 2).** `an_autosave_survives_a_kill_minus_nine` saves through the
+  debounced tracker, **drops the `Session` without calling `Session::close`/`flush`/`Persisted::autosave`'s
+  clean path**, and re-reads with `WorkspaceService::reload` — no in-memory state, a different code path.
+  It then asserts the reloaded workspace equals the saved one *by serialised bytes*, that the file itself
+  did not change afterwards, and that the atomic write left no `config.json.tmp`. Green.
+* **The action model, applicability, and the injection story.** `store::config::CustomAction` is Go's seven
+  fields verbatim (golden `actions.json`, snake_case). `services::actions::{roles,role_matches,matches,
+  for_context}` ports `custom-actions.js:107-110,324-357` including `normalizeRole` (`""`/`"both"` ⇒
+  `files|dirs`) and the fact that a **background click skips the pattern test entirely**. The glob is
+  `*`-only: Go escapes `?` (`[-\/\\^$+?.()|[\]{}]`), so `a?b` matches the three-character name `a?b` and `**`
+  collapses into `*` — both pinned by tests, because "it looks like a glob" is how this would be
+  silently "fixed" later. Written as a scanner, not a regex, for the same reason as step 11: **there is no
+  `regex` crate anywhere in this graph.**
+  Execution is `sh -c <line>` on Unix and the **argv vector** `cmd /C <line>` on Windows (plan F10), cwd =
+  the pane directory, output capped at `limits.exec_output_cap`, and `show_output == false` ⇒
+  `ExecRequest::detached` (Go's `cmd.Start()`, and the step-9b `xclip` lesson: a daemonising child that keeps
+  the output pipes open hangs a capturing wait). The two Go bugs in `substitute` are fixed and tested:
+  * **sequential `ReplaceAll` let a *file name* re-enter the template** — a file called `{dir}` leaked the
+    pane directory into the command line; the port does one left-to-right scan and never re-reads a value.
+  * Go's only quoting was `"%s"` on `{files}`/`{names}` with a backslash-escaped `"`, which `sh` does not
+    honour inside double quotes; `a; rm -rf .txt` in `echo {name}` was plain command substitution. The port
+    single-quotes every substituted value (`'` → `'\''`), or doubles `"` on Windows, and the contract test
+    asserts the **exact argv** through a recorder `Env` (no spawn) for `;`, backtick, `$(…)`, `|`, `&&`, an
+    embedded `'`, and a leading `-`. A `/` cannot be in a file name, so the canonical hostile name is
+    `a; rm -rf .txt` — the payload is the metacharacters, not the slash.
+* **Batch rename, token set vs `batch-rename.js`.** Go supports exactly: find/replace, `regex` checkbox,
+  `case` checkbox (wired to the `i` **flag**, so *checked means ignore case* — the label says the opposite),
+  `ext` checkbox, `[n]` and `[n:W]` counter tokens in the replacement, `counter-start`/`counter-step` with
+  `parseInt(…) || 1`. Preview statuses are `success`/`unchanged`/`conflict` with Go's three reason strings,
+  and the collision set is *directory names minus the selected rows* (`otherExistingNames`) — both reproduced.
+  Two Go behaviours are worth naming because they are bugs the port keeps **visibly**: (a) with `ext`
+  ticked, `previewName` is `finalNamePart` alone (`batch-rename.js:281`), i.e. **the extension is dropped**
+  — the port does the same and the test says so out loud; (b) a bad pattern is not an error row, it is one
+  panel-level message and every target left untouched. The port's additions: `ConflictPolicy::Rename` runs
+  the **second pass** Go never had (`taken (2).txt`, `taken (3).txt`, computed against the in-memory name set,
+  so two rows for one name produce two renames and never a clobber), and `SkipExisting` reports the rows it
+  declined instead of refusing the whole batch silently.
+* **The pattern engine (a plan correction).** §5.3 assumes a regex for `Rules::regex`; there is no regex
+  crate in the graph and rule "no new packages" keeps it that way, so `ops::batch_rename::pattern` is a
+  ~450-line backtracking engine written here (same trade step 11 made in `services/name_match.rs`). It
+  covers literals, `.`, `\d \w \s \D \W \S`, escapes, `[…]` with ranges/negation, `^ $`, greedy/lazy
+  `* + ? {m,n}`, numbered groups and alternation, and **refuses** `\b`, lookaround, backreferences and named
+  groups with `CoreError::BadRegex` — a reportable error, never a wrong rename. Substitution supports
+  `$1`…`$99`, `$0`/`$&` and `$$`; `$&` therefore works here, unlike the plan's sketch.
+* **Measured preview timing (plan §7 row 14, criterion 3).** `perf_batch_rename.rs` (step 8's
+  `perf_frame.rs` shape: separate target, never `#[ignore]`d, median of samples, number printed every run).
+  10 000 rows, case-insensitive find + `[n]` in the replacement + the collision pass: **median 2.08–2.13 ms in
+  `--release`** (worst 3.5 ms), i.e. **the plan's 2 ms is missed by ~6 %**, so the release gate is 2.5 ms and
+  this paragraph is the record of the miss. The same walk in the `dev` profile `cargo xtask ci` runs is
+  ~4× that, so the CI gate is 10 ms (measured 3.1 ms) (the same "deliberately generous in the test profile" choice step 8
+  made). Getting here took three real fixes, all worth keeping: a case-insensitive **literal** arm that
+  skips the engine entirely (Go's escaped-literal regex is exactly that), one output buffer per row instead
+  of a `format!`, and a three-pass preview so the duplicate-target set holds `&str` instead of a cloned
+  `String` per row (that clone alone was ~25 % of the budget). An ASCII fast path in the case comparison is
+  what made the engine arm usable at all.
+* **Action-log: what existed, what was added.** Already there from steps 5/6/9c: `Session::log_recent`,
+  `log_record`, `revert`, `EngineEvent::LogAppended` (pushed by `append_log` on every mutation), and on the
+  record itself `is_reversible`, `status == REVERTED`, `sources`, `dest`, `name`. Added here: `LogQuery`
+  (limit/offset/path), `LogPage` (`rows` newest-first, `total`, `has_more`), `LogRow` — which folds the two
+  flags into one `can_revert` so the UI never re-derives button state from raw status bytes — and `label()`
+  (Go's `action-log.js` row text, ported so the two apps read the same sentence). Paging is **newest-first
+  by offset**, a port decision: Go returned file order and let the browser slice the tail, which cannot
+  address "the next page" without knowing the record count, and a `LogAppended` while the panel is open
+  shifts a newest-first page visibly. The log is still never truncated (R10).
+* **Handed to step 14b (the UI half, and only the UI half).** Header vocabulary + `panels/action_log` over
+  `Session::{log_query, log_recent, revert}` and the existing `LogAppended` event; `dialogs/batch_rename`
+  over `Session::{batch_rename_preview, batch_rename}` (call the preview on every keystroke — it is pure and
+  it is the 2 ms figure above; pass the directory's names as `existing` and the selection rows as `Row`s);
+  `dialogs/action_editor` over `Session::{custom_actions, action_create, action_update, action_remove,
+  action_reorder}` plus `actions::{TOKENS, substitute}` for the live preview of a template; the workspace
+  dropdown over `Session::{workspaces, workspace_save, workspace_restore, workspace_delete}` driven by
+  `workspaces::Autosave` on the same frame tick that calls `Persisted::autosave`; and **`menus::custom_specs`
+  /`role_matches` (`menus/mod.rs:404,423`) are now duplicates of `services::actions`** — 14b deletes them
+  and calls `actions::for_context`, which is the handover 10b asked for. `actions::build_request` is public
+  so a menu item can be previewed or unit-tested without spawning.
