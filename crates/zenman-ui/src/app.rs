@@ -47,7 +47,7 @@ use crate::panels::{
 use crate::persist::Persisted;
 use crate::state::{AppModel, Tab, TabId, panes_for, quad_slots};
 use crate::theme::{self, Tokens};
-use crate::widgets::{disk_meter, toast};
+use crate::widgets::toast;
 
 /// The context menu a pane asked for, and the state that keeps it open across frames.
 ///
@@ -986,61 +986,14 @@ impl ZenApp {
         panels::status_bar::show(ui, &model, &tokens);
     }
 
-    /// The right drawer: disks (plan §5.7: `widgets/disk_meter` is the point of it).
+    /// The right drawer: Go's Custom Actions manager (`index.html:425-487`), step 15b.
     fn right_drawer(&mut self, ui: &mut Ui) {
-        let tokens = self.tokens;
-        ui.label(
-            egui::RichText::new("Disks")
-                .color(tokens.text_main)
-                .strong(),
-        );
-        let path = AbsPath::from_path("/");
-        match path.map(|p| self.session.env().disk_space(&p)) {
-            Ok(Ok(space)) => {
-                let used = space.total.saturating_sub(space.free);
-                ui.add_space(tokens.drawer_section_gap);
-                let _ = disk_meter::show(ui, &tokens, "/", used, space.total);
-            }
-            Ok(Err(e)) => {
-                ui.label(
-                    egui::RichText::new(format!("disk space unavailable: {}", e.user_message()))
-                        .color(tokens.text_muted),
-                );
-            }
-            Err(_) => {
-                ui.label(egui::RichText::new("no filesystem root").color(tokens.text_muted));
-            }
-        }
+        crate::panels::side_panel::show_right(self, ui);
     }
 
-    /// The left drawer: the persisted bookmarks (config is real since step 4; the tree/places
-    /// model is step 14's).
+    /// The left drawer: places, favourites, mounted drives (step 15b; defects D8/D9).
     fn left_drawer(&mut self, ui: &mut Ui) {
-        let tokens = self.tokens;
-        ui.label(
-            egui::RichText::new("Places")
-                .color(tokens.text_main)
-                .strong(),
-        );
-        let bookmarks = self.session.config().bookmarks;
-        if bookmarks.is_empty() {
-            ui.label(
-                egui::RichText::new("no bookmarks yet — add them in step 14")
-                    .color(tokens.text_muted),
-            );
-            return;
-        }
-        for bookmark in bookmarks {
-            let label = bookmark.label.unwrap_or_else(|| bookmark.path.clone());
-            crate::icons::paint(
-                ui,
-                ui.available_rect_before_wrap(),
-                "folder",
-                tokens.drawer_icon_size,
-                tokens.text_muted,
-            );
-            ui.label(label);
-        }
+        crate::panels::side_panel::show_left(self, ui);
     }
 
     /// The action-log slide-in (step 14 owns the content; the panel and its toggle are step 7's so
@@ -1404,10 +1357,7 @@ impl ZenApp {
             // Step 13b: "extract shows progress + cancel". The panel is the progress; the cancel is
             // in it. Go's default (`ConflictPolicy::DEFAULT`, the same rule the paste path uses).
             Command::Extract => self.extract_here(slot, zenman_core::ops::ConflictPolicy::DEFAULT),
-            Command::AddToFavorites => self.notices.post(
-                toast::Level::Info,
-                "favorites are written by step 14's places service",
-            ),
+            Command::AddToFavorites => self.add_current_to_favourites(slot),
             Command::OpenContextMenu => {
                 let at = ctx.input(|i| i.pointer.hover_pos());
                 if let Some(at) = at {

@@ -60,6 +60,10 @@ pub struct LogRow {
     pub status: &'static str,
     /// RFC 3339 timestamp, Go's `time.Time` JSON shape.
     pub timestamp: String,
+    /// Go's `timeAgo` bucket for this record (`metrics::format_relative_time`): `42s ago`, `5m ago`,
+    /// `3h ago`, `9d ago`. Computed in core because `zenman-ui` has no `chrono` edge — the reason
+    /// step 14b printed the RFC 3339 stamp instead, retired by step 15b for parity (defect D10).
+    pub ago: String,
     /// The action type has an undo at all (`ActionType::is_reversible`).
     pub reversible: bool,
     /// The record was already undone.
@@ -88,6 +92,10 @@ impl LogRow {
             action: record.action_str(),
             status: record.status_str(),
             timestamp: record.timestamp.to_rfc3339(),
+            ago: crate::metrics::format_relative_time(
+                record.timestamp.timestamp(),
+                chrono::Utc::now().timestamp(),
+            ),
             reversible,
             reverted,
             can_revert: reversible && !reverted,

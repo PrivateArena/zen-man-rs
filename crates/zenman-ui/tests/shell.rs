@@ -101,15 +101,17 @@ fn drawers_toggle_from_their_header_buttons() {
     harness.get_by_label("places").click();
     harness.run();
     assert!(harness.state().model.left_drawer.open);
-    harness.get_by_label("Places");
+    // Step 15b: the drawers hold their real content — Go's section titles (uppercase, per
+    // `.sidebar-section-title`) and the history panel's Go title.
+    harness.get_by_label("PLACES");
     harness.get_by_label("disks").click();
     harness.run();
     assert!(harness.state().model.right_drawer.open);
-    harness.get_by_label("Disks");
+    harness.get_by_label("CUSTOM ACTIONS");
     harness.get_by_label("action log").click();
     harness.run();
     assert!(harness.state().model.log_panel);
-    harness.get_by_label("Action log");
+    harness.get_by_label("Action History");
 }
 
 #[test]

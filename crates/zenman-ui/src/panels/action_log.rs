@@ -22,9 +22,11 @@
 //!
 //! # Time
 //!
-//! The row prints the record's own RFC 3339 stamp (trimmed to the minute) rather than Go's
-//! "2 minutes ago" buckets: `zenman-ui` has no `chrono` edge (and rule "no new packages" keeps it
-//! that way), and a wrong relative time is worse than an absolute one. Recorded as a deviation.
+//! The row prints Go's vocabulary (step 15b, defect D10): the `timeAgo` bucket
+//! (`frontend/js/action-log.js:34-43`) as `LogRow::ago`, the per-type icon (`:17-24`) and the red
+//! `permanent` marker (`:105-108`) under the panel's own "Action History" title (`index.html:628`).
+//! The relative text is computed in core (`metrics::format_relative_time`) because `zenman-ui` has
+//! no `chrono` edge — which was step 14b's reason for printing RFC 3339 instead; parity wins.
 
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
@@ -180,7 +182,7 @@ pub fn show(app: &mut ZenApp, ui: &mut Ui) {
         .inner_margin(Margin::same(tokens.dialog_padding as i8))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Action log").color(tokens.text_main).strong());
+                ui.label(RichText::new(TITLE).color(tokens.text_main).strong());
                 ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("×").clicked() {
                         commands.push(LogCommand::Close);
@@ -188,7 +190,7 @@ pub fn show(app: &mut ZenApp, ui: &mut Ui) {
                 });
             });
             ui.label(
-                RichText::new(format!("{} record(s)", page.total))
+                RichText::new(DESCRIPTION)
                     .color(tokens.text_muted)
                     .size(tokens.font_size - 1.0),
             );
@@ -280,6 +282,18 @@ pub fn record_row(
                         colour,
                     );
                 }
+                // Go's per-type icon (`action-log.js:17-24`), paint-only beside the strip (rule 10).
+                let (icon, _) = ui.allocate_exact_size(
+                    vec2(tokens.row_icon_size + tokens.menu_icon_gap, height),
+                    Sense::hover(),
+                );
+                crate::icons::paint(
+                    ui,
+                    icon,
+                    row_icon(row.action),
+                    tokens.row_icon_size,
+                    tokens.text_muted,
+                );
                 ui.spacing_mut().item_spacing = vec2(tokens.log_inner_gap, 2.0);
                 ui.vertical(|ui| {
                     ui.label(
@@ -288,7 +302,7 @@ pub fn record_row(
                             .strong(),
                     );
                     ui.label(
-                        RichText::new(format!("{} · {}", stamp(&row.timestamp), row.status))
+                        RichText::new(format!("{} · {}", row.ago, row.status))
                             .color(tokens.text_muted)
                             .size(tokens.font_size - 1.0),
                     );
@@ -313,6 +327,14 @@ pub fn record_row(
                     }
                 });
                 ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                    if let Some(marker) = trailing_marker(row) {
+                        ui.label(
+                            RichText::new(marker)
+                                .color(tokens.danger)
+                                .italics()
+                                .size(tokens.font_size - 1.0),
+                        );
+                    }
                     let button = ui.add_enabled(
                         row.can_revert,
                         egui::Button::new(RichText::new("↩ Undo").color(if row.can_revert {
@@ -351,25 +373,6 @@ fn shorten(text: &str, budget: usize) -> String {
     format!("{cut}…")
 }
 
-/// The RFC 3339 stamp, trimmed to the minute for the panel (`2024-05-06T07:08:09+00:00` →
-/// `2024-05-06 07:08`).
-fn stamp(rfc3339: &str) -> String {
-    let date = rfc3339.split('T').next().unwrap_or(rfc3339);
-    let time = rfc3339.split('T').nth(1).unwrap_or("");
-    let mut clock = String::new();
-    for ch in time.chars() {
-        if ch.is_ascii_digit() || ch == ':' {
-            clock.push(ch);
-        } else {
-            break;
-        }
-        if clock.len() == 5 {
-            break;
-        }
-    }
-    format!("{date} {clock}")
-}
-
 // ------------------------------------------------------------------ the shell's answers
 
 impl ZenApp {
@@ -403,5 +406,44 @@ impl ZenApp {
         if self.model.log_panel {
             self.log.mark_dirty();
         }
+    }
+}
+
+// ------------------------------------------------------------------- Go's vocabulary (15b)
+
+/// Go's panel title (`index.html:628`).
+pub const TITLE: &str = "Action History";
+
+/// Go's description line under the title (`index.html:631`).
+pub const DESCRIPTION: &str = "Recent file operations. Reversible actions can be undone instantly.";
+
+/// Go's marker for a record that cannot be undone (`action-log.js:108`).
+pub const PERMANENT: &str = "permanent";
+
+/// The per-type icon — Go's `ACTION_META` (`action-log.js:17-24`) mapped onto this port's icon set,
+/// because the reference's emoji are glyphs our installed font stack does not carry (rule 11).
+#[must_use]
+pub fn row_icon(action: &str) -> &'static str {
+    match action {
+        "copy" => "copy",
+        "paste-copy" => "paste",
+        "paste-move" => "cut",
+        "delete" => "trash",
+        "rename" => "edit",
+        "mkdir" => "folder",
+        "chmod" => "settings",
+        "paste-link" => "link",
+        _ => "info",
+    }
+}
+
+/// What the row shows where `↩ Undo` would go: Go's `permanent` for a done record with no undo, and
+/// nothing for one that has already been reverted.
+#[must_use]
+pub fn trailing_marker(row: &LogRow) -> Option<&'static str> {
+    if row.can_revert || row.reverted {
+        None
+    } else {
+        Some(PERMANENT)
     }
 }

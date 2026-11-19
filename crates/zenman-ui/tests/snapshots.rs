@@ -57,6 +57,10 @@ const FIXED_UNIX: i64 = 1_700_000_000;
 /// that minute paints identically.
 const FIXED_RFC3339: &str = "2023-11-14T22:13:20+00:00";
 
+/// The frozen `timeAgo` bucket of the painted log rows (step 15b): a live one changes between
+/// runs, exactly like the RFC 3339 stamp beside it.
+const FIXED_AGO: &str = "1m ago";
+
 /// The rows the frozen index-running frame claims to have indexed. A rebuild's *live* count is a race
 /// against a worker thread, so the frame is stamped with a fixed one — see [`drive_index`].
 const INDEXED_FROZEN: i64 = 200;
@@ -425,7 +429,8 @@ fn render(scene: &Scene) -> Option<RgbaImage> {
         // between two runs of the same checkout.
         let rows = &harness.state().log.page.rows;
         assert!(
-            rows.iter().all(|r| r.timestamp == FIXED_RFC3339),
+            rows.iter()
+                .all(|r| r.timestamp == FIXED_RFC3339 && r.ago == FIXED_AGO),
             "the painted frame is backed by the frozen stamps, not live ones: {:?}",
             rows.iter().map(|r| r.timestamp.clone()).collect::<Vec<_>>()
         );
@@ -644,6 +649,55 @@ fn drive_drawer(harness: &mut Harness<'static, ZenApp>, side: Side) {
         PAGE,
         "the listing is behind the drawer"
     );
+    // Step 15b: the drawers are the real content now, and no row of either may reach the panel's
+    // edge (defect D9) — step 8d's breadcrumb rect test, against the drawer's own width.
+    let tokens = harness.state().tokens;
+    let places = harness.state().session.places();
+    assert!(
+        places.user.iter().any(|p| p.label == "Home"),
+        "the left drawer's Places list has Home"
+    );
+    assert!(!places.disks.is_empty(), "the drawer has a disk");
+    assert_labels(
+        harness,
+        match side {
+            Side::Left => &["PLACES", "BOOKMARKS", "MOUNTED DRIVES"],
+            Side::Right => &["CUSTOM ACTIONS"],
+        },
+    );
+    if side == Side::Left {
+        for label in ["Home", "Downloads"] {
+            let rect = harness.get_by_label(label).rect();
+            assert!(
+                rect.max.x <= tokens.left_drawer_width,
+                "`{label}` at {rect:?} must fit the {} px panel",
+                tokens.left_drawer_width
+            );
+        }
+        for disk in &places.disks {
+            // The mount's volume name can collide with a breadcrumb chip of the same word, so the
+            // nodes *inside the panel's own x-range* are the row: the assertion is that one exists
+            // and that it does not reach the panel's edge.
+            let rects: Vec<_> = harness
+                .query_all_by_label(&disk.label)
+                .map(|node| node.rect())
+                .filter(|rect| rect.min.x < tokens.left_drawer_width)
+                .collect();
+            assert!(
+                !rects.is_empty(),
+                "the disk row {:?} is in the frame",
+                disk.label
+            );
+            for rect in rects {
+                assert!(
+                    rect.max.x <= tokens.left_drawer_width,
+                    "the disk row {:?} at {rect:?} must fit the {} px panel",
+                    disk.label,
+                    tokens.left_drawer_width
+                );
+            }
+        }
+    }
     assert_labels(harness, &["Modified", "listing", "docs"]);
 }
 
@@ -711,6 +765,7 @@ fn freeze_log_panel(harness: &mut Harness<'static, ZenApp>) {
     let stamp = |h: &mut Harness<'static, ZenApp>| {
         for row in &mut h.state_mut().log.page.rows {
             row.timestamp = FIXED_RFC3339.to_string();
+            row.ago = FIXED_AGO.to_string();
         }
     };
     stamp(harness);
@@ -718,7 +773,8 @@ fn freeze_log_panel(harness: &mut Harness<'static, ZenApp>) {
     stamp(harness);
     let rows = &harness.state().log.page.rows;
     assert!(
-        rows.iter().all(|r| r.timestamp == FIXED_RFC3339),
+        rows.iter()
+            .all(|r| r.timestamp == FIXED_RFC3339 && r.ago == FIXED_AGO),
         "every painted row carries the frozen stamp: {:?}",
         rows.iter().map(|r| r.timestamp.clone()).collect::<Vec<_>>()
     );

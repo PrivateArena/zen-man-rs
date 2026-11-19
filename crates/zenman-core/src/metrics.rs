@@ -156,6 +156,29 @@ fn at(
     Some(offset.from_utc_datetime(&utc.naive_utc()))
 }
 
+/// A duration in Go's action-history buckets: `Ns ago` under a minute, `Nm ago` under an hour, `Nh
+/// ago` under a day, `Nd ago` after that (`frontend/js/action-log.js:34-43`, `timeAgo`).
+///
+/// Core owns it for the same reason [`format_mtime`] does — a date needs `chrono`, and `zenman-ui`
+/// has none (step 14b's stated reason for printing RFC 3339 stamps; step 15b retires that deviation
+/// in favour of parity, defect D10).
+#[must_use]
+pub fn format_relative_time(then_unix: i64, now_unix: i64) -> String {
+    let seconds = now_unix.saturating_sub(then_unix).max(0);
+    let minutes = seconds / 60;
+    let hours = minutes / 60;
+    let days = hours / 24;
+    if seconds < 60 {
+        format!("{seconds}s ago")
+    } else if minutes < 60 {
+        format!("{minutes}m ago")
+    } else if hours < 24 {
+        format!("{hours}h ago")
+    } else {
+        format!("{days}d ago")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

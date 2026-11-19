@@ -20,6 +20,7 @@ pub mod actions;
 pub mod archive;
 pub mod dirs;
 pub mod name_match;
+pub mod places;
 pub mod search_index;
 pub mod search_live;
 pub mod sort;

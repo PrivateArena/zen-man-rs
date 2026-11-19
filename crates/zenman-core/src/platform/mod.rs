@@ -645,6 +645,17 @@ fn under_mount(mount: &str, path: &Path) -> bool {
     mount == path || (mount.parent().is_some() && path.starts_with(mount))
 }
 
+/// The home directory this process runs in — `$HOME`, the value Go resolves `~` against for its
+/// Places list (`frontend/js/sidebar.js:9-15`). Answered here because `services/` never reads the
+/// environment (`services/mod.rs`): the OS answers OS questions. `None` when the variable is unset
+/// or is not an absolute path, which the drawer renders as a typed state.
+#[must_use]
+pub fn home_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|home| home.is_absolute())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

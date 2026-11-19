@@ -634,6 +634,66 @@ impl Session {
             .clone()
     }
 
+    /// The left drawer's content: places, favourites, mounted drives (plan §5.8 `side_panel.rs`).
+    #[must_use]
+    pub fn places(&self) -> crate::services::places::Places {
+        let home = crate::platform::home_dir();
+        crate::services::places::Places::build(
+            &**self.env(),
+            home.as_deref(),
+            &self.config().bookmarks,
+        )
+    }
+
+    /// The favourites (Go's `config.json` `bookmarks`, `api/places.go:14-63,120-197`).
+    #[must_use]
+    pub fn favourites(&self) -> Vec<crate::store::config::Bookmark> {
+        self.config().bookmarks
+    }
+
+    /// Add one favourite — the target of `Command::AddToFavorites`, Go's `POST /api/places`
+    /// `{"action":"add"}` (`api/places.go:147-166`): normalised, deduplicated, and persisted
+    /// through the same atomic [`ZenConfig::save`] step 12c writes the index config with.
+    pub fn add_favourite(
+        &self,
+        path: &str,
+    ) -> Result<Vec<crate::store::config::Bookmark>, CoreError> {
+        let normal = crate::services::places::normalize(path)?;
+        let mut candidate = self.config();
+        if !candidate.bookmarks.iter().any(|b| b.path == normal) {
+            candidate.bookmarks.push(crate::store::config::Bookmark {
+                path: normal,
+                label: None,
+                added_at: None,
+            });
+        }
+        self.write_bookmarks(candidate)
+    }
+
+    /// Remove one favourite (Go's `{"action":"remove"}`, `api/places.go:167-186`). Removing a path
+    /// that is not there is the no-op Go answered with `status: success`.
+    pub fn remove_favourite(
+        &self,
+        path: &str,
+    ) -> Result<Vec<crate::store::config::Bookmark>, CoreError> {
+        let normal = crate::services::places::normalize(path)?;
+        let mut candidate = self.config();
+        candidate.bookmarks.retain(|b| b.path != normal);
+        self.write_bookmarks(candidate)
+    }
+
+    /// The single write path of the two above: validate, save atomically, adopt.
+    fn write_bookmarks(
+        &self,
+        candidate: ZenConfig,
+    ) -> Result<Vec<crate::store::config::Bookmark>, CoreError> {
+        candidate.validate()?;
+        candidate.save(&self.inner.paths.config)?;
+        let bookmarks = candidate.bookmarks.clone();
+        *lock(&self.inner.config) = candidate;
+        Ok(bookmarks)
+    }
+
     /// Run `f` with the single connection.
     ///
     /// This — not a stored `Connection` — is what plan §5.4's "the DB is a private field" correction
