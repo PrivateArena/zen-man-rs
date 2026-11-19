@@ -110,6 +110,11 @@ pub struct ZenApp {
     pub archives_touched: bool,
     /// The file drag in flight (step 10c, `drag_drop`): `None` when the pointer is not dragging rows.
     pub drag: Option<crate::drag_drop::DragPayload>,
+    /// The header's workspace group: the dropdown, `New`/`Delete`, the `✓ Saved` chip and the
+    /// autosave clock (plan §5.8 `panels/header.rs`, step 14b).
+    pub workspaces: crate::panels::header::WorkspaceBar,
+    /// The action-log panel's state (plan §5.8 `panels/action_log.rs`, step 14b).
+    pub log: crate::panels::action_log::LogPanel,
     /// When the next debounced persist is due (plan §5.7 `persist_at`).
     pub persist_at: Option<Instant>,
     /// The last frame's start, for the step-8 `perf_frame` budget check.
@@ -142,6 +147,8 @@ impl ZenApp {
             extracts: Vec::new(),
             archives_touched: false,
             drag: None,
+            workspaces: crate::panels::header::WorkspaceBar::default(),
+            log: crate::panels::action_log::LogPanel::default(),
             persist_at: None,
             last_frame: Instant::now(),
         }
@@ -170,6 +177,8 @@ impl ZenApp {
             extracts: Vec::new(),
             archives_touched: false,
             drag: None,
+            workspaces: crate::panels::header::WorkspaceBar::default(),
+            log: crate::panels::action_log::LogPanel::default(),
             persist_at: None,
             last_frame: Instant::now(),
         };
@@ -732,10 +741,15 @@ impl ZenApp {
         self.reload_stale();
         let now = Instant::now();
         self.last_frame = now;
-        if dock::persist_pending(ctx, now) {
+        let dock_moved = dock::persist_pending(ctx, now);
+        if dock_moved {
             let snap = self.snapshot();
             self.persist.autosave(&snap, now);
         }
+        // Step 14b: the two 14a-backed clocks, on the same frame tick as `Persisted::autosave` —
+        // the log panel's event-driven/poll refresh, and the workspace autosave + `✓ Saved` chip.
+        crate::panels::action_log::tick(self);
+        self.tick_workspaces(now, dock_moved);
     }
 
     /// Re-list the tabs the engine's `DirChanged` events invalidated (plan §4.1/F2: coalesced by
@@ -848,6 +862,7 @@ impl ZenApp {
     /// The 48 px header (plan §2.2: an `egui::TopBottomPanel`, *not* a dock panel — `Side` has no
     /// `Top`).
     fn header(&mut self, ui: &mut Ui, toggle: &mut DrawerToggle) {
+        use crate::panels::header;
         let tokens = self.tokens;
         ui.horizontal(|ui| {
             ui.label(
@@ -855,6 +870,17 @@ impl ZenApp {
                     .color(tokens.text_active)
                     .strong(),
             );
+            // The workspace group (plan §5.8 `panels/header.rs`, step-8c review gap 1):
+            // `Workspace: <select>` · `New` · `Delete` · `✓ Saved` · the disk meter. It emits
+            // commands like a pane does; the shell answers them, and the answer may open a dialog,
+            // so nothing here is called from inside the draw closure.
+            let disk = AbsPath::from_path("/")
+                .ok()
+                .and_then(|root| self.session.env().disk_space(&root).ok())
+                .map(|space| (space.free, space.total));
+            self.workspaces.refresh(self.session.workspaces());
+            let commands = self.workspaces.show(ui, &tokens, disk, Instant::now());
+            self.header_commands(commands);
             if let Some(line) = self.boot_lines.first() {
                 ui.label(
                     egui::RichText::new(line)
@@ -863,6 +889,27 @@ impl ZenApp {
                 );
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // Right-to-left, so these come out in the reference's order: `History` ·
+                // `2-Pane (F3)` · `4-Pane (F4)`. The chord text is `KeyMap::hint`'s own spelling
+                // (plan D7), never a second table.
+                let quad = self.model.quad();
+                let split = self.model.layout == LayoutMode::Split && !quad;
+                let single = self.model.layout == LayoutMode::Single && !quad;
+                let quad_hint = self.keys.hint_text(Command::QuadLayout);
+                let split_hint = self.keys.hint_text(Command::SplitLayout);
+                if header::chord_button(ui, &tokens, format!("4-Pane ({quad_hint})"), quad) {
+                    toggle.quad = true;
+                }
+                if header::chord_button(ui, &tokens, format!("2-Pane ({split_hint})"), split) {
+                    toggle.split = true;
+                }
+                if header::chord_button(ui, &tokens, "History".to_string(), self.model.log_panel) {
+                    toggle.log = true;
+                }
+                ui.separator();
+                if layout_button(ui, &tokens, "list", "single pane", single).clicked() {
+                    toggle.single = true;
+                }
                 if icon_button(ui, &tokens, "info", "action log", self.model.log_panel).clicked() {
                     toggle.log = true;
                 }
@@ -880,34 +927,6 @@ impl ZenApp {
                 .clicked()
                 {
                     toggle.left = true;
-                }
-                ui.separator();
-                let mode = self.model.layout;
-                let quad = self.model.quad();
-                if layout_button(
-                    ui,
-                    &tokens,
-                    "list",
-                    "single pane",
-                    mode == LayoutMode::Single && !quad,
-                )
-                .clicked()
-                {
-                    toggle.single = true;
-                }
-                if layout_button(
-                    ui,
-                    &tokens,
-                    "split",
-                    "split panes",
-                    mode == LayoutMode::Split && !quad,
-                )
-                .clicked()
-                {
-                    toggle.split = true;
-                }
-                if layout_button(ui, &tokens, "quad", "quad panes", quad).clicked() {
-                    toggle.quad = true;
                 }
             });
         });
@@ -1027,13 +1046,7 @@ impl ZenApp {
     /// The action-log slide-in (step 14 owns the content; the panel and its toggle are step 7's so
     /// "drawers visible" is testable now).
     fn action_log_placeholder(&mut self, ui: &mut Ui) {
-        let tokens = self.tokens;
-        ui.label(
-            egui::RichText::new("Action log")
-                .color(tokens.text_main)
-                .strong(),
-        );
-        ui.label(egui::RichText::new("records appear here from step 9").color(tokens.text_muted));
+        crate::panels::action_log::show(self, ui);
     }
 
     /// The status line: what a user glances at — jobs, panes, engine step.
@@ -1070,7 +1083,7 @@ impl ZenApp {
             self.model.right_drawer.open = !self.model.right_drawer.open;
         }
         if toggle.log {
-            self.model.log_panel = !self.model.log_panel;
+            self.toggle_log_panel();
         }
     }
 
@@ -1114,7 +1127,8 @@ impl ZenApp {
         };
         let ctx = self.menu_context(open.slot, open.target);
         let actions = self.session.config().custom_actions;
-        menus::file_menu(&ctx, &actions)
+        let sel = self.action_context(open.slot);
+        menus::file_menu(&ctx, &sel, &actions)
     }
 
     /// The context the builders ask about, derived from live state field by field — the plan row's
@@ -1155,9 +1169,9 @@ impl ZenApp {
             // is called while a menu is open and never per frame). An unprobed environment is `false`:
             // no capability we cannot confirm is one we will not offer.
             can_symlink: self.session.env().supports_symlink().is_ok_and(|ok| ok),
-            // Step 14's batch-rename state does not exist yet, so nothing can be mid-batch; the
-            // builder's `in_batch` arm (the "Rename batch" row) is reachable only from a test.
-            in_batch: false,
+            // 14b: the real source. Go's `triggerRename` sent a selection of more than one row to
+            // `batch-rename.js`, so "mid-batch" *is* "more than one row is selected".
+            in_batch: tab.is_some_and(|tab| tab.sel.len() > 1),
             target,
         }
     }
@@ -1200,10 +1214,7 @@ impl ZenApp {
             self.menu = None;
             match action {
                 MenuAction::Command(command) => self.dispatch(open.slot, command, ctx),
-                MenuAction::Custom(action) => self.notices.post(
-                    toast::Level::Info,
-                    format!("{} runs with step 14's action executor", action.name),
-                ),
+                MenuAction::Custom(action) => self.run_action(open.slot, &action),
             }
         }
     }
@@ -1376,6 +1387,9 @@ impl ZenApp {
             Command::Delete => self.run_delete(slot),
             Command::Chmod => self.open_chmod_prompt(slot),
             Command::PermanentDelete => self.open_permanent_delete_confirm(slot),
+            // Go's `triggerRename`: one row renames in cell, more than one goes to batch rename
+            // (`context-menu.js:404-410`) — the same command, two arms, one dispatch.
+            Command::Rename if self.selection_abs(slot).len() > 1 => self.open_batch_rename(slot),
             Command::Rename => self.start_rename(slot),
             Command::Open => self.open_selection(slot),
             Command::NewFolder => self.open_new_folder_prompt(slot),
@@ -1438,7 +1452,7 @@ impl ZenApp {
 
     /// The shown directory as an absolute path — a paste destination. `None` on an archive path
     /// (plan §4.2: only a local path can be written to).
-    fn shown_dir_abs(&self, slot: PaneSlot) -> Option<AbsPath> {
+    pub(crate) fn shown_dir_abs(&self, slot: PaneSlot) -> Option<AbsPath> {
         self.shown_tab(slot)?.path.host_abs()
     }
 
@@ -1488,7 +1502,7 @@ impl ZenApp {
 
     /// The selection's absolute paths, in listing order (plan §5.8's display-order fix). Archive
     /// rows have no host path, so they are simply not part of a selection the engine can act on.
-    fn selection_abs(&self, slot: PaneSlot) -> Vec<AbsPath> {
+    pub(crate) fn selection_abs(&self, slot: PaneSlot) -> Vec<AbsPath> {
         let Some(tab) = self.shown_tab(slot) else {
             return Vec::new();
         };
@@ -1518,7 +1532,7 @@ impl ZenApp {
         tab.row_abs(entry)
     }
 
-    fn nothing_selected(&mut self, what: &str) {
+    pub(crate) fn nothing_selected(&mut self, what: &str) {
         self.notices
             .post(toast::Level::Warning, format!("{what}: nothing selected"));
     }
@@ -1728,6 +1742,48 @@ impl ZenApp {
     /// Turn a dialog answer into the command it stands for (plan §4.1). Called after the draw, like
     /// the pane commands, so a dialog can never mutate state another pane is painting from.
     pub fn answer(&mut self, answer: Answer) {
+        // Step 14b: batch rename and the action editor answer themselves; both carry their subject.
+        if let Answer::Batch { kind, outcome } = answer {
+            if let (
+                DialogKind::BatchRename { slot },
+                crate::dialogs::BatchOutcome::Apply {
+                    rows,
+                    rules,
+                    policy,
+                },
+            ) = (kind, outcome)
+            {
+                self.apply_batch_rename(slot, rows, rules, policy);
+            }
+            return;
+        }
+        if let Answer::Action { kind, outcome } = answer {
+            let slot = match kind {
+                DialogKind::ActionEditor { slot } => slot,
+                _ => self.model.active_pane,
+            };
+            match outcome {
+                crate::dialogs::ActionOutcome::Saved(draft) => self.save_action(draft),
+                crate::dialogs::ActionOutcome::TestRun(draft) => {
+                    // The dialog closes on any answer; a test run must not cost the user the draft,
+                    // so it comes straight back with the same one.
+                    self.run_action(slot, &draft);
+                    self.open_action_editor(slot, Some(draft));
+                }
+                crate::dialogs::ActionOutcome::Closed => {}
+            }
+            return;
+        }
+        if let Answer::Button {
+            kind: DialogKind::DeleteWorkspace { name },
+            choice,
+        } = &answer
+        {
+            if matches!(choice, Choice::Ok) {
+                self.delete_workspace(name);
+            }
+            return;
+        }
         // The Search Manager's closing answers (a row, or the dismissal); its non-closing requests
         // are drained by `search_manager::drain`.
         if let Answer::Index { outcome, .. } = answer {
@@ -1770,7 +1826,11 @@ impl ZenApp {
         let choice = answer.choice();
         let text = match &answer {
             Answer::Text { text, .. } => text.trim().to_string(),
-            Answer::Button { .. } | Answer::Quick { .. } | Answer::Index { .. } => String::new(),
+            Answer::Button { .. }
+            | Answer::Quick { .. }
+            | Answer::Index { .. }
+            | Answer::Batch { .. }
+            | Answer::Action { .. } => String::new(),
         };
         match kind {
             // The quick-find answer ran above; this arm only keeps the match total.
@@ -1780,6 +1840,11 @@ impl ZenApp {
             DialogKind::Properties { .. } => {}
             // The Search Manager's answers ran above; its requests are drained by the dialog module.
             DialogKind::SearchManager { .. } => {}
+            // Batch rename and the action editor ran above; a *cancelled* workspace delete is the
+            // only thing that reaches this match from 14b, and it changes nothing.
+            DialogKind::BatchRename { .. }
+            | DialogKind::ActionEditor { .. }
+            | DialogKind::DeleteWorkspace { .. } => {}
             DialogKind::NewFolder { slot } => {
                 if self.new_folder_request == Some(slot) {
                     self.new_folder_request = None;

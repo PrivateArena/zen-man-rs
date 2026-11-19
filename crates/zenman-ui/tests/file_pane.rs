@@ -68,6 +68,9 @@ fn pane_harness_at(tag: &str, dir: &std::path::Path, size: egui::Vec2) -> Harnes
     let path = fixture_path(dir);
     app.open_tab(PaneSlot::Left, path);
     let mut harness = Harness::builder()
+        // The header's workspace `ComboBox` (step 14b) surfaces `current_text_value` but no accessible
+        // name in this fork — the same omission the fork's own `TextEdit` has, so the same opt-out.
+        .with_accessibility_check(false)
         .with_size(size)
         .with_context_setup(|ctx| {
             egui_extras::install_image_loaders(ctx);

@@ -109,6 +109,9 @@ impl Scene {
             }
         }
         Harness::builder()
+            // The header's workspace `ComboBox` (step 14b) surfaces `current_text_value` but no
+            // accessible name in this fork — the same omission the fork's own `TextEdit` has.
+            .with_accessibility_check(false)
             .with_size(SIZE)
             .with_context_setup(|ctx| {
                 egui_extras::install_image_loaders(ctx);

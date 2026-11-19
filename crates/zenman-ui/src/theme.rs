@@ -177,6 +177,29 @@ pub struct Tokens {
     pub drawer_icon_size: f32,
     /// How much narrower a header icon button is than the 48 px header it lives in.
     pub header_button_inset: f32,
+    // ---- step 14b (header vocabulary, the action log, the two new dialogs) ----------------------
+    /// Gap between two header control groups (the CSS toolbar's `gap: 8px`, `toolbar.css:12`).
+    pub header_gap: f32,
+    /// Width of the workspace selector's collapsed text (`toolbar.css`'s `select` is 150 px).
+    pub workspace_select_width: f32,
+    /// Inner padding of the `Saved` chip.
+    pub chip_pad: f32,
+    /// One action-log row's height (the drawer's rows are two lines plus their padding).
+    pub log_row_height: f32,
+    /// Width of the accent strip an action-log row paints.
+    pub log_accent_width: f32,
+    /// Gap inside an action-log row (label, time, sources, button).
+    pub log_inner_gap: f32,
+    /// Width of a dialog form's label column.
+    pub form_label_width: f32,
+    /// Width of a dialog form's text field.
+    pub form_field_width: f32,
+    /// Gap between two rows of a dialog form.
+    pub form_gap: f32,
+    /// How many rows a header dropdown shows before it scrolls (the CSS `select`'s own 6).
+    pub dropdown_visible_rows: f32,
+    /// The width, in selector widths, the header needs before it prints the disk meter's text.
+    pub header_disk_fit_ratio: f32,
     // ---- menus (step 10b; `frontend/css/context-menu.css`) --------------------------------------
     /// `min-width: 180px` (`context-menu.css:8`); the frame grows to fit the widest label + chord.
     pub menu_min_width: f32,
@@ -315,6 +338,17 @@ impl Tokens {
             drawer_section_gap: 4.0,
             drawer_icon_size: 16.0,
             header_button_inset: 16.0,
+            header_gap: 8.0,
+            workspace_select_width: 150.0,
+            chip_pad: 6.0,
+            log_row_height: 54.0,
+            log_accent_width: 3.0,
+            log_inner_gap: 8.0,
+            form_label_width: 130.0,
+            form_field_width: 260.0,
+            form_gap: 6.0,
+            dropdown_visible_rows: 6.0,
+            header_disk_fit_ratio: 3.0,
             menu_min_width: 180.0,
             menu_max_width: 420.0,
             dialog_width: 420.0,

@@ -62,6 +62,7 @@ use egui::{
     WidgetInfo,
 };
 
+use zenman_core::services::actions::{self, ActionContext};
 use zenman_core::store::config::CustomAction;
 
 use crate::icons;
@@ -119,7 +120,7 @@ pub struct MenuContext {
     pub on_archive: bool,
     /// The platform can make symlinks (`platform::Env::supports_symlink`).
     pub can_symlink: bool,
-    /// A batch rename owns the pane (step 14's state; `false` until it exists — see
+    /// A batch rename owns the pane: more than one row is selected, which is exactly what sent Go's
     /// [`crate::app::ZenApp::menu_context`]).
     pub in_batch: bool,
     /// What the click landed on.
@@ -264,8 +265,9 @@ fn writable(ctx: &MenuContext) -> bool {
 }
 
 /// Step 14's batch rename is not on the shelf yet: the row is visible and says so by doing nothing.
-fn not_yet_wired(_: &MenuContext) -> bool {
-    false
+/// A row inside a store: `Extract here` is the write that *is* allowed on a read-only listing.
+fn archive_selection(ctx: &MenuContext) -> bool {
+    ctx.on_archive && selection(ctx)
 }
 
 // ------------------------------------------------------------------------------------------- builders
@@ -277,8 +279,12 @@ fn not_yet_wired(_: &MenuContext) -> bool {
 /// changes the plan names: the custom actions come **before** the danger group (Go appended them after
 /// Delete, `:127-130`), and Delete is split into the D6 pair.
 #[must_use]
-pub fn file_menu(ctx: &MenuContext, actions: &[CustomAction]) -> Vec<Vec<MenuSpec>> {
-    let custom = custom_specs(actions, ctx);
+pub fn file_menu(
+    ctx: &MenuContext,
+    sel: &ActionContext,
+    actions: &[CustomAction],
+) -> Vec<Vec<MenuSpec>> {
+    let custom = custom_specs(actions, sel);
     let groups = match ctx.target {
         MenuTarget::Background => {
             let mut groups = vec![vec![
@@ -299,7 +305,7 @@ pub fn file_menu(ctx: &MenuContext, actions: &[CustomAction]) -> Vec<Vec<MenuSpe
                     "Rename batch".to_string(),
                     Some("edit"),
                     false,
-                    not_yet_wired,
+                    selection_writable,
                 )
             } else {
                 item(Command::Rename, selection_writable, Some("edit"))
@@ -324,6 +330,12 @@ pub fn file_menu(ctx: &MenuContext, actions: &[CustomAction]) -> Vec<Vec<MenuSpe
             // Go's `Change Permissions` row sits directly under Rename (`context-menu.js:105-107`),
             // in the same block — 10b left it out, and 10c gives it the prompt it was missing.
             groups.push(vec![rename, item(Command::Chmod, selection_writable, None)]);
+            // The archive group (13b's handover): `Extract here` is the write that *is* allowed on a
+            // read-only listing, and Properties is the Alt+Enter row the menu never offered.
+            groups.push(vec![
+                item(Command::Properties, selection, Some("info")),
+                item(Command::Extract, archive_selection, Some("archive")),
+            ]);
             groups.push(custom);
             groups.push(vec![
                 danger(Command::Delete, selection_writable),
@@ -337,10 +349,14 @@ pub fn file_menu(ctx: &MenuContext, actions: &[CustomAction]) -> Vec<Vec<MenuSpe
 
 /// The empty-space variant, named because the plan names it: [`file_menu`] with the target forced.
 #[must_use]
-pub fn background_menu(ctx: &MenuContext, actions: &[CustomAction]) -> Vec<Vec<MenuSpec>> {
+pub fn background_menu(
+    ctx: &MenuContext,
+    sel: &ActionContext,
+    actions: &[CustomAction],
+) -> Vec<Vec<MenuSpec>> {
     let mut ctx = *ctx;
     ctx.target = MenuTarget::Background;
-    file_menu(&ctx, actions)
+    file_menu(&ctx, sel, actions)
 }
 
 /// The breadcrumb / sidebar folder menu (Go's `showFolderContextMenu`, `context-menu.js:134-156`).
@@ -349,18 +365,14 @@ pub fn background_menu(ctx: &MenuContext, actions: &[CustomAction]) -> Vec<Vec<M
 /// have chords; we print the real ones (D7). Its folder-scoped custom actions (`:151-155`, which
 /// execute against the clicked path rather than the selection) are step 14's.
 #[must_use]
-pub fn folder_menu(actions: &[CustomAction]) -> Vec<Vec<MenuSpec>> {
-    let ctx = MenuContext {
-        target: MenuTarget::Row { on_dir: true },
-        ..MenuContext::default()
-    };
+pub fn folder_menu(actions: &[CustomAction], sel: &ActionContext) -> Vec<Vec<MenuSpec>> {
     let groups = vec![
         vec![item(Command::OpenInNewTab, always, Some("plus"))],
         vec![
             item(Command::CopyPath, always, Some("document")),
             item(Command::CopyName, always, Some("file")),
         ],
-        custom_specs(actions, &ctx),
+        custom_specs(actions, sel),
     ];
     shrink(groups)
 }
@@ -397,14 +409,13 @@ pub fn search_menu() -> Vec<Vec<MenuSpec>> {
     ])
 }
 
-/// The custom-action group. Go filters by `role` (`files`/`dirs`/`background`, `|`-separated) and
-/// then by the `patterns` globs (`custom-actions.js:337-357`); **the glob half is step 14's**, and
-/// moving this whole function into `services/actions::for_context` with it is the handover.
+/// The custom-action group: `services::actions::for_context`, the same predicate the action
+/// editor's applicability preview uses. 10b's promised handover — the placeholder role-only filter
+/// and its private `role_matches` are gone, so the menu and the engine cannot disagree.
 #[must_use]
-pub fn custom_specs(actions: &[CustomAction], ctx: &MenuContext) -> Vec<MenuSpec> {
-    actions
-        .iter()
-        .filter(|action| role_matches(action, ctx))
+pub fn custom_specs(actions: &[CustomAction], sel: &ActionContext) -> Vec<MenuSpec> {
+    actions::for_context(actions, sel)
+        .into_iter()
         .map(|action| {
             spec(
                 MenuAction::Custom(action.clone()),
@@ -415,23 +426,6 @@ pub fn custom_specs(actions: &[CustomAction], ctx: &MenuContext) -> Vec<MenuSpec
             )
         })
         .collect()
-}
-
-/// Go's role filter (`custom-actions.js:340-353`) minus the glob half: a background click takes
-/// `background` actions, a dir row `dirs`, a file row `files`.
-#[must_use]
-pub fn role_matches(action: &CustomAction, ctx: &MenuContext) -> bool {
-    let mut roles = action.role.split('|').map(str::trim);
-    match ctx.target {
-        MenuTarget::Background => roles.any(|role| role == "background"),
-        MenuTarget::Row { on_dir } => roles.any(|role| {
-            if on_dir {
-                role == "dirs"
-            } else {
-                role == "files"
-            }
-        }),
-    }
 }
 
 /// A command row, danger-free.
@@ -769,6 +763,7 @@ mod tests {
 
     use super::*;
     use crate::keymap::KeyMap;
+    use zenman_core::path::AbsPath;
 
     /// The seven plan booleans in every combination, `bit 0` = `has_selection` … `bit 6` = `in_batch`.
     fn all_bits() -> impl Iterator<Item = [bool; 7]> {
@@ -828,10 +823,14 @@ mod tests {
             Command::Cut | Command::Delete | Command::PermanentDelete => {
                 (!background).then_some(ctx.has_selection && writable)
             }
-            // Go's >1-selection rename is the batch dialog (`context-menu.js:404-410`), step 14's.
-            Command::Rename => {
-                (!background).then_some(ctx.has_selection && writable && !ctx.in_batch)
-            }
+            // Go's >1-selection rename is the batch dialog (`context-menu.js:404-410`), and 14b
+            // gave it a real `in_batch`: the row is Rename either way, and it is live whenever a
+            // selection is — the *label* is what changes, not the predicate.
+            Command::Rename => (!background).then_some(ctx.has_selection && writable),
+            // 13b's handover: Properties is the Alt+Enter row, and `Extract here` is the one write
+            // a read-only store does allow.
+            Command::Properties => (!background).then_some(ctx.has_selection),
+            Command::Extract => (!background).then_some(ctx.has_selection && ctx.on_archive),
             Command::Copy | Command::CopyPath | Command::CopyName => {
                 (!background).then_some(ctx.has_selection)
             }
@@ -840,6 +839,25 @@ mod tests {
             Command::Chmod => (!background).then_some(ctx.has_selection && writable),
             _ => None,
         }
+    }
+
+    /// A context whose selection is one ordinary file — what `for_context` needs to test the
+    /// `patterns` half at all (a *background* context skips the pattern test, exactly as Go's does).
+    /// A context whose selection is one directory row (Go's `isDir` half of the pattern test).
+    fn dir_row() -> ActionContext {
+        ActionContext::rows(
+            None,
+            vec![AbsPath::from_path("/tree/docs").expect("a constant absolute path")],
+            true,
+        )
+    }
+
+    fn file_row() -> ActionContext {
+        ActionContext::rows(
+            None,
+            vec![AbsPath::from_path("/tree/a.txt").expect("a constant absolute path")],
+            false,
+        )
     }
 
     /// The snapshot spelling: `Label+` for enabled, `Label-` for greyed, groups separated by ` | `.
@@ -869,7 +887,7 @@ mod tests {
         for bits in all_bits() {
             for target in TARGETS {
                 let ctx = at_bits(bits, target);
-                let groups = file_menu(&ctx, &[]);
+                let groups = file_menu(&ctx, &ActionContext::background(None), &[]);
                 assert!(
                     groups.iter().all(|group| !group.is_empty()),
                     "no group is ever empty (an empty group is a dangling rule): {ctx:?}"
@@ -903,7 +921,7 @@ mod tests {
         for bits in all_bits() {
             for target in TARGETS {
                 let ctx = at_bits(bits, target);
-                let groups = file_menu(&ctx, &[]);
+                let groups = file_menu(&ctx, &ActionContext::background(None), &[]);
                 let enabled = |command: Command| {
                     groups
                         .iter()
@@ -940,10 +958,9 @@ mod tests {
                 );
                 assert_eq!(enabled(Command::PermanentDelete), enabled(Command::Delete));
                 assert_eq!(enabled(Command::Cut), enabled(Command::Delete));
-                assert_eq!(
-                    enabled(Command::Rename),
-                    enabled(Command::Delete) && !ctx.in_batch
-                );
+                // 14b: the batch row is the *same* command and the same predicate; only its label
+                // changes, which is what `in_batch` is for now that it has a real source.
+                assert_eq!(enabled(Command::Rename), enabled(Command::Delete));
                 // Reading is never refused: Copy/Copy path/Copy name work inside an archive.
                 if matches!(target, MenuTarget::Row { .. }) {
                     assert_eq!(enabled(Command::Copy), ctx.has_selection);
@@ -991,25 +1008,32 @@ mod tests {
     fn the_menu_shapes_are_this_table() {
         let row = |bits: u16, on_dir: bool| {
             shape(
-                &file_menu(&at(bits, MenuTarget::Row { on_dir }), &[]),
+                &file_menu(
+                    &at(bits, MenuTarget::Row { on_dir }),
+                    &ActionContext::background(None),
+                    &[],
+                ),
                 &at(bits, MenuTarget::Row { on_dir }),
             )
         };
         let background = |bits: u16| {
             let ctx = at(bits, MenuTarget::Background);
-            shape(&file_menu(&ctx, &[]), &ctx)
+            shape(
+                &file_menu(&ctx, &ActionContext::background(None), &[]),
+                &ctx,
+            )
         };
         let table = [
             // nothing selected, empty clipboard, plain filesystem
             (
                 "0x00 row(dir)",
                 row(0x00, true),
-                "Open in new tab-, Copy inside-, Cut inside-, Paste inside- | Open- | Cut-, Copy-, Copy path-, Copy name- | Rename-, Change permissions- | Move to trash-, Delete permanently-",
+                "Open in new tab-, Copy inside-, Cut inside-, Paste inside- | Open- | Cut-, Copy-, Copy path-, Copy name- | Rename-, Change permissions- | Properties-, Extract here- | Move to trash-, Delete permanently-",
             ),
             (
                 "0x00 row(file)",
                 row(0x00, false),
-                "Open- | Cut-, Copy-, Copy path-, Copy name- | Rename-, Change permissions- | Move to trash-, Delete permanently-",
+                "Open- | Cut-, Copy-, Copy path-, Copy name- | Rename-, Change permissions- | Properties-, Extract here- | Move to trash-, Delete permanently-",
             ),
             (
                 "0x00 background",
@@ -1026,19 +1050,19 @@ mod tests {
             (
                 "0x01 row(file)",
                 row(0x01, false),
-                "Open+ | Cut+, Copy+, Copy path+, Copy name+ | Rename+, Change permissions+ | Move to trash+, Delete permanently+",
+                "Open+ | Cut+, Copy+, Copy path+, Copy name+ | Rename+, Change permissions+ | Properties+, Extract here- | Move to trash+, Delete permanently+",
             ),
             // the same row when it is a directory: Go's top block appears above Open
             (
                 "0x01+0x02 row(dir)",
                 row(0x01 | 0x02, true),
-                "Open in new tab+, Copy inside+, Cut inside+, Paste inside- | Open+ | Cut+, Copy+, Copy path+, Copy name+ | Rename+, Change permissions+ | Move to trash+, Delete permanently+",
+                "Open in new tab+, Copy inside+, Cut inside+, Paste inside- | Open+ | Cut+, Copy+, Copy path+, Copy name+ | Rename+, Change permissions+ | Properties+, Extract here- | Move to trash+, Delete permanently+",
             ),
             // a read-only store: every write is greyed, every read is not (Go offered Delete here)
             (
                 "0x01+0x10 row(file)",
                 row(0x01 | 0x10, false),
-                "Open+ | Cut-, Copy+, Copy path+, Copy name+ | Rename-, Change permissions- | Move to trash-, Delete permanently-",
+                "Open+ | Cut-, Copy+, Copy path+, Copy name+ | Rename-, Change permissions- | Properties+, Extract here+ | Move to trash-, Delete permanently-",
             ),
             (
                 "0x04+0x10 background",
@@ -1049,7 +1073,7 @@ mod tests {
             (
                 "0x01+0x40 row(file)",
                 row(0x01 | 0x40, false),
-                "Open+ | Cut+, Copy+, Copy path+, Copy name+ | Rename batch-, Change permissions+ | Move to trash+, Delete permanently+",
+                "Open+ | Cut+, Copy+, Copy path+, Copy name+ | Rename batch+, Change permissions+ | Properties+, Extract here- | Move to trash+, Delete permanently+",
             ),
             // everything true at once
             // every flag at once: the archive half *wins* the writes, and the batch half renames
@@ -1057,7 +1081,7 @@ mod tests {
             (
                 "0x7f row(dir)",
                 row(0x7f, true),
-                "Open in new tab+, Copy inside-, Cut inside-, Paste inside- | Open+ | Cut-, Copy+, Copy path+, Copy name+ | Rename batch-, Change permissions- | Move to trash-, Delete permanently-",
+                "Open in new tab+, Copy inside-, Cut inside-, Paste inside- | Open+ | Cut-, Copy+, Copy path+, Copy name+ | Rename batch-, Change permissions- | Properties+, Extract here+ | Move to trash-, Delete permanently-",
             ),
             (
                 "0x7f background",
@@ -1068,7 +1092,7 @@ mod tests {
             (
                 "0x6f row(dir)",
                 row(0x6f, true),
-                "Open in new tab+, Copy inside+, Cut inside+, Paste inside+ | Open+ | Cut+, Copy+, Copy path+, Copy name+ | Rename batch-, Change permissions+ | Move to trash+, Delete permanently+",
+                "Open in new tab+, Copy inside+, Cut inside+, Paste inside+ | Open+ | Cut+, Copy+, Copy path+, Copy name+ | Rename batch+, Change permissions+ | Properties+, Extract here- | Move to trash+, Delete permanently+",
             ),
             (
                 "0x6f background",
@@ -1097,7 +1121,7 @@ mod tests {
     fn the_danger_group_is_last_and_holds_the_delete_pair() {
         for bits in all_bits() {
             let ctx = at_bits(bits, MenuTarget::Row { on_dir: false });
-            let groups = file_menu(&ctx, &[]);
+            let groups = file_menu(&ctx, &ActionContext::background(None), &[]);
             let last = groups.last().expect("the row menu always has a group");
             let commands: Vec<Command> = last.iter().filter_map(|spec| spec.command()).collect();
             assert_eq!(
@@ -1136,7 +1160,7 @@ mod tests {
             action("bg-only", "background"),
         ];
         let ctx = at(0x01, MenuTarget::Row { on_dir: false });
-        let groups = file_menu(&ctx, &actions);
+        let groups = file_menu(&ctx, &file_row(), &actions);
         let names: Vec<&str> = groups
             .iter()
             .flatten()
@@ -1159,7 +1183,7 @@ mod tests {
         );
 
         let dir_ctx = at_(MenuTarget::Row { on_dir: true });
-        let dir_names: Vec<String> = file_menu(&dir_ctx, &actions)
+        let dir_names: Vec<String> = file_menu(&dir_ctx, &dir_row(), &actions)
             .iter()
             .flatten()
             .filter_map(|spec| match &spec.action {
@@ -1170,7 +1194,7 @@ mod tests {
         assert_eq!(dir_names, ["on-dirs", "everywhere"]);
 
         let bg_ctx = at(0x00, MenuTarget::Background);
-        let bg_names: Vec<String> = file_menu(&bg_ctx, &actions)
+        let bg_names: Vec<String> = file_menu(&bg_ctx, &ActionContext::background(None), &actions)
             .iter()
             .flatten()
             .filter_map(|spec| match &spec.action {
@@ -1191,7 +1215,10 @@ mod tests {
     fn every_hint_is_the_keymaps_own_chord_and_menu_only_rows_print_none() {
         let keys = KeyMap::default();
         let ctx = at(0x7f, MenuTarget::Row { on_dir: true });
-        for spec in file_menu(&ctx, &[]).iter().flatten() {
+        for spec in file_menu(&ctx, &ActionContext::background(None), &[])
+            .iter()
+            .flatten()
+        {
             let command = spec.command().expect("no custom actions passed");
             assert_eq!(
                 spec.hint(&keys),
@@ -1209,7 +1236,7 @@ mod tests {
         // rows the table leaves unbound.
         let bg = at(0x04, MenuTarget::Background);
         assert!(
-            file_menu(&bg, &[])
+            file_menu(&bg, &ActionContext::background(None), &[])
                 .iter()
                 .flatten()
                 .all(|spec| spec.hint(&keys).is_some()),
@@ -1229,7 +1256,7 @@ mod tests {
         };
         // `showFolderContextMenu` (`context-menu.js:134-156`).
         assert_eq!(
-            labels(&folder_menu(&[])),
+            labels(&folder_menu(&[], &ActionContext::background(None))),
             [
                 "Open in new tab Alt+T",
                 "Copy path Alt+Shift+C",
@@ -1258,7 +1285,7 @@ mod tests {
         // The folder and search menus have nothing to be greyed by: their target is the click.
         let ctx = MenuContext::default();
         assert!(
-            folder_menu(&[])
+            folder_menu(&[], &ActionContext::background(None))
                 .iter()
                 .flatten()
                 .all(|spec| spec.enabled(&ctx))
@@ -1271,7 +1298,7 @@ mod tests {
         assert_eq!(icon_paste(&ctx), Some("paste"));
         ctx.clip_is_cut = true;
         assert_eq!(icon_paste(&ctx), Some("cut"));
-        let groups = file_menu(&ctx, &[]);
+        let groups = file_menu(&ctx, &ActionContext::background(None), &[]);
         let paste = &groups[0][0];
         assert_eq!(paste.command(), Some(Command::Paste));
         assert_eq!(
@@ -1286,8 +1313,12 @@ mod tests {
         for bits in all_bits() {
             let ctx = at_bits(bits, MenuTarget::Row { on_dir: true });
             assert_eq!(
-                background_menu(&ctx, &[]),
-                file_menu(&at_bits(bits, MenuTarget::Background), &[]),
+                background_menu(&ctx, &ActionContext::background(None), &[]),
+                file_menu(
+                    &at_bits(bits, MenuTarget::Background),
+                    &ActionContext::background(None),
+                    &[]
+                ),
                 "the plan names both builders; they must not diverge"
             );
         }

@@ -79,6 +79,11 @@ impl JobsUi {
             ctx.request_repaint();
         }
         for event in events {
+            // Step 14b: the log panel refreshes on its own event, so an action you just took shows
+            // up on the next frame and not up to 5 s later (plan §5.8's named improvement on Go).
+            if matches!(event, EngineEvent::LogAppended { .. }) {
+                app.log.mark_dirty();
+            }
             // The quick-find dialog owns this answer (step 11b): it goes to the dialog's lane,
             // where the stale-origin rule filters it — never to a tab.
             if let EngineEvent::SearchReady {
@@ -261,7 +266,7 @@ pub fn route(jobs: &mut JobsUi, model: &mut AppModel, event: EngineEvent) -> Rou
         | EngineEvent::IndexChanged { .. }
         | EngineEvent::LogAppended { .. } => {
             // Disk sizes paint from the cache (step 8+); the index's shape is step 12's UI; the log
-            // panel is step 14's.
+            // panel's own refresh is raised in `tick`, before the event is moved into `route`.
         }
         EngineEvent::DirChanged {
             path,

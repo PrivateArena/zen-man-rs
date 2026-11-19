@@ -20,6 +20,8 @@
 //! from acting on whichever pane happens to be focused when the button is clicked: the subject
 //! travels inside [`DialogKind`].
 
+pub mod action_editor;
+pub mod batch_rename;
 pub mod confirm;
 pub mod extract;
 pub mod prompt;
@@ -27,6 +29,8 @@ pub mod properties;
 pub mod quick_find;
 pub mod search_manager;
 
+pub use action_editor::{ActionEditor, ActionOutcome};
+pub use batch_rename::{BatchOutcome, BatchRename};
 pub use confirm::{Choice, Confirm, ConfirmButton};
 pub use extract::ExtractProgress;
 pub use prompt::{Prompt, Validation};
@@ -88,6 +92,21 @@ pub enum DialogKind {
         /// A drag's sources; empty for a clipboard paste, which reads the live clipboard.
         sources: Vec<AbsPath>,
     },
+    /// Batch rename (step 14b) — the subject is the pane whose selection the rows came from.
+    BatchRename {
+        /// The pane the rows came from, and the pane the reload lands in.
+        slot: PaneSlot,
+    },
+    /// The custom-action editor (step 14b) — the subject is the pane a test run is aimed at.
+    ActionEditor {
+        /// The pane whose selection the applicability preview was computed against.
+        slot: PaneSlot,
+    },
+    /// `Confirm` → `Session::workspace_delete` (step 14b; destructive, so it asks).
+    DeleteWorkspace {
+        /// The stored workspace the answer is about.
+        name: String,
+    },
     /// `Properties` (step 13b) — the subject is the path it printed, and the only answer is "close".
     Properties {
         /// The pane the dialog was opened from.
@@ -123,6 +142,20 @@ pub enum Answer {
         /// What the user did.
         outcome: QuickOutcome,
     },
+    /// A batch-rename answer.
+    Batch {
+        /// The subject ([`DialogKind::BatchRename`]).
+        kind: DialogKind,
+        /// What the user did.
+        outcome: BatchOutcome,
+    },
+    /// A custom-action editor answer.
+    Action {
+        /// The subject ([`DialogKind::ActionEditor`]).
+        kind: DialogKind,
+        /// What the user did.
+        outcome: ActionOutcome,
+    },
     /// A Search Manager answer: a row to act on, or the dismissal. Everything else the manager asks
     /// for is a request it keeps for `search_manager::drain` — a config panel must not close on Save.
     Index {
@@ -139,7 +172,7 @@ impl Answer {
     pub fn kind(&self) -> &DialogKind {
         match self {
             Self::Text { kind, .. } | Self::Button { kind, .. } | Self::Quick { kind, .. } => kind,
-            Self::Index { kind, .. } => kind,
+            Self::Index { kind, .. } | Self::Batch { kind, .. } | Self::Action { kind, .. } => kind,
         }
     }
 
@@ -152,7 +185,7 @@ impl Answer {
                 outcome: QuickOutcome::Activate { .. } | QuickOutcome::Closed { .. },
                 ..
             } => Choice::Ok,
-            Self::Index { .. } => Choice::Ok,
+            Self::Index { .. } | Self::Batch { .. } | Self::Action { .. } => Choice::Ok,
         }
     }
 
@@ -177,6 +210,10 @@ pub enum Dialog {
     SearchManager(Box<SearchManager>),
     /// Properties (step 13b) — local **and** archive subjects, one dialog, two engines.
     Properties(PropertiesDialog),
+    /// Batch rename (step 14b). Boxed: it carries the whole preview table.
+    BatchRename(Box<BatchRename>),
+    /// The custom-action editor (step 14b).
+    ActionEditor(Box<ActionEditor>),
 }
 
 impl Dialog {
@@ -188,6 +225,8 @@ impl Dialog {
             Self::QuickFind(find) => find.show(ui, tokens),
             Self::SearchManager(manager) => manager.show(ui, tokens),
             Self::Properties(dialog) => dialog.show(ui, tokens),
+            Self::BatchRename(dialog) => dialog.show(ui, tokens),
+            Self::ActionEditor(editor) => editor.show(ui, tokens),
         }
     }
 }

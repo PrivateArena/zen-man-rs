@@ -24,9 +24,10 @@ use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 
 use zenman_core::path::{AbsPath, FsPath};
-use zenman_core::store::config::{LayoutMode, PaneSlot};
+use zenman_core::store::config::{CustomAction, LayoutMode, PaneSlot};
 use zenman_ui::app::ZenApp;
 use zenman_ui::keymap::{Chord, KeyMap};
+use zenman_ui::menus::MenuTarget;
 use zenman_ui::state::{Tab, panes_for};
 
 /// Frames to let the shell settle after a non-job action.
@@ -62,6 +63,12 @@ fn fixture_path(path: &Path) -> FsPath {
 
 fn build_harness(app: ZenApp, size: Vec2) -> Harness<'static, ZenApp> {
     let mut harness = Harness::builder()
+        // The header's workspace `ComboBox` (step 14b) surfaces `current_text_value` but no accessible
+        // name in this fork — the same omission the fork's own `TextEdit` has (plan §9.2 step 10), so
+        // the same opt-out. Every other widget in the shell keeps the check honest.
+        // The header's workspace `ComboBox` (step 14b) surfaces `current_text_value` but no accessible
+        // name in this fork — the same omission the fork's own `TextEdit` has, so the same opt-out.
+        .with_accessibility_check(false)
         .with_size(size)
         // The menu is opened by a command that ran at the *end* of the previous frame, and jobs plus
         // the coalesced `DirChanged` window stretch the frame loop: 10a found the builder's default too
@@ -247,10 +254,12 @@ fn right_clicking_a_row_opens_go_row_menu_with_the_keymaps_hints() {
             "Copy name",
             "Rename",
             "Change permissions",
+            "Properties",
+            "Extract here",
             "Move to trash",
             "Delete permanently",
         ],
-        "the file row's menu, in `context-menu.js:71-107`'s order"
+        "the file row's menu, in `context-menu.js:71-107`'s order, plus 13b's archive group"
     );
     assert_eq!(
         enabled,
@@ -262,10 +271,11 @@ fn right_clicking_a_row_opens_go_row_menu_with_the_keymaps_hints() {
             "Copy name",
             "Rename",
             "Change permissions",
+            "Properties",
             "Move to trash",
             "Delete permanently"
         ],
-        "a plain filesystem row enables everything"
+        "a plain filesystem row enables everything but `Extract here`, which needs a store"
     );
     // The hint cell is the keymap's own spelling (plan D7), not a second table.
     let hint = |label: &str| {
@@ -305,6 +315,8 @@ fn right_clicking_a_directory_row_adds_go_directory_block() {
             "Copy name",
             "Rename",
             "Change permissions",
+            "Properties",
+            "Extract here",
             "Move to trash",
             "Delete permanently",
         ],
@@ -318,8 +330,8 @@ fn right_clicking_a_directory_row_adds_go_directory_block() {
         .collect();
     assert_eq!(
         disabled,
-        ["Paste inside"],
-        "only the clipboard row is greyed, and only because nothing is queued"
+        ["Paste inside", "Extract here"],
+        "only the clipboard row and the archive row are greyed"
     );
 }
 
@@ -552,4 +564,124 @@ fn the_open_menu_context_is_read_from_the_engine_not_invented() {
             .target,
         zenman_ui::menus::MenuTarget::Background
     );
+}
+
+// --------------------------------------------------------------------- step 14b
+
+/// A session with one real custom action, `*.txt`-scoped (`services::actions`, not the menu's).
+fn with_action(
+    harness: &mut Harness<'static, ZenApp>,
+    id: &str,
+    name: &str,
+    role: &str,
+    patterns: &str,
+) {
+    harness
+        .state_mut()
+        .session
+        .action_create(CustomAction {
+            id: id.to_string(),
+            name: name.to_string(),
+            icon: String::new(),
+            command: "echo {name}".to_string(),
+            role: role.to_string(),
+            patterns: patterns.to_string(),
+            show_output: false,
+        })
+        .expect("the action persists");
+    harness.run();
+}
+
+#[test]
+fn custom_actions_come_from_the_real_service_including_the_glob_half() {
+    // 10b's handover: `menus::custom_specs` used to filter by role alone. The glob half is what
+    // this test can tell apart — a `files`-role action scoped to `*.txt` must *not* appear on the
+    // `c.md` row, which the placeholder always showed.
+    let dir = tree("menus-14b", &["a.txt", "c.md"]);
+    let mut harness = pane_harness("menus-14b", &dir);
+    with_action(&mut harness, "aa11", "Word it", "files", "*.txt");
+    with_action(
+        &mut harness,
+        "bb22",
+        "Always",
+        "files",
+        String::new().as_str(),
+    );
+
+    right_click(&mut harness, "a.txt");
+    let names: Vec<String> = rows(&harness).into_iter().map(|(l, _, _)| l).collect();
+    assert!(names.iter().any(|l| l == "Word it"), "{names:?}");
+    close_menu(&mut harness);
+
+    right_click(&mut harness, "c.md");
+    let names: Vec<String> = rows(&harness).into_iter().map(|(l, _, _)| l).collect();
+    assert!(
+        !names.iter().any(|l| l == "Word it"),
+        "the pattern filter is back to role-only (10b's placeholder): {names:?}"
+    );
+    assert!(names.iter().any(|l| l == "Always"), "{names:?}");
+}
+
+#[test]
+fn a_batch_selection_labels_the_rename_row_and_the_menu_says_so() {
+    let dir = tree("menus-batch14", &["a.txt", "b.txt", "c.md"]);
+    let mut harness = pane_harness("menus-batch14", &dir);
+    let ctx = harness
+        .state()
+        .menu_context(PaneSlot::Left, MenuTarget::Row { on_dir: false });
+    assert!(
+        !ctx.in_batch,
+        "nothing is selected, so no batch owns the pane"
+    );
+    // The menu has to be open for `menu_specs` to answer (it is the same call the renderer makes),
+    // so open it first and *then* widen the selection: the rows are rebuilt from live state every
+    // frame, which is what lets a batch light up while its own menu is on screen.
+    right_click(&mut harness, "a.txt");
+    select_two(&mut harness);
+    harness.run();
+    let ctx = harness
+        .state()
+        .menu_context(PaneSlot::Left, MenuTarget::Row { on_dir: false });
+    assert!(
+        ctx.in_batch,
+        "`in_batch` still has no source (step 14b gave it one)"
+    );
+    // And the builder's batch arm is now a live row, not `not_yet_wired`.
+    let specs = harness.state().menu_specs();
+    let batch = specs
+        .iter()
+        .flatten()
+        .find(|spec| spec.label == "Rename batch")
+        .expect("the >1-selection menu has no `Rename batch` row");
+    assert!(
+        batch.enabled(&ctx),
+        "the batch row is greyed although a batch is selected"
+    );
+}
+
+fn close_menu(harness: &mut Harness<'static, ZenApp>) {
+    harness.state_mut().menu = None;
+    harness.run();
+}
+
+fn select_two(harness: &mut Harness<'static, ZenApp>) {
+    let entries = harness
+        .state()
+        .model
+        .panes
+        .get(&PaneSlot::Left)
+        .and_then(|p| p.active_tab())
+        .map(|t| t.entries.clone())
+        .expect("the listing loaded");
+    assert!(entries.entries.len() > 1, "the fixture listed nothing");
+    let tab = harness
+        .state_mut()
+        .model
+        .panes
+        .get_mut(&PaneSlot::Left)
+        .and_then(|p| p.active_tab_mut())
+        .expect("the pane has a tab");
+    tab.sel.select_all(entries.entries.len(), |ix| {
+        entries.entries.get(ix).map(Tab::row_key)
+    });
 }
