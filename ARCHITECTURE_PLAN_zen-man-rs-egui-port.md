@@ -1466,9 +1466,13 @@ test count **621 → 631** (9 archive UI + 1 core 7z), `cargo xtask ci` exit 0, 
   **The test-run gates, stated plainly:** (1) the action must already be **saved** — `exec_action`
   resolves an id against the persisted config, so a draft cannot spawn anything; (2) every target must
   resolve **inside the pane's own directory** (checked on the resolved `AbsPath`s, not on the
-  template); (3) the output goes to a capped toast. The integration proof is 14a's: the executor's
-  argv is asserted through a **recorder `Env`** in `contract_workspaces.rs` (`platform::stub` as the
-  base, no spawn), and no 14b test spawns a process either.
+  template); (3) the output goes to a capped toast. `tests/action_editor.rs` proves the whole chain on
+  14a's terms: the session's `Env` is a **recorder** (`platform::stub`-backed, nothing ever spawns),
+  and the assertion is the recorded `ExecRequest` — `program == "echo 'normal.txt'"`, `args == []`,
+  `shell == true`, `detached == true`, `cwd == the pane's directory` — plus that an unsaved id is a
+  typed `NotFound` that reaches the recorder not at all. Gate (2) is exercised only in its affirmative
+  form: its refusal branch needs a context the pane itself would not build, which is why the context
+  is computed in one place (`ZenApp::action_context`).
 * **Menus.** `custom_specs(actions, &ActionContext)` is the whole custom group now, so the `patterns`
   half of Go's filter reaches the menu (`custom_actions_come_from_the_real_service_including_the_glob_
   half`: a `files`-role `*.txt` action appears on the `.txt` row and not on the `.md` row — the
@@ -1483,3 +1487,18 @@ test count **621 → 631** (9 archive UI + 1 core 7z), `cargo xtask ci` exit 0, 
   step 15 nothing it cannot render then). The three existing baselines **changed and were
   regenerated** — the header is in every one of them, and step 14b is exactly the commit that fills
   it in.
+* **Step-14b follow-up (`tests/action_editor.rs`, 4 tests).** The editor's own seam was missing from
+  the first commit, so it has its own file now: Save persisting through `Session::action_create` /
+  `action_update` and being re-read from the settings *file* by an independent reader
+  (`WorkspaceService::reload`), the applicability preview agreeing with `actions::for_context` on role
+  and glob, the recorder-`Env` argv proof, and the unsaved-id refusal reaching the executor not at all.
+  Workspace test count 680 → **684**.
+* **Environment trap, recorded for step 15 (which runs the same gate):** `xtask ci`'s
+  `zenman --test gpu_fallback` boots the real binary against `$DISPLAY`, so it needs the *desktop*
+  display — under `xvfb-run` it fails with "No suitable graphics adapter found … not compatible with
+  provided surface", because this box has no lavapipe (§2.1). The suite therefore cannot be run under
+  a virtual display. It also exhausts the X client limit if `contract_ops`' `open` tests leave their
+  opener processes behind: 68 leaked `kate -b /tmp/zenman-contract-ops-write-events-*/…` instances
+  made every later X client fail with "Maximum number of clients reached", which surfaces as a
+  *gpu_fallback* failure and looks like a code regression. `pkill -f "[k]ate -b /tmp/zenman-contract"`
+  clears it; step 15 should make the opener test reap what it spawns.
