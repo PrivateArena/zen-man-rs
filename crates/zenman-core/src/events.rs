@@ -217,8 +217,16 @@ pub enum JobPayload {
     Extract(ExtractSummary),
     /// Index rebuild (`JobKind::IndexRebuild`).
     Index(IndexSummary),
+    /// A custom action that finished (`JobKind::ActionExec`, step 14a) — Go's `{output}` body, typed.
+    Exec(crate::services::actions::ExecOutcome),
     /// A job whose answer lives entirely in its [`JobOutcome`](crate::jobs::JobOutcome).
     None,
+}
+
+impl From<crate::services::actions::ExecOutcome> for JobPayload {
+    fn from(out: crate::services::actions::ExecOutcome) -> Self {
+        Self::Exec(out)
+    }
 }
 
 impl JobPayload {

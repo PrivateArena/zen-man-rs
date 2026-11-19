@@ -3304,3 +3304,272 @@ mod tests {
         cleanup(&dir);
     }
 }
+
+// --------------------------------------------------------- step 14a: workspaces, actions, batch rename, log
+
+/// The request behind [`Session::exec_action`] — Go's `/api/action/exec` body (`{id, paths, dir}`),
+/// spelled as the action id plus a fully-resolved [`ActionContext`](crate::services::actions::ActionContext)
+/// so the expansion has no hidden filesystem read left to do.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActionExec {
+    /// The action to run, by id. An unknown id is
+    /// [`CoreError::NotFound`] — Go's `{"error":"Custom action not found"}` 404, golden
+    /// `err-action-exec-unknown.json`.
+    pub id: String,
+    /// What it was run on.
+    pub ctx: crate::services::actions::ActionContext,
+}
+
+/// What [`Session::batch_rename`] did.
+pub struct BatchRenameReport {
+    /// The preview the user was shown, so a toast can name the row that failed.
+    pub preview: crate::ops::batch_rename::PreviewSet,
+    /// Names skipped because they conflicted and the policy was not
+    /// [`Rename`'s](crate::ops::ConflictPolicy::Rename) disambiguating one.
+    pub skipped: Vec<String>,
+    /// The rename that ran, per-item outcomes and undo-log id included.
+    pub rename: crate::ops::rename::RenameReport,
+}
+
+impl Session {
+    // ---------------------------------------------------------------------------- workspaces (§5.3)
+
+    /// The workspace half of `config.json` (plan §5.3's `WorkspaceService`), pointed at this session's
+    /// settings file. Constructed on demand — it is a path, not a cache, and the session is the only
+    /// holder of the in-memory config, so a long-lived service object would be a second source of truth.
+    #[must_use]
+    pub fn workspace_service(&self) -> crate::services::workspaces::WorkspaceService {
+        crate::services::workspaces::WorkspaceService::new(self.inner.paths.config.clone())
+    }
+
+    /// `GET /api/workspaces`: the stored names, alphabetical, with [`RESERVED`](crate::services::workspaces::RESERVED)
+    /// flagged rather than silently dropped.
+    #[must_use]
+    pub fn workspaces(&self) -> Vec<crate::services::workspaces::WorkspaceMeta> {
+        crate::services::workspaces::WorkspaceService::list(&self.config())
+    }
+
+    /// `POST /api/workspaces` `{"action":"save"}`. Writes through [`ZenConfig::save`] (atomic
+    /// tmp+rename), so the bytes on disk are complete the moment this returns — the property the
+    /// `kill -9` test checks.
+    ///
+    /// # Errors
+    /// [`CoreError::Empty`] for a blank name, [`CoreError::Config`] for an illegal one, and the config
+    /// write's own failures.
+    pub fn workspace_save(
+        &self,
+        name: &str,
+        session: &crate::store::config::Workspace,
+    ) -> Result<(), CoreError> {
+        let next = self
+            .workspace_service()
+            .save(&self.config(), name, session)?;
+        *lock(&self.inner.config) = next;
+        Ok(())
+    }
+
+    /// `{"action":"restore"}`: the stored session, [`CoreError::NotFound`] when the name is unknown
+    /// (never a panic, and never an empty default dressed up as a restore).
+    ///
+    /// # Errors
+    /// [`CoreError::NotFound`].
+    pub fn workspace_restore(
+        &self,
+        name: &str,
+    ) -> Result<crate::store::config::Workspace, CoreError> {
+        crate::services::workspaces::WorkspaceService::restore(&self.config(), name)
+    }
+
+    /// `{"action":"delete"}`. `false` when no workspace had that name; Go answered success either way.
+    ///
+    /// # Errors
+    /// The config write's own failures.
+    pub fn workspace_delete(&self, name: &str) -> Result<bool, CoreError> {
+        let (next, removed) = self.workspace_service().delete(&self.config(), name)?;
+        *lock(&self.inner.config) = next;
+        Ok(removed)
+    }
+
+    // ------------------------------------------------------------------------------ custom actions
+
+    /// `GET /api/actions` (golden `actions.json`): the actions, in menu order.
+    #[must_use]
+    pub fn custom_actions(&self) -> Vec<crate::store::config::CustomAction> {
+        self.config().custom_actions
+    }
+
+    /// `POST /api/actions` `{"action":"create"}`. Returns the whole list, as Go's
+    /// `{"status":"success","custom_actions":[…]}` did (golden `actions-create.json`).
+    ///
+    /// # Errors
+    /// The config write's own failures.
+    pub fn action_create(
+        &self,
+        action: crate::store::config::CustomAction,
+    ) -> Result<Vec<crate::store::config::CustomAction>, CoreError> {
+        self.set_custom_actions(crate::services::actions::insert(
+            &self.custom_actions(),
+            action,
+        ))
+    }
+
+    /// `{"action":"update"}`.
+    ///
+    /// # Errors
+    /// [`CoreError::NotFound`] for an unknown id, plus the config write.
+    pub fn action_update(
+        &self,
+        action: &crate::store::config::CustomAction,
+    ) -> Result<Vec<crate::store::config::CustomAction>, CoreError> {
+        let next = crate::services::actions::update(&self.custom_actions(), action)?;
+        self.set_custom_actions(next)
+    }
+
+    /// `{"action":"delete"}` (golden `actions-delete.json`).
+    ///
+    /// # Errors
+    /// [`CoreError::NotFound`] for an unknown id, plus the config write.
+    pub fn action_remove(
+        &self,
+        id: &str,
+    ) -> Result<Vec<crate::store::config::CustomAction>, CoreError> {
+        let next = crate::services::actions::remove(&self.custom_actions(), id)?;
+        self.set_custom_actions(next)
+    }
+
+    /// `{"action":"reorder"}`: the given ids first, the rest appended, Go's rule
+    /// (`api/actions.go:96-119`) — a partial list never loses a row.
+    ///
+    /// # Errors
+    /// The config write's own failures.
+    pub fn action_reorder(
+        &self,
+        ids: &[String],
+    ) -> Result<Vec<crate::store::config::CustomAction>, CoreError> {
+        let next = crate::services::actions::reorder(&self.custom_actions(), ids);
+        self.set_custom_actions(next)
+    }
+
+    fn set_custom_actions(
+        &self,
+        next: Vec<crate::store::config::CustomAction>,
+    ) -> Result<Vec<crate::store::config::CustomAction>, CoreError> {
+        let mut candidate = self.config();
+        candidate.custom_actions = next;
+        candidate.save(&self.inner.paths.config)?;
+        let out = candidate.custom_actions.clone();
+        *lock(&self.inner.config) = candidate;
+        Ok(out)
+    }
+
+    /// Run one custom action.
+    ///
+    /// Two arms, and the split is Go's `show_output` flag — which is also the *blocking* question:
+    ///
+    /// * `show_output == false` → [`Receipt::Done`] immediately: the spawn is
+    ///   [`detached`](crate::platform::ExecRequest::detached), Go's `cmd.Start()`, so a GUI launcher
+    ///   that daemonises cannot park the caller (step 9b's `xclip` lesson, plan F10);
+    /// * `show_output == true` → a [`JobKind::ActionExec`](crate::jobs::JobKind::ActionExec) job whose
+    ///   [`JobPayload::Exec`] carries the capped output; the caller keeps the `origin` from the receipt.
+    ///
+    /// # Errors
+    /// [`CoreError::NotFound`] for an unknown id (synchronously, before anything spawns), and the
+    /// spawn failure in the detached arm.
+    pub fn exec_action(
+        &self,
+        req: &ActionExec,
+        origin: Origin,
+    ) -> Result<Receipt<crate::services::actions::ExecOutcome>, CoreError> {
+        let action = self
+            .custom_actions()
+            .into_iter()
+            .find(|a| a.id == req.id)
+            .ok_or_else(|| CoreError::NotFound {
+                path: format!("custom action {:?}", req.id),
+                source_path: None,
+            })?;
+        let cap = self.inner.limits.exec_output_cap;
+        if !action.show_output {
+            return Ok(Receipt::Done(crate::services::actions::exec(
+                self.env().as_ref(),
+                &action,
+                &req.ctx,
+                cap,
+            )?));
+        }
+        let env = Arc::clone(&self.inner.env);
+        let ctx = req.ctx.clone();
+        let label = format!("Run {}", action.name);
+        let job = self.spawn_job(
+            crate::jobs::JobKind::ActionExec,
+            label,
+            None,
+            move |_cancel, _progress| {
+                let out = crate::services::actions::exec(env.as_ref(), &action, &ctx, cap)?;
+                let summary = out.trimmed().to_string();
+                Ok(crate::jobs::JobResult::done(out, summary))
+            },
+        );
+        Ok(Receipt::Running { job, origin })
+    }
+
+    // ------------------------------------------------------------------------------- batch rename
+
+    /// The pure preview half (plan §7 step 14's 2 ms / 10 k-row criterion; the engine is
+    /// [`ops::batch_rename::preview`], the timing gate is `tests/perf_batch_rename.rs`).
+    ///
+    /// Stateless on purpose: the dialog recomputes it on every keystroke, so it takes the rows and the
+    /// directory's names and returns values — no cache, no session mutation, no event.
+    #[must_use]
+    pub fn batch_rename_preview(
+        rows: &[crate::ops::batch_rename::Row],
+        rules: &crate::ops::batch_rename::Rules,
+        existing: &std::collections::HashSet<String>,
+    ) -> crate::ops::batch_rename::PreviewSet {
+        crate::ops::batch_rename::preview(rows, rules, existing)
+    }
+
+    /// Preview, resolve the collisions under `policy`, and run the whole batch as **one**
+    /// [`Session::rename`] — which is the point: the parent-rewrite rule step 9c proved, the Go-parity
+    /// log record and the `DirChanged`/index traffic are the single-rename ones, not a second
+    /// implementation.
+    ///
+    /// # Errors
+    /// [`CoreError::Empty`] when no row would change (Go's `changedIndexes.length === 0` early return,
+    /// reported rather than swallowed), plus [`Session::rename`]'s own set.
+    pub fn batch_rename(
+        &self,
+        rows: &[crate::ops::batch_rename::Row],
+        rules: &crate::ops::batch_rename::Rules,
+        existing: &std::collections::HashSet<String>,
+        policy: crate::ops::ConflictPolicy,
+        origin: Origin,
+    ) -> Result<BatchRenameReport, CoreError> {
+        let preview = crate::ops::batch_rename::preview(rows, rules, existing);
+        let (req, report) = crate::ops::batch_rename::apply(rows, &preview, existing, policy)?;
+        let rename = self.rename(&req, origin)?;
+        Ok(BatchRenameReport {
+            preview: report.preview,
+            skipped: report.skipped,
+            rename,
+        })
+    }
+
+    // --------------------------------------------------------------------------------- action log
+
+    /// A page of the undo log, newest first ([`LogQuery`] explains the window; the flags the panel
+    /// needs are on [`LogRow`](crate::services::action_log::LogRow)).
+    ///
+    /// Synchronous like [`Self::log_recent`] — the store keeps its frame index in memory from open.
+    ///
+    /// # Errors
+    /// The store's read errors (a log file that changed under us).
+    pub fn log_query(
+        &self,
+        query: &crate::services::action_log::LogQuery,
+    ) -> Result<crate::services::action_log::LogPage, CoreError> {
+        let guard = lock(&self.inner.log);
+        let records = guard.records()?;
+        Ok(crate::services::action_log::LogPage::new(&records, query))
+    }
+}

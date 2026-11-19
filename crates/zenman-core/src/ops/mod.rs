@@ -42,6 +42,7 @@
 //!
 //! [`crate::error::CoreError`]: crate::error::CoreError
 
+pub mod batch_rename;
 pub mod chmod;
 pub mod clipboard;
 pub mod copy;
