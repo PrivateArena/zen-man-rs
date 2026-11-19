@@ -452,3 +452,122 @@ mod tests {
         );
     }
 }
+
+// --------------------------------------------------------------------------- zip-slip
+
+/// Resolve one archive-internal path *under* `dest`, or refuse it.
+///
+/// The plan (F9) names this function as the guard against zip-slip, and the two things that make it a
+/// guard rather than a string test are:
+///
+/// 1. the containment check runs on the **resolved** path — an [`AbsPath`] cannot hold `.` or `..`, so
+///    `is_ancestor_of` is a component-wise compare of normalised forms, not the prefix test Go used
+///    (`api/archive_extract.go:68-78`, which also flagged the legal name `a..b.txt`:
+///    `tests/golden/archive-extract-dotdot-falsepositive.json`); and
+/// 2. every **existing intermediate** is `symlink_metadata`-checked, so an earlier member that was a
+///    symlink (or a pre-existing link in the destination) cannot be walked through by a later one.
+///
+/// A literal `..` component is refused before resolution: it has no meaning inside a store, and refusing
+/// it is what makes "extracts to nothing" true for a hostile container.
+///
+/// # Errors
+/// [`CoreError::InvalidPath`] with [`PathReject::EscapesRoot`] for a member that escapes `dest` or resolves
+/// through a symlink; whatever [`AbsPath::join`] reports for an illegal name.
+pub fn safe_join(dest: &AbsPath, member: &str) -> Result<AbsPath, CoreError> {
+    let raw = member.to_string();
+    let mut target = dest.clone();
+    let mut intermediates: Vec<AbsPath> = Vec::new();
+    for comp in member.split('/') {
+        if comp.is_empty() || comp == "." {
+            continue;
+        }
+        if comp == ".." {
+            return Err(CoreError::InvalidPath {
+                raw,
+                reason: PathReject::EscapesRoot,
+            });
+        }
+        target = target.join(comp)?;
+        intermediates.push(target.clone());
+    }
+    // The belt to the type's braces: prove containment after normalisation.
+    if !dest.is_ancestor_of(&target) || dest == &target {
+        return Err(CoreError::InvalidPath {
+            raw,
+            reason: PathReject::EscapesRoot,
+        });
+    }
+    for path in intermediates
+        .iter()
+        .take(intermediates.len().saturating_sub(1))
+    {
+        if let Ok(md) = std::fs::symlink_metadata(path.as_path())
+            && md.file_type().is_symlink()
+        {
+            return Err(CoreError::InvalidPath {
+                raw,
+                reason: PathReject::EscapesRoot,
+            });
+        }
+    }
+    Ok(target)
+}
+
+#[cfg(test)]
+mod safe_join_tests {
+    use super::*;
+
+    /// The banned-method-free recursive delete the tests need (see `clippy.toml`).
+    fn rm_rf(path: &std::path::Path) {
+        if path.symlink_metadata().is_err() {
+            return;
+        }
+        if let Ok(entries) = std::fs::read_dir(path) {
+            for entry in entries.flatten() {
+                let child = entry.path();
+                let is_dir = child
+                    .symlink_metadata()
+                    .map(|m| m.is_dir())
+                    .unwrap_or(false)
+                    && !child.is_symlink();
+                if is_dir {
+                    rm_rf(&child);
+                } else {
+                    let _ = std::fs::remove_file(&child);
+                }
+            }
+        }
+        let _ = std::fs::remove_dir(path);
+    }
+
+    #[test]
+    fn traversal_is_refused_and_legal_names_are_not() {
+        let dest = AbsPath::from_path("/tmp/dest").expect("abs");
+        for bad in ["../../evil", "a/../../evil", "../evil", "a/../../b/../../c"] {
+            let e = safe_join(&dest, bad).expect_err("must refuse");
+            assert_eq!(e.kind(), "invalid_path", "{bad}");
+        }
+        for ok in ["a..b.txt", "deep/nested/x.txt", "..name", "name.."] {
+            let t = safe_join(&dest, ok).expect("legal");
+            assert!(dest.is_ancestor_of(&t), "{ok} -> {t}");
+        }
+        // The member may not *be* the destination either (that would clobber the directory itself).
+        assert!(safe_join(&dest, "").is_err());
+    }
+
+    #[test]
+    fn an_existing_symlink_intermediate_is_refused() {
+        let base = std::env::temp_dir().join(format!("zenman-safe-join-{}", std::process::id()));
+        std::fs::create_dir_all(&base).expect("tmp");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&outside).expect("outside");
+        let dest = base.join("dest");
+        std::fs::create_dir_all(&dest).expect("dest");
+        let abs_dest = AbsPath::from_path(&dest).expect("abs dest");
+        let link = dest.join("link");
+        std::os::unix::fs::symlink(&outside, &link).expect("symlink");
+        let e = safe_join(&abs_dest, "link/escape.txt").expect_err("must not follow the link");
+        assert_eq!(e.kind(), "invalid_path");
+        rm_rf(&base);
+    }
+}

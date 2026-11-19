@@ -39,6 +39,7 @@
 )]
 #![deny(clippy::wildcard_imports)]
 
+pub mod archive;
 pub mod cursor;
 pub mod entry;
 pub mod error;

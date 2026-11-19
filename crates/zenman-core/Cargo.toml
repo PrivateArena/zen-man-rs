@@ -16,6 +16,14 @@ description = "zen-man headless engine: files, archives, index, undo log, jobs (
 # compiles on and off", gated in `xtask ci`).
 watch = []
 
+# Plan §5.5/§10 item 3: RAR support. **This feature adds no dependency**, on purpose: the two Rust RAR
+# crates (`rar` 0.4, `unrar` 0.5) declare MIT but wrap the unRar binary / vendored UnRAR source, whose
+# licence is not on the Craft allowlist (`deny.toml` `[bans]` denies both names). Enabling it therefore
+# only compiles the `#[cfg(feature = "rar")]` code paths, which return the same typed
+# `CoreError::Unsupported` the default build returns; the real reader is an external, user-installed
+# binary (plan §10 item 3's clean-room note), which is later work.
+rar = []
+
 # `unsafe_code = "forbid"` is inherited from `[workspace.lints.rust]` (plan §5.1); the crate also
 # states it in source with `#![forbid(unsafe_code)]` (plan §5.1 lib.rs row).
 [lints]
@@ -41,3 +49,6 @@ open = "5.4.5"
 # makes the FTS5 + trigram tokenizer the Go schema needs available, and what lets `xtask licenses` see a
 # C SQLite we control rather than whatever the distro ships.
 rusqlite = { workspace = true }
+# Plan §5.5 step 13a: the two default-build archive readers (licence note in the root table).
+zip = { workspace = true }
+sevenz-rust = { workspace = true }

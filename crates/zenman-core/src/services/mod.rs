@@ -15,6 +15,7 @@
 //!   open — goes through `Env`; [`FsSource`] is the *listing* seam because `Env` has no such method, and
 //!   it is the only place under `services/` where a filesystem call happens.
 
+pub mod archive;
 pub mod dirs;
 pub mod name_match;
 pub mod search_index;

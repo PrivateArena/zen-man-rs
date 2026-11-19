@@ -160,6 +160,11 @@ pub enum CoreError {
     #[error("Archive was modified while reading")]
     ArchiveModified { archive: String },
 
+    /// A container that parses as a known format but whose bytes do not: bad magic, a truncated central
+    /// directory, a failed CRC (plan §5.5's "corrupt entry" case; Go answered 500 with a `%v` body).
+    #[error("archive is corrupt: {archive}: {reason}")]
+    ArchiveCorrupt { archive: String, reason: String },
+
     /// No reader for this container format (plan §5.5).
     #[error("unsupported archive format: {archive}")]
     UnsupportedArchive { archive: String },
@@ -265,6 +270,7 @@ impl CoreError {
             Self::ArchiveEncrypted { .. } => "archive_encrypted",
             Self::ArchiveModified { .. } => "archive_modified",
             Self::UnsupportedArchive { .. } => "unsupported_archive",
+            Self::ArchiveCorrupt { .. } => "archive_corrupt",
             Self::SymlinkUnsupported => "symlink_unsupported",
             Self::Cancelled => "cancelled",
             Self::IndexNotReady => "index_not_ready",
@@ -315,6 +321,7 @@ impl CoreError {
             Self::ArchiveEncrypted { .. } => 422,
             Self::ArchiveModified { .. } => 409,
             Self::UnsupportedArchive { .. } => 400,
+            Self::ArchiveCorrupt { .. } => 422,
             Self::SymlinkUnsupported => 500,
             Self::Cancelled => 408,
             Self::IndexNotReady => 503,

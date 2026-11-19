@@ -30,6 +30,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 
+use crate::archive::extract::{ExtractReport, ExtractReq};
 use crate::entry::{DirPage, FileEntry};
 use crate::error::CoreError;
 use crate::events::{ChangeCause, EngineEvent};
@@ -411,6 +412,8 @@ struct Inner {
     limits: Arc<Limits>,
     env: Arc<dyn Env>,
     dirs: Arc<DirService>,
+    /// The archive facility (plan §5.5 step 13a): the manifest cache, the caps, and the extract jobs.
+    archives: Arc<crate::services::archive::ArchiveService>,
     /// The live-search walk service (plan §5.3 `services/search_live.rs`), over the same filesystem
     /// seam as the listing service so one swap covers both.
     search: Arc<SearchService>,
@@ -537,6 +540,11 @@ impl Session {
         let source: Arc<dyn FsSource> = Arc::new(OsDirRead);
         let dirs = Arc::new(DirService::new(Arc::clone(&source), Arc::clone(&limits)));
         let search = Arc::new(SearchService::new(source, Arc::clone(&limits)));
+        let job_registry = Arc::new(crate::jobs::JobRegistry::new());
+        let archives = Arc::new(crate::services::archive::ArchiveService::new(
+            Arc::clone(&job_registry),
+            Arc::clone(&limits),
+        ));
         let watch_policy = Mutex::new(options.watcher);
         let session = Session {
             inner: Arc::new(Inner {
@@ -547,7 +555,8 @@ impl Session {
                 dirs,
                 search,
                 search_lane: Mutex::new(SearchLane::default()),
-                jobs: Arc::new(JobRegistry::new()),
+                jobs: job_registry,
+                archives,
                 log: Mutex::new(log),
                 db: Mutex::new(db),
                 db_disabled: Mutex::new(db_disabled),
@@ -2440,6 +2449,115 @@ pub fn noop_intent() -> Arc<dyn IndexIntent> {
 
 /// The type alias the plan's §4.3 `Arc<OriginAlloc>` line refers to, spelled through the session.
 pub type OriginHandle = Arc<OriginAlloc>;
+
+// --------------------------------------------------------------------------- archives (step 13a)
+
+impl Session {
+    /// The archive facility (plan §5.5). The pane reaches the four operations below through it; nothing
+    /// in `zenman-ui` may call `archive/*` directly.
+    #[must_use]
+    pub fn archives(&self) -> &Arc<crate::services::archive::ArchiveService> {
+        &self.inner.archives
+    }
+
+    /// `archive_list` — the rows of an archive directory (`path` must be in an archive store).
+    ///
+    /// Synchronous by design: it reads the container's central directory, cached per host mtime, which is
+    /// what Go's `/api/archive/dir` did too — and the answer is bounded by the manifest caps, so a job
+    /// would cost more than the read.
+    ///
+    /// # Errors
+    /// [`CoreError::UnsupportedArchive`] for a filesystem path, [`CoreError::ArchiveModified`] when the
+    /// host changed since the manifest was built (plan F7), [`CoreError::ArchiveEncrypted`] /
+    /// [`CoreError::ArchiveCorrupt`] / [`CoreError::CapacityExceeded`] from the reader.
+    pub fn archive_list(&self, path: &FsPath) -> Result<Vec<crate::entry::FileEntry>, CoreError> {
+        self.inner.archives.list(path)
+    }
+
+    /// `archive_read` — one member's bytes, capped by
+    /// [`Limits::nested_archive_max_bytes`](crate::limits::Limits::nested_archive_max_bytes).
+    pub fn archive_read(&self, path: &FsPath) -> Result<Vec<u8>, CoreError> {
+        self.inner.archives.read(path)
+    }
+
+    /// `archive_stream` — one member into the caller's sink, with no whole-member buffer (the plan's
+    /// `stream_file` criterion; the preview/`open with` path).
+    pub fn archive_stream(
+        &self,
+        path: &FsPath,
+        sink: &mut dyn std::io::Write,
+    ) -> Result<u64, CoreError> {
+        self.inner.archives.stream(path, sink)
+    }
+
+    /// `archive_props` — the payload step 13b's properties dialog shows for an archive row (plan §7 row
+    /// 13: Alt+Enter works on archive entries too).
+    pub fn archive_props(
+        &self,
+        path: &FsPath,
+    ) -> Result<crate::services::archive::ArchiveProps, CoreError> {
+        self.inner.archives.props(path)
+    }
+
+    /// `archive_extract` — start an extraction **job**.
+    ///
+    /// The receipt is always [`Receipt::Running`] (unbounded work, cancellable, plan F1). On completion the
+    /// destination is invalidated with the caller's `origin` — extraction writes real files, and a pane
+    /// that does not reload would show a directory it just filled (F13) — and every written path is
+    /// noted to the index intent, because those paths are filesystem paths, unlike archive *members*
+    /// (which are never indexed; the decision and its proof are in `services/archive.rs`).
+    ///
+    /// # Errors
+    /// Synchronously, before any thread starts: a destination inside an archive
+    /// ([`CoreError::VfsReadOnly`]), a traversal in it, a stale/encrypted/corrupt container, or a member
+    /// that would escape the destination ([`CoreError::InvalidPath`] — the zip-slip refusal).
+    pub fn archive_extract(
+        &self,
+        req: &ExtractReq,
+        origin: Origin,
+    ) -> Result<Receipt<ExtractReport>, CoreError> {
+        let sess = self.clone();
+        let dest = req.dest.clone();
+        let hook: crate::archive::extract::DoneHook =
+            Some(Arc::new(move |report: ExtractReport| {
+                sess.invalidate_from(
+                    &FsPath::from_abs(dest.clone()),
+                    ChangeCause::LocalJob,
+                    origin,
+                );
+                let ops: Vec<IndexOp> = report
+                    .written
+                    .iter()
+                    .map(|path| IndexOp::Created { path: path.clone() })
+                    .collect();
+                if !ops.is_empty() {
+                    sess.intent().note_all(&ops);
+                }
+            }));
+        let job = self.inner.archives.extract(req, origin, hook)?;
+        Ok(Receipt::Running { job, origin })
+    }
+
+    /// The extraction's progress snapshot (the dialog's poll; `None` once it has been collected).
+    #[must_use]
+    pub fn archive_extract_status(
+        &self,
+        id: JobId,
+    ) -> Option<Arc<crate::archive::extract::ExtractJob>> {
+        self.inner.archives.extract_status(id)
+    }
+
+    /// Ask a running extraction to stop (plan F3: the job answers `JobFinished{Cancelled}`, and whatever
+    /// it had written up to that point stays — the report is the truth about what happened).
+    pub fn archive_cancel(&self, id: JobId) -> bool {
+        self.inner.jobs.cancel(id)
+    }
+
+    /// Collect finished extractions past the retention window. Cheap; the shell's tick calls it.
+    pub fn archive_gc(&self) {
+        self.inner.archives.gc();
+    }
+}
 
 #[cfg(test)]
 mod tests {

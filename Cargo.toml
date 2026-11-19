@@ -59,6 +59,14 @@ serde_json = "1"
 # depend on a distro `libsqlite3` that may have been built without FTS5 — and `xtask licenses` sees the
 # same code everywhere.
 rusqlite = { version = "0.43", features = ["bundled"] }
+# --- archives (plan §5.5, step 13a; licence decision plan §10 item 3) -----------------------------
+# `zip` 9.7 (MIT) and `sevenz-rust` 0.6.1 (Apache-2.0) are the two formats in the *default* build.
+# Features are cut to the minimum that reads the fixture archives (plan §10 item 3 records the RAR
+# decision: the `rar`/`unrar` wrappers advertise MIT but bundle the UnRAR source, which is not on the
+# Craft allowlist — `deny.toml` `[bans]` keeps them out and `zenman-core`'s `rar` feature is a
+# pure `#[cfg]` switch that adds no dependency at all).
+zip = { version = "9.7", default-features = false, features = ["deflate"] }
+sevenz-rust = { version = "0.6.1", default-features = false }
 # --- internal (domain-named crates only; plan §5 layout bans `misc`/`core`/`utils`/`common`) -----
 zenman-core = { path = "crates/zenman-core" }
 zenman-ui = { path = "crates/zenman-ui" }

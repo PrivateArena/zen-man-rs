@@ -1837,3 +1837,147 @@ mod tests {
         );
     }
 }
+
+/// The store-side extensions step 13a adds to [`FsPath`] — kept as their own `impl` block so the
+/// archive rule ("entering an archive *file* opens a store") lives next to the code that uses it.
+/// The navigation rule step 13a adds to [`FsPath`]: entering a row can change *store*.
+///
+/// [`FsPath::is_archive_file`] itself already exists from step 3 (and so does the two-level
+/// `VfsKind::Archive` shape), so what is added here is the depth accessor and the two navigation calls a
+/// pane needs: [`FsPath::as_store`] (activate an archive row) and [`FsPath::enter`] (activate a child
+/// row, which may itself be an archive).
+impl FsPath {
+    /// The store this path opens, when it names an archive; an error when it does not.
+    ///
+    /// * an `Fs` path whose last component claims a format becomes that store's root
+    ///   (`/a/b.zip` → `Archive{host:/a/b.zip, nested:None}`, relative `""`);
+    /// * an archive **member** whose name claims a format becomes the *nested* store, which is depth 2 and
+    ///   therefore the cap: once a `nested` exists, a further archive-named member stays a member, because
+    ///   Go's parser could not express a third level either (`frontend/js/utils.js:45-90`).
+    ///
+    /// # Errors
+    /// [`CoreError::UnsupportedArchive`] for a path that names no container.
+    pub fn as_store(&self) -> Result<Self, CoreError> {
+        match &self.store {
+            VfsKind::Fs => {
+                let name = self.last_segment().unwrap_or_default().to_string();
+                if !is_archive_name(&name) {
+                    return Err(CoreError::UnsupportedArchive {
+                        archive: self.to_string(),
+                    });
+                }
+                Ok(Self {
+                    store: VfsKind::Archive {
+                        host: self
+                            .host_abs()
+                            .ok_or_else(|| CoreError::UnsupportedArchive {
+                                archive: self.to_string(),
+                            })?,
+                        nested: None,
+                    },
+                    relative: String::new(),
+                })
+            }
+            VfsKind::Archive { host, nested } => {
+                let already_nested = nested.as_deref().is_some_and(|n| !n.is_empty());
+                if already_nested || !is_archive_name(&self.relative) {
+                    // Depth 2 is the cap: inside a nested store, an archive-named row is a member.
+                    return Ok(self.clone());
+                }
+                Ok(Self {
+                    store: VfsKind::Archive {
+                        host: host.clone(),
+                        nested: Some(self.relative.clone()),
+                    },
+                    relative: String::new(),
+                })
+            }
+        }
+    }
+
+    /// The depth of stores this path addresses: 1 for a host, 2 for a nested store, 0 for the filesystem.
+    ///
+    /// [`MAX_NEST_DEPTH`](crate::archive::MAX_NEST_DEPTH) is the cap, and it is structural:
+    /// `VfsKind::Archive` has room for exactly one `nested`.
+    #[must_use]
+    pub fn store_depth(&self) -> usize {
+        match &self.store {
+            VfsKind::Fs => 0,
+            VfsKind::Archive { nested, .. } => {
+                if nested.as_deref().is_some_and(|n| !n.is_empty()) {
+                    2
+                } else {
+                    1
+                }
+            }
+        }
+    }
+
+    /// Enter one child row: a plain join inside the same store, except that a child naming a container
+    /// opens it as a store (see [`Self::as_store`] for the depth rule).
+    pub fn enter(&self, name: &str) -> Result<Self, CoreError> {
+        let joined = self.join(name)?;
+        match &self.store {
+            VfsKind::Fs if is_archive_name(name) => joined.as_store(),
+            VfsKind::Archive { nested: None, .. } if is_archive_name(name) => joined.as_store(),
+            _ => Ok(joined),
+        }
+    }
+}
+
+#[cfg(test)]
+mod archive_store_tests {
+    use super::*;
+
+    #[test]
+    fn activating_an_archive_row_opens_its_store_exactly_once() {
+        let f = FsPath::fs("a/plain.zip").expect("fs path");
+        assert!(f.is_archive_file());
+        let store = f.as_store().expect("activate the row");
+        assert_eq!(store.store_depth(), 1);
+        assert_eq!(store.relative, "");
+        assert_eq!(
+            store.host_abs().expect("host").to_string(),
+            "/a/plain.zip",
+            "the host is the file, not the file with its own name appended"
+        );
+        assert!(matches!(
+            &store.store,
+            VfsKind::Archive { nested: None, .. }
+        ));
+        // A plain file names no container.
+        let plain = FsPath::fs("a/b.txt").expect("fs");
+        assert_eq!(
+            plain.as_store().expect_err("no container").kind(),
+            "unsupported_archive"
+        );
+        // A member of the store stays in the store: entering a normal directory does not switch again.
+        let dir = store.join("docs").expect("join");
+        assert_eq!(dir.relative, "docs");
+        assert_eq!(dir.store_depth(), 1);
+        assert!(
+            dir.is_archive_file(),
+            "step 3's predicate means *inside* a store"
+        );
+    }
+
+    #[test]
+    fn nesting_caps_at_two_the_way_gos_parser_did() {
+        let host = FsPath::fs("tree/nested.zip")
+            .expect("fs")
+            .as_store()
+            .expect("host");
+        let inner = host.enter("inner.zip").expect("nested store opens");
+        assert_eq!(inner.store_depth(), 2);
+        assert_eq!(inner.relative, "");
+        assert_eq!(inner.store.nested().unwrap(), "inner.zip");
+        // Depth 3 is not a store: it is a member path inside the nested one.
+        let deep = inner.join("deeper.zip").expect("third level is a member");
+        assert_eq!(deep.relative, "deeper.zip");
+        assert_eq!(deep.store_depth(), 2);
+        assert!(
+            deep.to_string().contains("deeper.zip"),
+            "the third archive component renders as a member"
+        );
+    }
+}
