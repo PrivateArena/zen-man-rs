@@ -1209,3 +1209,92 @@ exit 0.
   table* is the single source of truth for liveness — `ExtractJob` is the status record, not a second
   scheduler, so `Session::archive_extract` returns `Receipt::Running` with the same `JobId` the jobs pane
   shows. Go had two ids (its extract job id and nothing else); the port has one.
+
+### Step 13b (archive browsing in the UI + Properties + extract progress) — execution log
+
+Files: `crates/zenman-ui/src/dialogs/{properties,extract}.rs` (new), `dialogs/mod.rs`
+(`Dialog::Properties`, `DialogKind::Properties`, `Dialogs::{take,put}`), `app.rs` (the archive listing
+branch, store-switching row activation, the read-only guard, the extract command + panels, the teardown
+tick), `keymap.rs` (`Command::Extract`, `Ctrl+E`), `panels/breadcrumb.rs` (store-aware boundary chips),
+`panels/file_pane.rs` (no "Directory is empty" under an error), `state.rs` (tab history, see the finding
+below), `crates/zenman-core/tests/archive_sevenz.rs`, `crates/zenman-ui/tests/archives.rs`. Workspace
+test count **621 → 631** (9 archive UI + 1 core 7z), `cargo xtask ci` exit 0, `--smoke 1` under Xvfb 0.
+
+* **The navigation model as shipped: the store travels in `FsPath::store`, and only two places branch
+  on it.** `list_at` asks `matches!(tab.path.store, VfsKind::Archive { .. })` and then reads the manifest
+  through `Session::archive_list` instead of `page_dir` — the listing is whole (no cursor, no `has_more`,
+  no page job), so it is wrapped in a plain `DirPage` and handed to the same `set_page_keeping_selection`
+  a directory page takes; 13a's promise that the pane needs no archive-specific row type held exactly (the
+  rows are `FileEntry`s, `rel_path` = internal path, mode `-r--r--r--`). The second branch is row
+  activation: `PaneCommand::Open` now goes through `FsPath::enter`/`as_store`, so a directory joins, an
+  archive-named row **switches store**, and at depth 2 an archive-named row is a member (the cap is
+  structural in `VfsKind::Archive`, so `MAX_NEST_DEPTH` is a statement, not a check). Everything else —
+  history, back/forward/up/Escape, selection-by-path, sorting, the status bar — is unchanged and needed no
+  archive case. `tab_title` and the breadcrumb already print the host-then-member form.
+* **The breadcrumb needed the fix 13a left open.** `trail` was store-aware about *labels* but made the
+  container's own chip the filesystem file, so clicking `box.zip` listed a file (an error pane). The host
+  chip is now `FsPath::from_abs(host).as_store()` and a nested member's chip is `path.store.root_path()` —
+  i.e. the chips are the stores they open, which is what Go's `data-path` + archive query triple did.
+* **Read-only enforcement list (the honest one).** `ZenApp::in_archive(slot)` gates, with the reason in a
+  toast and no engine call: `NewFolder`, `Paste`, `PasteInside`, `PasteLink`, `Cut`, `CutInside`, `Delete`,
+  `PermanentDelete`, `Rename`, `Chmod`. That is `dispatch`'s guard (chords, menu rows, drag) on top of
+  `menus`' existing `MenuContext::on_archive` `when` predicates, so a greyed row and a refused chord say
+  the same sentence. Reading is never refused: Copy / Copy path / Open-in-pane / Properties all work inside
+  a container, and `ops::guard::vfs_write_guard` remains the engine's own last word.
+* **Properties: one dialog, two engines, and nothing computed in the UI.** `Alt+Enter` (§5.8's named
+  chord, `Command::Properties`) opens `Dialog::Properties` for the first selected row, or for the pane's
+  directory when nothing is selected. A local subject prints the listing's own `FileEntry` (name, type,
+  path, permissions, modified) plus the size block; a directory's size is a `Session::dir_size` **job** and
+  the row prints `--` until the cached `DirSizeStat` answers (**D11**, and the dialog re-reads the cache
+  from `properties::tick`, never from `show`). An archive subject prints `archive_props`' payload: format,
+  store depth, container size, uncompressed total, member/file/dir counts, encrypted count, nested count.
+  Fields the wire has never carried (accessed, owner/group, symlink target) print `--` with a comment —
+  Go had no properties dialog at all (`/api/props` was dead), so there is no golden to agree with here,
+  and inventing values would have been the cheaper, wrong move.
+* **Extract UX decision: modeless panels, not a modal.** `Command::Extract` (`Ctrl+E`; Go wired the endpoint
+  and never wired a caller) extracts the shown container — or the selection, using Go's `sources: []` =
+  whole-archive rule — into the directory that holds it, with the caller's `ConflictPolicy` threaded
+  through `ZenApp::extract_here` (dispatch uses `ConflictPolicy::DEFAULT`, the engine's own answer to a
+  collision; the test drives `SkipExisting`, and the report's `skipped`/`renamed` lists are printed).
+  Each job gets one bottom-left panel: a bar fed by `ExtractJob::state`'s byte counters, real
+  `n of total` text (never `0 of 0`), a **Cancel** button on `Session::archive_cancel`, and a terminal line
+  built from `ExtractReport` (written / skipped / renamed / dirs / bytes) or the cancellation. The
+  `Receipt::Running` origin is registered in `JobsUi` like `dir_size`/`paste`, so the status strip and the
+  terminal toast behave like every other job's, and the destination reload is core's own `DirChanged`
+  from the done hook — the panel reloads nothing. Modeless is deliberate: a modal would block the very pane
+  the extraction repopulates. `dialogs/extract.rs` is not a §5.8 file; it is the plan's own
+  "a job row plus a progress dialog" option, and the row-13 criterion does not name a file.
+* **Teardown hygiene.** `logic()` runs `Session::archive_gc()` + `ArchiveStore::cache().evict_stale()`
+  once per frame, and only once `archives_touched` is true (set by the first archive listing or extract),
+  so an archive-free shell frame touches neither cache; both are bounded by `Limits` regardless.
+* **The 7z situation: resolved on the port side, still owed against Go.** `archive_sevenz.rs` writes a
+  genuine 7z with `sevenz-rust`'s writer and reads it back through `archive::reader` (list + stream +
+  read-to-vec, sizes as the extract total sees them). The writer half is behind the crate's `compress`
+  feature (there is no feature named `write`), added **as a dev-dependency feature only** — the shipped
+  build still reads 7z and never writes one, and no package entered the graph. What is still owed is
+  unchanged and unchanged-able here: no capture of Go's `bodgit/sevenzip` answering a real 7z exists, so
+  this is a round trip, not a golden. `docs/contracts.md`'s "fixtures we cannot generate" sentence stands.
+* **A step-8 bug this step walked into: `Tab::go_forward` could not work.** The history stored each
+  navigation's *previous* path and `hist_ix` pointed past the end, so after `go_back` the forward entry had
+  been overwritten by the back step and `go_forward` returned the current path again — Forward was a no-op
+  for every pane, archive or not (row 8's "navigating after going back truncates forward entries" was only
+  ever tested for the truncation half). Fixed by keeping the current path *in* `history`
+  (`Tab::new` seeds it, `navigate_to` truncates to `hist_ix + 1` then appends, `can_go_forward` compares
+  `hist_ix + 1`), which is the model the breadcrumb's enable/disable already assumed.
+  `archives::a_nested_archive_browses_to_depth_two_and_a_third_level_does_not_open` now exercises
+  back-and-forward *across a store switch*.
+* **§7 row 13, line by line, after 13b.** `contract_archive` green ✓ (13a). `a.zip/b.7z` browses to depth
+  2 matching golden fixtures ✓ — the UI browses the captured `nested.zip`→`inner.zip` and a synthetic
+  three-container chain to the cap, with the third level refusing to open; the `b.7z` *golden* half
+  remains the stub 13a documented, now covered by the port-side round trip above. Zip-slip refused ✓
+  (13a). Extract shows progress + cancel ✓ (panels + `archive_cancel`, both terminal states tested against
+  real files on disk). Properties opens on Alt+Enter for local **and** archive entries ✓. Step **13 is
+  complete**; snapshots 02/03 are unaffected (no archive is in the snapshot fixture), and `docs/parity/`
+  holds no archive-browsing or properties reference — there is no human gate to open here, which is worth
+  saying out loud rather than inventing a screenshot to match.
+* **Handed to step 14.** `ZenApp::{in_archive, extract_here}`, `dialogs::extract::{start, tick, cancel,
+  show}` (the job-panel pattern the action-log/other job dialogs should copy), `Dialogs::{take, put}` (the
+  safe way for a frame's owner to visit a dialog with the app), `properties::tick` as the pattern for a
+  dialog that watches a job, and `Command::Extract`'s place in `menus` — the file menu's shape table has
+  the row's slot open (Extract is chord-only today, so the menus' literal shape table did not have to be
+  rewritten in this step).
