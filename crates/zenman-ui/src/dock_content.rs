@@ -114,37 +114,42 @@ impl PaneDock<'_> {
             Stroke::new(1.0, tokens.border)
         });
         frame.show(ui, |ui| {
-            let has_tabs = self
-                .model
-                .panes
-                .get(&slot)
-                .is_some_and(|pane| !pane.tabs.is_empty());
-            if has_tabs {
-                self.tab_strip(ui, slot);
-                self.address_strip(ui, slot);
-                self.listing(ui, slot);
-            } else {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(tokens.empty_pane_space);
-                    ui.label(
-                        egui::RichText::new(placeholder_title(slot))
-                            .color(tokens.text_main)
-                            .strong(),
-                    );
-                    ui.label(
-                        egui::RichText::new("no tab — press + to open a directory")
-                            .color(tokens.text_muted),
-                    );
-                });
-            }
-            // The pane takes focus on click (DockOutput::focused also reports it; both agree).
-            if ui.input(|i| i.pointer.any_pressed())
-                && ui
-                    .input(|i| i.pointer.interact_pos())
-                    .is_some_and(|p| ui.max_rect().contains(p))
-            {
-                self.model.active_pane = slot;
-            }
+            // One egui id space per pane: without this, the identically-ordered widgets of two
+            // panes (back/forward/up, row rects) share one `Id`, and the second pane trips
+            // `Context::check_for_id_clash` — whose flame glyph this font stack panics on (rule 11).
+            ui.push_id(slot as u8, |ui| {
+                let has_tabs = self
+                    .model
+                    .panes
+                    .get(&slot)
+                    .is_some_and(|pane| !pane.tabs.is_empty());
+                if has_tabs {
+                    self.tab_strip(ui, slot);
+                    self.address_strip(ui, slot);
+                    self.listing(ui, slot);
+                } else {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(tokens.empty_pane_space);
+                        ui.label(
+                            egui::RichText::new(placeholder_title(slot))
+                                .color(tokens.text_main)
+                                .strong(),
+                        );
+                        ui.label(
+                            egui::RichText::new("no tab — press + to open a directory")
+                                .color(tokens.text_muted),
+                        );
+                    });
+                }
+                // The pane takes focus on click (DockOutput::focused also reports it; both agree).
+                if ui.input(|i| i.pointer.any_pressed())
+                    && ui
+                        .input(|i| i.pointer.interact_pos())
+                        .is_some_and(|p| ui.max_rect().contains(p))
+                {
+                    self.model.active_pane = slot;
+                }
+            });
         });
     }
 

@@ -349,13 +349,14 @@ fn path_chips(
             rest.max.y,
         ),
     );
-    let space = ui
-        .interact(
-            edge,
-            egui::Id::unique("zenman-crumb-space"),
-            egui::Sense::click(),
-        )
-        .on_hover_text("Edit the path");
+    let space = {
+        // Scoped to this pane's `Ui` (`scope_id`), not `Id::unique` (which is the *same* id everywhere — two
+        // panes' trails then collide on one id at two rects and egui paints its id-clash flame,
+        // which this font stack panics on, rule 11).
+        let space_id = ui.scope_id().with("zenman-crumb-space");
+        ui.interact(edge, space_id, egui::Sense::click())
+            .on_hover_text("Edit the path")
+    };
     ui.advance_cursor_after_rect(space.rect);
     space
 }

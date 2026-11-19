@@ -315,6 +315,11 @@ pub struct Tab {
     /// `DockContent::resolve_drag` reads it to build the payload; the pane records it from
     /// `RowEvent::DndGrab` (plan §5.8's `DndGrab{ix}`).
     pub drag_row: Option<usize>,
+    /// The row <kbd>F2</kbd> put into rename, by **row key** (never an index: a reload must not
+    /// move the editor onto another file — the same reason [`Tab::sel`] is keyed). Step 10a's
+    /// `Command::Rename` sets it; the in-cell editor of step 10c is the consumer that must clear it
+    /// (commit) or reset it to `None` (cancel).
+    pub rename_target: Option<String>,
 }
 
 impl Tab {
@@ -343,6 +348,7 @@ impl Tab {
             loading_more: false,
             page_size: DEFAULT_PAGE_SIZE,
             drag_row: None,
+            rename_target: None,
             error: None,
             pending: BTreeSet::new(),
         }
@@ -458,11 +464,14 @@ impl Tab {
     /// local path can have a `dir_size` answer).
     #[must_use]
     pub fn row_abs(&self, entry: &zenman_core::entry::FileEntry) -> Option<AbsPath> {
-        let path = if entry.rel_path.is_empty() {
-            self.path.clone()
+        // `rel_path` is only filled by the flat listings; in a plain directory the row *is* its
+        // name — joining the name is what makes the row point at the entry, not at the directory.
+        let rel = if entry.rel_path.is_empty() {
+            entry.name.as_str()
         } else {
-            self.path.join_rel(&entry.rel_path).ok()?
+            entry.rel_path.as_str()
         };
+        let path = self.path.join_rel(rel).ok()?;
         path.host_abs()
     }
 
