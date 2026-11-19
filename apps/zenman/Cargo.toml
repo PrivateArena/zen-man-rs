@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "zen-man: a native egui file manager (plan §5.9); step 1 is a GPU-safe scaffold"
+description = "zen-man: a native egui file manager (plan §5.9) — the thin binary over zenman-core + zenman-ui"
 
 # Plan §5.1/§5.9 and rule R4 of the step-1 brief: the binary may declare `deny` where the workspace
 # says `forbid`, so a future platform shim is a crate-local, reviewable exception. Mechanism copied
