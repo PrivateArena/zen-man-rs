@@ -1757,3 +1757,63 @@ pins it if the claim is a test.
   the machine-specific drawer artefacts (`06`/`07`, real `statvfs` + real `$HOME`), which must stay out
   of any cross-machine pixel comparison; and the custom-action drawer's two unfinished halves (executing
   an action from the right drawer, per-row delete/reorder).
+
+* **step 16a — the Windows platform layer + the cross-target build story.** Measured before written:
+  `cargo check -p zenman-core --target x86_64-pc-windows-msvc` at HEAD `23c0611` did **not** reach
+  `rustc` at all. The failure list, crate by crate, was exactly one entry — `libsqlite3-sys 0.40.0`
+  (`rusqlite`'s `bundled` SQLite): `cc-rs` looks for the MSVC archiver and compiler (`lib.exe`/`cl.exe`),
+  warns `GNU compiler is not supported for this target`, and dies with `failed to find tool "lib.exe"`.
+  No mingw SDK either (`x86_64-w64-mingw32-gcc`, `dlltool`, `windows.h` all absent), so **no Linux host on
+  this box can compile the bundled amalgamation for `-windows-msvc`** — that is an upstream/toolchain
+  block, not a gating bug, and it is why `xtask ci`'s new cross rung reports PARTIAL instead of pretending
+  (see below). Everything else in the graph was measured clean for the target: `trash`, `open`, `zip`,
+  `sevenz-rust` each `cargo check` green for `x86_64-pc-windows-msvc`.
+  *Gating* fixes (as opposed to missing code) turned out to be almost nothing, because step 3 had already
+  written `platform/linux.rs` per-call-gated: the only real change is `rustix` moving from
+  `[dependencies]` to `[target.'cfg(unix)'.dependencies]` in `zenman-core/Cargo.toml` — rustix *does* build
+  for Windows (to an almost empty module set), which is precisely the trap: an un-gated `rustix::fs::…`
+  call would have compiled here and failed there. Plus one test gate, `ops/guard.rs`'s
+  `an_existing_symlink_intermediate_is_refused`, now `#[cfg(unix)]` so a `--all-targets` cross check does not
+  trip over `std::os::unix::fs::symlink`. Everything else (`path.rs`, `entry.rs`, `ops/{copy,mkdir}`,
+  `index/walker.rs`, `platform/env_probe.rs`) was already `#[cfg(unix)]`-gated; nothing needed a
+  Windows-only hack, and Linux behaviour is byte-identical (the 722 incoming tests are the regression net).
+  *The dependency question, answered:* **no new dependency**, and none is addable for the FFI cases —
+  `unsafe_code` is `forbid`ded at workspace level, so `GetDiskFreeSpaceExW`, `GetLogicalDrives`,
+  `GetDriveTypeW`, `GetVolumeInformationW` and `IShellLink` are unreachable even with `windows-sys` in the
+  graph (its calls are `unsafe`). `std::fs::Metadata::file_system` — the safe wrapper for exactly Go's two
+  `GetDiskFreeSpaceExW` numbers — is **still unstable** (`rust-lang/rust#67087`), which is the discovery of
+  this step and the reason `disk_space` on Windows is a typed `CoreError::Unsupported` naming the syscall
+  rather than a plausible-looking `0/0` (the disk meter renders its `--` state).
+  *What `platform/windows.rs` does answer first-class:* drive enumeration (`enumerate_drives`/
+  `drive_entries` over the 26 roots — the gap Go's `api/places.go:274` left by returning early for
+  non-Linux), name validation (`name_reject`: the 24 reserved device names case-insensitively with and
+  without an extension, the nine illegal characters, control characters, trailing dot/space, the 255 cap;
+  `PathReject::WindowsName` added for the 400 channel), the `cmd /C` **argv-vector** form
+  (`to_windows_request` + `quote_arg`, doubled `""`, no shell interpolation — plan F10, step 14a's POSIX
+  single-quote counterpart), `trash`/`can_trash` (volume root and UNC refused; `recycle_bin_exists` kept as
+  the name rule a future volume probe feeds), `has_program` with `PATHEXT`, `is_writable` from the
+  read-only attribute, `open_with` through `open`. Shared with the unix side by reuse, not duplication:
+  `copy_paths`/`paste_link`/`exec_program` delegate to `platform/linux.rs`, whose bodies are `std`-only
+  outside their own `#[cfg(unix)]` arms. `.lnk` (`create_shortcut`) and `chmod` stay typed refusals —
+  COM and an `st_mode` that does not exist.
+  *Watcher, deliberately deferred:* no Windows backend was written. Step 12b's discipline already made
+  `--features watch` compile everywhere and answer `CoreError::Watcher` off Linux, and
+  `windows.rs::the_deferred_watcher_answers_a_typed_error` pins it; the module doc records what a real
+  `ReadDirectoryChangesW` backend needs (an owned handle per root, a 64 KiB completion buffer whose
+  overflow flag means *rescan*, `FILE_ACTION_*`→`Kind` mapping, the one-handle-recursive vs
+  one-handle-per-directory rename trade-off) — all of it behind `unsafe`, so it needs a crate that owns
+  that, licence-cleared.
+  *The gate:* `xtask/src/cross_target.rs`, run inside `xtask ci`. Rung 1 probes
+  `rustup target list --installed` and prints a skip reason when the target or `rustup` is missing.
+  Rung 2 (hard) checks `trash`/`open`/`zip`/`sevenz-rust` for the target — the realistic regression,
+  someone adding a unix-only crate. Rung 3 tries the whole crate and, when the *only* failure is the
+  known `libsqlite3-sys` build script, prints the documented PARTIAL; any `error[E…` or a
+  `zenman-core` compile failure makes it a hard error, so the rung self-promotes the moment an MSVC
+  toolchain appears. Rustc-level coverage of *our* Windows code that rung 3 cannot give is recovered by
+  `platform/windows.rs` being target-neutral `std`: its 16 tests compile **and run** on the host.
+  *Step 16b inherits:* the `contract.rs` full sweep, `crash_guard` polish, `README.md`, MSRV check; the
+  `#[cfg(not(unix))]` arms of `platform/linux.rs` (`statvfs`, `accessat`, `with_shell`) are still only
+  compile-proven on a Windows host, so run rung 3 there once; the `disk_space` decision (wait for
+  `Metadata::file_system` stabilisation, or take a licence-cleared crate that owns the `unsafe`); a real
+  `.lnk`/`.url` writer; `GetDriveTypeW`-backed `removable` (the sidebar shows no eject button today); and
+  `services/places.rs`'s Windows branch, which should now call `platform::windows::mount_entries`.

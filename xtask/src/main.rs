@@ -34,6 +34,7 @@ use serde_json::Value;
 
 mod assets;
 mod contracts;
+mod cross_target;
 mod fixture_tree;
 mod parity;
 mod png;
@@ -92,6 +93,9 @@ fn ci() -> Result<(), Box<dyn Error>> {
     step("cargo check -p zenman-core --features watch")?;
     step("cargo clippy -p zenman-core --features watch --all-targets -- -D warnings")?;
     step("cargo test -p zenman-core --features watch")?;
+    // Step 16a: plan §7 row 16's "or a documented `#[cfg]` stub audit when that target is absent" — the
+    // cross-target rungs, self-skipping when the target or the toolchain is not there.
+    cross_target::check()?;
     contracts::contracts()?;
     deps()?;
     licenses()?;

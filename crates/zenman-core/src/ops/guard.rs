@@ -555,6 +555,9 @@ mod safe_join_tests {
         assert!(safe_join(&dest, "").is_err());
     }
 
+    /// Symlinks are the subject, so this is a unix test by nature: `#[cfg(unix)]` keeps a
+    /// `--all-targets` cross check for Windows (step 16a) from tripping over `std::os::unix` here.
+    #[cfg(unix)]
     #[test]
     fn an_existing_symlink_intermediate_is_refused() {
         let base = std::env::temp_dir().join(format!("zenman-safe-join-{}", std::process::id()));

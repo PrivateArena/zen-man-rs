@@ -40,6 +40,12 @@ pub enum PathReject {
     /// (`api/dir.go:49-51`); the plan's five-variant `PathReject` set has no member for it, so this
     /// is a documented addition (step-3 report, plan §5.2 gap).
     NoHome,
+    /// A name Windows refuses for its own reasons — a reserved device name (`CON`, `LPT1`, `NUL`), an
+    /// illegal character (`<`, `>`, `:` …), a trailing dot/space, or a control character. Step 16a's
+    /// addition, alongside the `NoHome` one: the rules live in
+    /// [`platform::windows::name_reject`](crate::platform::windows::name_reject), which keeps the precise
+    /// rule in its own `NameReject` type and maps here for the 400-class error channel.
+    WindowsName,
 }
 
 impl std::fmt::Display for PathReject {
@@ -51,6 +57,7 @@ impl std::fmt::Display for PathReject {
             Self::InteriorDot => "path contains a `..` component",
             Self::Wildcard => "path contains a wildcard",
             Self::NoHome => "home directory is unknown (HOME is unset)",
+            Self::WindowsName => "illegal Windows file name",
         };
         f.write_str(s)
     }

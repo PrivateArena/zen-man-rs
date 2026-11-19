@@ -34,6 +34,7 @@ pub mod env_probe;
 pub mod linux;
 pub mod stub;
 pub mod system;
+pub mod windows;
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -51,6 +52,7 @@ pub use env_probe::{
 };
 pub use linux::Linux;
 pub use stub::Unsupported;
+pub use windows::Windows;
 
 /// An owned future the job runner can poll. `Pin<Box<…>>` rather than the plan's literal
 /// `Box<dyn Future<…>>` because only the pinned form implements `Future` and is therefore `.await`-able
@@ -173,14 +175,14 @@ pub fn detect() -> Platform {
     Platform { os, caps }
 }
 
-/// The `Env` this build should use. Step 16 replaces the non-Linux branch with `platform::windows`.
+/// The `Env` this build runs on: the unix implementation everywhere but Windows, where step 16a's
+/// [`Windows`] implementation answers. [`stub::Unsupported`] stays available (and table-tested) as the
+/// "no implementation at all" lane the tests use.
 #[must_use]
 pub fn default_env() -> std::sync::Arc<dyn Env> {
     match Os::current() {
         Os::Linux | Os::Macos | Os::Other => std::sync::Arc::new(Linux::new()),
-        // `stub::Unsupported` is the Windows answer until step 16 lands `platform/windows.rs`; it fails
-        // with a typed error rather than pretending.
-        Os::Windows => std::sync::Arc::new(Unsupported::new()),
+        Os::Windows => std::sync::Arc::new(Windows::new()),
     }
 }
 

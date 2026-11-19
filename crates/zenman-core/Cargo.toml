@@ -39,7 +39,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 # `fs` covers `rustix::fs::inotify` (plan §5.5 `index/watcher.rs`, step 12b) as well as the `statvfs`
 # and xattr calls `platform/linux.rs` needs; there is no `inotify` feature in rustix 1.1.6 to add.
-rustix = { version = "1.1.6", features = ["fs"] }
+# **Step 16a:** the dependency itself moved to `[target.'cfg(unix)'.dependencies]` at the bottom.
 trash = "5.4.0"
 open = "5.4.5"
 # `rustix` (safe `statvfs`, incl. the `f_fsid` VFS id), `trash` (plan R/D6 delete path) and `open` (the
@@ -59,3 +59,14 @@ sevenz-rust = { workspace = true }
 # shipped build reads 7z and never writes one, so `cargo build` still compiles the reader-only feature
 # set. This adds no package to the graph — `sevenz-rust` is already a dependency above.
 sevenz-rust = { workspace = true, features = ["compress"] }
+
+# Step 16a target gating. `rustix` is **unix-only by construction**: it does compile for
+# `x86_64-pc-windows-msvc`, but to an almost empty module set, so a plain dependency lets a
+# `rustix::fs::statvfs` call sit behind a `#[cfg(not(unix))]` arm that nothing compiles until step 16a and
+# that then fails *there*. As a target dependency it is simply absent on Windows, which is the honest
+# shape: `platform/linux.rs`'s `statvfs`/`accessat` calls and `index/watcher.rs`'s inotify backend are
+# already `#[cfg(unix)]` / `#[cfg(target_os = "linux")]`, and `platform/windows.rs` names no rustix path at
+# all. `trash` and `open` stay unconditional — both are cross-platform, and both *are* the Windows
+# implementation's trash/opener too (plan §10 item 4).
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1.6", features = ["fs"] }
