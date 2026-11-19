@@ -195,8 +195,10 @@ fn consume_key(ui: &mut Ui, key: Key) -> bool {
 /// The card every dialog is drawn inside (the plan's `modal_frame`; `dock_content::modal_frame` is a
 /// different thing — the drawers' frame, with no width contract).
 pub(crate) fn modal_frame(tokens: &Tokens, ui: &mut Ui, width: f32, content: impl FnOnce(&mut Ui)) {
+    // 15c D1: the fill is opaque *by construction* (`Tokens::modal_fill`), and the shell behind it is
+    // dimmed by `Dialogs::show` — a card that lets the listing through is the defect that was found.
     Frame::new()
-        .fill(tokens.bg_card)
+        .fill(tokens.modal_fill())
         .stroke(Stroke::new(1.0, tokens.border))
         .corner_radius(CornerRadius::same(tokens.corner_radius))
         .inner_margin(Margin::same(tokens.dialog_padding as i8))

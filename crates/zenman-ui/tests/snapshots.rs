@@ -921,6 +921,15 @@ fn drive_quick_find(harness: &mut Harness<'static, ZenApp>) {
         }
         other => panic!("quick find closed itself: {other:?}"),
     }
+    // 15c D6: the list must *realise* its rows. The pane behind the dialog shows `row-0007.txt` as its
+    // last visible row, so a node for row 8 or 9 can only have come from the dialog's own list — the
+    // frame that showed a single row cannot produce one.
+    let deep = harness.query_all_by_label("row-0008.txt").count()
+        + harness.query_all_by_label("row-0009.txt").count();
+    assert!(
+        deep > 0,
+        "the quick-find list realises rows below the pane's own viewport (D6)"
+    );
     assert_labels(harness, &["listing"]);
 }
 
@@ -995,6 +1004,54 @@ fn drive_index(harness: &mut Harness<'static, ZenApp>, running: bool) {
     });
     settle(harness);
     freeze_index(harness, running);
+    // 15c D2/D3, pinned on the painted frame: with **no query typed** the manager still shows the
+    // results table and Go's empty-state line, and the `last indexed` stamp is a *date*, never the raw
+    // unix second the golden carries.
+    for label in [
+        "Name",
+        "Path",
+        "Size",
+        "Modified",
+        "No items matched your query",
+    ] {
+        assert!(
+            harness.query_all_by_label(label).count() > 0,
+            "`{label}` is in the manager's frame with an empty query (D2)"
+        );
+    }
+    let stamp = format!(
+        "last indexed {}",
+        zenman_core::metrics::format_mtime(Some(FIXED_UNIX))
+    );
+    assert!(
+        harness.query_all_by_label(&stamp).count() > 0,
+        "the frozen stamp is painted as a date: `{stamp}` (D3)"
+    );
+    assert_eq!(
+        harness
+            .query_all_by_label(&format!("last indexed {FIXED_UNIX}"))
+            .count(),
+        0,
+        "the raw unix second never reaches the frame (D3)"
+    );
+    if running {
+        // 15c D4: the mid-rebuild frame is the settings view, with the live progress line on it.
+        for label in ["Index roots", "Exclude patterns", "indexing 200"] {
+            assert!(
+                harness.query_all_by_label(label).count() > 0,
+                "`{label}` is in the running frame (D4)"
+            );
+        }
+        // 15c D5: this frame claims a rebuild is running, so a *completion* notice beside it is the
+        // contradiction the review found. The shell withdraws it on the state transition; this scene
+        // reaches the running state through a direct `Session::index_rebuild`, so it withdraws it here
+        // through the very call the shell makes (the transition itself is pinned by the `tick` code).
+        let withdrawn = harness
+            .state_mut()
+            .notices
+            .dismiss_containing("row(s) indexed");
+        println!("index-running frame: withdrew {withdrawn} stale completion notice(s)");
+    }
     match harness.state_mut().dialogs.active_mut() {
         Some(Dialog::SearchManager(m)) => {
             m.status.last_indexed = FIXED_UNIX;

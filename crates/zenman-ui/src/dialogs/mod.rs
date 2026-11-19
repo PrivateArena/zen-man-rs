@@ -38,7 +38,7 @@ pub use properties::{PropertiesDialog, Subject as PropertiesSubject};
 pub use quick_find::{QuickFind, QuickOutcome};
 pub use search_manager::{IndexOutcome, SearchManager};
 
-use egui::Ui;
+use egui::{Align2, Area, CornerRadius, Id, Order, Ui, Vec2};
 
 use zenman_core::ops::paste::PasteMode;
 use zenman_core::path::AbsPath;
@@ -288,6 +288,13 @@ impl Dialogs {
     /// Draw the dialog and take its answers (it closes itself when it has one).
     pub fn show(&mut self, ui: &mut Ui, tokens: &Tokens) -> Vec<Answer> {
         let mut out = Vec::new();
+        if self.active.is_some() {
+            // 15c D1: dim the shell *before* the card is drawn. The card is opaque on its own layer
+            // (`modal_frame` + `Order::Foreground`); the dim is what the reference does with the rest
+            // of the window, and what makes "nothing of the listing shows through" a property of the
+            // frame rather than of the colour's alpha.
+            paint_backdrop(ui, tokens);
+        }
         if let Some(dialog) = &mut self.active
             && let Some(answer) = dialog.show(ui, tokens)
         {
@@ -296,4 +303,26 @@ impl Dialogs {
         }
         out
     }
+}
+
+/// The dim over the shell, on its own layer: `Order::Middleware` sits above the panels
+/// (`Order::Background`) and below the dialog card (`Order::Foreground`). It allocates **no input
+/// sense** and is `interactable(false)`, so it cannot claim a hover or a click any widget owns
+/// (rule 10: a losing claim repaints forever).
+fn paint_backdrop(ui: &Ui, tokens: &Tokens) {
+    let viewport = ui.input(|i| i.viewport_rect());
+    Area::new(Id::unique("zenman-modal-backdrop"))
+        // `Order::Middle` is this egui's layer between the panels (`Background`) and the dialog card
+        // (`Foreground`) — there is no `Middleware` variant here.
+        .order(Order::Middle)
+        .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+        .constrain(false)
+        .interactable(false)
+        .show(ui.ctx(), |ui| {
+            ui.spacing_mut().item_spacing = Vec2::ZERO;
+            ui.allocate_space(viewport.size());
+            let rect = ui.min_rect();
+            ui.painter()
+                .rect_filled(rect, CornerRadius::ZERO, tokens.modal_backdrop());
+        });
 }

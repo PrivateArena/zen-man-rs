@@ -45,9 +45,12 @@
 
 use std::time::{Duration, Instant};
 
-use egui::{Align2, Area, CornerRadius, Key, Order, ScrollArea, Sense, TextEdit, Ui, Vec2};
+use egui::{
+    Align2, Area, CornerRadius, Key, Order, Rect, ScrollArea, Sense, TextEdit, Ui, Vec2, vec2,
+};
 
 use zenman_core::jobs::JobId;
+use zenman_core::metrics::format_mtime;
 use zenman_core::path::{AbsPath, FsPath};
 use zenman_core::services::search_index::{IndexEntry, IndexSearchResults, IndexStatus};
 use zenman_core::session::{IndexConfig, Origin, WatchPolicy};
@@ -75,6 +78,12 @@ const LIMITS: [usize; 3] = [50, DEFAULT_LIMIT, 1000];
 
 /// Result rows on screen before the list scrolls (Go's table is `max-height: 45vh`).
 const LIST_ROWS: f32 = 9.0;
+
+/// Size column's share of the space after the path (the remainder is the `Modified` column).
+const SIZE_OF_META: f32 = 0.5;
+
+/// Go's four result columns, in its words (`search-manager.html`'s table head).
+const COLUMNS: [&str; 4] = ["Name", "Path", "Size", "Modified"];
 
 /// The field's own horizontal inset, counted in cell paddings (the pill buttons live beside it).
 const FIELD_INSET_PADDINGS: f32 = 6.0;
@@ -318,6 +327,11 @@ pub struct SearchManager {
     pub watch_error: Option<String>,
     /// The rebuild job, while it runs.
     pub rebuild: Option<JobId>,
+    /// The rebuild job's own fraction, `None` while the walk cannot know a total (15c D4).
+    pub progress_fraction: Option<f32>,
+    /// The stage the walking job is on — `JobProgress::current`, read out of the job by [`tick`]
+    /// (15c D4: the per-root progress note).
+    pub progress_stage: Option<String>,
     /// The correlation token of the newest dispatch (the stale-answer rule compares against it).
     pub origin: Option<Origin>,
     /// The keyboard cursor.
@@ -375,6 +389,8 @@ impl SearchManager {
             error: None,
             watch_error: None,
             rebuild: None,
+            progress_fraction: None,
+            progress_stage: None,
             origin: None,
             cursor: None,
             watch: WatchReport::default(),
@@ -483,6 +499,25 @@ impl SearchManager {
         self.error = None;
         self.painted += 1;
         true
+    }
+
+    /// The settings/status view (15c D4): Go's mid-rebuild frame *is* the settings view — INDEX
+    /// ROOTS / EXCLUDE PATTERNS / Auto index / Follow symlinks above the results table — so an active
+    /// rebuild opens it whether or not the user asked for it.
+    #[must_use]
+    pub fn shows_settings(&self) -> bool {
+        self.settings_open || self.status.is_indexing
+    }
+
+    /// The progress line beside the bar (15c D4). Core owns the counting and the stage; this only
+    /// words them, and says nothing it does not know.
+    #[must_use]
+    pub fn progress_text(&self) -> String {
+        let indexed = self.status.progress.indexed;
+        match &self.progress_stage {
+            Some(stage) => format!("indexing {indexed} — {stage}"),
+            None => format!("indexing {indexed}"),
+        }
     }
 
     /// The status line: Go's `#index-status` text, in its words.
@@ -708,11 +743,17 @@ impl SearchManager {
                     if let Some(err) = error.clone() {
                         ui.label(egui::RichText::new(err).color(tokens.danger));
                     }
-                    // ---- the results table (name, absolute path, size, mode where present)
+                    // ---- the results table (name, absolute path, size, mode where present). The
+                    // header and its block are drawn **always** (15c D2): Go's empty-query frame is a
+                    // table that says `No items matched your query`, not a blank card.
+                    result_header(ui, tokens);
                     if !self.hits.is_empty() {
                         let row_h = tokens.row_height;
                         ScrollArea::vertical()
-                            .auto_shrink([false, false])
+                            // 15c D6's lesson, applied here too: shrinking to the content (up to the
+                            // cap) is what makes the list show `LIST_ROWS` rows; a non-shrinking axis
+                            // inside an `Area` collapses to the row it happened to measure.
+                            .auto_shrink([false, true])
                             .max_height(row_h * LIST_ROWS)
                             .show_rows(ui, row_h, self.hits.len(), |ui, range| {
                                 let painter = ui.painter().clone();
@@ -739,23 +780,23 @@ impl SearchManager {
                                         );
                                     }
                                     let pad = tokens.cell_padding;
-                                    let name_w = rect.width() * NAME_SHARE;
+                                    let [name_cell, path_cell, size_cell, date_cell] =
+                                        result_cells(rect);
                                     painter.text(
-                                        rect.left_center() + Vec2::X * pad,
+                                        name_cell.left_center() + Vec2::X * pad,
                                         Align2::LEFT_CENTER,
                                         &hit.name,
                                         font.clone(),
                                         tokens.text_main,
                                     );
                                     painter.text(
-                                        egui::pos2(rect.left() + name_w, rect.center().y),
+                                        path_cell.left_center() + Vec2::X * pad,
                                         Align2::LEFT_CENTER,
                                         &hit.rel_path,
                                         font.clone(),
                                         tokens.text_muted,
                                     );
-                                    let meta_w = rect.width() * (1.0 - NAME_SHARE) * META_SHARE;
-                                    let meta_x = rect.right() - meta_w - pad;
+                                    let meta_x = size_cell.right() - pad;
                                     let meta = if hit.is_dir {
                                         String::new()
                                     } else {
@@ -768,20 +809,21 @@ impl SearchManager {
                                         font.clone(),
                                         tokens.text_muted,
                                     );
-                                    // Go's index rows carry `mode: ""` (plan §2.4): the column is
-                                    // there for a value that may arrive, never for a placeholder.
-                                    if !hit.mode.is_empty() {
-                                        painter.text(
-                                            egui::pos2(
-                                                meta_x + tokens.cell_padding,
-                                                rect.center().y,
-                                            ),
-                                            Align2::RIGHT_CENTER,
-                                            &hit.mode,
-                                            font.clone(),
-                                            tokens.text_muted,
-                                        );
-                                    }
+                                    // Go's index rows carry `mode: ""` (plan §2.4) and no date, so its
+                                    // `Modified` cell is the placeholder Go printed — and the mode is
+                                    // only painted if a value ever arrives in it.
+                                    let date = if hit.mode.is_empty() {
+                                        "--".to_string()
+                                    } else {
+                                        hit.mode.clone()
+                                    };
+                                    painter.text(
+                                        egui::pos2(date_cell.right() - pad, rect.center().y),
+                                        Align2::RIGHT_CENTER,
+                                        date,
+                                        font.clone(),
+                                        tokens.text_muted,
+                                    );
                                     if resp.clicked() {
                                         clicked = Some(ix);
                                     } else if resp.double_clicked() {
@@ -789,10 +831,19 @@ impl SearchManager {
                                     }
                                 }
                             });
-                    } else if !self.query.trim().is_empty() && error.is_none() {
+                    } else {
+                        // Go's own empty-state words (`search-manager.html`'s no-results line).
                         ui.label(
-                            egui::RichText::new("No matching files or folders found")
+                            egui::RichText::new("No items matched your query")
                                 .color(tokens.text_muted),
+                        );
+                    }
+                    // ---- the rebuild's progress bar (15c D4), above the status line
+                    if self.status.is_indexing {
+                        ui.add(
+                            egui::ProgressBar::new(self.progress_fraction.unwrap_or(0.0)).text(
+                                egui::RichText::new(self.progress_text()).color(tokens.text_main),
+                            ),
                         );
                     }
                     // ---- the status block (`index-status.json`'s fields) and the actions
@@ -889,7 +940,7 @@ impl SearchManager {
                         .color(tokens.text_muted)
                         .size(tokens.font_size - 2.0),
                     );
-                    if self.settings_open {
+                    if self.shows_settings() {
                         settings(self, ui, tokens);
                     }
                 });
@@ -915,13 +966,65 @@ impl SearchManager {
     }
 }
 
-/// Go's `last_indexed` rendering: `0` is "never", anything else is the unix second it stored (Go
-/// printed a `toLocaleString`; the port prints the value it has, without a locale).
-fn last_indexed_text(secs: i64) -> String {
+/// The result table's four columns (15c D2/D6): one function owns them, so the header and the
+/// painted rows cannot disagree, and so "the columns are disjoint" is a fact a test can assert instead
+/// of a property a reviewer has to eyeball in a PNG.
+#[must_use]
+pub fn result_cells(rect: Rect) -> [Rect; 4] {
+    let name_w = rect.width() * NAME_SHARE;
+    let rest = (rect.width() - name_w).max(0.0);
+    let path_w = rest * PATH_SHARE;
+    let meta_w = (rest * META_SHARE).max(0.0);
+    let size_w = meta_w * SIZE_OF_META;
+    let date_w = (meta_w - size_w).max(0.0);
+    let mut cells = [
+        Rect::from_min_size(rect.min, vec2(name_w, rect.height())),
+        Rect::NOTHING,
+        Rect::NOTHING,
+        Rect::NOTHING,
+    ];
+    let mut x = rect.left() + name_w;
+    for (slot, width) in cells[1..].iter_mut().zip([path_w, size_w, date_w]) {
+        *slot = Rect::from_min_size(
+            egui::pos2(x, rect.min.y),
+            vec2(width.max(0.0), rect.height()),
+        );
+        x += width;
+    }
+    cells
+}
+
+/// The header row, allocated as labels (not painted): the a11y tree sees it, which is what makes
+/// "the table is there before anything is typed" testable (15c D2).
+fn result_header(ui: &mut Ui, tokens: &Tokens) {
+    let (rect, _) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), tokens.header_row_height),
+        Sense::hover(),
+    );
+    for (label, cell) in COLUMNS.iter().zip(result_cells(rect)) {
+        crate::widgets::in_rect(
+            ui,
+            cell,
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                ui.label(egui::RichText::new(*label).color(tokens.text_muted));
+            },
+        );
+    }
+    // The band is reserved after its cells are filled: the header owns `header_row_height` of the
+    // frame whatever the labels measured (15c D2/D7).
+    ui.advance_cursor_after_rect(rect);
+}
+
+/// Go's `last_indexed` rendering: `0` is "never", anything else is the date it stored. **Formatted by
+/// core** (15c D3): `metrics::format_mtime` is the port's one date voice — the UI owns no calendar,
+/// and printing the raw unix second (what this function used to do) is the defect the review found.
+#[must_use]
+pub fn last_indexed_text(secs: i64) -> String {
     if secs <= 0 {
         return "never".to_string();
     }
-    secs.to_string()
+    format_mtime(Some(secs))
 }
 
 /// The inline config editor (plan §5.8's `settings` — inline, **not** a `prompt()`).
@@ -1097,12 +1200,30 @@ pub fn tick(app: &mut ZenApp, ctx: &egui::Context) {
             m.polled = Some(now);
             m.watch = report;
             let indexing = status.is_indexing;
+            let was_indexing = m.status.is_indexing;
             m.status = status;
             if m.rebuild.is_some() && !indexing {
                 // The job reached a terminal state on its own; the panel keeps the progress line for
                 // the frame the event lands, then forgets the job.
                 m.rebuild = None;
+                m.progress_stage = None;
             }
+            if !was_indexing && indexing {
+                // 15c D5: the previous rebuild's terminal toast is history the moment a new one is
+                // running — the frame must not say `indexing` beside `462 row(s) indexed`.
+                app.notices.dismiss_containing("row(s) indexed");
+            }
+            // 15c D4: the bar follows the *job*, whose `JobInfo` carries both the fraction core
+            // computed and the current item (`JobProgress::current`).
+            let info = m.rebuild.and_then(|job| app.session.job_info(job));
+            m.progress_fraction = info
+                .as_ref()
+                .filter(|job| job.state == "running")
+                .map(|job| job.progress.clamp(0.0, 1.0));
+            m.progress_stage = info
+                .as_ref()
+                .map(|job| job.message.clone())
+                .filter(|message| !message.is_empty());
         }
         ctx.request_repaint_after(STATUS_POLL);
     }
@@ -1161,6 +1282,8 @@ pub fn drain(app: &mut ZenApp) {
         match request {
             ManagerRequest::Rebuild => match app.session.index_rebuild() {
                 Ok(job) => {
+                    // 15c D5: same rule as the poll's, applied the frame the button was pressed.
+                    app.notices.dismiss_containing("row(s) indexed");
                     if let Some(Dialog::SearchManager(m)) = app.dialogs.active_mut() {
                         m.rebuild = Some(job);
                         m.error = None;

@@ -1308,6 +1308,35 @@ mod tests {
         );
     }
 
+    /// **D11, reviewed against the Go source rather than the report.** The background menu *is*
+    /// Paste / Paste Link / New Folder and nothing else: `context-menu.js:112-131` — the `else` arm of
+    /// `showContextMenu` — emits exactly those three rows, and no `Select all` / `Invert selection` row
+    /// exists anywhere in `frontend/` (`selectAll` is a `file-list.js` export reached by the
+    /// `select-all` keyboard command, `keyboard.js:249`). The reference frame the defect cites
+    /// (`docs/parity/10-context-menu-background.png`) does not show a menu at all — it shows the
+    /// Search Manager's empty-query frame, so the scene name and the pixels disagree; 15d re-shoots
+    /// it. Adding the block would be inventing a feature, so this test pins the shape Go has instead,
+    /// and fails if anyone later "fixes" parity by adding one.
+    #[test]
+    fn background_menu_is_go_three_rows_and_carries_no_selection_block() {
+        let ctx = at_bits([false; 7], MenuTarget::Background);
+        let menu = background_menu(&ctx, &ActionContext::background(None), &[]);
+        let rows: Vec<String> = menu
+            .iter()
+            .flat_map(|group| group.iter().map(|spec| spec.label.clone()))
+            .collect();
+        assert_eq!(
+            rows,
+            vec!["Paste", "Paste link", "New folder"],
+            "Go's background menu, in Go's order"
+        );
+        let shape = shape(&menu, &ctx);
+        assert!(
+            !shape.to_lowercase().contains("select") && !shape.to_lowercase().contains("invert"),
+            "the reference has no selection block to be missing: {shape}"
+        );
+    }
+
     #[test]
     fn background_menu_is_the_file_menus_background_half() {
         for bits in all_bits() {

@@ -42,7 +42,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use egui::{Align2, Area, CornerRadius, Key, Order, Pos2, ScrollArea, Sense, TextEdit, Ui, Vec2};
+use egui::{
+    Align2, Area, CornerRadius, Key, Order, Pos2, Rect, ScrollArea, Sense, TextEdit, Ui, Vec2,
+};
 
 use zenman_core::error::CoreError;
 use zenman_core::jobs::JobId;
@@ -60,6 +62,12 @@ use crate::dialogs::prompt::consume_key;
 use crate::dialogs::{Answer, Dialog, DialogKind};
 use crate::theme::Tokens;
 use crate::widgets::disk_meter::format_size;
+
+/// Name column's share of the row (the rest carries the path, then the size).
+const NAME_SHARE: f32 = 0.45;
+
+/// Size column's share of the row.
+const SIZE_SHARE: f32 = 0.18;
 
 /// Result rows on screen before the list scrolls (Go's overlay is `max-height: 60vh`,
 /// `quick-find.css`; ten 40 px rows is the same order at our window size).
@@ -396,7 +404,7 @@ impl QuickFind {
                     if !self.results.is_empty() {
                         let row_h = tokens.row_height;
                         ScrollArea::vertical()
-                            .auto_shrink([false, false])
+                            .auto_shrink([false, true])
                             .max_height(row_h * LIST_ROWS)
                             .show_rows(ui, row_h, self.results.len(), |ui, range| {
                                 let painter = ui.painter().clone();
@@ -410,6 +418,11 @@ impl QuickFind {
                                     );
                                     // Paint decoration only — the row's *one* interaction rect is the
                                     // allocated one (plan §9.2 step 8's painting rule).
+                                    let [name_cell, path_cell, size_cell] = row_cells(rect, tokens);
+                                    // Paint decoration only — the row's *one* interaction rect is the
+                                    // allocated one (plan §9.2 step 8's painting rule) — and every cell
+                                    // is disjoint, so the name can never print over the path again
+                                    // (15c D6: `row-0000txt0000.txt`).
                                     if selected {
                                         painter.rect_filled(
                                             rect,
@@ -424,28 +437,34 @@ impl QuickFind {
                                         );
                                     }
                                     let pad = tokens.cell_padding;
+                                    let name = hit.name().to_string();
                                     painter.text(
-                                        rect.left_center() + Vec2::X * pad,
+                                        name_cell.left_center() + Vec2::X * pad,
                                         Align2::LEFT_CENTER,
-                                        hit.name(),
+                                        fit_text(&name, name_cell.width() - pad * 2.0),
                                         font.clone(),
                                         tokens.text_main,
                                     );
-                                    let rel_x = pad
-                                        + font.size * 2.0
-                                        + estimate_name_advance(hit.name().chars().count());
                                     painter.text(
-                                        Pos2::new(rect.left() + rel_x, rect.center().y),
+                                        path_cell.left_center() + Vec2::X * pad,
                                         Align2::LEFT_CENTER,
-                                        hit.rel_path.as_str(),
+                                        fit_text(
+                                            hit.rel_path.as_str(),
+                                            path_cell.width() - pad * 2.0,
+                                        ),
                                         font.clone(),
                                         tokens.text_muted,
                                     );
-                                    if !hit.is_dir() {
+                                    let meta = if hit.is_dir() {
+                                        String::new()
+                                    } else {
+                                        format_size(u64::try_from(hit.entry.size).unwrap_or(0))
+                                    };
+                                    if !meta.is_empty() {
                                         painter.text(
-                                            rect.right_center() - Vec2::X * pad,
+                                            size_cell.right_center() - Vec2::X * pad,
                                             Align2::RIGHT_CENTER,
-                                            format_size(u64::try_from(hit.entry.size).unwrap_or(0)),
+                                            meta,
                                             font.clone(),
                                             tokens.text_muted,
                                         );
@@ -457,6 +476,15 @@ impl QuickFind {
                                             clicked = Some(ix);
                                         }
                                     }
+                                    // One accessible node per row, named like the pane's own rows
+                                    // (`entry_row`'s pattern): it is what lets a test *count* the rows
+                                    // the list realised and compare their rects (15c D6).
+                                    let label = name.clone();
+                                    resp.widget_info(|| {
+                                        let mut info = egui::WidgetInfo::new(egui::Role::Button);
+                                        info.label = Some(label.as_str().into());
+                                        info
+                                    });
                                 }
                             });
                     } else if show_empty {
@@ -491,6 +519,45 @@ impl QuickFind {
 
 /// A rough stand-in for "name column width": the rel path starts after the name run, and the
 /// painter has no layout engine here. Two character widths per row are Go's proportion.
+/// The row's three columns (15c D6): the name cell carries the icon slot, the path cell starts where
+/// the name cell **ends**, and the size cell hugs the right edge. The old code put the path at an
+/// *estimated* advance from the left edge, and the two texts painted on top of each other.
+#[must_use]
+pub fn row_cells(rect: Rect, tokens: &Tokens) -> [Rect; 3] {
+    let pad = tokens.cell_padding;
+    let inner = Rect::from_min_size(
+        rect.min + Vec2::X * pad,
+        Vec2::new((rect.width() - pad * 2.0).max(0.0), rect.height()),
+    );
+    let size_w = inner.width() * SIZE_SHARE;
+    let name_w = (inner.width() - size_w) * NAME_SHARE;
+    let path_w = (inner.width() - size_w - name_w).max(0.0);
+    [
+        Rect::from_min_size(inner.min, Vec2::new(name_w, inner.height())),
+        Rect::from_min_size(
+            Pos2::new(inner.min.x + name_w, inner.min.y),
+            Vec2::new(path_w, inner.height()),
+        ),
+        Rect::from_min_size(
+            Pos2::new(inner.max.x - size_w, inner.min.y),
+            Vec2::new(size_w, inner.height()),
+        ),
+    ]
+}
+
+/// Trim `text` to the cell's width (15c D6): a painted label has no clip rect in this fork, so an
+/// over-long name would run under the next column exactly as the defect's `row-0000txt0000.txt` did.
+/// Three ASCII dots, not `…` — rule 11 says a symbol needs a face in the installed stack.
+fn fit_text(text: &str, max: f32) -> String {
+    let per_char = estimate_name_advance(1);
+    if text.is_empty() || per_char <= 0.0 || text.chars().count() as f32 * per_char <= max {
+        return text.to_string();
+    }
+    let keep = (max / per_char).floor() as usize;
+    let head: String = text.chars().take(keep.saturating_sub(3)).collect();
+    format!("{head}...")
+}
+
 fn estimate_name_advance(chars: usize) -> f32 {
     2.0 * chars as f32
 }

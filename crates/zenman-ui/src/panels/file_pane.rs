@@ -461,21 +461,44 @@ fn push_background_context(
 fn toolbar(ui: &mut Ui, model: &PaneModel<'_>, tokens: &Tokens, out: &mut Vec<PaneCommand>) {
     let grid = model.tab.view == ViewMode::Grid;
     let flat = model.tab.flat;
-    ui.horizontal(|ui| {
-        let toggle = if grid { "list" } else { "grid" };
-        let tip = if grid {
-            "Switch to the list view"
-        } else {
-            "Switch to the grid view"
-        };
-        if tool_icon(ui, tokens, toggle, tip).clicked() {
-            out.push(PaneCommand::ToggleGrid);
-        }
-        if tool_icon(ui, tokens, "refresh", "Re-read the directory (F5)").clicked() {
-            out.push(PaneCommand::Refresh);
-        }
-        flat_buttons(ui, flat, out);
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+    // 15c D7: reserve the band, then place the two groups in it. The old form put the select buttons
+    // in a `right_to_left` arm *inside* the horizontal, which continues from the cursor and not from
+    // the pane's right edge — the quad layout's panes therefore clipped them.
+    let whole = Rect::from_min_size(
+        ui.cursor().min,
+        egui::vec2(ui.available_width(), tokens.toolbar_height),
+    );
+    let (left, right) = band(whole);
+    // Vertically centre each group inside the reserved band (the tokens' own heights, no literals).
+    let inset = ((tokens.toolbar_height - tokens.menu_item_height) * 0.5).max(0.0);
+    let shift = egui::Vec2::Y * inset;
+    let left = Rect::from_min_max(left.min + shift, left.max - shift);
+    let right = Rect::from_min_max(right.min + shift, right.max - shift);
+    crate::widgets::in_rect(
+        ui,
+        left,
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            let toggle = if grid { "list" } else { "grid" };
+            let tip = if grid {
+                "Switch to the list view"
+            } else {
+                "Switch to the grid view"
+            };
+            if tool_icon(ui, tokens, toggle, tip).clicked() {
+                out.push(PaneCommand::ToggleGrid);
+            }
+            if tool_icon(ui, tokens, "refresh", "Re-read the directory (F5)").clicked() {
+                out.push(PaneCommand::Refresh);
+            }
+            flat_buttons(ui, flat, out);
+        },
+    );
+    crate::widgets::in_rect(
+        ui,
+        right,
+        egui::Layout::right_to_left(egui::Align::Center),
+        |ui| {
             if ui
                 .button("Select none")
                 .on_hover_text("Clear the selection")
@@ -490,8 +513,29 @@ fn toolbar(ui: &mut Ui, model: &PaneModel<'_>, tokens: &Tokens, out: &mut Vec<Pa
             {
                 out.push(PaneCommand::SelectAll);
             }
-        });
-    });
+        },
+    );
+    ui.advance_cursor_after_rect(whole);
+}
+
+/// The two anchored halves of a full-width band, split at its centre (see [`band_at`]).
+#[must_use]
+pub fn band(whole: Rect) -> (Rect, Rect) {
+    band_at(whole, 0.5)
+}
+
+/// The two anchored halves of a full-width band (15c D7): the left controls start at the pane's left
+/// edge, the right controls end at its **right** edge, and the halves are disjoint by construction —
+/// so neither group can eat the other's clicks (rule 10) and neither can be pushed out of a narrow
+/// pane. The band is reserved *before* the groups are placed in it, which is step 8's
+/// `load_more_height` lesson: reserve the height, then let the container fill it.
+#[must_use]
+pub fn band_at(whole: Rect, share: f32) -> (Rect, Rect) {
+    let mid = whole.min.x + whole.width() * share;
+    (
+        Rect::from_min_max(whole.min, Pos2::new(mid, whole.max.y)),
+        Rect::from_min_max(Pos2::new(mid, whole.min.y), whole.max),
+    )
 }
 
 /// The column header: four sortable cells, the active one carrying the arrow.
@@ -869,16 +913,31 @@ fn banner(ui: &mut Ui, model: &PaneModel<'_>, tokens: &Tokens, out: &mut Vec<Pan
             tokens.row_pad_y as i8,
         ))
         .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new(format!(
-                        "! Loading limited to {loaded} items to prevent interface lag. \
-                         {remaining} more are available."
-                    ))
-                    .color(tokens.warning)
-                    .size(tokens.font_size - 1.0),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // 15c D7: the same band discipline as the toolbar — the message keeps the left half, the
+            // two buttons the right half, so a narrow pane loses characters of the message instead of
+            // the only way out of it.
+            let whole = ui.available_rect_before_wrap();
+            let (message, buttons) = band_at(whole, 0.6);
+            crate::widgets::in_rect(
+                ui,
+                message,
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "! Loading limited to {loaded} items to prevent interface lag. \
+                             {remaining} more are available."
+                        ))
+                        .color(tokens.warning)
+                        .size(tokens.font_size - 1.0),
+                    );
+                },
+            );
+            crate::widgets::in_rect(
+                ui,
+                buttons,
+                egui::Layout::right_to_left(egui::Align::Center),
+                |ui| {
                     if ui
                         .button("Load all items (may cause lag)")
                         .on_hover_text("Load every remaining row at once (may be slow)")
@@ -893,8 +952,9 @@ fn banner(ui: &mut Ui, model: &PaneModel<'_>, tokens: &Tokens, out: &mut Vec<Pan
                     {
                         out.push(PaneCommand::LoadMore);
                     }
-                });
-            });
+                },
+            );
+            ui.advance_cursor_after_rect(whole);
         });
 }
 

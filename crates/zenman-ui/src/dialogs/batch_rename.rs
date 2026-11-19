@@ -24,10 +24,10 @@
 
 use std::collections::HashSet;
 
-use egui::{Align2, Area, Id, Key, Order, RichText, ScrollArea, Ui, Vec2, vec2};
+use egui::{Align2, Area, Id, Key, Order, Rect, RichText, ScrollArea, Sense, Ui, Vec2, vec2};
 
 use zenman_core::ops::ConflictPolicy;
-use zenman_core::ops::batch_rename::{PreviewRow, PreviewSet, Row, RowStatus, Rules};
+use zenman_core::ops::batch_rename::{PreviewSet, Row, RowStatus, Rules};
 use zenman_core::session::{BatchRenameReport, Session};
 use zenman_core::store::config::PaneSlot;
 
@@ -77,6 +77,57 @@ pub struct BatchRename {
     pub fresh: bool,
 }
 
+/// The preview table's columns, in Go's dry-run words (15c D12).
+pub const COLUMNS: [&str; 3] = ["Original Name", "New Name", "Status"];
+
+/// One cell row of the preview table — what [`BatchRename::table`] builds and [`preview_row`] paints,
+/// so the text a test asserts on is the text the frame shows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreviewCell {
+    /// The name the row has.
+    pub original: String,
+    /// The name it would get.
+    pub preview: String,
+    /// The status column's words.
+    pub status: String,
+    /// Which colour the row gets.
+    pub kind: RowStatus,
+}
+
+/// The table's three columns as cells of a row rect (15c D12: the columns, not a `old → new` string).
+#[must_use]
+pub fn preview_cells(rect: Rect) -> [Rect; 3] {
+    let shares = [0.36, 0.36, 0.28];
+    let mut out = [Rect::NOTHING; 3];
+    let mut x = rect.left();
+    for (slot, share) in out.iter_mut().zip(shares) {
+        let width = rect.width() * share;
+        *slot = Rect::from_min_size(egui::pos2(x, rect.min.y), vec2(width, rect.height()));
+        x += width;
+    }
+    out
+}
+
+/// Did the rename drop the extension? Go's `Rename Extension Too` box previews the **stem** alone
+/// (`batch-rename.js:281`), which is why `a.txt` legitimately renames to `a` — 15c D12 checked, and it
+/// is the kept quirk, not a truncated paint.
+#[must_use]
+pub fn extension_dropped(original: &str, preview: &str) -> bool {
+    original.rfind('.').is_some() && preview.rfind('.').is_none()
+}
+
+/// The status column's words: Go's dry-run labels, plus the reason when the reason is the extension
+/// box (15c D12 — the frame has to *say* what happened).
+#[must_use]
+pub fn row_status_text(kind: RowStatus, dropped_extension: bool) -> &'static str {
+    match (kind, dropped_extension) {
+        (RowStatus::Success, true) => "RENAMED (extension dropped)",
+        (RowStatus::Success, false) => "RENAMED",
+        (RowStatus::Unchanged, _) => "UNCHANGED",
+        (RowStatus::Conflict, _) => "CONFLICT",
+    }
+}
+
 impl BatchRename {
     /// Build the dialog and run the first preview (the table is never empty on open).
     #[must_use]
@@ -92,6 +143,34 @@ impl BatchRename {
             computes: 1,
             fresh: true,
         }
+    }
+
+    /// The preview as the table paints it (15c D12). Built once per draw, from the last preview — the
+    /// `computes` counter still says how often the *engine* ran.
+    #[must_use]
+    pub fn table(&self) -> Vec<PreviewCell> {
+        self.preview
+            .rows
+            .iter()
+            .map(|row| PreviewCell {
+                original: row.original.clone(),
+                preview: row.preview.clone(),
+                kind: row.status,
+                status: {
+                    let words = row_status_text(
+                        row.status,
+                        self.rules.include_extension
+                            && row.status == RowStatus::Success
+                            && extension_dropped(&row.original, &row.preview),
+                    );
+                    if row.status == RowStatus::Conflict && !row.reason.is_empty() {
+                        format!("{words} ({})", row.reason)
+                    } else {
+                        words.to_string()
+                    }
+                },
+            })
+            .collect()
     }
 
     /// Re-run the pure preview (the 2 ms / 10 k figure) and count it.
@@ -233,12 +312,17 @@ impl BatchRename {
                         ))
                         .color(tokens.text_main),
                     );
+                    // The preview is a **table** (15c D12): Go's dry-run view gave every row its
+                    // original name, its new name and a status, and the old `old → new` line read as a
+                    // truncation exactly where Go's kept extension quirk had done something real.
+                    let table = self.table();
+                    preview_header(ui, tokens);
                     ScrollArea::vertical()
                         .max_height(tokens.log_row_height * tokens.dropdown_visible_rows)
-                        .auto_shrink([false, false])
+                        .auto_shrink([false, true])
                         .show(ui, |ui| {
-                            for row in &self.preview.rows {
-                                preview_row(ui, row, tokens);
+                            for cell in &table {
+                                preview_row(ui, cell, tokens);
                             }
                         });
                     let ok = self.can_apply();
@@ -269,23 +353,52 @@ impl BatchRename {
     }
 }
 
-/// One preview line: `old → new`, coloured by status.
-fn preview_row(ui: &mut Ui, row: &PreviewRow, tokens: &Tokens) {
-    let colour = match row.status {
+/// The table's header, allocated as labels so the a11y tree carries it (15c D12).
+fn preview_header(ui: &mut Ui, tokens: &Tokens) {
+    let (rect, _) = ui.allocate_exact_size(
+        vec2(ui.available_width(), tokens.header_row_height),
+        Sense::hover(),
+    );
+    for (label, cell) in COLUMNS.iter().zip(preview_cells(rect)) {
+        crate::widgets::in_rect(
+            ui,
+            cell,
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                ui.label(RichText::new(*label).color(tokens.text_muted));
+            },
+        );
+    }
+    ui.advance_cursor_after_rect(rect);
+}
+
+/// One table line: three disjoint cells, coloured by status (15c D12).
+fn preview_row(ui: &mut Ui, cell: &PreviewCell, tokens: &Tokens) {
+    let colour = match cell.kind {
         RowStatus::Success => tokens.success,
         RowStatus::Unchanged => tokens.text_muted,
         RowStatus::Conflict => tokens.danger,
     };
-    let text = if row.status == RowStatus::Conflict && !row.reason.is_empty() {
-        format!("{} → {} ({})", row.original, row.preview, row.reason)
-    } else {
-        format!("{} → {}", row.original, row.preview)
-    };
-    ui.label(
-        RichText::new(text)
-            .color(colour)
-            .size(tokens.font_size - 1.0),
+    let (rect, _) = ui.allocate_exact_size(
+        vec2(ui.available_width(), tokens.log_row_height),
+        Sense::hover(),
     );
+    let texts = [&cell.original, &cell.preview, &cell.status];
+    for (text, cell_rect) in texts.iter().zip(preview_cells(rect)) {
+        crate::widgets::in_rect(
+            ui,
+            cell_rect,
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                ui.label(
+                    RichText::new(text.as_str())
+                        .color(colour)
+                        .size(tokens.font_size - 1.0),
+                );
+            },
+        );
+    }
+    ui.advance_cursor_after_rect(rect);
 }
 
 /// The rows + `existing` pair, split out so a test can call it without a shell.

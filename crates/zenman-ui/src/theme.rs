@@ -433,6 +433,23 @@ impl Tokens {
         }
     }
 
+    /// The dim that goes between the shell and an open dialog card (15c D1: Go darkened the whole
+    /// page behind its overlay instead of letting the listing read through the card). Translucent
+    /// **by design** — the card itself is [`Self::modal_fill`], which is not.
+    #[must_use]
+    pub fn modal_backdrop(&self) -> Color32 {
+        let base = self.bg_main;
+        Color32::from_rgba_unmultiplied(base.r() / 2, base.g() / 2, base.b() / 2, 200)
+    }
+
+    /// The dialog card's fill, forced **opaque** (15c D1: the snapshot review found the listing's
+    /// columns painting into the Search Manager's body). `bg_card` with its alpha channel discarded,
+    /// so no future token edit can make a modal translucent again.
+    #[must_use]
+    pub fn modal_fill(&self) -> Color32 {
+        let base = self.bg_card;
+        Color32::from_rgb(base.r(), base.g(), base.b())
+    }
     /// The proportional font at the token size (the `DockStyle` font, table rows, tab labels).
     #[must_use]
     pub fn font(&self) -> FontId {

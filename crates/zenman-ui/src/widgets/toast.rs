@@ -85,6 +85,17 @@ impl State {
         before - self.queue.len()
     }
 
+    /// Drop every notice whose text contains `needle`; returns how many went.
+    ///
+    /// 15c D5: a *terminal* notice ("462 row(s) indexed") must not sit on screen while the state
+    /// line beside it says `indexing` — the finished job's toast belongs to the past, and Go's
+    /// per-action overlay could not show the contradiction because it had no toast at all.
+    pub fn dismiss_containing(&mut self, needle: &str) -> usize {
+        let before = self.queue.len();
+        self.queue.retain(|notice| !notice.text.contains(needle));
+        before - self.queue.len()
+    }
+
     /// The queue, oldest first (render order top-to-bottom, newest nearest the corner).
     #[must_use]
     pub fn queued(&self) -> &VecDeque<Notice> {
