@@ -621,18 +621,23 @@ Legend for the table: **Depends** = other rows (by file) *and* build steps (§7 
 
 | Change | Why | Guard test |
 |---|---|---|
-| `files_count` typed as `Option` → renders `--` | `undefined files` bug (`file-list.js:159`) | `widgets/entry_row.rs` snapshot |
-| Symlinked directories report `is_dir: true` | Go's `entry.Info()` is `lstat`, so `cd` into a symlinked dir showed files but the row said file | `entry.rs::symlink_to_a_directory_is_a_directory_and_a_link` (the row this table cited as an "`ops/list.rs` test" names a file this port never grew — corrected by step 15d) |
-| `copyFile` collisions reported | silent skip = data loss | `ops/copy.rs` test |
+| `files_count` typed as `Option` → renders `--` | `undefined files` bug (`file-list.js:159`) | `widgets/entry_row.rs` snapshot + `contract.rs::d01_unknown_sizes_are_absent_never_zero` |
+| Symlinked directories report `is_dir: true` **when the target is resolved** | Go's `entry.Info()` is `lstat`, so `cd` into a symlinked dir showed files but the row said file. Scope, measured by step 16b: the value-type rule (`EntryKind::SymlinkToDir` ⇒ `is_dir: true`) holds for entries built from a resolved target; the raw `lstat` listing seam deliberately does not resolve and keeps Go's `is_dir: false` + `is_symlink: true` row (golden-pinned, `services/dirs.rs::FsSource::lstat`) | `entry.rs::symlink_to_a_directory_is_a_directory_and_a_link` + `contract.rs::d02_symlinked_directory_rows_keep_the_link_bit_at_the_listing_seam` |
+| `copyFile` collisions reported | silent skip = data loss | `contract.rs::d03_copy_collision_is_reported_not_silent` (+ the `ops/copy.rs` unit tests) |
 | Errors are typed `CoreError`, no `text/plain` JSON | Go emitted JSON bodies with a `text/plain` content type and unescaped `%v` (could emit invalid JSON) | `contract.rs::assert_matches` |
-| Paste conflict is an enum variant, not `status:"conflict"` in a 200 | Go used HTTP 200 + magic string | `contract_ops.rs::paste_conflict` |
-| Batch rename uses `RenameTarget::Batch`, not JSON-in-`name` | the double-encoding was un-restorable when it failed | `contract_ops.rs::batch_rename` |
-| Bookmarks percent-decoded on save | Go stored raw text, so `%20` stayed forever | `services/places.rs` test |
-| Index status distinguishes dead root vs corrupt DB | identical error strings today | `search_index.rs` test |
-| Revert refreshes the pane immediately | `zen-refresh-filelist` has no subscriber in the JS app | `panels/action_log.rs` test |
+| Paste conflict is an enum variant, not `status:"conflict"` in a 200 | Go used HTTP 200 + magic string | `contract.rs::d05_paste_conflict_is_a_typed_field` (the cited `contract_ops.rs::paste_conflict` name never existed — corrected by step 16b) |
+| Batch rename uses `RenameTarget::Batch`, not JSON-in-`name` | the double-encoding was un-restorable when it failed | `contract.rs::d06_batch_rename_is_a_typed_target` (+ `ops/batch_rename.rs` unit tests) |
+| Favourite paths normalised on save (trailing slashes trimmed), relative refused | **corrected by step 16b**: the original claim ("percent-decoded on save") is not what the port does — nothing decodes favourites; the decode Go runs is `file://` URI-list parsing on the *clipboard* path (`api/ops.go:611-627`), which the port keeps | `services/places.rs::favourite_paths_are_normalised_and_relative_ones_refused` + `contract.rs::d07_favourites_are_normalised_verbatim_on_save` |
+| Index status distinguishes dead root vs corrupt DB | identical error strings today | `contract.rs::d08_corrupt_database_and_dead_root_are_different_channels` (DB half, through the session) + `index/rebuild.rs`'s `roots_failed` (root half) |
+| Revert refreshes the pane immediately | `zen-refresh-filelist` has no subscriber in the JS app | `zenman-ui/tests/action_log.rs::reverting_through_the_panel_changes_the_filesystem_and_marks_the_record` + `contract.rs::d09_revert_invalidates_the_pane` |
 | `journal_mode = DELETE`, explicitly asserted, and WAL is never enabled | Go ran `PRAGMA wal_checkpoint(PASSIVE)` without ever enabling WAL (a no-op); the port deliberately keeps Go's on-disk `delete` journal because WAL leaves `-wal`/`-shm` sidecars the Go app cannot fold away in a shared data directory (step 5's rule) | `store/sql.rs` pragma assert |
-| Sort is clickable | `data-sort` existed with zero handlers | `panels/file_pane.rs` snapshot |
-| Arrow/Home/End/PageUp/PageDown/Esc added | absent in the JS app; a desktop file manager without them is not usable | `keymap.rs` table test |
+| Trash-first delete, with a *measured* refusal instead of a silent destroy (decision D6; the row was missing from this table until step 16b) | `Del` goes to the bin; a volume with no native bin (per-path probe — `/media/…` volumes with their own fsid have none) must never mean a permanent delete unless the user accepted the fallback | `contract.rs::d14_delete_is_trash_first_and_never_silently_permanent` + the `ops/delete.rs` ladder tests |
+| Directory sizes are `Option` end-to-end (decision D11; row added by step 16b) | "size 0 means unknown" *is* the `(undefined files)` bug; an un-walked directory has no size, not size 0 | `contract.rs::d01_unknown_sizes_are_absent_never_zero` |
+| Binary units render as `KiB/MiB/GiB`, not `KB/…` | the Go UI divided by 1000³ and labelled it GB; the port labels what it computes | `widgets/disk_meter.rs` format tests (`format_size(5 \* 1024\^3) == "5.0 GiB"`) |
+| The header chip reads `Saved`, not `✓ Saved` | this egui panics on a missing glyph (house rule 11) and the pinned font stack has no face for U+2713 | `theme.rs::every_glyph_the_shell_paints_has_a_face_in_the_installed_stack` + the header snapshots |
+| Listing sort is stable (and dirs-first) | Go's `sort.Slice` is unstable, so equal keys had no defined order across refreshes | `services/dirs.rs` sort tests + the `contract_dirs.rs` order asserts |
+| Sort is clickable | `data-sort` existed with zero handlers | `zenman-ui/tests/file_pane.rs::the_header_sorts_the_loaded_rows_without_a_refetch` + `contract.rs::d11_sort_is_a_request_field_and_dirs_come_first` |
+| Arrow/Home/End/PageUp/PageDown/Esc added | absent in the JS app; a desktop file manager without them is not usable | `zenman-ui/src/keymap.rs`'s `every_table_row_is_a_command_and_every_command_has_a_row` + `zenman-ui/tests/keymap.rs` |
 | **OPEN DECISION — an unterminated `"` in a query filter, and interior quotes in a word** (a behaviour *difference*, not one of this table's bug fixes) | Go's filter regex `(\bext|\bin|\btype):(?:"([^"]+)"|(\S+))` (`api/search_index.go:44`) falls back to `(\S+)` when the quote never closes, so `in:"/a/b` yields the folder `"/a/b` **with** the leading quote (`:246-262`); the port's scanner consumes the opening quote and yields `/a/b`. Same family: for an unquoted token, Go's `strings.Trim(w, '"')` keeps an interior quote (`ab"cd`), the port's word scanner strips it (`abcd`). Neither side is wrong — parity-with-Go would reproduce a quote-eating artefact, the port's reading is the cleaner one; the choice is **not made**, so do not silently "fix" either side. | `services/search_index.rs::an_unterminated_quote_keeps_the_path_clean_the_port_side_of_a_known_divergence` pins the **port** side until the decision is taken |
 
 ---
@@ -1817,3 +1822,50 @@ pins it if the claim is a test.
   `Metadata::file_system` stabilisation, or take a licence-cleared crate that owns the `unsafe`); a real
   `.lnk`/`.url` writer; `GetDriveTypeW`-backed `removable` (the sidebar shows no eject button today); and
   `services/places.rs`'s Windows branch, which should now call `platform::windows::mount_entries`.
+
+### Step 16b (`contract.rs` full sweep, crash_guard polish, README, MSRV — the release gate) — execution log — **step 16 COMPLETE, plan executed**
+
+The last row of §7. `crates/zenman-core/tests/contract.rs` (§5.10's named file, previously absent)
+is now the **full sweep**: 14 tests, one per §6.2 line plus the three behaviours the table owed but
+never carried (trash-first D6, D11 `Option` sizes, and the `roots_failed` split). Every line is now
+either proven by a named test in this file or corrected in the ledger.
+
+* **Sweep verdict: 13 ledger lines checked, 8 guard-test citations stale (corrected in place),
+  1 claim factually wrong (the percent-decode row — corrected, not the code: nothing in the port or
+  in Go's bookmark path decodes; the decode is clipboard URI parsing, `api/ops.go:611-627`),
+  1 claim over-scoped (symlink `is_dir` — holds for resolved targets only; the `lstat` listing seam
+  deliberately keeps Go's `false` and the goldens pin it — line corrected, code untouched),
+  0 code bugs found** (every mismatch was the ledger drifting from behaviour, never behaviour from
+  the plan). 5 rows added: trash-first, D11 sizes, `GiB`, `Saved` without the glyph, stable sort.
+* **crash_guard polish** (§5.9 row): three boundaries, all real. Boot (`main.rs`, unit-tested),
+  **job worker** (`jobs::spawn` now `catch_unwind`s the closure and sends a typed
+  `JobEvent::Failed(CoreError::System)` naming the job and carrying the panic message — previously
+  the table only synthesised a failure from the disconnected receiver; pinned by
+  `jobs::tests::a_panicking_job_becomes_a_typed_failure_not_a_lost_thread`, a real panic injected
+  through the public `spawn` seam), and **frame** (`ShellApp` wraps `logic` and `ui` in
+  `crash_guard::guard`; a panic becomes one `Error` toast + the hook's report file, the window
+  survives). The frame wiring has no headless test because **no public API injects a panic into
+  `ZenApp::logic`** — recorded per the honesty rule; the guard/report mechanics themselves are the
+  two `crash_guard` unit tests. `docs/crash-reports.md` gained the boundary table.
+* **MSRV, honestly:** `rust-version = "1.95"` is declared but **was not build-verified on this
+  box**: `rust-toolchain.toml` pins `stable` because the `1.95.0` channel is not installed (its
+  comment records exactly this), and `cargo msrv` is not installed either. What is verified: the
+  pinned `stable` (1.100) builds the whole workspace green, and `cargo metadata` accepts the
+  `rust-version` field; nothing in the tree uses a feature newer than the 2024 edition baseline the
+  craft-libs rev itself requires. Treat 1.95 as *declared, unmeasured*.
+* **Known gaps carried past the gate** (each verified still real at HEAD; fix location in parens):
+  D7 quad-pane body overflows its dock rect by ~35 px (dock/content width arithmetic, not
+  `file_pane`); `file_pane::grouped_walks…` is an intermittent flake against the 2 s `settle_until`
+  deadline (`zenman-ui/tests/common.rs`); quirk 12's >100-entry `reload_required` side has no test,
+  golden-only evidence (`contract_ops.rs`); the unterminated-`"` filter decision stays OPEN (§6.2
+  open row; port side pinned); Windows `disk_space`/`.lnk`/`GetDriveTypeW` are typed refusals pending
+  a licence-cleared owner of the `unsafe` FFI or `Metadata::file_system` (plan §6.2/16a); the Windows
+  watcher backend is unwritten (`index/watcher` stays `CoreError::Watcher` there); snapshot artefacts
+  `06`/`07` are machine-specific (real `statvfs`, real `$HOME`) and must stay out of cross-machine
+  pixel comparison; `Session::paste_preflight` does not exist, so the cold-destination conflict
+  prompt falls back to `SkipExisting` (core session + `dialogs/confirm`).
+* Gates at this commit: `cargo xtask ci` exit 0 (workspace + `--features watch` lanes), the
+  Windows-target rung reporting its documented PARTIAL, `cargo xtask licenses` green, `cargo xtask
+  parity` green, `xvfb-run -a cargo run -p zenman -- --safe-gpu --smoke 1` exit 0. No `todo!`/
+  `unimplemented!` anywhere (row 16's rule). `README.md` records the step table, the deviations
+  users will notice, and the gap list above.
