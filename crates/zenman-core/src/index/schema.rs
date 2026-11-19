@@ -78,6 +78,76 @@ pub const DDL_INDEXES: [&str; 5] = [
     "CREATE        INDEX IF NOT EXISTS idx_files_shadow_mtime  ON files(mtime);",
 ];
 
+/// Drop the leftover FTS shadow table — Go's `runRebuild` step 3 (`api/search_index_walker.go:119`).
+pub const SHADOW_FTS_DROP_SQL: &str = "DROP TABLE IF EXISTS files_fts_shadow;";
+/// Drop the leftover row shadow table — Go's `runRebuild` step 1 (`:83`).
+pub const SHADOW_DROP_SQL: &str = "DROP TABLE IF EXISTS files_shadow;";
+
+/// The shadow `files` table, verbatim from Go (`api/search_index_walker.go:92-104`). Same columns as
+/// `files`; the rebuild fills it, walks it into place and renames it.
+pub const DDL_SHADOW_TABLE: &str = r#"
+	CREATE TABLE files_shadow (
+		id         INTEGER PRIMARY KEY,
+		path       TEXT NOT NULL,
+		name       TEXT NOT NULL,
+		name_orig  TEXT NOT NULL,
+		ext        TEXT NOT NULL,
+		parent     TEXT NOT NULL,
+		size       INTEGER NOT NULL,
+		mtime      INTEGER NOT NULL,
+		is_dir     INTEGER NOT NULL,
+		is_symlink INTEGER NOT NULL
+	);
+"#;
+
+/// The shadow FTS table (`:111-115`) — the same trigram definition, shadow name.
+pub const DDL_SHADOW_FTS: &str = r#"
+	CREATE VIRTUAL TABLE files_fts_shadow USING fts5(
+		name,
+		tokenize='trigram'
+	);
+"#;
+
+/// The five indexes Go creates on `files_shadow` **after** the walk and before the swap
+/// (`:227-234`) — inserting under a unique index during the walk is the cost Go avoids, and the reason
+/// [`DDL_INDEXES`] carries `IF NOT EXISTS` while these do not.
+pub const DDL_SHADOW_INDEXES: [&str; 5] = [
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_files_shadow_path   ON files_shadow(path);",
+    "CREATE        INDEX IF NOT EXISTS idx_files_shadow_name   ON files_shadow(name);",
+    "CREATE        INDEX IF NOT EXISTS idx_files_shadow_ext    ON files_shadow(ext);",
+    "CREATE        INDEX IF NOT EXISTS idx_files_shadow_parent ON files_shadow(parent);",
+    "CREATE        INDEX IF NOT EXISTS idx_files_shadow_mtime  ON files_shadow(mtime);",
+];
+
+/// The five shadow index names. The port's fresh databases already carry these names on `files`
+/// (see the module docs), so the rebuild must `DROP INDEX` them before creating them on
+/// `files_shadow` — `IF NOT EXISTS` alone would silently skip, the live table would then be dropped
+/// with its indexes, and the renamed shadow would arrive unindexed. (Go hits the same collision from
+/// its *second* rebuild on; the captured golden is a first-rebuild database, which is why nobody
+/// noticed. The port fixes it at the source.)
+pub const SHADOW_INDEX_NAMES: [&str; 5] = [
+    "idx_files_shadow_path",
+    "idx_files_shadow_name",
+    "idx_files_shadow_ext",
+    "idx_files_shadow_parent",
+    "idx_files_shadow_mtime",
+];
+
+/// FTS is filled from the finished shadow table in one statement (`:245`), not row by row.
+pub const FTS_POPULATE_SQL: &str =
+    "INSERT INTO files_fts_shadow(rowid, name) SELECT id, name FROM files_shadow;";
+
+/// The atomic swap, one transaction (`:255-279`): drop live, rename shadow in. The rename carries the
+/// `idx_files_shadow_*` index names onto `files` — the naming oddity documented in the module docs.
+pub const SWAP_SQL: &str = "DROP TABLE IF EXISTS files;\
+                            DROP TABLE IF EXISTS files_fts;\
+                            ALTER TABLE files_shadow RENAME TO files;\
+                            ALTER TABLE files_fts_shadow RENAME TO files_fts;";
+
+/// Go's post-swap `PRAGMA wal_checkpoint(PASSIVE)` (`:283`). A no-op on a `DELETE`-mode database —
+/// which is what `store/sql.rs` measures Go as using — kept for text parity.
+pub const CHECKPOINT_SQL: &str = "PRAGMA wal_checkpoint(PASSIVE);";
+
 /// What [`apply`] did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SchemaReport {

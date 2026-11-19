@@ -12,4 +12,7 @@
 //! `journal_mode`, `busy_timeout` and the retry loop.
 
 pub mod intent;
+pub mod rebuild;
 pub mod schema;
+pub mod updater;
+pub mod walker;

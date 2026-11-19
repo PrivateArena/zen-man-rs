@@ -415,6 +415,14 @@ struct Inner {
     /// properties dialog can ask for on every repaint — is a lock read.
     probe: Arc<RwLock<Option<bool>>>,
     config: Mutex<ZenConfig>,
+    /// Step 12a runtime index state (Go's `IndexState` — the config file keeps only the settings).
+    index_state: Mutex<IndexRunState>,
+    /// The step-12 queueing intent, applied by `poll_at` at the 2 s cadence (plan §5.5's updater row).
+    index_queue: Arc<crate::index::updater::QueuedIntent>,
+    /// The live rebuild job, when one is running (`Session::index_cancel` needs its id).
+    rebuild_job: Mutex<Option<JobId>>,
+    /// Rows written by the live rebuild (Go's `ProgressCount`).
+    index_progress: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Session {
@@ -483,6 +491,15 @@ impl Session {
             },
         };
 
+        // Step 12a: with a database the default sink is the queueing intent (`poll_at` drains it); a
+        // database-less session keeps dropping ops exactly as the step-6 seam did.
+        let index_queue = Arc::new(crate::index::updater::QueuedIntent::new());
+        let index_progress = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let default_intent: SharedIntent = if db.is_some() {
+            Arc::clone(&index_queue) as SharedIntent
+        } else {
+            crate::index::intent::noop_intent()
+        };
         let source: Arc<dyn FsSource> = Arc::new(OsDirRead);
         let dirs = Arc::new(DirService::new(Arc::clone(&source), Arc::clone(&limits)));
         let search = Arc::new(SearchService::new(source, Arc::clone(&limits)));
@@ -499,7 +516,11 @@ impl Session {
                 log: Mutex::new(log),
                 db: Mutex::new(db),
                 db_disabled: Mutex::new(db_disabled),
-                intent: Mutex::new(crate::index::intent::noop_intent()),
+                intent: Mutex::new(default_intent),
+                index_queue,
+                index_state: Mutex::new(IndexRunState::default()),
+                rebuild_job: Mutex::new(None),
+                index_progress,
                 events: Mutex::new(std::collections::VecDeque::new()),
                 clipboard: Mutex::new(None),
                 origins: OriginAlloc::new(),
@@ -1368,6 +1389,260 @@ impl Session {
         Ok(Receipt::Running { job, origin })
     }
 
+    /// `POST /api/index/rebuild` (`api/search_index_api.go:69`, plan §5.5): the staged shadow rebuild
+    /// as a `JobKind::IndexRebuild` job on a **dedicated connection** — `with_db` would hold the
+    /// session's connection mutex for the whole walk, freezing every read and every queue drain.
+    ///
+    /// # Errors
+    /// [`CoreError::Sql`] when the session runs without a database; a bad exclude pattern is
+    /// [`CoreError::BadRegex`] (Go dropped it silently — the plan §5.4 fix).
+    pub fn index_rebuild(&self) -> Result<JobId, CoreError> {
+        let db_path = self
+            .inner
+            .paths
+            .database
+            .clone()
+            .ok_or_else(|| CoreError::Sql {
+                msg: "this session runs without a database".to_string(),
+            })?;
+        let cfg = {
+            let c = self.config();
+            crate::index::walker::WalkCfg::from_settings(
+                &c.indexer.roots,
+                &c.indexer.excludes,
+                c.indexer.max_depth,
+                c.indexer.follow_symlinks,
+                c.indexer.worker_count,
+            )?
+        };
+        let attempts = self.inner.paths.db_open.attempts;
+        let backoff = self.inner.paths.db_open.backoff;
+        {
+            let mut st = lock(&self.inner.index_state);
+            st.is_dirty = true;
+            st.last_error = None;
+        }
+        let spec = JobSpec::new(
+            self.inner.jobs.next_id(),
+            crate::jobs::JobKind::IndexRebuild,
+            "Rebuild search index",
+            self.next_origin(),
+        );
+        let id = spec.id;
+        *lock(&self.inner.rebuild_job) = Some(id);
+        self.inner
+            .index_progress
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        let progress_rows = Arc::clone(&self.inner.index_progress);
+        self.inner.jobs.attach(spec, move |cancel, progress| {
+            let conn = crate::store::sql::connect_with_retry(
+                &db_path,
+                crate::store::config::StoreMode::Full,
+                attempts,
+                backoff,
+            )?;
+            let summary = crate::index::rebuild::run_with_hook(
+                &conn,
+                &cfg,
+                cancel,
+                &|p: &crate::index::rebuild::RebuildProgress| {
+                    progress_rows.store(p.rows, std::sync::atomic::Ordering::Relaxed);
+                    progress.set(0, p.rows, Some(p.stage.as_str().to_string()));
+                },
+            )?;
+            Ok(JobResult::done(
+                crate::events::JobPayload::Index(crate::events::IndexSummary {
+                    rows: summary.rows,
+                    roots_ok: summary.roots_ok,
+                    roots_failed: summary.roots_failed,
+                }),
+                format!("{} row(s) indexed", summary.rows),
+            ))
+        });
+        Ok(id)
+    }
+
+    /// `true` while a rebuild job is live.
+    #[must_use]
+    pub fn index_is_running(&self) -> bool {
+        let id = *lock(&self.inner.rebuild_job);
+        id.is_some_and(|id| {
+            self.inner
+                .jobs
+                .info(id)
+                .is_some_and(|i| i.state == "running")
+        })
+    }
+
+    /// `GET /api/index/status` (`api/search_index_api.go:88`): the `index-status.json` keys, with Go's
+    /// optional `error` when the last rebuild failed.
+    #[must_use]
+    pub fn index_status(&self) -> crate::services::search_index::IndexStatus {
+        use crate::services::search_index::{IndexStatus, IndexStatusConfig, IndexStatusProgress};
+        let st = lock(&self.inner.index_state);
+        let cfg = self.config();
+        let indexing = self.index_is_running();
+        let indexed = if indexing {
+            self.inner
+                .index_progress
+                .load(std::sync::atomic::Ordering::Relaxed)
+        } else {
+            u64::try_from(st.total_files).unwrap_or(0)
+        };
+        IndexStatus {
+            is_indexing: indexing,
+            total_files: st.total_files,
+            last_indexed: st.last_indexed_unix,
+            is_dirty: st.is_dirty,
+            config: IndexStatusConfig {
+                roots: cfg.indexer.roots.clone(),
+                excludes: cfg.indexer.excludes.clone(),
+                auto_index: cfg.indexer.auto_index,
+                worker_count: cfg.indexer.worker_count,
+                follow_symlinks: cfg.indexer.follow_symlinks,
+            },
+            progress: IndexStatusProgress {
+                indexed: i64::try_from(indexed).unwrap_or(0),
+            },
+            error: st.last_error.clone(),
+        }
+    }
+
+    /// `GET /api/index/search` (`api/search_index_api.go:10`): parse + execute against the live index.
+    /// Go's handler clamps a non-positive `limit` back to [`DEFAULT_LIMIT`] and a negative `offset` to
+    /// 0; the same clamps live in the service, and `None` means "the caller sent nothing".
+    ///
+    /// # Errors
+    /// [`CoreError::Sql`] when there is no database or the query fails.
+    pub fn index_search(
+        &self,
+        q: &str,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) -> Result<crate::services::search_index::IndexSearchResults, CoreError> {
+        let limit = limit.filter(|l| *l > 0).unwrap_or(i64::MAX);
+        let offset = offset.filter(|o| *o >= 0).unwrap_or(0);
+        let (dirty, last) = {
+            let st = lock(&self.inner.index_state);
+            (st.is_dirty, st.last_indexed_unix)
+        };
+        self.with_db(move |conn| {
+            crate::services::search_index::search(conn, q, limit, offset, dirty, last)
+        })?
+    }
+
+    /// `POST /api/index/cancel`: cancel the live rebuild. `true` when one was running (Go answered
+    /// `{"cancelled": true` unconditionally; the port reports the truth).
+    #[must_use]
+    pub fn index_cancel(&self) -> bool {
+        let id = *lock(&self.inner.rebuild_job);
+        id.is_some_and(|id| self.inner.jobs.cancel(id))
+    }
+
+    /// The rebuild half of `poll`: a finished `IndexRebuild` job lands its state and is announced as
+    /// `IndexChanged` (Go updated `IndexState` in the goroutine's tail; the port does it where the
+    /// terminal event is seen, so the state and the event can never disagree).
+    fn index_finished_events(&self, finished: &[EngineEvent]) -> Vec<EngineEvent> {
+        let mut out = Vec::new();
+        for ev in finished {
+            if let EngineEvent::JobFinished {
+                kind: crate::jobs::JobKind::IndexRebuild,
+                payload,
+                error,
+                ..
+            } = ev
+            {
+                let mut st = lock(&self.inner.index_state);
+                match payload {
+                    crate::events::JobPayload::Index(summary) => {
+                        st.total_files = i64::try_from(summary.rows).unwrap_or(i64::MAX);
+                        st.last_indexed_unix = unix_now();
+                        st.is_dirty = false;
+                        out.push(EngineEvent::IndexChanged {
+                            total: summary.rows,
+                            dirty: false,
+                        });
+                    }
+                    other => {
+                        let cancelled = error
+                            .as_ref()
+                            .is_some_and(|e| matches!(**e, CoreError::Cancelled));
+                        if let Some(e) = error {
+                            st.last_error = Some(e.user_message());
+                        }
+                        let _ = other;
+                        // Go set `IsDirty` on a failed rebuild and left it alone on a cancel; the
+                        // first rebuild starts dirty, so a cancel before any success stays dirty too.
+                        if !cancelled {
+                            st.is_dirty = true;
+                        }
+                        out.push(EngineEvent::IndexChanged {
+                            total: u64::try_from(st.total_files).unwrap_or(0),
+                            dirty: st.is_dirty,
+                        });
+                    }
+                }
+                drop(st);
+                *lock(&self.inner.rebuild_job) = None;
+            }
+        }
+        out
+    }
+
+    /// Plan §5.5's updater cadence: apply the queued [`IndexOp`]s at most once per
+    /// [`Session::INDEX_DRAIN_CADENCE`], from `poll_at`. A replaced intent (a test's
+    /// `RecordingIntent`) means the queue is not the live sink — its contents are discarded, because
+    /// applying stale ops behind a caller that watches the stream itself would double-write.
+    fn drain_index_queue(&self, now: std::time::Instant) -> Vec<EngineEvent> {
+        let due = {
+            let mut st = lock(&self.inner.index_state);
+            if st.last_flush + Self::INDEX_DRAIN_CADENCE <= now {
+                st.last_flush = now;
+                true
+            } else {
+                false
+            }
+        };
+        if !due {
+            return Vec::new();
+        }
+        let queue: SharedIntent = Arc::clone(&self.inner.index_queue) as SharedIntent;
+        if !Arc::ptr_eq(&self.intent(), &queue) {
+            let _ = self.inner.index_queue.take();
+            return Vec::new();
+        }
+        let ops = self.inner.index_queue.take();
+        if ops.is_empty() {
+            return Vec::new();
+        }
+        match self
+            .with_db(|conn| crate::index::updater::apply_ops(conn, &ops))
+            .and_then(|r| r)
+        {
+            Ok(applied) => {
+                let total = self
+                    .with_db(|conn| {
+                        conn.query_row("SELECT COUNT(*) FROM files;", [], |r| r.get::<_, i64>(0))
+                            .unwrap_or(0)
+                    })
+                    .unwrap_or(0);
+                let mut st = lock(&self.inner.index_state);
+                st.total_files = total;
+                if applied > 0 {
+                    st.is_dirty = false;
+                }
+                vec![EngineEvent::IndexChanged {
+                    total: u64::try_from(total).unwrap_or(0),
+                    dirty: st.is_dirty,
+                }]
+            }
+            Err(e) => {
+                lock(&self.inner.index_state).last_error = Some(e.user_message());
+                Vec::new()
+            }
+        }
+    }
+
     /// Replace the index-intent sink — the seam plan §5.5/§5.6 built this for: step 12's queueing
     /// implementation is installed here and no caller changes. A test installs
     /// [`RecordingIntent`](crate::index::intent::RecordingIntent) to see what a mutation reported.
@@ -1534,6 +1809,9 @@ impl Session {
         }
     }
 
+    /// The updater drain cadence (plan §5.5: "a 2 s coalescing drain").
+    pub const INDEX_DRAIN_CADENCE: Duration = Duration::from_secs(2);
+
     /// Drain the engine's event queue: the job table's coalesced events, the invalidations the
     /// directory service has been holding, and anything the session itself pushed (notices, the size
     /// answers a finished walk produced).
@@ -1547,7 +1825,11 @@ impl Session {
     /// `now`, which is what makes the boundary testable exactly.
     pub fn poll_at(&mut self, now: std::time::Instant) -> Vec<EngineEvent> {
         self.promote_due_search(now);
+        let drained = self.drain_index_queue(now);
         let mut out = self.inner.jobs.poll_at(now);
+        out.extend(drained);
+        let mut rebuilt = self.index_finished_events(&out);
+        out.append(&mut rebuilt);
         // The broadcast half, collected first so the loop below is not mutating what it is reading:
         // every row showing this directory gets the number, not only the widget that asked
         // (plan §4.1's `DirSizeReady`).
@@ -1788,6 +2070,42 @@ fn check_config_file(path: &Path) -> Result<Option<StartupNote>, CoreError> {
 /// one panicked job must not disable the session's clipboard or event queue.
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The session's runtime index state — Go's `IndexConfig.IndexState` (`api/search_index.go:30-34`),
+/// held in memory here because `store::config` keeps the settings file pure (plan §5.5: the config
+/// file is settings, not state). `is_dirty` starts `true` exactly like Go's default.
+struct IndexRunState {
+    /// Unix seconds of the last successful rebuild.
+    last_indexed_unix: i64,
+    /// Rows after the last successful rebuild or drain.
+    total_files: i64,
+    /// The index is behind the filesystem.
+    is_dirty: bool,
+    /// Why the last rebuild failed ([`CoreError::Cancelled`] clears it, Go's `LastErr`).
+    last_error: Option<String>,
+    /// When `poll_at` last ran the updater drain (the 2 s cadence's clock).
+    last_flush: std::time::Instant,
+}
+
+impl Default for IndexRunState {
+    fn default() -> Self {
+        Self {
+            last_indexed_unix: 0,
+            total_files: 0,
+            is_dirty: true,
+            last_error: None,
+            last_flush: std::time::Instant::now(),
+        }
+    }
+}
+
+/// Unix seconds, Go's `time.Now().Unix()`.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_secs()).unwrap_or(0))
+        .unwrap_or(0)
 }
 
 /// `Session`'s convenience: the intent sink every service holds (plan §5.3's no-connection rule).

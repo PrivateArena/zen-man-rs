@@ -946,3 +946,585 @@ fn search_ready_carries_the_rows_the_dialog_needs() {
     );
     assert!(result.hits.iter().all(|h| !h.entry.mode.is_empty()));
 }
+// ============================================================================================= 12a
+//
+// Step 12's half of this plan row: the FTS index, asserted two ways — against the captured
+// `search-index-*.json` / `index-status*.json` goldens *and* against the captured `zen-man.db`
+// itself (`api/search_index*.go`). The live-tree goldens were captured on a tree without the
+// `--with-heavy` additions (the capture's `many` holds 1 200 files and `index-status.json` counts
+// 1 260 rows; the heavy directory would add 10 005 more), so this section builds its own
+// `--hostile --fifo` tree and leaves the shared `fixtures()` one to the live tests.
+
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use rusqlite::Connection;
+use zenman_core::index::intent::{IndexIntent, IndexOp};
+use zenman_core::index::rebuild::{self, Stage};
+use zenman_core::index::updater::{self, QueuedIntent};
+use zenman_core::index::walker::WalkCfg;
+use zenman_core::jobs::CancelToken;
+use zenman_core::services::search_index;
+use zenman_core::store::config::StoreMode;
+use zenman_core::store::sql::connect_with_retry;
+
+/// The seven excludes the capture ran with (`index-status.json` → `config.excludes`): Go's six
+/// defaults plus the fixture config's `**/flatcap`.
+const GO_EXCLUDES: [&str; 7] = [
+    "/proc",
+    "/sys",
+    "/dev",
+    "**/.git",
+    "**/node_modules",
+    "**/__pycache__",
+    "**/flatcap",
+];
+
+/// The capture machine's fixture root (`search-index-*.json` header note; the captured database was
+/// never normalised, so its rows still carry it literally).
+const CAPTURE_ROOT: &str = "/tmp/zm-fix";
+
+struct IdxFixtures {
+    root: PathBuf,
+}
+
+fn idx_fixtures() -> &'static IdxFixtures {
+    static TREE: OnceLock<IdxFixtures> = OnceLock::new();
+    TREE.get_or_init(|| {
+        let root =
+            std::env::temp_dir().join(format!("zenman-contract-index-{}", std::process::id()));
+        wipe(&root);
+        std::fs::create_dir_all(&root).expect("index scratch root");
+        let tree = root.join("tree");
+        let output = Command::new("python3")
+            .current_dir(REPO)
+            .arg(
+                Path::new(REPO)
+                    .join("scripts/make-fixtures.py")
+                    .display()
+                    .to_string(),
+            )
+            .arg("--root")
+            .arg(tree.display().to_string())
+            .arg("--hostile")
+            .arg("--fifo")
+            .spawn()
+            .and_then(|child| child.wait_with_output())
+            .expect("python3 runs the repository's own fixture generator");
+        assert!(
+            output.status.success(),
+            "make-fixtures.py failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // NOTE: deliberately NOT `relax`ed — the hostile permissions (noexec-dir, noread-dir) are what make the
+        // count 1 260; `wipe` relaxes on the way out. eprintln for the location:
+        eprintln!("contract_search: index fixture tree at {}", tree.display());
+        IdxFixtures { root }
+    })
+}
+
+fn idx_tree() -> AbsPath {
+    abs(&idx_fixtures().root.join("tree"))
+}
+
+/// The golden's `${FIXTURE_ROOT}` text, made real against the *index* tree (not the shared live one).
+fn materialise_idx(value: Value) -> Value {
+    let text = value.to_string();
+    let swapped = text.replace("${FIXTURE_ROOT}", &idx_fixtures().root.to_string_lossy());
+    serde_json::from_str(&swapped).expect("materialised golden is valid")
+}
+
+fn idx_conn(name: &str) -> Connection {
+    let dir = idx_fixtures().root.join(name);
+    std::fs::create_dir_all(&dir).expect("index db dir");
+    connect_with_retry(
+        &dir.join("zen-man.db"),
+        StoreMode::Full,
+        8,
+        Duration::from_millis(50),
+    )
+    .expect("a database for the index tests")
+}
+
+fn idx_walk_cfg() -> WalkCfg {
+    WalkCfg::from_settings(
+        &[idx_tree().to_string_lossy().to_owned()],
+        &GO_EXCLUDES
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect::<Vec<_>>(),
+        0,
+        false,
+        2,
+    )
+    .expect("the capture's settings compile")
+}
+
+/// A session with a real database over the index fixture tree, rebuilt once through
+/// `Session::index_rebuild` — so the job plumbing, the `IndexChanged` synthesis and the dirty-flag
+/// transition are all on the tested path (Go's rebuild-then-status flow).
+fn indexed_session(tag: &str) -> Session {
+    let dir = idx_fixtures().root.join(tag);
+    std::fs::create_dir_all(&dir).expect("index dir");
+    let mut cfg = ZenConfig::default();
+    cfg.indexer.roots = vec![idx_tree().to_string_lossy().to_owned()];
+    cfg.indexer.excludes = GO_EXCLUDES.iter().map(|s| (*s).to_string()).collect();
+    let env: Arc<dyn Env> = zenman_core::platform::default_env();
+    let (mut session, _notes) = Session::open(
+        SessionPaths::new(
+            dir.join("config.json"),
+            dir.join("action.log"),
+            Some(dir.join("zen-man.db")),
+            dir.join("probe"),
+        )
+        .with_db_open(8, Duration::from_millis(50)),
+        cfg,
+        env,
+        Limits::default(),
+    )
+    .expect("a session with a database opens");
+    let job = session.index_rebuild().expect("the rebuild is accepted");
+    let seen = settle(&mut session, &|evs: &[EngineEvent]| {
+        evs.iter()
+            .any(|e| matches!(e, EngineEvent::JobFinished { id, .. } if *id == job))
+    });
+    assert!(
+        seen.iter().any(
+            |e| matches!(e, EngineEvent::IndexChanged { dirty: false, total } if *total == 1_260)
+        ),
+        "a landed rebuild announces itself with the golden's row count; saw {seen:?}"
+    );
+    session
+}
+
+#[test]
+fn excludes_glob_parity() {
+    // Go's seven default excludes, compiled by the hand-rolled NFA (`(^|/)P($|/)`, whole-component
+    // semantics, matched against the absolute AND the root-relative path), produce the golden count.
+    let sess = indexed_session("idx-excludes");
+    let st = sess.index_status();
+    assert_eq!(st.total_files, 1_260, "the golden's row count");
+    assert!(
+        !st.is_dirty,
+        "a successful rebuild clears the dirty flag (Go's IndexState)"
+    );
+    assert!(!st.is_indexing);
+    assert_eq!(st.progress.indexed, 1_260);
+    assert_eq!(
+        st.config.excludes,
+        GO_EXCLUDES
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(st.config.worker_count, 2);
+    assert_eq!(
+        st.last_indexed,
+        unix_seconds(),
+        "the rebuild stamps the time (±1 s tolerance aside)"
+    );
+    // The `noexec-dir` drop: `noexec-dir/inner.txt` cannot be `lstat`ed (the directory has no +x), so
+    // Go's `d.Info()` error path drops the row — that is what makes the count 1 260 and not 1 261.
+    // (The *name* `inner.txt` also exists under `fake.zip/`, which IS indexed, so the check has to
+    // be path-scoped, exactly like Go's `in:` operator.)
+    let scoped = sess
+        .index_search(
+            &format!("in:{}/tree/noexec-dir", idx_fixtures().root.display()),
+            None,
+            None,
+        )
+        .expect("search");
+    assert_eq!(
+        scoped.total_matched, 0,
+        "`in:` lists the directory's CONTENTS (Go's parent-prefix semantics) — and it has no
+         indexed children, because inner.txt's lstat fails"
+    );
+    let noexec = sess.index_search("noexec-dir", None, None).expect("search");
+    assert_eq!(
+        noexec.total_matched, 1,
+        "the directory row itself is indexed"
+    );
+    // The `/proc`-style absolute excludes must match whole components, not substrings: a tree
+    // directory named `dev-tools` is NOT excluded by `/dev`.
+    let ours = sess.index_search("flatcap", None, None).expect("search");
+    assert_eq!(
+        ours.total_matched, 0,
+        "`**/flatcap` prunes the fixture's flatcap directory"
+    );
+    // The depth trap: `leaf.txt` sits 21 levels under the root. `limits.rs`' INDEX_MAX_DEPTH = 20 is a
+    // config-validation bound, not a walk default — Go's default depth is unlimited, and applying 20
+    // here would make leaf.txt vanish and break the word golden.
+    let leaf = sess.index_search("leaf", None, None).expect("leaf");
+    assert_eq!(
+        leaf.total_matched, 1,
+        "the 21-level-deep leaf.txt must be indexed"
+    );
+    // And the 30 directories (root included) are all there.
+    let dirs = sess.index_search("type:dir", None, None).expect("dirs");
+    assert_eq!(dirs.total_matched, 30);
+}
+
+fn unix_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_secs()).unwrap_or(0))
+        .unwrap_or(0)
+}
+
+#[test]
+fn fts_query_parity() {
+    // (a) our query engine against OUR index of the capture's tree.
+    let sess = indexed_session("idx-fts");
+    let paged = sess.index_search(".txt", Some(3), Some(3)).expect("paged");
+    let want = materialise_idx(golden("search-index-paged"));
+    assert_eq!(paged.total_matched, 1_223);
+    assert_eq!(want["total_matched"], 1_223);
+    assert!(paged.capped);
+    assert_eq!(want["capped"], true);
+    let want_entries = want["entries"].as_array().expect("golden entries");
+    assert_eq!(paged.entries.len(), want_entries.len());
+    let names: Vec<&str> = paged.entries.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(
+        names,
+        ["a9.txt", "B.txt", "back\\slash.txt"],
+        "ranks 4-6 of the lowercased-name order"
+    );
+    for (got, w) in paged.entries.iter().zip(want_entries) {
+        assert_eq!(got.name, w["name"].as_str().expect("name"));
+        assert_eq!(got.is_dir, w["is_dir"].as_bool().expect("is_dir"));
+        assert_eq!(got.size, w["size"].as_i64().expect("size"));
+        // §2.4: `rel_path` carries the ABSOLUTE path and `mode` is always "" on this endpoint.
+        assert_eq!(got.rel_path, w["rel_path"].as_str().expect("rel_path"));
+        assert_eq!(got.mode, "");
+    }
+
+    let word = sess.index_search("leaf", None, None).expect("word");
+    let want = materialise_idx(golden("search-index-word"));
+    assert_eq!(
+        word.total_matched,
+        want["total_matched"].as_i64().expect("total")
+    );
+    assert_eq!(word.entries[0].rel_path, want["entries"][0]["rel_path"]);
+
+    let ext = sess.index_search("ext:sh", None, None).expect("ext");
+    assert_eq!(ext.total_matched, 1);
+    assert_eq!(ext.entries[0].name, "executable.sh");
+
+    let dirs = sess.index_search("type:dir", None, None).expect("type");
+    let want = materialise_idx(golden("search-index-type-dir"));
+    assert_eq!(dirs.total_matched, 30);
+    let got: Vec<&str> = dirs.entries.iter().map(|e| e.name.as_str()).collect();
+    let want_names: Vec<&str> = want["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .map(|e| e["name"].as_str().expect("name"))
+        .collect();
+    assert_eq!(
+        got, want_names,
+        "the full 30-row order, lowercased name ascending"
+    );
+
+    let inf = sess
+        .index_search(
+            &format!("in:{}/tree/subdir", idx_fixtures().root.display()),
+            None,
+            None,
+        )
+        .expect("in");
+    let got: Vec<&str> = inf.entries.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(
+        got,
+        ["b", "a.txt", "c.txt"],
+        "dirs first, then files, name order"
+    );
+    assert_eq!(inf.total_matched, 3);
+
+    let none = sess.index_search("zzzznope", None, None).expect("empty");
+    assert_eq!(none.total_matched, 0);
+    assert!(none.entries.is_empty(), "§6.2: always-[], never JSON null");
+    assert!(!none.capped);
+
+    captured_db_parity();
+}
+
+/// The same query engine against the captured Go database, byte-for-byte against the capture.
+fn captured_db_parity() {
+    let cap = idx_fixtures().root.join("captured/zen-man.db");
+    std::fs::create_dir_all(cap.parent().expect("parent")).expect("captured dir");
+    std::fs::copy(Path::new(GOLDEN).join("zen-man.db"), &cap).expect("copy the captured database");
+    let conn = connect_with_retry(&cap, StoreMode::Full, 8, Duration::from_millis(50))
+        .expect("the Go-produced database opens (schema gate and all)");
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM files;", [], |r| r.get(0))
+        .expect("count");
+    assert_eq!(rows, 1_260, "the captured index holds the golden's rows");
+    let paged = search_index::search(&conn, ".txt", 3, 3, false, 0).expect("captured search");
+    let raw = golden("search-index-paged");
+    assert_eq!(
+        paged.total_matched, 1_223,
+        "the FTS trigram count over Go's own data"
+    );
+    let want_entries = raw["entries"].as_array().expect("entries");
+    assert_eq!(paged.entries.len(), want_entries.len());
+    for (got, w) in paged.entries.iter().zip(want_entries) {
+        assert_eq!(got.name, w["name"].as_str().expect("name"));
+        assert_eq!(
+            got.rel_path,
+            w["rel_path"]
+                .as_str()
+                .expect("rel_path")
+                .replace("${FIXTURE_ROOT}", CAPTURE_ROOT),
+            "the captured absolute path, backslash and all"
+        );
+        assert_eq!(got.mode, "");
+    }
+    // Ranks 4-6 are the golden's own rows — the same engine, Go's data, Go's answer.
+    let names: Vec<&str> = paged.entries.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(names, ["a9.txt", "B.txt", "back\\slash.txt"]);
+}
+
+#[test]
+fn rebuild_is_atomic() {
+    let sess = indexed_session("idx-atomic");
+    let db = sess
+        .paths()
+        .database
+        .clone()
+        .expect("this session has a database");
+    // A dedicated writer connection, exactly like `Session::index_rebuild`'s job — `with_db` would
+    // hold the session mutex for the whole pipeline.
+    let conn = connect_with_retry(&db, StoreMode::Full, 8, Duration::from_millis(50))
+        .expect("a second connection to the same database");
+    let walk_cfg = idx_walk_cfg();
+    let cancel = CancelToken::new();
+    let reached = AtomicBool::new(false);
+    let res = rebuild::run_with_hook(&conn, &walk_cfg, &cancel, &|p| {
+        if p.stage == Stage::PopulateFts {
+            reached.store(true, Ordering::SeqCst);
+            let _ = cancel.cancel();
+        }
+    });
+    assert!(
+        reached.load(Ordering::SeqCst),
+        "the pipeline reached PopulateFts"
+    );
+    assert!(
+        matches!(res, Err(CoreError::Cancelled)),
+        "cancelling at the PopulateFts boundary stops the rebuild: {res:?}"
+    );
+    // The OLD index still answers, with the OLD numbers: the swap never ran, so `files` is the first
+    // rebuild, untouched.
+    let hits = search_index::search(&conn, ".txt", 3, 0, false, 0).expect("the old index answers");
+    assert_eq!(hits.total_matched, 1_223);
+    // And the shadow tables are gone — cleaned up on the cancel path, not left for the next run.
+    let left: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name IN ('files_shadow', 'files_fts_shadow');",
+            [],
+            |r| r.get(0),
+        )
+        .expect("sqlite_master");
+    assert_eq!(
+        left, 0,
+        "a cancelled rebuild leaves no shadow tables behind"
+    );
+    let counts: (i64, i64) = conn
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM files), (SELECT COUNT(*) FROM files_fts);",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("counts");
+    assert_eq!(counts, (1_260, 1_260));
+    // A second, complete rebuild lands: the pipeline is re-runnable after a cancelled one.
+    let again =
+        rebuild::run(&conn, &walk_cfg, &CancelToken::new()).expect("the next rebuild works");
+    assert_eq!(again.rows, 1_260);
+}
+
+#[test]
+fn incremental_update() {
+    // A small tree of our own: the shared fixture trees are read-only for the other tests here.
+    let root = idx_fixtures().root.join("idx-incr-tree");
+    wipe(&root);
+    std::fs::create_dir_all(root.join("sub")).expect("sub");
+    std::fs::write(root.join("a.txt"), b"one").expect("a");
+    std::fs::write(root.join("keep.txt"), b"keep").expect("keep");
+    std::fs::write(root.join("sub/b.txt"), b"bee").expect("b");
+    std::fs::write(root.join("sub/c.txt"), b"cee").expect("c");
+    let conn = idx_conn("idx-incr");
+    let cfg = WalkCfg::from_settings(&[root.display().to_string()], &[], 0, false, 2)
+        .expect("no excludes here");
+    let seed = rebuild::run(&conn, &cfg, &CancelToken::new()).expect("seed rebuild");
+    assert_eq!(seed.rows, 6, "root + a + keep + sub + b + c");
+
+    let path =
+        |rel: &str| AbsPath::from_path(root.join(rel).display().to_string()).expect("absolute");
+    let total = |q: &str| -> i64 {
+        search_index::search(&conn, q, search_index::DEFAULT_LIMIT, 0, false, 0)
+            .expect("query")
+            .total_matched
+    };
+    let scalar = |sql: &str, arg: &str| -> Option<i64> {
+        conn.query_row(sql, [arg], |r| r.get::<_, i64>(0)).ok()
+    };
+
+    // Created: the row appears and FTS learns the name in the same op.
+    std::fs::write(root.join("new.txt"), b"hello").expect("write new");
+    updater::apply_op(
+        &conn,
+        &IndexOp::Created {
+            path: path("new.txt"),
+        },
+    )
+    .expect("created");
+    assert_eq!(
+        total("new.txt"),
+        1,
+        "the new row is findable, not just present"
+    );
+
+    // Refreshed: the numbers are re-read from the filesystem.
+    std::fs::write(root.join("new.txt"), b"hello world!").expect("write new2");
+    updater::apply_op(
+        &conn,
+        &IndexOp::Refreshed {
+            path: path("new.txt"),
+        },
+    )
+    .expect("refreshed");
+    assert_eq!(
+        scalar(
+            "SELECT size FROM files WHERE path = ?1;",
+            &path("new.txt").to_string_lossy()
+        ),
+        Some(12)
+    );
+
+    // Renamed: path/name/ext move, the rowid (and so the FTS link) survives, under the NEW name.
+    std::fs::rename(root.join("new.txt"), root.join("renamed.txt")).expect("rename");
+    updater::apply_op(
+        &conn,
+        &IndexOp::Renamed {
+            from: path("new.txt"),
+            to: path("renamed.txt"),
+        },
+    )
+    .expect("renamed");
+    assert_eq!(total("renamed.txt"), 1);
+    assert_eq!(total("new.txt"), 0);
+
+    // Moved: the subtree — the root row AND every descendant's path/parent change.
+    std::fs::rename(root.join("sub"), root.join("moved")).expect("move");
+    updater::apply_op(
+        &conn,
+        &IndexOp::Moved {
+            from: path("sub"),
+            to: path("moved"),
+        },
+    )
+    .expect("moved");
+    assert_eq!(
+        scalar("SELECT COUNT(*) FROM files WHERE path LIKE ?1;", "%moved/%"),
+        Some(2),
+        "b.txt and c.txt carry the new prefix"
+    );
+    assert_eq!(
+        scalar(
+            "SELECT COUNT(*) FROM files WHERE path = ?1;",
+            &root.join("moved").display().to_string()
+        ),
+        Some(1),
+        "the moved directory's own row moved too"
+    );
+    assert_eq!(
+        scalar(
+            "SELECT COUNT(*) FROM files WHERE parent = ?1;",
+            &root.join("moved").display().to_string()
+        ),
+        Some(2),
+        "both children now report the new parent"
+    );
+    assert_eq!(total("b.txt"), 1, "descendants keep their FTS entries");
+
+    // Deleted: one row, its FTS entry with it.
+    std::fs::remove_file(root.join("keep.txt")).expect("rm");
+    updater::apply_op(
+        &conn,
+        &IndexOp::Deleted {
+            path: path("keep.txt"),
+        },
+    )
+    .expect("deleted");
+    assert_eq!(total("keep"), 0);
+
+    // Pruned: the bounded `LIKE 'x/%' ESCAPE '\'` subtree delete, FTS rowids gathered first.
+    wipe(&root.join("moved"));
+    updater::apply_op(
+        &conn,
+        &IndexOp::Pruned {
+            path: path("moved"),
+        },
+    )
+    .expect("pruned");
+    assert_eq!(
+        scalar("SELECT COUNT(*) FROM files WHERE path LIKE ?1;", "%moved%"),
+        Some(0)
+    );
+    let files: i64 = conn
+        .query_row("SELECT COUNT(*) FROM files;", [], |r| r.get(0))
+        .expect("files");
+    let fts: i64 = conn
+        .query_row("SELECT COUNT(*) FROM files_fts;", [], |r| r.get(0))
+        .expect("fts");
+    assert_eq!(files, fts, "no ghost FTS rowids after the prune");
+
+    // AttributesChanged: a real op with no statement — the schema stores no mode (`index/intent.rs`).
+    let before = scalar(
+        "SELECT size FROM files WHERE path = ?1;",
+        &path("a.txt").to_string_lossy(),
+    );
+    updater::apply_op(
+        &conn,
+        &IndexOp::AttributesChanged {
+            path: path("a.txt"),
+        },
+    )
+    .expect("a chmod is accepted and writes nothing");
+    assert_eq!(
+        before,
+        scalar(
+            "SELECT size FROM files WHERE path = ?1;",
+            &path("a.txt").to_string_lossy()
+        )
+    );
+
+    // The queued intent: coalescing on arrival, the drain applying the rest.
+    let queue = QueuedIntent::new();
+    queue.note(IndexOp::Created {
+        path: path("a.txt"),
+    });
+    queue.note(IndexOp::Refreshed {
+        path: path("a.txt"),
+    });
+    assert_eq!(
+        queue.len(),
+        2,
+        "create-then-refresh is not a mergeable pair"
+    );
+    queue.note(IndexOp::Created {
+        path: path("q.txt"),
+    });
+    queue.note(IndexOp::Created {
+        path: path("q.txt"),
+    });
+    assert_eq!(queue.len(), 3, "identical ops collapse");
+    std::fs::write(root.join("q.txt"), b"queued").expect("write q");
+    let applied = queue.drain_into(&conn).expect("drain");
+    assert!(
+        applied >= 3,
+        "every queued op reached the database: {applied}"
+    );
+    assert_eq!(total("q.txt"), 1, "the drained op is searchable");
+    assert!(queue.is_empty());
+}

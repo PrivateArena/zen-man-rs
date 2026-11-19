@@ -17,5 +17,6 @@
 
 pub mod dirs;
 pub mod name_match;
+pub mod search_index;
 pub mod search_live;
 pub mod sort;
