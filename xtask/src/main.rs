@@ -85,6 +85,12 @@ fn ci() -> Result<(), Box<dyn Error>> {
     io_guard()?;
     step("cargo clippy --workspace --all-targets -- -D warnings")?;
     step("cargo test --workspace")?;
+    // Step 12b: the `watch` feature is off by default, so nothing above compiles `index/watcher.rs`'s
+    // inotify half at all. Plan §7 step 12's "watcher feature compiles on and off" is only an acceptance
+    // criterion if the gate runs it — a feature nothing builds rots silently (§9.2 step-12a).
+    step("cargo check -p zenman-core --features watch")?;
+    step("cargo clippy -p zenman-core --features watch --all-targets -- -D warnings")?;
+    step("cargo test -p zenman-core --features watch")?;
     contracts::contracts()?;
     deps()?;
     licenses()?;

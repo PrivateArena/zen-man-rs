@@ -16,3 +16,8 @@ pub mod rebuild;
 pub mod schema;
 pub mod updater;
 pub mod walker;
+/// The filesystem watcher (plan §5.5 `index/watcher.rs`), feature-gated: `Watcher`/`start` are the
+/// inotify backend with `--features watch` on Linux and a typed-error stub everywhere else, while
+/// `DirChanged`/`Coalescer` are always compiled — that split is what lets the no-feature build keep the
+/// event type the `Session` pump consumes without pulling in a backend it cannot build.
+pub mod watcher;

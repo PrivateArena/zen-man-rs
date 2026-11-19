@@ -201,6 +201,25 @@ pub struct SessionOptions {
     /// How deep a `.zip` inside a `.7z` inside a … may go before the read refuses. Go recursed without
     /// a bound; `0` means "no nested archives at all".
     pub nested_archive_max_depth: u8,
+    /// Whether the session may run a filesystem watcher (plan §4.1's `SessionConfig.watcher`).
+    pub watcher: WatchPolicy,
+}
+
+/// Plan §4.1's `SessionConfig.watcher` — the three states a watcher policy has, and the reason a
+/// session that was never asked for one does not open an inotify descriptor.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WatchPolicy {
+    /// Never start one from the config: `Session::watch_start` refuses with a typed
+    /// [`CoreError::Watcher`](crate::error::CoreError::Watcher). The default — Go shipped no watcher at
+    /// all (plan §9.2 step-12b), so starting one behind the user's back is a deviation, not a parity.
+    #[default]
+    Off,
+    /// Start one when the indexer's own `auto_index` flag is on
+    /// (`IndexerSettings::auto_index`, the `config.auto_index` key of `index-status.json`). The knob
+    /// the wire already has; the port does not invent a second one.
+    AutoIndex,
+    /// Always start one when asked (step 12c's SearchManager toggle).
+    On,
 }
 
 impl Default for SessionOptions {
@@ -225,6 +244,7 @@ impl SessionOptions {
             // Plan §5.5: the manifest split recognises one nesting level (`host` + `nested`), which is
             // what `FsPath`/`VfsKind` can even name, so the engine refuses deeper.
             nested_archive_max_depth: 1,
+            watcher: WatchPolicy::default(),
         }
     }
 }
@@ -423,6 +443,17 @@ struct Inner {
     rebuild_job: Mutex<Option<JobId>>,
     /// Rows written by the live rebuild (Go's `ProgressCount`).
     index_progress: Arc<std::sync::atomic::AtomicU64>,
+    /// The step-12b watcher: the live handle plus the channel its reader thread sends on. `None` half
+    /// means "not watching", which is the state every session boots in.
+    watch: Mutex<WatchState>,
+}
+
+/// The session's watcher slot (plan §5.5's `Watcher`, owned by nobody else — see `Session::watch_stop`
+/// for why the receiver lives here too).
+#[derive(Debug, Default)]
+struct WatchState {
+    watcher: Option<crate::index::watcher::Watcher>,
+    rx: Option<std::sync::mpsc::Receiver<crate::index::watcher::DirChanged>>,
 }
 
 impl Session {
@@ -521,6 +552,7 @@ impl Session {
                 index_state: Mutex::new(IndexRunState::default()),
                 rebuild_job: Mutex::new(None),
                 index_progress,
+                watch: Mutex::new(WatchState::default()),
                 events: Mutex::new(std::collections::VecDeque::new()),
                 clipboard: Mutex::new(None),
                 origins: OriginAlloc::new(),
@@ -1651,6 +1683,159 @@ impl Session {
         *slot = intent;
     }
 
+    // ---------------------------------------------------------------------------------- the watcher
+
+    /// The watcher policy this session was opened with (plan §4.1's `SessionConfig.watcher`).
+    #[must_use]
+    pub fn watch_policy(&self) -> WatchPolicy {
+        self.inner.options.watcher
+    }
+
+    /// Start watching the **index root set**, honouring [`WatchPolicy`]: refused while the policy is
+    /// [`WatchPolicy::Off`] and the indexer's own `auto_index` flag is false (the setting's real name is
+    /// `IndexerSettings::auto_index` — `search-config.json`'s key, the `config.auto_index` field of
+    /// `tests/golden/index-status.json`; the port does not invent a second switch for the same thing).
+    ///
+    /// # Errors
+    /// [`CoreError::Watcher`] when the policy refuses, when the index config names no roots, or when the
+    /// backend cannot start (no `watch` feature, a non-Linux platform, an over-budget root set —
+    /// plan §5.5's stub row makes all of those the same typed error).
+    pub fn watch_start(&self) -> Result<usize, CoreError> {
+        let cfg = self.config();
+        let allowed = match self.inner.options.watcher {
+            WatchPolicy::On => true,
+            // `Off` and `AutoIndex` agree today because nothing outside the session can set the policy
+            // (`Session::open` derives `SessionOptions` from `Limits`; plan §5.4: the settings store owns
+            // config writes), so the indexer's own `auto_index` flag is the only way a session learns it
+            // should watch. `On` is the explicit toggle step 12c's dialog will set.
+            _ => cfg.indexer.auto_index,
+        };
+        if !allowed {
+            return Err(CoreError::Watcher {
+                msg: format!(
+                    "watch policy {:?} is not enabled and the indexer's auto_index flag is off",
+                    self.inner.options.watcher
+                ),
+            });
+        }
+        let roots: Vec<AbsPath> = cfg
+            .indexer
+            .roots
+            .iter()
+            .filter_map(|root| AbsPath::from_path(root).ok())
+            .collect();
+        if roots.is_empty() {
+            return Err(CoreError::Watcher {
+                msg: "the index configuration names no roots to watch".to_string(),
+            });
+        }
+        self.watch_start_at(&roots)
+    }
+
+    /// Start watching exactly these directories, replacing any watcher already running.
+    ///
+    /// The explicit-roots form: the caller has decided, so [`WatchPolicy`] does not veto it (that is what
+    /// makes it usable from a settings dialog and from a test). What it does share with
+    /// [`Self::watch_start`] is the consequence — every event lands in the same two places.
+    ///
+    /// Returns the number of watch descriptors the backend took (the budget spend, plan §5.5).
+    ///
+    /// # Errors
+    /// As [`Self::watch_start`].
+    pub fn watch_start_at(&self, roots: &[AbsPath]) -> Result<usize, CoreError> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cfg = crate::index::watcher::WatchConfig::from_limits(&self.inner.limits);
+        let watcher = crate::index::watcher::start(roots, &cfg, tx)?;
+        let count = watcher.watch_count();
+        let mut state = lock(&self.inner.watch);
+        // Replacing a live watcher: stop it (joining its thread) before the new one is installed, so two
+        // readers never feed one queue.
+        if let Some(old) = state.watcher.take() {
+            let _ = old.stop();
+        }
+        state.watcher = Some(watcher);
+        state.rx = Some(rx);
+        Ok(count)
+    }
+
+    /// Stop watching, joining the reader thread, and return the events that had not yet aged out of
+    /// their coalescing window (the flush of [`Coalescer::take_all`](crate::index::watcher::Coalescer::take_all)).
+    ///
+    /// Idempotent: stopping a session that is not watching returns nothing and is not an error.
+    pub fn watch_stop(&self) -> Vec<crate::index::watcher::DirChanged> {
+        let mut state = lock(&self.inner.watch);
+        let leftover = match state.watcher.take() {
+            Some(watcher) => watcher.stop(),
+            None => Vec::new(),
+        };
+        if let Some(rx) = state.rx.take() {
+            // Drop whatever the thread sent but this frame never read, so a restart cannot replay it.
+            while rx.try_recv().is_ok() {}
+        }
+        leftover
+    }
+
+    /// `true` while a watcher thread is running.
+    #[must_use]
+    pub fn watch_is_running(&self) -> bool {
+        lock(&self.inner.watch)
+            .watcher
+            .as_ref()
+            .is_some_and(crate::index::watcher::Watcher::is_running)
+    }
+
+    /// How many directories are watched right now (`0` when not watching).
+    #[must_use]
+    pub fn watch_count(&self) -> usize {
+        lock(&self.inner.watch)
+            .watcher
+            .as_ref()
+            .map_or(0, crate::index::watcher::Watcher::watch_count)
+    }
+
+    /// Move everything the watcher thread delivered into the engine's own channels — the two halves plan
+    /// §5.5 requires for one event:
+    ///
+    /// * the **pane reload** half: the containing directory is invalidated with
+    ///   [`ChangeCause::External`](crate::events::ChangeCause::External), which is the honest cause (the
+    ///   change came from outside this process; `ChangeCause::Watcher` stays reserved for an event that
+    ///   names the watcher as its subject, which nothing in the UI distinguishes today), and the
+    ///   `DirService` coalescing then does its usual de-duplication per frame; and
+    /// * the **index** half: an [`IndexOp`] into [`Session::intent`] — the *same* [`QueuedIntent`]
+    ///   (plan §9.2 step-12a note (2)), so an external change is applied by the 2 s drain rather than by
+    ///   a rebuild, and a test that swapped the intent out sees the op instead of the database.
+    ///
+    /// A removal maps to [`IndexOp::Pruned`], not `Deleted`: the watcher cannot know whether the name was
+    /// a file or a directory, and a pruned subtree is the safe shape of both (a file's prune is one row).
+    fn pump_watcher(&self) {
+        let batch = {
+            let state = lock(&self.inner.watch);
+            let Some(rx) = state.rx.as_ref() else {
+                return;
+            };
+            let mut batch = Vec::new();
+            while let Ok(event) = rx.try_recv() {
+                batch.push(event);
+            }
+            batch
+        };
+        for event in batch {
+            let dir = event
+                .path()
+                .parent()
+                .unwrap_or_else(|| event.path().clone());
+            self.invalidate(&crate::path::FsPath::from_abs(dir), ChangeCause::External);
+            let op = match event {
+                crate::index::watcher::DirChanged::Created { path } => IndexOp::Created { path },
+                crate::index::watcher::DirChanged::Removed { path } => IndexOp::Pruned { path },
+                crate::index::watcher::DirChanged::Metadata { path } => {
+                    IndexOp::AttributesChanged { path }
+                }
+            };
+            self.note_index(op);
+        }
+    }
+
     /// Mark one undo-log record reverted (the in-place status patch; see [`Self::revert`]).
     pub(crate) fn mark_log_reverted(
         &self,
@@ -1824,6 +2009,9 @@ impl Session {
     /// [`Self::poll`] with an injectable clock: the deferred search's 250 ms deadline is evaluated at
     /// `now`, which is what makes the boundary testable exactly.
     pub fn poll_at(&mut self, now: std::time::Instant) -> Vec<EngineEvent> {
+        // First the watcher: its events become invalidations and index ops, both of which this frame
+        // drains further down, so pumping here is what makes an external change visible in one poll.
+        self.pump_watcher();
         self.promote_due_search(now);
         let drained = self.drain_index_queue(now);
         let mut out = self.inner.jobs.poll_at(now);
@@ -1958,6 +2146,9 @@ impl Session {
     /// A job that ignores its cancel token is *not* waited for: the plan's shutdown rule is that the
     /// user's own action ends the session, so the thread is left detached and the process exit reaps it.
     pub fn close(&self) {
+        // Step 12b: the watcher is not a job, so `cancel_all` would not reach it; its thread is joined
+        // here (and by its `Drop`) so no reader outlives a closed session.
+        let _ = self.watch_stop();
         let asked = self.inner.jobs.cancel_all();
         if asked == 0 {
             self.inner.jobs.reap_finished();

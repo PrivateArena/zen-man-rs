@@ -7,6 +7,15 @@ license.workspace = true
 repository.workspace = true
 description = "zen-man headless engine: files, archives, index, undo log, jobs (plan §5.2-§5.6)"
 
+[features]
+# Plan §5.5 `index/watcher.rs`: the filesystem watcher. **No dependency is added by this feature** —
+# the backend is `rustix::fs::inotify`, already a pinned dependency under the `fs` feature that
+# `platform/linux.rs` needs (rustix 1.1.6 has no separate `inotify` feature), so `watch = []` is a
+# pure `#[cfg]` switch and `cargo xtask licenses` prints the same graph with it on or off. Off by
+# default: the default build must not change behaviour at all (plan §7 step 12 "watcher feature
+# compiles on and off", gated in `xtask ci`).
+watch = []
+
 # `unsafe_code = "forbid"` is inherited from `[workspace.lints.rust]` (plan §5.1); the crate also
 # states it in source with `#![forbid(unsafe_code)]` (plan §5.1 lib.rs row).
 [lints]
@@ -20,6 +29,8 @@ bitflags = "2"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# `fs` covers `rustix::fs::inotify` (plan §5.5 `index/watcher.rs`, step 12b) as well as the `statvfs`
+# and xattr calls `platform/linux.rs` needs; there is no `inotify` feature in rustix 1.1.6 to add.
 rustix = { version = "1.1.6", features = ["fs"] }
 trash = "5.4.0"
 open = "5.4.5"

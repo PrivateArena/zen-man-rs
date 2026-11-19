@@ -93,6 +93,16 @@ pub const PROGRESS_THROTTLE: Duration = Duration::from_millis(50);
 /// user action, not per file.
 pub const SYNC_EACH_WRITE: bool = true;
 
+/// Watch-descriptor ceiling for one filesystem watcher (plan §5.5 `index/watcher.rs`, step 12b).
+///
+/// inotify costs one `inotify_add_watch` per directory — a recursive watch over N roots is N watches plus
+/// one per subdirectory that appears — so the budget has to be a number the engine owns rather than an
+/// arbitrary constant in the watcher. It sits below the usual `fs.inotify.max_user_watches` default
+/// (8 192 on this box) because the same quota is shared with every other inotify user in the session
+/// (and with the Go app, if it is still running); a root set over budget is refused at `start`, and a
+/// directory that appears after the budget is spent is reported, not silently skipped.
+pub const WATCH_MAX_WATCHES: usize = 1_024;
+
 /// Per-directory TTLs, indexed by [`DirCacheTier`].
 ///
 /// Go re-read every page of every directory and cached nothing, so these are ours; the three sizes
@@ -187,6 +197,8 @@ pub struct Limits {
     pub dir_cache_ttls: [Duration; 3],
     /// `flush` + `sync_all` every undo-log append (see [`SYNC_EACH_WRITE`]).
     pub sync_each_write: bool,
+    /// Watch descriptors one watcher may hold (see [`WATCH_MAX_WATCHES`]; step 12b's watcher).
+    pub watch_max_watches: usize,
 }
 
 impl Default for Limits {
@@ -211,6 +223,7 @@ impl Default for Limits {
             index_max_entries: INDEX_MAX_ENTRIES,
             dir_cache_ttls: DIR_CACHE_TTLS,
             sync_each_write: SYNC_EACH_WRITE,
+            watch_max_watches: WATCH_MAX_WATCHES,
         }
     }
 }
@@ -245,6 +258,7 @@ mod tests {
         assert_eq!(l.live_job_ttl, LIVE_JOB_TTL);
         assert_eq!(l.dir_cache_ttls, DIR_CACHE_TTLS);
         assert_eq!(l.sync_each_write, SYNC_EACH_WRITE);
+        assert_eq!(l.watch_max_watches, WATCH_MAX_WATCHES);
     }
 
     #[test]
