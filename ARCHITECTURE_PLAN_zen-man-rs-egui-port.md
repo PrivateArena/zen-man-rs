@@ -1408,3 +1408,78 @@ test count **621 → 631** (9 archive UI + 1 core 7z), `cargo xtask ci` exit 0, 
   /`role_matches` (`menus/mod.rs:404,423`) are now duplicates of `services::actions`** — 14b deletes them
   and calls `actions::for_context`, which is the handover 10b asked for. `actions::build_request` is public
   so a menu item can be previewed or unit-tested without spawning.
+
+### Step 14b (the UI half: header vocabulary, `panels/action_log`, `dialogs/{batch_rename,action_editor}`, menus on the real service) — execution log
+
+* **Files.** `panels/{header,action_log}.rs` (new), `dialogs/{batch_rename,action_editor}.rs` (new),
+  `menus/mod.rs` (the 10b handover: `custom_specs` is `services::actions::for_context`, the private
+  `role_matches` placeholder is deleted, the `Extract`/`Properties` rows 13b left out are added, and the
+  "Rename batch" row is live), `app.rs` (the header, the two clocks in `logic`, the new `DialogKind`s /
+  `Answer`s, `in_batch`'s real source, `Command::Rename`'s two arms), `jobs_ui.rs` (`LogAppended` →
+  `LogPanel::mark_dirty`), `theme.rs` (11 new tokens), tests `action_log.rs` / `batch_rename.rs` /
+  `workspaces.rs` (680 tests, from 659). No new packages, no new dependencies.
+* **Header gap 1 (the step-8c review) is closed**, in the reference's order: `Workspace: <select>` ·
+  `New` · `Delete` · `Saved` chip · disk meter (`18.9 GiB free of 30.2 GiB`, `format_size`) · `History` ·
+  `2-Pane (F3)` · `4-Pane (F4)`, the chords being `KeyMap::hint`'s own spelling (D7). Two named
+  deviations: **the check mark is not drawn** — `✓` U+2713 has no face in the installed stack, which
+  rule 11's `every_glyph_the_shell_paints_has_a_face_in_the_installed_stack` test proved the moment it
+  was added (same finding as `⟳`/`⚠`), so the chip is a success-coloured bordered `Saved`; and the
+  meter says `GiB`, not Go's `GB`, because `disk_meter::format_size` is base-1024 (plan §5.8's own
+  spec). The plan's `craft_ui::layout::fit_toolbar` does not exist in the pinned rev, so the fit is
+  local: the *optional, non-interactive* members (boot note, disk text) are dropped before any control,
+  and `every_interactive_header_control_is_reachable_at_800_px` asserts the five clickable ones are in
+  the widget tree at 800 px. Pixel-level placement is still step 15's human gate.
+* **`ComboBox` is a `clippy::disallowed_types` item in this repo** (egui's popup cannot grow while
+  open), and the framework's replacement is `craft_ui::ComboBox`, whose `show_ui` returns
+  `InnerResponse<Option<R>>`. Neither names itself to the accessibility tree — the fork's ComboBox node
+  carries `current_text_value` and no label, exactly like its `TextEdit` — so every test harness that
+  draws the header now passes `with_accessibility_check(false)`. That is a real, recorded weakening of
+  the a11y guard, scoped to the one widget class.
+* **The workspace bar** owns `workspaces::Autosave` and the `SAVED_INDICATOR_TTL` chip clock, driven
+  from the same frame tick as `Persisted::autosave` (`ZenApp::tick_workspaces(now, dock_moved)`); the
+  dock JSON is re-serialised only when `dock::persist_pending` says it moved, so the per-frame cost is
+  one `Workspace` clone. Autosave writes the **reserved** name (Go's `autoSaveSession()` target); an
+  explicit `New` stores under a typed name, `Delete` asks first (a `Confirm`, D6), and `Restore`
+  replaces the grid, the pane's tabs and the active pane (`apply_workspace`).
+* **The action-log panel** is a `SidePanel` over `Session::log_query`, newest-first with `has_more`
+  paging, `↩ Undo` gated by `LogRow::can_revert`, and a source list that truncates behind a `more`
+  button. Refresh is **event + poll, never per frame**: `tick` re-reads only when `LogAppended` dirtied
+  it or `POLL_INTERVAL` elapsed, and it assigns (and so repaints) only when the page actually changed.
+  `revert` is `Session::revert(id, origin)` and both synchronous refusals surface in the panel's own
+  error strip *and* a toast, because the toast expires and a refusal should not.
+  **Deviation:** the row prints the record's trimmed RFC 3339 stamp, not Go's relative "2 minutes ago"
+  buckets — `zenman-ui` has no `chrono` edge and the no-new-packages rule keeps it that way.
+* **Batch rename.** The preview is recomputed **on input change only**, never per frame, and the dialog
+  counts the recomputes (`BatchRename::computes`) so the claim is testable: 12 idle frames change the
+  counter by zero. The 2 ms figure itself is 14a's `perf_batch_rename` (2.08–2.13 ms median, release,
+  gate 2.5 ms; ~4× in dev, gate 10 ms) — nothing in 14b changes it, and the dialog's own
+  per-keystroke use is the intended consumer of it. Kept-Go-bug parity is asserted out loud: the
+  `ext` box drops the extension, `case` means *ignore* case, a bad pattern is one panel-level message
+  with every target untouched, and the *first* claimant of a duplicate target wins (the later row is
+  the conflict) — Go's order, which also means "unchanged" beats "conflict" for a row that renames to
+  its own name. Apply goes through `Session::batch_rename` (one record, `DirChanged` reload); a
+  numbering checkbox switches the policy to `ConflictPolicy::Rename`, which is what makes 14a's second
+  pass reachable from the UI (`photo.jpg` + `photo (2).jpg`, asserted on disk).
+* **Action editor.** The seven golden fields, a live `substitute()` preview, an applicability line
+  built from `actions::for_context` + per-row `actions::matches` (the same predicates the menu uses, so
+  the two surfaces cannot disagree), and Save through `action_create`/`action_update`.
+  **The test-run gates, stated plainly:** (1) the action must already be **saved** — `exec_action`
+  resolves an id against the persisted config, so a draft cannot spawn anything; (2) every target must
+  resolve **inside the pane's own directory** (checked on the resolved `AbsPath`s, not on the
+  template); (3) the output goes to a capped toast. The integration proof is 14a's: the executor's
+  argv is asserted through a **recorder `Env`** in `contract_workspaces.rs` (`platform::stub` as the
+  base, no spawn), and no 14b test spawns a process either.
+* **Menus.** `custom_specs(actions, &ActionContext)` is the whole custom group now, so the `patterns`
+  half of Go's filter reaches the menu (`custom_actions_come_from_the_real_service_including_the_glob_
+  half`: a `files`-role `*.txt` action appears on the `.txt` row and not on the `.md` row — the
+  role-only placeholder could not tell those apart). `in_batch` is finally derived from real state
+  (>1 row selected, which is exactly Go's `triggerRename` branch), the batch row is enabled, and
+  `Command::Rename` routes 1 row to the in-cell editor and >1 to the dialog. The literal menu-shape
+  table was **updated, not deleted**: the archive group (`Properties`, `Extract here`) and the batch
+  row's new enabled flags are in it, and `expect()` grew the two new commands' rules — the
+  cross-product test still walks 3 targets × 128 bit combinations.
+* **Snapshots.** No new scenes (`05-action-log` / `06-batch-rename` skipped: the drawer and the
+  dialog are both asserted through the widget tree instead, and a scene that is only *rendered* buys
+  step 15 nothing it cannot render then). The three existing baselines **changed and were
+  regenerated** — the header is in every one of them, and step 14b is exactly the commit that fills
+  it in.
