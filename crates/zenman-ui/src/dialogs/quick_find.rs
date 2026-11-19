@@ -403,90 +403,111 @@ impl QuickFind {
                     }
                     if !self.results.is_empty() {
                         let row_h = tokens.row_height;
-                        ScrollArea::vertical()
-                            .auto_shrink([false, true])
-                            .max_height(row_h * LIST_ROWS)
-                            .show_rows(ui, row_h, self.results.len(), |ui, range| {
-                                let painter = ui.painter().clone();
-                                let font = tokens.font();
-                                for ix in range {
-                                    let hit = &self.results[ix];
-                                    let selected = self.cursor == Some(ix);
-                                    let (rect, resp) = ui.allocate_exact_size(
-                                        Vec2::new(ui.available_width(), row_h),
-                                        Sense::click(),
-                                    );
-                                    // Paint decoration only — the row's *one* interaction rect is the
-                                    // allocated one (plan §9.2 step 8's painting rule).
-                                    let [name_cell, path_cell, size_cell] = row_cells(rect, tokens);
-                                    // Paint decoration only — the row's *one* interaction rect is the
-                                    // allocated one (plan §9.2 step 8's painting rule) — and every cell
-                                    // is disjoint, so the name can never print over the path again
-                                    // (15c D6: `row-0000txt0000.txt`).
-                                    if selected {
-                                        painter.rect_filled(
-                                            rect,
-                                            CornerRadius::ZERO,
-                                            tokens.selected_row_bg,
-                                        );
-                                    } else if resp.hovered() {
-                                        painter.rect_filled(
-                                            rect,
-                                            CornerRadius::ZERO,
-                                            tokens.bg_hover,
-                                        );
-                                    }
-                                    let pad = tokens.cell_padding;
-                                    let name = hit.name().to_string();
-                                    painter.text(
-                                        name_cell.left_center() + Vec2::X * pad,
-                                        Align2::LEFT_CENTER,
-                                        fit_text(&name, name_cell.width() - pad * 2.0),
-                                        font.clone(),
-                                        tokens.text_main,
-                                    );
-                                    painter.text(
-                                        path_cell.left_center() + Vec2::X * pad,
-                                        Align2::LEFT_CENTER,
-                                        fit_text(
-                                            hit.rel_path.as_str(),
-                                            path_cell.width() - pad * 2.0,
-                                        ),
-                                        font.clone(),
-                                        tokens.text_muted,
-                                    );
-                                    let meta = if hit.is_dir() {
-                                        String::new()
-                                    } else {
-                                        format_size(u64::try_from(hit.entry.size).unwrap_or(0))
-                                    };
-                                    if !meta.is_empty() {
-                                        painter.text(
-                                            size_cell.right_center() - Vec2::X * pad,
-                                            Align2::RIGHT_CENTER,
-                                            meta,
-                                            font.clone(),
-                                            tokens.text_muted,
-                                        );
-                                    }
-                                    if resp.clicked() {
-                                        if resp.double_clicked() {
-                                            activated = Some(ix);
-                                        } else {
-                                            clicked = Some(ix);
+                        // 15c D6: the list owns a *reserved* band of LIST_ROWS rows. A ScrollArea
+                        // loose in a free-floating `Area` had nothing to measure against and realised
+                        // a single row; the band is placed by `in_rect` (the D2/D7/D12 cell idiom),
+                        // then reserved.
+                        let list_h = row_h * LIST_ROWS;
+                        let list_rect = Rect::from_min_size(
+                            ui.cursor().min,
+                            Vec2::new(ui.available_width(), list_h),
+                        );
+                        crate::widgets::in_rect(
+                            ui,
+                            list_rect,
+                            egui::Layout::top_down(egui::Align::LEFT),
+                            |ui| {
+                                ScrollArea::vertical()
+                                    .auto_shrink([false, false])
+                                    .max_height(list_h)
+                                    .show_rows(ui, row_h, self.results.len(), |ui, range| {
+                                        let painter = ui.painter().clone();
+                                        let font = tokens.font();
+                                        for ix in range {
+                                            let hit = &self.results[ix];
+                                            let selected = self.cursor == Some(ix);
+                                            let (rect, resp) = ui.allocate_exact_size(
+                                                Vec2::new(ui.available_width(), row_h),
+                                                Sense::click(),
+                                            );
+                                            // Paint decoration only — the row's *one* interaction rect is the
+                                            // allocated one (plan §9.2 step 8's painting rule).
+                                            let [name_cell, path_cell, size_cell] =
+                                                row_cells(rect, tokens);
+                                            // Paint decoration only — the row's *one* interaction rect is the
+                                            // allocated one (plan §9.2 step 8's painting rule) — and every cell
+                                            // is disjoint, so the name can never print over the path again
+                                            // (15c D6: `row-0000txt0000.txt`).
+                                            if selected {
+                                                painter.rect_filled(
+                                                    rect,
+                                                    CornerRadius::ZERO,
+                                                    tokens.selected_row_bg,
+                                                );
+                                            } else if resp.hovered() {
+                                                painter.rect_filled(
+                                                    rect,
+                                                    CornerRadius::ZERO,
+                                                    tokens.bg_hover,
+                                                );
+                                            }
+                                            let pad = tokens.cell_padding;
+                                            let name = hit.name().to_string();
+                                            painter.text(
+                                                name_cell.left_center() + Vec2::X * pad,
+                                                Align2::LEFT_CENTER,
+                                                fit_text(&name, name_cell.width() - pad * 2.0),
+                                                font.clone(),
+                                                tokens.text_main,
+                                            );
+                                            painter.text(
+                                                path_cell.left_center() + Vec2::X * pad,
+                                                Align2::LEFT_CENTER,
+                                                fit_text(
+                                                    hit.rel_path.as_str(),
+                                                    path_cell.width() - pad * 2.0,
+                                                ),
+                                                font.clone(),
+                                                tokens.text_muted,
+                                            );
+                                            let meta = if hit.is_dir() {
+                                                String::new()
+                                            } else {
+                                                format_size(
+                                                    u64::try_from(hit.entry.size).unwrap_or(0),
+                                                )
+                                            };
+                                            if !meta.is_empty() {
+                                                painter.text(
+                                                    size_cell.right_center() - Vec2::X * pad,
+                                                    Align2::RIGHT_CENTER,
+                                                    meta,
+                                                    font.clone(),
+                                                    tokens.text_muted,
+                                                );
+                                            }
+                                            if resp.clicked() {
+                                                if resp.double_clicked() {
+                                                    activated = Some(ix);
+                                                } else {
+                                                    clicked = Some(ix);
+                                                }
+                                            }
+                                            // One accessible node per row, named like the pane's own rows
+                                            // (`entry_row`'s pattern): it is what lets a test *count* the rows
+                                            // the list realised and compare their rects (15c D6).
+                                            let label = name.clone();
+                                            resp.widget_info(|| {
+                                                let mut info =
+                                                    egui::WidgetInfo::new(egui::Role::Button);
+                                                info.label = Some(label.as_str().into());
+                                                info
+                                            });
                                         }
-                                    }
-                                    // One accessible node per row, named like the pane's own rows
-                                    // (`entry_row`'s pattern): it is what lets a test *count* the rows
-                                    // the list realised and compare their rects (15c D6).
-                                    let label = name.clone();
-                                    resp.widget_info(|| {
-                                        let mut info = egui::WidgetInfo::new(egui::Role::Button);
-                                        info.label = Some(label.as_str().into());
-                                        info
                                     });
-                                }
-                            });
+                            },
+                        );
+                        ui.advance_cursor_after_rect(list_rect);
                     } else if show_empty {
                         // Go's `.quick-find-empty` line, verbatim (`quick-find.js:277`).
                         ui.label(
