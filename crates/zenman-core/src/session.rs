@@ -54,6 +54,7 @@ use crate::platform::env_probe::ProbeReport;
 use crate::services::dirs::{
     DirService, DirSizeOpts, DirSizeSink, DirSizeStat, FsSource, ListDir, OsDirRead,
 };
+use crate::services::search_live::{SearchAdmission, SearchLane, SearchQuery, SearchService};
 use crate::store::config::ZenConfig;
 
 // ------------------------------------------------------------------------------------- correlation
@@ -390,6 +391,12 @@ struct Inner {
     limits: Arc<Limits>,
     env: Arc<dyn Env>,
     dirs: Arc<DirService>,
+    /// The live-search walk service (plan §5.3 `services/search_live.rs`), over the same filesystem
+    /// seam as the listing service so one swap covers both.
+    search: Arc<SearchService>,
+    /// The "≤1 walk per 250 ms" lane (§7 step 11): the throttle, the job whose answer still counts and
+    /// the newest deferred request.
+    search_lane: Mutex<SearchLane>,
     jobs: Arc<JobRegistry>,
     log: Mutex<ActionLogStore>,
     /// The single connection (Go's `SetMaxOpenConns(1)`). `None` when [`StartupNote::DatabaseDisabled`].
@@ -476,7 +483,9 @@ impl Session {
             },
         };
 
-        let dirs = Arc::new(DirService::new(Arc::new(OsDirRead), Arc::clone(&limits)));
+        let source: Arc<dyn FsSource> = Arc::new(OsDirRead);
+        let dirs = Arc::new(DirService::new(Arc::clone(&source), Arc::clone(&limits)));
+        let search = Arc::new(SearchService::new(source, Arc::clone(&limits)));
         let session = Session {
             inner: Arc::new(Inner {
                 paths,
@@ -484,6 +493,8 @@ impl Session {
                 limits,
                 env,
                 dirs,
+                search,
+                search_lane: Mutex::new(SearchLane::default()),
                 jobs: Arc::new(JobRegistry::new()),
                 log: Mutex::new(log),
                 db: Mutex::new(db),
@@ -750,6 +761,154 @@ impl Session {
     #[must_use]
     pub fn cached_dir_sizes(&self, dirs: &[AbsPath]) -> Vec<Option<DirSizeStat>> {
         self.inner.dirs.cached_sizes(dirs)
+    }
+
+    // ------------------------------------------------------------------------------------ live search
+
+    /// Search the filesystem live (§4.1's `search_live`, plan §5.3 `services/search_live.rs`, §7 step 11).
+    ///
+    /// Three rules are encoded here rather than left to the caller:
+    ///
+    /// * **a pattern that does not compile is refused now**, before a job slot is spent — the answer is
+    ///   [`CoreError::BadRegex`] with Go's own message, which is what step 11b shows inline.
+    /// * **at most one walk per [`SearchThrottle::window`]** (§7 step 11's cadence). A refused request is
+    ///   not dropped: it is remembered and starts itself from [`Self::poll`] when the window closes, so
+    ///   the newest keystroke always wins and nobody has to keep a timer.
+    /// * **starting a walk supersedes the previous one**, whose job is cancelled and whose rows are
+    ///   therefore never emitted (see [`crate::events::EngineEvent::SearchReady`]).
+    ///
+    /// The rows arrive as `SearchReady { origin, job, result }`; `result` carries the query, so a pane
+    /// that reused an origin can still tell an old answer from a new one.
+    ///
+    /// # Errors
+    /// [`CoreError::BadRegex`] for an unparseable pattern. Everything else — a missing scope, a denied
+    /// directory, an I/O failure — arrives on the job's terminal event, as for any other job.
+    pub fn search_live(
+        &self,
+        req: &SearchQuery,
+        origin: Origin,
+    ) -> Result<SearchAdmission, CoreError> {
+        self.search_live_at(req, origin, std::time::Instant::now())
+    }
+
+    /// [`Self::search_live`] with an injectable clock, so the 250 ms boundary is *asserted* at 249 ms and
+    /// 250 ms rather than slept on (the same reason [`crate::jobs::JobRegistry::poll_at`] exists).
+    ///
+    /// # Errors
+    /// As [`Self::search_live`].
+    pub fn search_live_at(
+        &self,
+        req: &SearchQuery,
+        origin: Origin,
+        now: std::time::Instant,
+    ) -> Result<SearchAdmission, CoreError> {
+        req.matcher()?;
+        let after = {
+            let lane = self.inner.search_lane.lock();
+            let mut lane = lane.unwrap_or_else(std::sync::PoisonError::into_inner);
+            match lane.throttle().try_acquire_at(now) {
+                Err(after) => {
+                    let due = now.checked_add(after).unwrap_or(now);
+                    lane.defer(req.clone(), origin, due);
+                    Some(after)
+                }
+                Ok(()) => None,
+            }
+        };
+        if let Some(after) = after {
+            return Ok(SearchAdmission::Deferred { origin, after });
+        }
+        Ok(SearchAdmission::Running {
+            job: self.start_search(req.clone(), origin),
+            origin,
+        })
+    }
+
+    /// The cadence in force (§7 step 11: 250 ms).
+    #[must_use]
+    pub fn search_window(&self) -> Duration {
+        self.inner
+            .search_lane
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .window()
+    }
+
+    /// The job whose rows still count, `None` when no search has been accepted yet.
+    #[must_use]
+    pub fn live_search(&self) -> Option<JobId> {
+        self.inner
+            .search_lane
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .live()
+    }
+
+    /// The request the throttle is still holding, if any — what a pane shows as "still typing".
+    #[must_use]
+    pub fn pending_search(&self) -> Option<SearchQuery> {
+        self.inner
+            .search_lane
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .deferred()
+            .map(|d| d.query.clone())
+    }
+
+    /// Forget the throttle window (a new search box, a new scope: not "more typing in the same box").
+    pub fn reset_search_throttle(&self) {
+        self.inner
+            .search_lane
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .throttle()
+            .reset();
+    }
+
+    /// Start a walk, cancelling the one it supersedes. The lane is updated *after* `attach`, so the
+    /// registry's `JobStarted` and the lane's `live` agree by construction.
+    fn start_search(&self, req: SearchQuery, origin: Origin) -> JobId {
+        if let Some(prev) = self.live_search() {
+            self.inner.jobs.cancel(prev);
+        }
+        let svc = Arc::clone(&self.inner.search);
+        let label = format!("Search {:?} in {}", req.query, req.scope.to_string_lossy());
+        let spec = JobSpec::new(
+            self.inner.jobs.next_id(),
+            JobKind::SearchLive,
+            label,
+            origin,
+        );
+        let id = spec.id;
+        self.inner.jobs.attach(spec, move |cancel, _progress| {
+            let results = svc.search(&req, cancel)?;
+            Ok(JobResult::done(
+                results.clone(),
+                format!("{} hit(s)", results.len()),
+            ))
+        });
+        let mut lane = self
+            .inner
+            .search_lane
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        lane.mark_started(id);
+        id
+    }
+
+    /// Start the deferred request once its window has closed (`poll`'s first step).
+    fn promote_due_search(&self, now: std::time::Instant) {
+        let due = {
+            let mut lane = self
+                .inner
+                .search_lane
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            lane.take_due(now).map(|d| (d.query, d.origin))
+        };
+        if let Some((query, origin)) = due {
+            self.start_search(query, origin);
+        }
     }
 
     // ------------------------------------------------------------------------------------- the write path
@@ -1353,6 +1512,8 @@ impl Session {
         if self.inner.jobs.has_live()
             || !self.events_are_queued()
             || self.inner.dirs.has_pending_invalidations()
+            // A deferred search has to be started by a `poll`, so the frame has to happen (§7 step 11).
+            || self.pending_search().is_some()
         {
             Some(Duration::from_millis(16))
         } else {
@@ -1366,7 +1527,14 @@ impl Session {
     ///
     /// Non-blocking by construction — see `JobRegistry::poll_at`.
     pub fn poll(&mut self) -> Vec<EngineEvent> {
-        let mut out = self.inner.jobs.poll();
+        self.poll_at(std::time::Instant::now())
+    }
+
+    /// [`Self::poll`] with an injectable clock: the deferred search's 250 ms deadline is evaluated at
+    /// `now`, which is what makes the boundary testable exactly.
+    pub fn poll_at(&mut self, now: std::time::Instant) -> Vec<EngineEvent> {
+        self.promote_due_search(now);
+        let mut out = self.inner.jobs.poll_at(now);
         // The broadcast half, collected first so the loop below is not mutating what it is reading:
         // every row showing this directory gets the number, not only the widget that asked
         // (plan §4.1's `DirSizeReady`).
@@ -1402,6 +1570,33 @@ impl Session {
             })
             .collect();
         out.extend(pages);
+        // A live search's rows go to the pane that asked, and only for the search the session still
+        // considers live: a superseded or cancelled walk produced nothing worth delivering (§7 step 11).
+        let searches: Vec<EngineEvent> = out
+            .iter()
+            .filter_map(|ev| match ev {
+                EngineEvent::JobFinished {
+                    id,
+                    origin,
+                    payload: crate::events::JobPayload::SearchHits(result),
+                    ..
+                } => {
+                    let current = self
+                        .inner
+                        .search_lane
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .is_current(*id);
+                    current.then(|| EngineEvent::SearchReady {
+                        origin: *origin,
+                        job: *id,
+                        result: Arc::clone(result),
+                    })
+                }
+                _ => None,
+            })
+            .collect();
+        out.extend(searches);
         // A paste that did not do everything it was asked is the one job result the core insists the UI
         // show: Go returned the skipped list in the response body and the browser dropped it on the floor
         // (ledger #9, plan F12). It arrives as a notice so the toast exists even when nobody kept the

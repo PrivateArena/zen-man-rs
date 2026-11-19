@@ -27,6 +27,7 @@ use crate::ops::delete::DeleteReport;
 use crate::ops::paste::PasteReport;
 use crate::path::AbsPath;
 use crate::services::dirs::DirSizeStat;
+use crate::services::search_live::SearchResults;
 use crate::session::Origin;
 
 /// Everything the engine may tell the UI. `Clone` because one event can feed several listeners (the
@@ -79,6 +80,18 @@ pub enum EngineEvent {
         path: crate::path::FsPath,
         /// The page.
         page: Arc<DirPage>,
+    },
+    /// The rows a live search produced, addressed to the widget that asked (plan §4.1's `DirPageReady`
+    /// precedent, §7 step 11). The session emits this **only** for the search it still considers live: a
+    /// superseded or cancelled walk emits its terminal `JobFinished` and nothing else, so a stale
+    /// keystroke can never repaint a quick-find list.
+    SearchReady {
+        /// Who asked (plan §4.3's correlation rule — nothing looks a result up by path alone).
+        origin: Origin,
+        /// The job that produced it, which is the `Receipt::Running` half the caller kept.
+        job: JobId,
+        /// The rows, the walk status, and the query that produced them.
+        result: Arc<SearchResults>,
     },
     /// The asynchronous answer to `dir_size`, keyed by path and broadcast to every row showing it.
     DirSizeReady {
@@ -133,7 +146,8 @@ impl EngineEvent {
             Self::JobStarted { origin, .. }
             | Self::JobProgress { origin, .. }
             | Self::JobFinished { origin, .. }
-            | Self::DirPageReady { origin, .. } => Some(*origin),
+            | Self::DirPageReady { origin, .. }
+            | Self::SearchReady { origin, .. } => Some(*origin),
             Self::DirChanged { origin, .. } => *origin,
             Self::DirSizeReady { .. }
             | Self::IndexChanged { .. }
@@ -149,7 +163,8 @@ impl EngineEvent {
         match self {
             Self::JobStarted { id, .. }
             | Self::JobProgress { id, .. }
-            | Self::JobFinished { id, .. } => Some(*id),
+            | Self::JobFinished { id, .. }
+            | Self::SearchReady { job: id, .. } => Some(*id),
             _ => None,
         }
     }
@@ -195,8 +210,9 @@ pub enum JobPayload {
     Revert(crate::history::revert::RevertReport),
     /// A completed size walk (`JobKind::DirSize`).
     DirSize(DirSizeStat),
-    /// Live search hits (`JobKind::SearchLive`).
-    Search(SearchSummary),
+    /// The rows a live search produced (`JobKind::SearchLive`), with the request and the walk status
+    /// inside, so the answer is self-describing (plan §5.3's `SearchHit` rows, §7 step 11).
+    SearchHits(Arc<SearchResults>),
     /// Archive extraction (`JobKind::Extract`).
     Extract(ExtractSummary),
     /// Index rebuild (`JobKind::IndexRebuild`).
@@ -242,6 +258,15 @@ impl JobPayload {
         }
     }
 
+    /// The `SearchResults` payload, when that is what this is.
+    #[must_use]
+    pub fn search_hits(&self) -> Option<&Arc<SearchResults>> {
+        match self {
+            Self::SearchHits(r) => Some(r),
+            _ => None,
+        }
+    }
+
     /// The `RevertReport` payload, when that is what this is.
     #[must_use]
     pub fn revert(&self) -> Option<&crate::history::revert::RevertReport> {
@@ -282,6 +307,18 @@ impl From<Arc<DirPage>> for JobPayload {
     }
 }
 
+impl From<SearchResults> for JobPayload {
+    fn from(value: SearchResults) -> Self {
+        Self::SearchHits(Arc::new(value))
+    }
+}
+
+impl From<Arc<SearchResults>> for JobPayload {
+    fn from(value: Arc<SearchResults>) -> Self {
+        Self::SearchHits(value)
+    }
+}
+
 impl From<DirSizeStat> for JobPayload {
     fn from(value: DirSizeStat) -> Self {
         Self::DirSize(value)
@@ -292,18 +329,6 @@ impl From<()> for JobPayload {
     fn from(_: ()) -> Self {
         Self::None
     }
-}
-
-/// What a live search produced. Step 11 replaces the hit rows with its own `SearchHit`; the shape the
-/// UI needs *now* is "how many, and were we cut off".
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct SearchSummary {
-    /// Hits collected.
-    pub hits: usize,
-    /// The result limit was reached before the walk ended (plan §5.3 `live_search_cap`).
-    pub truncated: bool,
-    /// Directories visited.
-    pub nodes_seen: usize,
 }
 
 /// What an extract produced (plan §5.5 `ExtractState`, whose byte counters are the same ones but

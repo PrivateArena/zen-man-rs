@@ -237,6 +237,10 @@ pub fn route(jobs: &mut JobsUi, model: &mut AppModel, event: EngineEvent) -> Rou
             };
             notices.push((mapped, message));
         }
+        // Step 11a's search rows are addressed to a dialog, not to a tab: `dialogs/quick_find` (step 11b)
+        // consumes them where it owns the `Origin`, and the jobs strip has already stopped its spinner on
+        // the terminal `JobFinished`, so routing them here would be a second owner for one answer.
+        EngineEvent::SearchReady { .. } => {}
         EngineEvent::DirSizeReady { .. }
         | EngineEvent::IndexChanged { .. }
         | EngineEvent::LogAppended { .. } => {

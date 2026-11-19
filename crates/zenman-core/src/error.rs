@@ -92,6 +92,19 @@ pub enum CoreError {
     #[error("Invalid permission mode: {raw}")]
     InvalidMode { raw: String },
 
+    /// `api/search.go:83-86` → `{"error": "Invalid regex: %v"}` (HTTP 400), where `%v` is Go's
+    /// `regexp/syntax` text (`err-search-bad-regex.json`). Plan §5.3's `search_live` row asks for an
+    /// "`InvalidPath`-shaped" error rather than a 500; a pattern is not a path, so this is the same
+    /// *class* of typed input rejection with its own variant. `reason` carries Go's message verbatim,
+    /// which is what lets the step-11 dialog show the same words the Go frontend showed.
+    #[error("Invalid regex: {reason}")]
+    BadRegex {
+        /// The pattern as typed, so the caller can point at the offending box.
+        pattern: String,
+        /// Go's `error parsing regexp: …` detail.
+        reason: String,
+    },
+
     /// Nothing to work on. Go had two prose messages for this and no sentinel: `"No files selected"`
     /// (`api/ops.go:146`, HTTP 400) and `"folder is empty, nothing to copy/cut"` (`api/ops.go:207`,
     /// 500 via the error return). One variant with a `what` noun covers both, and the display text is
@@ -243,6 +256,7 @@ impl CoreError {
             Self::VfsReadOnly { .. } => "vfs_readonly",
             Self::InvalidPath { .. } => "invalid_path",
             Self::InvalidMode { .. } => "invalid_mode",
+            Self::BadRegex { .. } => "bad_regex",
             Self::Empty { .. } => "empty",
             Self::DestInsideSource { .. } => "dest_inside_source",
             Self::Conflict { .. } => "conflict",
@@ -289,6 +303,7 @@ impl CoreError {
             Self::VfsReadOnly { .. } => 405,
             Self::InvalidPath { .. } => 400,
             Self::InvalidMode { .. } => 400,
+            Self::BadRegex { .. } => 400,
             // Both new variants are request-shape rejections, i.e. Go's 400 class. `Empty` was literally
             // a 400 for the "No files selected" branch (`api/ops.go:146`); the "folder is empty" branch
             // rode the error return to a 500, which was never the intent of the message.
