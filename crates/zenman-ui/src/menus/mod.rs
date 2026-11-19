@@ -321,7 +321,9 @@ pub fn file_menu(ctx: &MenuContext, actions: &[CustomAction]) -> Vec<Vec<MenuSpe
                 item(Command::CopyPath, selection, Some("document")),
                 item(Command::CopyName, selection, Some("file")),
             ]);
-            groups.push(vec![rename]);
+            // Go's `Change Permissions` row sits directly under Rename (`context-menu.js:105-107`),
+            // in the same block — 10b left it out, and 10c gives it the prompt it was missing.
+            groups.push(vec![rename, item(Command::Chmod, selection_writable, None)]);
             groups.push(custom);
             groups.push(vec![
                 danger(Command::Delete, selection_writable),
@@ -833,6 +835,9 @@ mod tests {
             Command::Copy | Command::CopyPath | Command::CopyName => {
                 (!background).then_some(ctx.has_selection)
             }
+            // Go's `Change Permissions` row (`context-menu.js:105-107`) sits with Rename and needs the
+            // same thing: a selection whose mode to change.
+            Command::Chmod => (!background).then_some(ctx.has_selection && writable),
             _ => None,
         }
     }
@@ -999,12 +1004,12 @@ mod tests {
             (
                 "0x00 row(dir)",
                 row(0x00, true),
-                "Open in new tab-, Copy inside-, Cut inside-, Paste inside- | Open- | Cut-, Copy-, Copy path-, Copy name- | Rename- | Move to trash-, Delete permanently-",
+                "Open in new tab-, Copy inside-, Cut inside-, Paste inside- | Open- | Cut-, Copy-, Copy path-, Copy name- | Rename-, Change permissions- | Move to trash-, Delete permanently-",
             ),
             (
                 "0x00 row(file)",
                 row(0x00, false),
-                "Open- | Cut-, Copy-, Copy path-, Copy name- | Rename- | Move to trash-, Delete permanently-",
+                "Open- | Cut-, Copy-, Copy path-, Copy name- | Rename-, Change permissions- | Move to trash-, Delete permanently-",
             ),
             (
                 "0x00 background",
@@ -1021,19 +1026,19 @@ mod tests {
             (
                 "0x01 row(file)",
                 row(0x01, false),
-                "Open+ | Cut+, Copy+, Copy path+, Copy name+ | Rename+ | Move to trash+, Delete permanently+",
+                "Open+ | Cut+, Copy+, Copy path+, Copy name+ | Rename+, Change permissions+ | Move to trash+, Delete permanently+",
             ),
             // the same row when it is a directory: Go's top block appears above Open
             (
                 "0x01+0x02 row(dir)",
                 row(0x01 | 0x02, true),
-                "Open in new tab+, Copy inside+, Cut inside+, Paste inside- | Open+ | Cut+, Copy+, Copy path+, Copy name+ | Rename+ | Move to trash+, Delete permanently+",
+                "Open in new tab+, Copy inside+, Cut inside+, Paste inside- | Open+ | Cut+, Copy+, Copy path+, Copy name+ | Rename+, Change permissions+ | Move to trash+, Delete permanently+",
             ),
             // a read-only store: every write is greyed, every read is not (Go offered Delete here)
             (
                 "0x01+0x10 row(file)",
                 row(0x01 | 0x10, false),
-                "Open+ | Cut-, Copy+, Copy path+, Copy name+ | Rename- | Move to trash-, Delete permanently-",
+                "Open+ | Cut-, Copy+, Copy path+, Copy name+ | Rename-, Change permissions- | Move to trash-, Delete permanently-",
             ),
             (
                 "0x04+0x10 background",
@@ -1044,7 +1049,7 @@ mod tests {
             (
                 "0x01+0x40 row(file)",
                 row(0x01 | 0x40, false),
-                "Open+ | Cut+, Copy+, Copy path+, Copy name+ | Rename batch- | Move to trash+, Delete permanently+",
+                "Open+ | Cut+, Copy+, Copy path+, Copy name+ | Rename batch-, Change permissions+ | Move to trash+, Delete permanently+",
             ),
             // everything true at once
             // every flag at once: the archive half *wins* the writes, and the batch half renames
@@ -1052,7 +1057,7 @@ mod tests {
             (
                 "0x7f row(dir)",
                 row(0x7f, true),
-                "Open in new tab+, Copy inside-, Cut inside-, Paste inside- | Open+ | Cut-, Copy+, Copy path+, Copy name+ | Rename batch- | Move to trash-, Delete permanently-",
+                "Open in new tab+, Copy inside-, Cut inside-, Paste inside- | Open+ | Cut-, Copy+, Copy path+, Copy name+ | Rename batch-, Change permissions- | Move to trash-, Delete permanently-",
             ),
             (
                 "0x7f background",
@@ -1063,7 +1068,7 @@ mod tests {
             (
                 "0x6f row(dir)",
                 row(0x6f, true),
-                "Open in new tab+, Copy inside+, Cut inside+, Paste inside+ | Open+ | Cut+, Copy+, Copy path+, Copy name+ | Rename batch- | Move to trash+, Delete permanently+",
+                "Open in new tab+, Copy inside+, Cut inside+, Paste inside+ | Open+ | Cut+, Copy+, Copy path+, Copy name+ | Rename batch-, Change permissions+ | Move to trash+, Delete permanently+",
             ),
             (
                 "0x6f background",

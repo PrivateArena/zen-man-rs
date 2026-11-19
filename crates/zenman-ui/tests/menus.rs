@@ -246,6 +246,7 @@ fn right_clicking_a_row_opens_go_row_menu_with_the_keymaps_hints() {
             "Copy path",
             "Copy name",
             "Rename",
+            "Change permissions",
             "Move to trash",
             "Delete permanently",
         ],
@@ -260,6 +261,7 @@ fn right_clicking_a_row_opens_go_row_menu_with_the_keymaps_hints() {
             "Copy path",
             "Copy name",
             "Rename",
+            "Change permissions",
             "Move to trash",
             "Delete permanently"
         ],
@@ -302,6 +304,7 @@ fn right_clicking_a_directory_row_adds_go_directory_block() {
             "Copy path",
             "Copy name",
             "Rename",
+            "Change permissions",
             "Move to trash",
             "Delete permanently",
         ],

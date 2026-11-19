@@ -19,16 +19,23 @@ use std::sync::Arc;
 use zenman_core::error::CoreError;
 use zenman_core::events::ChangeCause;
 use zenman_core::jobs::JobId;
+use zenman_core::mode::ModeBits;
 use zenman_core::ops::ConflictPolicy;
+use zenman_core::ops::chmod::ChmodReq;
 use zenman_core::ops::clipboard::{ClipOp, ClipScope, ClipboardStore};
-use zenman_core::ops::delete::DeleteReq;
+use zenman_core::ops::delete::{DeleteMode, DeleteReq};
+use zenman_core::ops::mkdir::MkdirReq;
 use zenman_core::ops::paste::{PasteMode, PasteReq};
+use zenman_core::ops::rename::RenameReq;
 use zenman_core::path::{AbsPath, FsPath};
 use zenman_core::services::dirs::ListDir;
 use zenman_core::session::Origin;
 use zenman_core::session::{Receipt, Session, StartupNote};
 use zenman_core::store::config::{LayoutMode, PaneSlot, ThemeMode};
 
+use crate::dialogs::{
+    self, Answer, Choice, Confirm, ConfirmButton, DialogKind, Prompt, Validation,
+};
 use crate::dock::{self, Dock};
 use crate::jobs_ui::JobsUi;
 use crate::keymap::{Command, KeyMap};
@@ -88,9 +95,14 @@ pub struct ZenApp {
     /// The keymap — **the** single source of truth for dispatch and for the menu hints 10b draws
     /// (plan D7).
     pub keys: KeyMap,
-    /// The pane whose <kbd>Ctrl+Shift+N</kbd> is waiting for step 10c's name prompt
-    /// (`Session::mkdir` needs a name, and inventing one is not an option).
+    /// The pane whose <kbd>Ctrl+Shift+N</kbd> armed the name prompt. It stays set while the prompt
+    /// is up, which is what lets a second <kbd>Ctrl+Shift+N</kbd> be an honest no-op instead of a
+    /// second dialog.
     pub new_folder_request: Option<PaneSlot>,
+    /// The modal stack (step 10c): one prompt or one confirm, and its answer is a command.
+    pub dialogs: dialogs::Dialogs,
+    /// The file drag in flight (step 10c, `drag_drop`): `None` when the pointer is not dragging rows.
+    pub drag: Option<crate::drag_drop::DragPayload>,
     /// When the next debounced persist is due (plan §5.7 `persist_at`).
     pub persist_at: Option<Instant>,
     /// The last frame's start, for the step-8 `perf_frame` budget check.
@@ -119,6 +131,8 @@ impl ZenApp {
             menu: None,
             keys: KeyMap::default(),
             new_folder_request: None,
+            dialogs: dialogs::Dialogs::default(),
+            drag: None,
             persist_at: None,
             last_frame: Instant::now(),
         }
@@ -143,6 +157,8 @@ impl ZenApp {
             menu: None,
             keys: KeyMap::default(),
             new_folder_request: None,
+            dialogs: dialogs::Dialogs::default(),
+            drag: None,
             persist_at: None,
             last_frame: Instant::now(),
         };
@@ -429,6 +445,16 @@ impl ZenApp {
                     pane.active = pane.active.min(pane.tabs.len().saturating_sub(1));
                 }
             }
+            PaneCommand::BeginDrag { ix } => self.begin_drag(slot, ix),
+            PaneCommand::DropInto { ix, copy } => self.drop_into_row(slot, ix, copy),
+            PaneCommand::DropOnBackground { copy } => self.drop_into_pane(slot, copy),
+            PaneCommand::CommitRename { ix, name } => self.commit_rename(slot, ix, name),
+            PaneCommand::CancelRename => {
+                if let Some(tab) = self.tab_mut_of(slot) {
+                    tab.rename_target = None;
+                    tab.rename_editor = None;
+                }
+            }
             PaneCommand::SelectAll | PaneCommand::SelectNone => {
                 if let Some(tab) = self.tab_mut_of(slot) {
                     let keys: Vec<String> = tab
@@ -446,6 +472,135 @@ impl ZenApp {
                 }
             }
         }
+    }
+
+    // ------------------------------------------------------------------------ drag & drop (10c)
+
+    /// Go's `dragstart` (`file-list.js:299-306`): a row outside the selection *replaces* it, and the
+    /// payload is the selection, not the row. The mode is the clipboard's own op, which is what makes a
+    /// Go drag "paste the clipboard into that folder" rather than a copy of what was grabbed.
+    fn begin_drag(&mut self, slot: PaneSlot, ix: usize) {
+        let paths = {
+            let Some(tab) = self.shown_tab(slot) else {
+                return;
+            };
+            let Some(entry) = tab.entries.entries.get(ix) else {
+                return;
+            };
+            let key = Tab::row_key(entry);
+            if tab.sel.contains(key) {
+                self.selection_abs(slot)
+            } else {
+                tab.row_abs(entry)
+                    .map(|path| vec![path])
+                    .unwrap_or_default()
+            }
+        };
+        if paths.is_empty() {
+            return;
+        }
+        let mode = crate::drag_drop::grab_mode(self.session.clipboard().as_ref());
+        self.drag = Some(crate::drag_drop::DragPayload {
+            source: slot,
+            paths,
+            mode,
+        });
+    }
+
+    /// The payload the release means, taken out of the app before the frame's end clears it.
+    fn take_drag(&mut self, copy: bool) -> Option<crate::drag_drop::DragPayload> {
+        let mut payload = self.drag.take()?;
+        if copy {
+            payload.mode = crate::drag_drop::DragMode::Copy;
+        }
+        Some(payload)
+    }
+
+    /// A drop on a directory row: Go's `executeFileOp('paste', sources, path)` (`file-list.js:320-330`).
+    fn drop_into_row(&mut self, slot: PaneSlot, ix: usize, copy: bool) {
+        let Some(payload) = self.take_drag(copy) else {
+            return;
+        };
+        let Some(entry) = self
+            .tab_mut_of(slot)
+            .and_then(|tab| tab.entries.entries.get(ix).cloned())
+        else {
+            return;
+        };
+        if !entry.is_dir {
+            // Unreachable through the pane, which only offers directory rows — but `PaneCommand` is a
+            // public seam, and a drop on a file must be refused out loud, not pasted next to it.
+            self.notices.post(
+                toast::Level::Warning,
+                format!("drop: {} is not a folder", entry.name),
+            );
+            return;
+        }
+        let Some(dest) = self.shown_tab(slot).and_then(|tab| tab.row_abs(&entry)) else {
+            return;
+        };
+        self.drop_paste(&payload, slot, dest, payload.mode);
+    }
+
+    /// A drop on a pane's own background — `DropIntent::PasteInto{pane}`, into the directory it shows.
+    fn drop_into_pane(&mut self, slot: PaneSlot, copy: bool) {
+        let Some(payload) = self.take_drag(copy) else {
+            return;
+        };
+        let Some(dest) = self.shown_dir_abs(slot) else {
+            self.no_directory(Command::Paste);
+            return;
+        };
+        self.drop_paste(&payload, slot, dest, payload.mode);
+    }
+
+    /// A drop the *dock* routed at a pane body rather than the pane's own rows (`DockContent`'s half of
+    /// the seam, which the file drag does not normally reach).
+    pub fn drop_from_dock(&mut self, slot: PaneSlot) {
+        self.drop_into_pane(slot, false);
+    }
+
+    /// The drop's paste, behind the same collision pre-flight the clipboard chords run — so a drop can
+    /// never clobber silently either.
+    pub fn drop_paste(
+        &mut self,
+        payload: &crate::drag_drop::DragPayload,
+        slot: PaneSlot,
+        dest: AbsPath,
+        mode: crate::drag_drop::DragMode,
+    ) {
+        let conflicts = self.paste_conflicts(&dest, &payload.paths);
+        let same_dir = payload
+            .paths
+            .first()
+            .and_then(|path| path.as_path().parent())
+            .is_some_and(|parent| parent == dest.as_path());
+        if same_dir && conflicts.is_empty() {
+            // Dropping rows back into their own directory: Go performed the no-op happily, core refuses
+            // it (plan F11), and the refusal is worth hearing rather than watching nothing happen.
+            self.notices.post(
+                toast::Level::Info,
+                format!("{}: already there", mode.word().to_lowercase()),
+            );
+            return;
+        }
+        if !conflicts.is_empty() {
+            self.open_paste_conflict_confirm(
+                slot,
+                dest,
+                Some(mode.paste_mode()),
+                payload.paths.clone(),
+                conflicts,
+            );
+            return;
+        }
+        self.run_paste_with(
+            slot,
+            dest,
+            Some(mode.paste_mode()),
+            &payload.paths,
+            ConflictPolicy::SkipExisting,
+        );
     }
 
     /// File the active tab's selection under its directory (plan §4.3's `sel_by_path`).
@@ -572,6 +727,25 @@ impl ZenApp {
         // wins hover and click (plan §9.2 step 8), so the menu is drawn after every panel, the dock
         // and the toast stack, and nothing can steal its rows.
         self.draw_menu(ui.ctx());
+        // **Last**, above the menu: a modal is the only thing on screen that may answer a key, and
+        // `handle_keys` has already stood down for it. Its answers run here, after the draw, exactly
+        // like the pane commands — a dialog never touches the engine itself.
+        let answers = self.dialogs.show(ui, &self.tokens);
+        for answer in answers {
+            self.answer(answer);
+        }
+        // The drag ghost, on the foreground layer, paint-only: it must never claim a click from the row
+        // under the pointer (`drag_drop::paint_ghost`).
+        if let Some(payload) = self.drag.clone()
+            && let Some(at) = ui.ctx().pointer_hover_pos()
+        {
+            crate::drag_drop::paint_ghost(ui, &self.tokens, &payload, at);
+        }
+        // The button came up: whatever did not claim the release this frame never will. The targets ran
+        // first (they `take` the payload), so this is the "dropped on nothing" case.
+        if ui.ctx().input(|i| i.pointer.any_released()) {
+            self.drag = None;
+        }
     }
 
     /// The 48 px header (plan §2.2: an `egui::TopBottomPanel`, *not* a dock panel — `Side` has no
@@ -949,7 +1123,12 @@ impl ZenApp {
     /// (`action-log-init.js:16`) safe to bind. A dock float that owns typing is skipped too — its
     /// keys belong to it ([`crate::dock_content::forward_window_keys`], plan F16).
     pub fn handle_keys(&mut self, ctx: &egui::Context) {
-        if ctx.text_edit_focused() || craft_ui::docking::typing_window(ctx).is_some() {
+        if ctx.text_edit_focused()
+            || craft_ui::docking::typing_window(ctx).is_some()
+            || self.dialogs.is_open()
+        {
+            // Plan **F15**, in all three of its shapes: a text field (the address bar, the in-cell
+            // rename) owns the keys, a dock float owns its own, and a modal owns everything.
             return;
         }
         let commands = ctx.input(|input| self.keys.lookup_events(&input.events));
@@ -1072,34 +1251,11 @@ impl ZenApp {
                 None => self.no_directory(command),
             },
             Command::Delete => self.run_delete(slot),
-            Command::PermanentDelete => {
-                // Plan **D6**: a permanent delete needs the user's answer, and the dialog that asks
-                // it is step 10c's. Until that exists the only honest channel is this toast, and
-                // nothing is destroyed. Recorded as a gap in plan §9.2's step-10a row.
-                let count = self.selection_abs(slot).len();
-                self.notices.post(
-                    toast::Level::Warning,
-                    if count == 0 {
-                        "delete permanently: nothing selected".to_string()
-                    } else {
-                        format!(
-                            "delete permanently: {count} item(s) need the confirmation dialog \
-                             (step 10c) — nothing was deleted"
-                        )
-                    },
-                );
-            }
+            Command::Chmod => self.open_chmod_prompt(slot),
+            Command::PermanentDelete => self.open_permanent_delete_confirm(slot),
             Command::Rename => self.start_rename(slot),
             Command::Open => self.open_selection(slot),
-            Command::NewFolder => {
-                // `Session::mkdir` needs a name; Go asked for it with `window.prompt`, and the real
-                // prompt is step 10c's, so the request is recorded and said out loud.
-                self.new_folder_request = Some(slot);
-                self.notices.post(
-                    toast::Level::Info,
-                    "new folder: the name prompt arrives with step 10c",
-                );
-            }
+            Command::NewFolder => self.open_new_folder_prompt(slot),
             Command::QuickFind => self.notices.post(
                 toast::Level::Info,
                 "quick find arrives with step 11 (`dialogs/quick_find.rs`)",
@@ -1206,6 +1362,447 @@ impl ZenApp {
             toast::Level::Warning,
             format!("{}: this tab lists no local directory", command.label()),
         );
+    }
+
+    // --------------------------------------------------------------------------- dialogs (10c)
+
+    /// Put a modal up. The context menu comes down first: two foreground layers that both answer the
+    /// pointer is how step 10b's overlapping-rect repaint was born, and a dialog is modal in Go's own
+    /// sense — `window.prompt` took the whole page down with it.
+    fn open_dialog(&mut self, dialog: dialogs::Dialog) -> bool {
+        if self.dialogs.is_open() {
+            self.notices
+                .post(toast::Level::Warning, "a dialog is already open");
+            return false;
+        }
+        self.menu = None;
+        self.context_request = None;
+        self.dialogs.open(dialog)
+    }
+
+    /// The loaded listing's names — the fast "that name is taken" list the prompts show. The engine's
+    /// guard stays the authority; this only saves a round trip on the common case.
+    fn shown_names(&self, slot: PaneSlot) -> Vec<String> {
+        self.shown_tab(slot)
+            .map(|tab| {
+                tab.entries
+                    .entries
+                    .iter()
+                    .map(|entry| entry.name.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Go's `prompt('Enter new folder name:', 'New Folder')` (`context-menu.js:548-549`).
+    fn open_new_folder_prompt(&mut self, slot: PaneSlot) {
+        self.new_folder_request = Some(slot);
+        let mut prompt = Prompt::new(
+            DialogKind::NewFolder { slot },
+            "New folder",
+            "Enter new folder name:",
+            "New Folder",
+            "Create",
+            Validation::Name,
+        );
+        prompt.taken = self.shown_names(slot);
+        prompt.select = Some("New Folder".len());
+        self.open_dialog(dialogs::Dialog::Prompt(prompt));
+    }
+
+    /// Go's `triggerChmod` prompt (`context-menu.js:475-490`), message and default included. Go
+    /// seeded it with the literal `'755'`; the port seeds it with the selected row's **own** mode, in
+    /// the octal spelling [`ChmodReq`] logs, because a prompt that lies about the current state is the
+    /// kind of thing that changes a permission by accident.
+    fn open_chmod_prompt(&mut self, slot: PaneSlot) {
+        let paths = self.selection_abs(slot);
+        if paths.is_empty() {
+            self.nothing_selected("change permissions");
+            return;
+        }
+        let seed = self
+            .shown_tab(slot)
+            .and_then(|tab| {
+                tab.entries
+                    .entries
+                    .iter()
+                    .find(|entry| tab.sel.contains(Tab::row_key(entry)))
+            })
+            .map(|entry| octal_text_of(&entry.mode))
+            .unwrap_or_else(|| "755".to_string());
+        let mut prompt = Prompt::new(
+            DialogKind::Chmod { slot, paths },
+            "Change permissions",
+            format!(
+                "Changing permissions for {} item(s).\n\
+                 Common Permissions:\n\
+                 \u{20}755 - Read/Write/Exec for owner, Read/Exec for others (Standard for folders & scripts)\n\
+                 \u{20}644 - Read/Write for owner, Read-only for others (Standard for files)\n\
+                 \u{20}700 - Full access for owner only (Private folders & scripts)\n\
+                 \u{20}600 - Read/Write for owner only (Private configuration & keys)\n\
+                 \u{20}777 - Full public access (Insecure)\n\
+                 \n\
+                 Enter 3 or 4-digit octal permissions:",
+                // The count is the *selection*, which is what Go printed (`selectedPaths.size`).
+                self.selection_abs(slot).len()
+            ),
+            seed.clone(),
+            "Apply",
+            Validation::Octal,
+        );
+        prompt.select = Some(seed.len());
+        self.open_dialog(dialogs::Dialog::Prompt(prompt));
+    }
+
+    /// Plan **D6**'s question, in Go's copy (`context-menu.js:507`) with the part a browser `confirm`
+    /// could not carry: *which* paths, and what "permanently" costs.
+    fn open_permanent_delete_confirm(&mut self, slot: PaneSlot) {
+        let paths = self.selection_abs(slot);
+        if paths.is_empty() {
+            self.nothing_selected("delete permanently");
+            return;
+        }
+        let count = paths.len();
+        let mut named: Vec<String> = paths
+            .iter()
+            .take(3)
+            .map(|path| {
+                path.as_path().file_name().map_or_else(
+                    || path.as_path().display().to_string(),
+                    |name| name.to_string_lossy().into_owned(),
+                )
+            })
+            .collect();
+        if count > named.len() {
+            named.push(format!("and {} more", count - named.len()));
+        }
+        let confirm = Confirm::new(
+            DialogKind::PermanentDelete { slot, paths },
+            "Delete permanently",
+            format!("Are you sure you want to permanently delete these {count} item(s)?"),
+            vec![
+                named.join(", "),
+                "The data is not recoverable — nothing goes to the trash.".to_string(),
+            ],
+            // Safe answer first: `fresh` focuses the first button, so <kbd>Enter</kbd> and
+            // <kbd>Escape</kbd> both leave the bytes alone. Go's `confirm` defaulted to OK, i.e. to
+            // destroying them — a §6.2-class deviation, recorded in the step-10c log.
+            vec![
+                ConfirmButton::new("Cancel", Choice::Cancel),
+                ConfirmButton::danger("Delete permanently", Choice::Ok),
+            ],
+        );
+        self.open_dialog(dialogs::Dialog::Confirm(confirm));
+    }
+
+    /// Go's paste conflict (`context-menu.js:306` / `:379`) was a two-way *merge* `confirm`; the port
+    /// asks the three-way question core can actually answer, in Go's wording, and re-runs the paste
+    /// with the chosen [`ConflictPolicy`] instead of the silent `DEFAULT` skip.
+    fn open_paste_conflict_confirm(
+        &mut self,
+        slot: PaneSlot,
+        dest: AbsPath,
+        mode: Option<PasteMode>,
+        sources: Vec<AbsPath>,
+        conflicts: Vec<String>,
+    ) {
+        let confirm = Confirm::new(
+            DialogKind::PasteConflict {
+                slot,
+                dest,
+                mode,
+                sources,
+            },
+            "Resolve conflict",
+            format!(
+                "Entry(s) \"{}\" already exist at the destination.",
+                conflicts.join(", ")
+            ),
+            vec![
+                "Skip keeps what is there · Rename keeps both · Overwrite replaces it.".to_string(),
+            ],
+            vec![
+                ConfirmButton::new("Skip", Choice::Skip),
+                ConfirmButton::new("Rename", Choice::Rename),
+                ConfirmButton::danger("Overwrite", Choice::Overwrite),
+                ConfirmButton::new("Cancel", Choice::Cancel),
+            ],
+        );
+        self.open_dialog(dialogs::Dialog::Confirm(confirm));
+    }
+
+    /// Turn a dialog answer into the command it stands for (plan §4.1). Called after the draw, like
+    /// the pane commands, so a dialog can never mutate state another pane is painting from.
+    pub fn answer(&mut self, answer: Answer) {
+        let kind = answer.kind().clone();
+        let choice = answer.choice();
+        let text = match &answer {
+            Answer::Text { text, .. } => text.trim().to_string(),
+            Answer::Button { .. } => String::new(),
+        };
+        match kind {
+            DialogKind::NewFolder { slot } => {
+                if self.new_folder_request == Some(slot) {
+                    self.new_folder_request = None;
+                }
+                if choice != Choice::Ok {
+                    return;
+                }
+                let Some(dest) = self.shown_dir_abs(slot) else {
+                    self.no_directory(Command::NewFolder);
+                    return;
+                };
+                let origin = self.session.next_origin();
+                match self.session.mkdir(&MkdirReq::new(dest, &text), origin) {
+                    Ok(entry) => self
+                        .notices
+                        .post(toast::Level::Success, format!("new folder: {}", entry.name)),
+                    Err(e) => self.toast_error("new folder", e),
+                }
+            }
+            DialogKind::Chmod { paths, .. } => {
+                if choice != Choice::Ok {
+                    return;
+                }
+                let origin = self.session.next_origin();
+                match ChmodReq::parse(paths, &text) {
+                    Ok(req) => match self.session.chmod(&req, origin) {
+                        Ok(report) => self.notices.post(
+                            toast::Level::Success,
+                            format!("chmod {}: {} path(s)", report.text, report.applied.len()),
+                        ),
+                        Err(e) => self.toast_error("chmod", e),
+                    },
+                    Err(e) => self.toast_error("chmod", e),
+                }
+            }
+            DialogKind::PermanentDelete { slot, paths } => {
+                if choice != Choice::Ok {
+                    // The safety property the test asserts: a cancelled confirm changes nothing.
+                    self.notices.post(
+                        toast::Level::Info,
+                        format!(
+                            "delete permanently: cancelled — {} item(s) left alone",
+                            paths.len()
+                        ),
+                    );
+                    return;
+                }
+                let origin = self.session.next_origin();
+                let req = DeleteReq {
+                    sources: paths,
+                    mode: DeleteMode::Permanent,
+                    // The confirm *is* the opt-in plan **D6** asks for: the user has just been told,
+                    // in the dialog's own words, that nothing is recoverable.
+                    permanent_fallback: true,
+                };
+                match self.session.delete(&req, origin) {
+                    Ok(Receipt::Running { job, origin }) => self.note_running(slot, job, origin),
+                    Ok(Receipt::Done(report)) => self.notices.post(
+                        toast::Level::Success,
+                        format!("delete: {}", report.summary()),
+                    ),
+                    Err(e) => self.toast_error("delete permanently", e),
+                }
+            }
+            DialogKind::PasteConflict {
+                slot,
+                dest,
+                mode,
+                sources,
+            } => {
+                if choice == Choice::Cancel {
+                    self.notices
+                        .post(toast::Level::Info, "paste: cancelled — nothing was written");
+                    return;
+                }
+                let policy = match choice {
+                    Choice::Overwrite => ConflictPolicy::Overwrite,
+                    Choice::Rename => ConflictPolicy::Rename,
+                    _ => ConflictPolicy::SkipExisting,
+                };
+                self.run_paste_with(slot, dest, mode, &sources, policy);
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------------------- paste (10c)
+
+    /// Which of `sources` already has a name at `dest` — the pre-flight the plan's §7 row 10 asks for
+    /// before anything is written.
+    ///
+    /// It is a *read*, not a new core API: [`Session::list_dir`] is the synchronous listing call the
+    /// address bar already uses, and the destination's first page is what a paste lands next to. A
+    /// proper `Session::paste_preflight(&PasteReq) -> Vec<Conflict>` would be better still (it could
+    /// see past the page, and would not repeat `plan`'s name arithmetic); what it would need is
+    /// recorded in the plan log. On a read failure this answers "no conflicts", which is honest: the
+    /// engine's guard is the authority, and `SkipExisting` — the policy the no-conflict path passes —
+    /// cannot destroy anything.
+    #[must_use]
+    pub fn paste_conflicts(&self, dest: &AbsPath, sources: &[AbsPath]) -> Vec<String> {
+        let Some(existing) = self.listing_names_of(dest) else {
+            return Vec::new();
+        };
+        let mut out: Vec<String> = Vec::new();
+        for path in sources {
+            let name = path
+                .as_path()
+                .file_name()
+                .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+            if existing.contains(&name) && !out.contains(&name) {
+                out.push(name);
+            }
+        }
+        out
+    }
+
+    /// The names in `dest`, from whichever listing already exists: a pane showing it (the paste-into-the-
+    /// current-directory case, and the cross-pane drop), or `DirService`'s cache answered synchronously by
+    /// [`Session::page_dir`] (plan §4.1's "cached ⇒ usually `Done`"). `None` when neither has it — a cold
+    /// destination, which the pre-flight honestly cannot answer.
+    #[must_use]
+    fn listing_names_of(&self, dest: &AbsPath) -> Option<Vec<String>> {
+        let path = FsPath::from_abs(dest.clone());
+        let names = |page: &zenman_core::entry::DirPage| {
+            page.entries
+                .iter()
+                .map(|entry| entry.name.clone())
+                .collect::<Vec<_>>()
+        };
+        for pane in self.model.panes.values() {
+            if let Some(tab) = pane.active_tab()
+                && tab.path == path
+            {
+                return Some(names(&tab.entries));
+            }
+        }
+        let origin = self.session.next_origin();
+        match self.session.page_dir(&ListDir::first(path), origin) {
+            Ok(Receipt::Done(page)) => Some(names(&page)),
+            _ => None,
+        }
+    }
+
+    /// <kbd>Ctrl+V</kbd> / <kbd>Alt+V</kbd> / <kbd>Ctrl+Alt+V</kbd>, with the collision pre-flight in
+    /// front: a paste that would land on an existing name asks first (Go asked too, with a two-button
+    /// `confirm`; plan F12 forbids the silent skip).
+    fn run_paste(&mut self, slot: PaneSlot, dest: AbsPath, mode: Option<PasteMode>) {
+        let Some(clip) = self.session.clipboard() else {
+            self.notices
+                .post(toast::Level::Warning, "paste: the clipboard is empty");
+            return;
+        };
+        let sources = clip.paths();
+        let conflicts = self.paste_conflicts(&dest, &sources);
+        if conflicts.is_empty() {
+            self.run_paste_with(slot, dest, mode, &[], ConflictPolicy::SkipExisting);
+            return;
+        }
+        self.open_paste_conflict_confirm(slot, dest, mode, Vec::new(), conflicts);
+    }
+
+    /// The paste itself. `explicit` empty means "the clipboard's own paths, with its own op" — that is
+    /// `Session::paste_clipboard`; a non-empty list is a drag's payload, which names its mode.
+    pub fn run_paste_with(
+        &mut self,
+        slot: PaneSlot,
+        dest: AbsPath,
+        mode: Option<PasteMode>,
+        explicit: &[AbsPath],
+        policy: ConflictPolicy,
+    ) {
+        let origin = self.session.next_origin();
+        let receipt = if explicit.is_empty() && mode.is_none() {
+            self.session.paste_clipboard(dest, policy, origin)
+        } else {
+            let sources = if explicit.is_empty() {
+                match self.session.clipboard() {
+                    Some(clip) => clip.paths(),
+                    None => {
+                        self.notices
+                            .post(toast::Level::Warning, "paste: the clipboard is empty");
+                        return;
+                    }
+                }
+            } else {
+                explicit.to_vec()
+            };
+            let mode = mode.unwrap_or(PasteMode::Copy);
+            let req = PasteReq {
+                sources,
+                dest,
+                mode,
+                policy,
+            };
+            self.session.paste(&req, origin)
+        };
+        match receipt {
+            Ok(Receipt::Running { job, origin }) => self.note_running(slot, job, origin),
+            Ok(Receipt::Done(report)) => self.notices.post(
+                toast::Level::Success,
+                format!("paste: {}", report.summary()),
+            ),
+            Err(e) => self.toast_error("paste", e),
+        }
+    }
+
+    /// The rename the in-cell editor committed (plan §5.8: "commits on Enter … and validates the name
+    /// through `ops::rename::validate_name` before submitting" — the engine's own guard is that
+    /// validation, and its answer comes back *into the cell* as an inline error).
+    fn commit_rename(&mut self, slot: PaneSlot, ix: usize, name: String) {
+        let Some(tab) = self.tab_mut_of(slot) else {
+            return;
+        };
+        let Some(entry) = tab.entries.entries.get(ix).cloned() else {
+            if let Some(tab) = self.tab_mut_of(slot) {
+                tab.rename_target = None;
+                tab.rename_editor = None;
+            }
+            return;
+        };
+        let Some(source) = tab.row_abs(&entry) else {
+            return;
+        };
+        let old = entry.name.clone();
+        if name == old {
+            // Nothing to do: close the editor quietly, exactly like Go's `if (newName !== oldName)`.
+            tab.rename_target = None;
+            tab.rename_editor = None;
+            return;
+        }
+        let origin = self.session.next_origin();
+        let outcome = self
+            .session
+            .rename(&RenameReq::one(source.clone(), name.clone()), origin)
+            .map_err(|e| e.user_message())
+            .and_then(|report| {
+                report
+                    .outcomes
+                    .first()
+                    .map(|outcome| match outcome {
+                        zenman_core::ops::rename::RenameOutcome::Renamed { .. } => Ok(()),
+                        zenman_core::ops::rename::RenameOutcome::Failed { error, .. } => {
+                            Err(error.user_message())
+                        }
+                    })
+                    .unwrap_or_else(|| Err("nothing was renamed".to_string()))
+            });
+        let Some(tab) = self.tab_mut_of(slot) else {
+            return;
+        };
+        match outcome {
+            Ok(()) => {
+                tab.rename_target = None;
+                tab.rename_editor = None;
+            }
+            Err(message) => {
+                // Refuse *in the cell*: the editor stays open, with the reason under the field.
+                if let Some(editor) = &mut tab.rename_editor {
+                    editor.error = Some(message);
+                    editor.fresh = false;
+                }
+            }
+        }
     }
 
     fn toast_error(&mut self, what: &str, e: CoreError) {
@@ -1479,43 +2076,6 @@ impl ZenApp {
         }
     }
 
-    /// <kbd>Ctrl+V</kbd> / <kbd>Alt+V</kbd> / <kbd>Ctrl+Alt+V</kbd>.
-    ///
-    /// `mode == None` takes the clipboard's own op (a cut clipboard moves, a copy clipboard copies —
-    /// that is `Session::paste_clipboard`); `Some(Link)` is Go's `paste-link`.
-    /// `ConflictPolicy::DEFAULT` is `SkipExisting` — Go's silent skip — and the conflict prompt that
-    /// replaces it is step 10c's (recorded as a gap).
-    fn run_paste(&mut self, slot: PaneSlot, dest: AbsPath, mode: Option<PasteMode>) {
-        let origin = self.session.next_origin();
-        let receipt = match mode {
-            None => self
-                .session
-                .paste_clipboard(dest, ConflictPolicy::DEFAULT, origin),
-            Some(mode) => {
-                let Some(clip) = self.session.clipboard() else {
-                    self.notices
-                        .post(toast::Level::Warning, "paste: the clipboard is empty");
-                    return;
-                };
-                let req = PasteReq {
-                    sources: clip.paths(),
-                    dest,
-                    mode,
-                    policy: ConflictPolicy::DEFAULT,
-                };
-                self.session.paste(&req, origin)
-            }
-        };
-        match receipt {
-            Ok(Receipt::Running { job, origin }) => self.note_running(slot, job, origin),
-            Ok(Receipt::Done(report)) => self.notices.post(
-                toast::Level::Success,
-                format!("paste: {}", report.summary()),
-            ),
-            Err(e) => self.toast_error("paste", e),
-        }
-    }
-
     /// <kbd>Delete</kbd> — **the trash path** (plan **D6**): `DeleteReq::to_trash`, which never
     /// escalates to destroying bytes without the user's answer. The tab reloads itself through the
     /// `DirChanged` the job emits.
@@ -1549,6 +2109,33 @@ impl ZenApp {
         }
         self.list(slot, false, false);
     }
+}
+
+/// The octal spelling of a listing's mode text (`-rwxr-xr-x` → `755`), for the chmod prompt's seed.
+///
+/// The listing carries Go's `fs.FileMode.String()` form, not octal, so the decode goes through core's
+/// own parser and the re-encode through [`octal_text`](zenman_core::ops::chmod::octal_text) — the same
+/// pair `ChmodReq::new` writes to the undo log, so the number in the prompt is the number in the log.
+fn octal_text_of(mode: &str) -> String {
+    // Go's `fs.FileMode.String()` is `<type><9 permission glyphs>`; the permission run is the tail, and
+    // the special-bit glyphs (`s`, `t`) sit inside it, so taking the run from the end is exact.
+    let glyphs: Vec<char> = mode
+        .chars()
+        .rev()
+        .take_while(|c| matches!(c, 'r' | 'w' | 'x' | '-' | 's' | 't' | 'S' | 'T'))
+        .take(9)
+        .collect();
+    if glyphs.len() != 9 {
+        // Nothing to decode: Go's own prompt default, which is what the field would have shown anyway.
+        return "755".to_string();
+    }
+    let mut bits = 0u32;
+    for (ix, glyph) in glyphs.iter().rev().enumerate() {
+        if *glyph != '-' {
+            bits |= 0o400 >> ix;
+        }
+    }
+    zenman_core::ops::chmod::octal_text(ModeBits::from_bits_retain(bits))
 }
 
 /// The nearest row at or after `target` that is an entry row rather than a flat listing's group

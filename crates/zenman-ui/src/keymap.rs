@@ -74,6 +74,9 @@ pub enum Command {
     Delete,
     /// `Shift+Delete` — `DeleteReq::permanent` (D6). **No Go binding**: Go's Delete was permanent.
     PermanentDelete,
+    /// Go's `Change Permissions` row (`context-menu.js:105-107`) — **no chord**: Go's
+    /// `shortcuts.js` registry has none for it either.
+    Chmod,
     /// `Ctrl+Shift+N` — `Session::mkdir` (Go's `create-folder`; the name prompt is step 10c).
     NewFolder,
     /// `Ctrl+F` — quick-find overlay (Go's `quick-find`; the dialog is step 11).
@@ -160,6 +163,7 @@ impl Command {
         Self::Rename,
         Self::Delete,
         Self::PermanentDelete,
+        Self::Chmod,
         Self::NewFolder,
         Self::QuickFind,
         Self::SearchManager,
@@ -213,6 +217,7 @@ impl Command {
             Self::Rename => "Rename",
             Self::Delete => "Move to trash",
             Self::PermanentDelete => "Delete permanently",
+            Self::Chmod => "Change permissions",
             Self::NewFolder => "New folder",
             Self::QuickFind => "Quick find",
             Self::SearchManager => "Search manager",
@@ -609,6 +614,7 @@ const TABLE: &[(Command, &[Chord])] = &[
     (Command::ActionLog, &[Chord::key(Key::H)]),
     // --- the plan's own additions, each named in the command doc --------------------------------
     (Command::PermanentDelete, &[Chord::shift(Key::Delete)]),
+    (Command::Chmod, &[]),
     (Command::SelectNone, &[Chord::key(Key::Escape)]),
     (Command::Refresh, &[Chord::key(Key::F5)]),
     (Command::ToggleRightDrawer, &[Chord::ctrl(Key::J)]),

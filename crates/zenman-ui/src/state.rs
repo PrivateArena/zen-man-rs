@@ -320,6 +320,9 @@ pub struct Tab {
     /// `Command::Rename` sets it; the in-cell editor of step 10c is the consumer that must clear it
     /// (commit) or reset it to `None` (cancel).
     pub rename_target: Option<String>,
+    /// The live in-cell rename editor for `rename_target` (step 10c). `None` until the row it names
+    /// has been painted, because the editor is *the row's* — it has no rect before the row does.
+    pub rename_editor: Option<RenameEditor>,
 }
 
 impl Tab {
@@ -349,6 +352,7 @@ impl Tab {
             page_size: DEFAULT_PAGE_SIZE,
             drag_row: None,
             rename_target: None,
+            rename_editor: None,
             error: None,
             pending: BTreeSet::new(),
         }
@@ -946,5 +950,53 @@ mod tests {
         assert!(tab.entries.entries.is_empty());
         assert!(!tab.entries.has_more);
         assert_eq!(tab.total, 0);
+    }
+}
+
+/// The in-cell rename editor (plan §5.8 `modals.rs`: "in-cell `TextEdit` for rename").
+///
+/// It lives on the [`Tab`], not on the app, for the same reason the selection does: the row it sits
+/// in belongs to one tab of one pane, and a tab that reloads out from under it loses both.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RenameEditor {
+    /// The row's key (the listing-relative identity `Selection` uses).
+    pub key: String,
+    /// The name being typed.
+    pub buf: String,
+    /// The inline refusal — Go's second `alert()`, now in the place the user is already looking.
+    pub error: Option<String>,
+    /// The names already in the directory (the loaded listing's; the engine's guard is the
+    /// authority, this is the fast path).
+    pub taken: Vec<String>,
+    /// Until the first frame the field holds the keyboard.
+    pub fresh: bool,
+    /// How many leading characters to select on open — the base name, extension excluded.
+    pub select: usize,
+}
+
+impl RenameEditor {
+    /// Open an editor on `name`: the buffer holds the whole name, the selection holds the base.
+    ///
+    /// The extension is excluded the way every desktop file manager does it — the split is at the
+    /// *last* dot that is not leading, so `.hidden` and `archive.tar.gz` keep their prefixes intact.
+    #[must_use]
+    pub fn new(key: String, name: &str) -> Self {
+        Self {
+            key,
+            buf: name.to_string(),
+            error: None,
+            taken: Vec::new(),
+            fresh: true,
+            select: base_name_len(name),
+        }
+    }
+}
+
+/// Where the base name ends (see [`RenameEditor::new`]).
+#[must_use]
+pub fn base_name_len(name: &str) -> usize {
+    match name.rfind('.') {
+        Some(dot) if dot > 0 => dot,
+        _ => name.len(),
     }
 }

@@ -42,8 +42,10 @@
 pub use craft_ui;
 
 pub mod app;
+pub mod dialogs;
 pub mod dock;
 pub mod dock_content;
+pub mod drag_drop;
 pub mod icons;
 pub mod jobs_ui;
 pub mod keymap;

@@ -33,7 +33,9 @@ use zenman_core::store::config::{PaneSlot, SortColumn, ViewMode};
 
 use crate::dock::DockId;
 use crate::jobs_ui::JobSlot;
-use crate::state::{FlatMode, Selection, Tab};
+use egui::widgets::text_edit::TextEditState;
+
+use crate::state::{FlatMode, RenameEditor, Selection, Tab};
 use crate::theme::Tokens;
 use crate::widgets::entry_row::{self, SelectionState, SizeLookup};
 use crate::widgets::virtual_list::{
@@ -87,6 +89,33 @@ pub enum PaneCommand {
     SelectAll,
     /// Clear the selection (Go's `Esc`, which its key registry never wired).
     SelectNone,
+    /// A row's drag began: the shell fills the payload (Go's `dragstart`, `file-list.js:299-306`).
+    BeginDrag {
+        /// Index into the listing.
+        ix: usize,
+    },
+    /// A drag was released over a **directory row** — Go's `if (isDir)` drop (`file-list.js:320-322`).
+    DropInto {
+        /// The directory row that was dropped on.
+        ix: usize,
+        /// <kbd>Ctrl</kbd> was held, which forces a copy (the port's addition; Go reads no modifier).
+        copy: bool,
+    },
+    /// A drag was released on the pane's own background: `DropIntent::PasteInto{pane}` in the dock's
+    /// vocabulary, i.e. into the directory that pane is showing.
+    DropOnBackground {
+        /// <kbd>Ctrl</kbd> held at release.
+        copy: bool,
+    },
+    /// The in-cell rename committed (Enter or its own accept path).
+    CommitRename {
+        /// Index into the listing — the row the editor was drawn over.
+        ix: usize,
+        /// What was typed.
+        name: String,
+    },
+    /// The in-cell rename was refused (Escape): the row is untouched.
+    CancelRename,
 }
 
 /// One row of the visual order: a listing row, or a group header.
@@ -289,6 +318,9 @@ pub struct PaneModel<'a> {
     pub sizes: &'a dyn Fn(&AbsPath) -> Option<FileSizes>,
     /// The row count the last frame showed, for the status bar.
     pub visible_rows: usize,
+    /// The drag in flight, if any (step 10c): every directory row and the pane background may claim
+    /// its release. Cloned in, because the pane must not hold the app's field across the draw.
+    pub drag: Option<crate::drag_drop::DragPayload>,
 }
 
 /// Draw one pane body, returning the commands the shell must carry out.
@@ -299,6 +331,7 @@ pub fn show(
     tokens: &Tokens,
 ) -> Vec<PaneCommand> {
     let mut out = Vec::new();
+    let drag = model.drag.clone();
     let _ = panel;
     toolbar(ui, model, tokens, &mut out);
     header_row(ui, model, tokens, &mut out);
@@ -340,7 +373,8 @@ pub fn show(
             list(ui, model, tokens)
         }
     });
-    let events = list.inner;
+    let inner = list.inner;
+    let events = inner.events;
     // The background is the band **below the rows**, never a rect stacked over them: an interactive
     // rect that overlaps the rows' own `ui.interact` rects does not merely lose the click to them,
     // it makes two hover claims disagree every frame and the pane never stops repainting (measured in
@@ -366,12 +400,21 @@ pub fn show(
     );
     model.visible_rows = order.len();
     apply_events(model, events, &order, &mut out);
+    out.extend(inner.commands);
     if model.tab.has_more {
         banner(ui, model, tokens, &mut out);
     }
     // Allocated **last**: the banner's buttons came earlier and are narrower, so the band cannot eat
     // them, and every row rect is above `bg`'s top edge by construction.
     let background = ui.interact(bg, ui.scope_id().with("pane-background"), Sense::click());
+    // A drag let go over the pane's own background lands in the directory the pane shows — the
+    // `DropIntent::PasteInto` route. `contains_pointer()` (not `hovered()`), because the dragged row
+    // still owns the drag and would otherwise swallow the release.
+    if drag.is_some() && background.contains_pointer() && ui.input(|i| i.pointer.any_released()) {
+        out.push(PaneCommand::DropOnBackground {
+            copy: ui.input(|i| i.modifiers.ctrl),
+        });
+    }
     // A row's own right-click (if there was one) already produced the request; the background only
     // answers when nothing under the cursor did.
     push_background_context(&background, bg, &mut out);
@@ -592,11 +635,25 @@ pub fn columns_of(flat: FlatMode) -> RowColumns {
     }
 }
 
+/// What one scroller produced this frame: the rows' own events, and the commands the in-cell editor
+/// and the drop targets added while they were painted.
+pub struct ListOut {
+    /// The row events, applied by [`apply_events`].
+    pub events: Vec<RowEvent>,
+    /// The commands, handed straight to the shell.
+    pub commands: Vec<PaneCommand>,
+}
+
 /// The row list.
-fn list(ui: &mut Ui, model: &mut PaneModel<'_>, tokens: &Tokens) -> Vec<RowEvent> {
+fn list(ui: &mut Ui, model: &mut PaneModel<'_>, tokens: &Tokens) -> ListOut {
     let metrics = row_metrics(tokens, model.tab.flat);
     let mut scroll = take_scroll(model.tab);
     let order = RowOrder::build(model.tab);
+    let drag = model.drag.clone();
+    // The editor comes *out* of the tab: the scroller borrows the tab immutably to paint rows, and the
+    // editor is the one piece of pane state that a draw mutates.
+    let mut editor = model.tab.rename_editor.take();
+    let mut commands = Vec::new();
     let tab: &Tab = model.tab;
     let sizes = model.sizes;
     let slot = model.slot;
@@ -609,21 +666,39 @@ fn list(ui: &mut Ui, model: &mut PaneModel<'_>, tokens: &Tokens) -> Vec<RowEvent
             has_more: tab.has_more,
         },
         |ix| row_id(slot, ix),
-        |ui, ix, hit| paint_row(ui, hit, ix, &order, tab, sizes, tokens),
+        |ui, ix, hit| {
+            let event = paint_row(ui, hit, ix, &order, tab, sizes, tokens);
+            paint_row_overlay(
+                ui,
+                hit,
+                ix,
+                &order,
+                tab,
+                tokens,
+                &drag,
+                &mut editor,
+                &mut commands,
+            );
+            event
+        },
         &mut scroll,
     );
     model.tab.scroll = scroll;
-    events
+    finish_editor(model.tab, &mut editor);
+    model.tab.rename_editor = editor;
+    ListOut { events, commands }
 }
 
 /// The icon grid.
-fn grid(ui: &mut Ui, model: &mut PaneModel<'_>, tokens: &Tokens) -> Vec<RowEvent> {
+fn grid(ui: &mut Ui, model: &mut PaneModel<'_>, tokens: &Tokens) -> ListOut {
     let metrics = row_metrics(tokens, model.tab.flat);
     let mut scroll = take_scroll(model.tab);
     let order = RowOrder::build(model.tab);
+    let mut commands: Vec<PaneCommand> = Vec::new();
     let tab: &Tab = model.tab;
     let sizes = model.sizes;
     let slot = model.slot;
+    let drag = model.drag.clone();
     let events = virtual_list::show_grid(
         ui,
         GridSpec {
@@ -637,11 +712,19 @@ fn grid(ui: &mut Ui, model: &mut PaneModel<'_>, tokens: &Tokens) -> Vec<RowEvent
             gap: tokens.grid_gap,
         },
         |ix| row_id(slot, ix),
-        |ui, ix, hit| paint_row(ui, hit, ix, &order, tab, sizes, tokens),
+        |ui, ix, hit| {
+            let event = paint_row(ui, hit, ix, &order, tab, sizes, tokens);
+            // A grid tile is a drop target too; the in-cell editor is a list-view thing (a tile has
+            // no name cell to sit in, and Go had no grid view at all).
+            if drag.is_some() {
+                drop_target(ui, hit, ix, &order, tokens, &mut commands);
+            }
+            event
+        },
         &mut scroll,
     );
     model.tab.scroll = scroll;
-    events
+    ListOut { events, commands }
 }
 
 /// Draw one visual row and read its click.
@@ -749,9 +832,10 @@ fn apply_events(
                 }
             }
             RowEvent::DndGrab { ix } => {
-                // Step 9's payload goes through `DockContent::resolve_drag`; the pane only records
-                // which row the grab started on, so the drag has an honest source to claim.
+                // Which row the grab started on (the dock's own drag protocol still reads this), and
+                // step 10c's file drag, whose payload the shell derives from the selection.
                 model.tab.drag_row = Some(ix);
+                out.push(PaneCommand::BeginDrag { ix });
             }
         }
     }
@@ -854,4 +938,190 @@ pub fn row_id(slot: PaneSlot, ix: usize) -> Id {
 /// while the paint callback reads the tab.
 fn take_scroll(tab: &mut Tab) -> ScrollState {
     std::mem::take(&mut tab.scroll)
+}
+
+// --------------------------------------------------------------------- step 10c overlays
+//
+// Both of these run *after* [`entry_row::paint`] and after the scroller's own `ui.interact` for the
+// row, which is the whole point: in this egui fork the last-allocated overlapping rect wins hover and
+// click (plan §9.2 step 8), so the in-cell editor is allocated last and therefore owns the pointer,
+// while the drop highlight is *painted* and owns nothing.
+
+/// The drop highlight for one directory row, and the release it claims.
+fn drop_target(
+    ui: &mut Ui,
+    hit: &RowHit<'_>,
+    visual: usize,
+    order: &RowOrder,
+    tokens: &Tokens,
+    out: &mut Vec<PaneCommand>,
+) {
+    if !order.entry_at(visual).is_some_and(|entry| entry.is_dir) {
+        // Go's `dragover` accepts a directory row and nothing else (`file-list.js:309-313`).
+        return;
+    }
+    if !hit.response.contains_pointer() {
+        return;
+    }
+    crate::drag_drop::paint_drop_target(ui, tokens, hit.rect);
+    if ui.input(|i| i.pointer.any_released()) {
+        let copy = ui.input(|i| i.modifiers.ctrl);
+        if let Some(ix) = order.entry_ix(visual) {
+            out.push(PaneCommand::DropInto { ix, copy });
+        }
+    }
+}
+
+/// The in-cell rename editor over the row's name cell, and the two keys it owns.
+fn rename_field(
+    ui: &mut Ui,
+    hit: &RowHit<'_>,
+    entry_ix: usize,
+    editor: &mut RenameEditor,
+    tokens: &Tokens,
+    out: &mut Vec<PaneCommand>,
+) {
+    // Read the decisive keys *before* the field exists, and consume them: a focused `TextEdit` would
+    // otherwise eat <kbd>Enter</kbd> (and may eat <kbd>Escape</kbd>), and while the editor is open it
+    // is the only thing on screen that may answer them.
+    let enter = consume_key(ui, egui::Key::Enter);
+    let escape = consume_key(ui, egui::Key::Escape);
+    let cells = entry_row::column_rects(hit.rect, &hit.metrics.columns, tokens);
+    let cell = cells[0];
+    let field = ui
+        .put(
+            cell,
+            egui::TextEdit::singleline(&mut editor.buf)
+                .desired_width((cell.width() - tokens.cell_padding).max(1.0))
+                .font(tokens.font()),
+        )
+        .on_hover_text("New name — Enter commits, Escape cancels");
+    if editor.fresh {
+        // Once, not every frame: re-asking for focus each frame is a repaint that never settles
+        // (plan §9.2 step-10b's "a losing hover claim repaints forever", from the other side).
+        field.request_focus();
+        let len = editor.select.min(editor.buf.chars().count());
+        select_prefix(ui.ctx(), field.id, len);
+        editor.fresh = false;
+    }
+    // The frame around the cell is paint, so it cannot compete with the field for the pointer.
+    let stroke = if editor.error.is_some() {
+        egui::Stroke::new(1.0, tokens.danger)
+    } else {
+        egui::Stroke::new(1.0, tokens.accent)
+    };
+    ui.painter().rect_stroke(
+        cell,
+        egui::CornerRadius::same(tokens.corner_radius),
+        stroke,
+        egui::StrokeKind::Inside,
+    );
+    if let Some(error) = &editor.error {
+        // The refusal is *painted* text in the row's right-hand cells: an allocated label there would
+        // claim hover from the row and the field alike (rule 10), and a painted one says the same thing.
+        ui.painter().text(
+            Pos2::new(cells[2].min.x, hit.rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            error.as_str(),
+            tokens.font(),
+            tokens.danger,
+        );
+    }
+    if enter {
+        out.push(PaneCommand::CommitRename {
+            ix: entry_ix,
+            name: editor.buf.clone(),
+        });
+    } else if escape {
+        out.push(PaneCommand::CancelRename);
+    }
+}
+
+/// Everything the row overlays need, in one call from the scroller's paint closure. `visual` is the
+/// row's index in the *visual* order, which is what the scroller hands out; the listing index is
+/// derived from it, because a grouped flat listing interleaves headers.
+#[allow(clippy::too_many_arguments)]
+fn paint_row_overlay(
+    ui: &mut Ui,
+    hit: &RowHit<'_>,
+    visual: usize,
+    order: &RowOrder,
+    _tab: &Tab,
+    tokens: &Tokens,
+    drag: &Option<crate::drag_drop::DragPayload>,
+    editor: &mut Option<RenameEditor>,
+    out: &mut Vec<PaneCommand>,
+) {
+    if drag.is_some() {
+        drop_target(ui, hit, visual, order, tokens, out);
+    }
+    let Some(editor) = editor.as_mut() else {
+        return;
+    };
+    let Some(entry) = order.entry_at(visual) else {
+        return;
+    };
+    if editor.key != Tab::row_key(entry) {
+        return;
+    }
+    if let Some(ix) = order.entry_ix(visual) {
+        rename_field(ui, hit, ix, editor, tokens, out);
+    }
+}
+
+/// Keep [`Tab::rename_target`] and the editor in step, and seed a freshly armed one.
+fn finish_editor(tab: &mut Tab, editor: &mut Option<RenameEditor>) {
+    let Some(key) = tab.rename_target.clone() else {
+        // Disarmed (committed, cancelled, or the tab moved on): the editor goes with the arming.
+        *editor = None;
+        return;
+    };
+    if editor.as_ref().is_some_and(|e| e.key == key) {
+        return;
+    }
+    let Some(name) = tab
+        .entries
+        .entries
+        .iter()
+        .find(|entry| Tab::row_key(entry) == key.as_str())
+        .map(|entry| entry.name.clone())
+    else {
+        tab.rename_target = None;
+        *editor = None;
+        return;
+    };
+    let taken: Vec<String> = tab
+        .entries
+        .entries
+        .iter()
+        .filter(|entry| Tab::row_key(entry) != key.as_str())
+        .map(|entry| entry.name.clone())
+        .collect();
+    let mut fresh = RenameEditor::new(key, &name);
+    fresh.taken = taken;
+    *editor = Some(fresh);
+}
+
+/// Take a key out of the event queue and report whether it was there.
+fn consume_key(ui: &mut Ui, key: egui::Key) -> bool {
+    ui.input_mut(|input| {
+        let pressed = input.key_pressed(key);
+        if pressed {
+            input.consume_key(egui::Modifiers::NONE, key);
+        }
+        pressed
+    })
+}
+
+/// Select `[0, len)` in a field that has just been shown (the base name, extension excluded).
+fn select_prefix(ctx: &egui::Context, id: egui::Id, len: usize) {
+    if let Some(mut state) = TextEditState::load(ctx, id) {
+        state
+            .cursor
+            .set_char_range(Some(egui::text::CCursorRange::two(
+                egui::text::CCursor::new(0),
+                egui::text::CCursor::new(len),
+            )));
+        state.store(ctx, id);
+    }
 }

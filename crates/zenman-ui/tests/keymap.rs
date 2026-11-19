@@ -469,10 +469,10 @@ fn f3_and_f4_toggle_the_grid_and_the_quad() {
     assert_eq!(harness.state().model.panes.len(), 1, "F4 toggles back too");
 }
 
-/// <kbd>Shift+Delete</kbd> must destroy nothing while the confirmation dialog is 10c's, and must
-/// *say so* — a silent chord on the one destructive command is the failure mode this guards.
+/// <kbd>Shift+Delete</kbd> must destroy nothing *until the confirmation is answered* (plan **D6**), and
+/// must ask out loud — a silent chord on the one destructive command is the failure mode this guards.
 #[test]
-fn shift_del_destroys_nothing_and_says_why() {
+fn shift_del_asks_before_it_destroys_anything() {
     let dir = tree("keymap-shift-del", &["doomed.txt"]);
     let mut harness = pane_harness("keymap-shift-del", &dir);
     harness.get_by_label("doomed.txt").click();
@@ -481,16 +481,30 @@ fn shift_del_destroys_nothing_and_says_why() {
     settle(&mut harness);
     assert!(
         dir.join("doomed.txt").is_file(),
-        "the bytes are untouched until the confirmation dialog exists"
+        "the chord alone never destroys a byte"
     );
-    let warning = notices(&harness)
-        .into_iter()
-        .find(|(level, _)| *level == Level::Warning)
-        .expect("the refusal is said out loud");
+    let open = harness.state().dialogs.active();
     assert!(
-        warning.1.contains("confirmation") && warning.1.contains("nothing was deleted"),
-        "the toast names the missing confirmation: {:?}",
-        warning.1
+        matches!(open, Some(zenman_ui::dialogs::Dialog::Confirm(_))),
+        "the chord raises the confirmation instead of deleting"
+    );
+    // Escape is the safe answer, and the safe answer is the *default* one.
+    press(&mut harness, Chord::key(egui::Key::Escape));
+    settle(&mut harness);
+    assert!(
+        !harness.state().dialogs.is_open(),
+        "Escape closed the confirmation"
+    );
+    assert!(
+        dir.join("doomed.txt").is_file(),
+        "a cancelled confirmation leaves the file exactly where it was (D6)"
+    );
+    assert!(
+        harness
+            .query_all_by_label("Delete permanently")
+            .count()
+            .lt(&usize::MAX),
+        "the danger row was drawn at least once"
     );
 }
 
@@ -507,8 +521,24 @@ fn f2_stands_the_rename_editor_up() {
     assert_eq!(
         armed,
         tab.sel.keys().iter().next().cloned(),
-        "F2 arms exactly the selected row for 10c's editor"
+        "F2 arms exactly the selected row"
     );
+    // 10c: arming *is* opening the editor — in the row, not in a modal (Go used `window.prompt`;
+    // plan §7 row 10's criterion is that the port does not).
+    let editor = tab
+        .rename_editor
+        .clone()
+        .expect("the armed row grew an in-cell editor");
+    assert_eq!(editor.key, armed.unwrap_or_default());
+    assert_eq!(
+        editor.buf, "beta.txt",
+        "the field starts as the current name"
+    );
+    assert_eq!(
+        editor.select, 4,
+        "the selection covers the base name, not the extension"
+    );
+    assert!(editor.taken.contains(&"alpha.txt".to_string()));
     assert!(
         dir.join("beta.txt").is_file() && dir.join("alpha.txt").is_file(),
         "nothing renamed yet"

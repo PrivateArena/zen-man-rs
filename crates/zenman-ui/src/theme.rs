@@ -202,6 +202,17 @@ pub struct Tokens {
     /// Widest a menu may grow: Go's box was content-sized and unbounded, so an action with a long
     /// name pushed the whole frame off-screen; here the label wraps instead.
     pub menu_max_width: f32,
+    // ---- dialogs (step 10c) ---------------------------------------------------------------------
+    /// How wide a modal card is. Go had no modal of its own — every one of its dialogs was the
+    /// browser's `window.prompt`/`confirm`, sized by the OS — so this is the port's own measure,
+    /// between the 360 px action-log panel and the 320 px menu cap.
+    pub dialog_width: f32,
+    /// The card's inner padding (the CSS cards' 16 px; the menus use 12).
+    pub dialog_padding: f32,
+    /// Vertical gap between two lines of a dialog.
+    pub dialog_gap: f32,
+    /// How far the drag ghost's card sits from the pointer (the desktop convention's hotspot offset).
+    pub drag_ghost_offset: egui::Vec2,
     /// `box-shadow: 0 10px 25px rgba(0,0,0,.5)` (`:10`) — the blur and the y-offset; the colour is
     /// [`Self::menu_shadow`].
     pub menu_shadow_blur: u8,
@@ -306,6 +317,10 @@ impl Tokens {
             header_button_inset: 16.0,
             menu_min_width: 180.0,
             menu_max_width: 420.0,
+            dialog_width: 420.0,
+            dialog_padding: 16.0,
+            dialog_gap: 8.0,
+            drag_ghost_offset: egui::Vec2::new(12.0, 12.0),
             menu_corner_radius: 6,
             menu_frame_pad_y: 5,
             menu_item_pad_x: 15.0,

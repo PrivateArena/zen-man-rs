@@ -41,6 +41,8 @@ pub struct PaneDock<'a> {
     pub jobs: &'a crate::jobs_ui::JobsUi,
     /// Commands the panes produced this frame, in `(pane, command)` order.
     pub commands: Vec<(PaneSlot, PaneCommand)>,
+    /// The file drag in flight, cloned in so a body can offer its rows as drop targets (step 10c).
+    pub drag: Option<crate::drag_drop::DragPayload>,
 }
 
 impl<'a> DockContent<DockId> for PaneDock<'a> {
@@ -188,6 +190,7 @@ impl PaneDock<'_> {
             jobs: &jobs,
             sizes: &sizes,
             visible_rows: 0,
+            drag: self.drag.clone(),
         };
         let panel = DockId::FilePane(slot);
         let commands = file_pane::show(ui, &panel, &mut model, &tokens);
@@ -299,6 +302,7 @@ pub fn show(app: &mut ZenApp, ui: &mut Ui) {
             intents: Vec::new(),
             jobs: &app.jobs,
             commands: Vec::new(),
+            drag: app.drag.clone(),
         };
         let output: DockOutput<DockId> = DockArea::new(dock::dock_area_id()).show_content(
             ui,
@@ -329,7 +333,14 @@ pub fn show(app: &mut ZenApp, ui: &mut Ui) {
     if let Some(text) = dock_error {
         app.notices.post(crate::widgets::toast::Level::Error, text);
     }
-    let _ = intents; // step 9's paste path reads these (plan §5.7 `DropIntent::PasteInto`)
+    // `DropIntent::PasteInto` is live: a drop the *dock* routed at a pane body (as opposed to the
+    // claims the pane's own rows and background make, which arrive as `PaneCommand`s) lands in that
+    // pane's directory.
+    for intent in intents {
+        match intent {
+            DropIntent::PasteInto { pane } => app.drop_from_dock(pane),
+        }
+    }
     // The pane's commands are the shell's per-frame input (plan §4.1): they run *after* the draw,
     // so a navigation never mutates the state another pane is painting from.
     for (slot, command) in commands {
@@ -407,6 +418,7 @@ mod tests {
             intents: Vec::new(),
             jobs: &jobs,
             commands: Vec::new(),
+            drag: None,
         };
         assert_eq!(
             content.logical_label(&DockId::FilePane(PaneSlot::Left)),
