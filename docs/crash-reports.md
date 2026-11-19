@@ -70,8 +70,20 @@ rm <data_dir>/gpu/starting.toml         # forget a crash marker after you have r
 `apps/zenman/tests/gpu_fallback.rs` uses to reproduce "every rung rejected" (exit 3) on a machine that
 does have a GPU. `WGPU_BACKEND` (wgpu's own variable) still overrides everything.
 
+## The three panic boundaries (step 16b)
+
+| Boundary | Code | What the user sees | Test |
+|---|---|---|---|
+| boot | `main.rs` wraps `run_with_context` in `crash_guard::guard("startup", …)` | exit 5 + report file | `crash_guard::tests::guard_turns_a_panic_into_an_error_without_aborting` |
+| job worker | `zenman-core::jobs::spawn` catches panics inside the closure and sends a typed `JobEvent::Failed` naming the job | the job fails as a toast, the session stays alive | `jobs::tests::a_panicking_job_becomes_a_typed_failure_not_a_lost_thread` (a real panic through the public `spawn` seam) |
+| frame | `apps/zenman/src/app.rs::ShellApp` wraps `logic` and `ui` in `crash_guard::guard` | one `Error` toast ("internal error in the UI logic …"), the window survives; the report file is written by the hook | the guard + report mechanics are the two `crash_guard` unit tests; the *wiring* of a shell panic to a toast has no headless test because no public API injects a panic into `ZenApp::logic` — this is stated rather than faked |
+
+A panic inside an *op* is covered by whichever boundary runs it: synchronous ops run on the frame
+thread (frame boundary), job ops on the worker (job boundary). The panic hook always writes the
+report first, so every path leaves a file under `<data_dir>/crashes/`.
+
 ## Not yet here
 
-Job-state dumping (the panic hook records no `JobInfo` list yet because `jobs`/`jobs_ui` are plan §5.6
-and §5.7, steps 6 and 7), and any Windows/macOS-specific report path — the layout above is the one
-`app_dirs` resolves on each platform, so the directory differs but the files do not.
+Job-state dumping (the hook records no `JobInfo` list yet — the report names the panic, not the
+running jobs), and any Windows/macOS-specific report path — the layout above is the one `app_dirs`
+resolves on each platform, so the directory differs but the files do not.

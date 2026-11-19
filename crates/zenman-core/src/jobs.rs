@@ -551,9 +551,11 @@ pub struct JobHandle {
 /// Run `f` on its own thread and hand back its handle plus its event stream.
 ///
 /// The wrapper guarantees the table's invariants: the final counters are flushed before the terminal
-/// event, and the terminal event exists in every path — success, cancellation, error. A closure that
-/// *panics* takes down only its own thread; the table sees the disconnected receiver and synthesises a
-/// `Failed` terminal event.
+/// event, and the terminal event exists in every path — success, cancellation, error, **panic**. A
+/// closure that panics is caught at this boundary (plan §6.1: a job thread must never be able to
+/// take the process or a silently-`Failed`-forever job down with it): the panic becomes a typed
+/// `CoreError` terminal event naming the job, so the poller sees a normal failure. The default panic
+/// hook still runs first, which is what `crash_guard` (plan §5.9) hooks to write a report.
 #[must_use = "a spawned job's receiver must be polled, or its completion is lost"]
 pub fn spawn<F, T>(spec: JobSpec, f: F) -> (JobHandle, Receiver<JobEvent>)
 where
@@ -569,7 +571,29 @@ where
     let join = std::thread::Builder::new()
         .name(name)
         .spawn(move || {
-            let result = f(&token, &progress);
+            // The panic boundary (step 16b): `catch_unwind` here, not in the caller — every job
+            // closure is `FnOnce`, so a panic that escaped would both kill the thread and leave the
+            // table guessing from a disconnected receiver. The payload is reduced to its message;
+            // an exotic payload that is not a string is still named.
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&token, &progress)))
+                    .unwrap_or_else(|payload| {
+                        let msg = payload.downcast_ref::<&str>().map_or_else(
+                            || {
+                                payload
+                                    .downcast_ref::<String>()
+                                    .cloned()
+                                    .unwrap_or_else(|| "<non-string panic payload>".to_string())
+                            },
+                            |s| (*s).to_string(),
+                        );
+                        // `System` renders its payload whole (the `Io` variant would hide the panic
+                        // message behind "I/O on <name>"), and the user deserves to see what panicked.
+                        Err(CoreError::System(std::io::Error::other(format!(
+                            "job {} panicked: {msg}",
+                            spec.id
+                        ))))
+                    });
             progress.flush();
             let terminal = match result {
                 Ok(res) => JobEvent::Finished {
@@ -1143,6 +1167,41 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
+
+    /// Step 16b (`crash_guard` polish, plan §5.9): a panicking job closure becomes a typed
+    /// `Failed` terminal event — headless, through the public `spawn` seam, with a real panic.
+    #[test]
+    fn a_panicking_job_becomes_a_typed_failure_not_a_lost_thread() {
+        let spec = JobSpec::new(
+            JobId(999),
+            JobKind::List,
+            "panic probe".to_string(),
+            Origin(1),
+        );
+        let (_handle, rx) = spawn(
+            spec,
+            |_cancel, _progress| -> Result<JobResult<()>, CoreError> {
+                panic!("deliberate job panic from a test");
+            },
+        );
+        // The flush of the final counters may precede the terminal event; drain to the terminal one.
+        let event = loop {
+            let ev = rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("the worker sends a terminal event even when it panics");
+            if matches!(ev, JobEvent::Failed(_)) {
+                break ev;
+            }
+        };
+        match event {
+            JobEvent::Failed(err) => {
+                let msg = err.user_message();
+                assert!(msg.contains("panicked"), "{msg}");
+                assert!(msg.contains("deliberate job panic"), "{msg}");
+            }
+            other => panic!("a panic must surface as Failed, got {other:?}"),
+        }
+    }
 
     fn spec(reg: &JobRegistry, kind: JobKind) -> JobSpec {
         JobSpec::new(reg.next_id(), kind, "test", Origin(7))

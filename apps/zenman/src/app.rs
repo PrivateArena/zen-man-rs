@@ -25,6 +25,9 @@ pub struct ShellApp {
     smoke_after: Option<Duration>,
     started: Instant,
     close_sent: bool,
+    /// Set once the frame guard has turned a panic into a notice, so a panic that repeats every
+    /// frame posts one toast, not one per frame (step 16b, plan §5.9 `crash_guard` row).
+    frame_panicked: bool,
 }
 
 impl ShellApp {
@@ -85,7 +88,35 @@ impl ShellApp {
             smoke_after,
             started: Instant::now(),
             close_sent: false,
+            frame_panicked: false,
         }
+    }
+
+    /// The frame boundary (plan §5.9 `crash_guard`: "a deliberately panicking widget produces a
+    /// report and the next start recovers"). A panic escaping the shell's per-frame code becomes a
+    /// typed notice through `crash_guard::guard` — the report file is written by the hook, the
+    /// process keeps running. `logic` and `ui` are guarded separately so a paint panic still gets
+    /// its notice posted by the next `logic` pass.
+    fn guarded_logic(&mut self, ctx: &egui::Context) {
+        let outcome = crate::crash_guard::guard("UI logic", || {
+            self.shell.logic(ctx);
+            Ok::<(), std::convert::Infallible>(())
+        });
+        if let Err(report) = outcome {
+            self.post_frame_panic_notice(report);
+        }
+    }
+
+    /// One toast per distinct panic, not one per frame (a panicking logic path runs every frame).
+    fn post_frame_panic_notice(&mut self, report: String) {
+        if self.frame_panicked {
+            return;
+        }
+        self.frame_panicked = true;
+        self.shell.notices.post(
+            zenman_ui::widgets::toast::Level::Error,
+            format!("internal error in the UI logic — {report}"),
+        );
     }
 }
 
@@ -93,7 +124,7 @@ impl eframe::App for ShellApp {
     /// `logic` runs every frame and may not draw: the shell polls its jobs there, and this is
     /// where the smoke timer is checked (`egui/crates/eframe/src/epi.rs:152-172`).
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.shell.logic(ctx);
+        self.guarded_logic(ctx);
         let Some(after) = self.smoke_after else {
             return;
         };
@@ -115,6 +146,13 @@ impl eframe::App for ShellApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.shell.ui(ui);
+        if let Err(report) = crate::crash_guard::guard("UI paint", || {
+            self.shell.ui(ui);
+            Ok::<(), std::convert::Infallible>(())
+        }) {
+            // The notice lands on the next frame's logic pass; the paint panic itself is already
+            // reported by the hook (`data_dir/crashes/`).
+            log::error!("frame paint recovered: {report}");
+        }
     }
 }
