@@ -133,6 +133,19 @@ pub const SHADOW_INDEX_NAMES: [&str; 5] = [
     "idx_files_shadow_mtime",
 ];
 
+/// The same five index definitions retargeted at the **live** `files` table. `build` drops the
+/// colliding names off `files` before creating them on the shadow, so a cancel or an error anywhere
+/// after that point would otherwise leave the live table unindexed for good (every search then
+/// full-scans until the next successful swap). [`crate::index::rebuild`]'s cleanup path re-creates
+/// them; `IF NOT EXISTS` makes the statement a no-op when the drop never happened.
+pub const DDL_LIVE_INDEX_RESTORE: [&str; 5] = [
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_files_shadow_path   ON files(path);",
+    "CREATE        INDEX IF NOT EXISTS idx_files_shadow_name   ON files(name);",
+    "CREATE        INDEX IF NOT EXISTS idx_files_shadow_ext    ON files(ext);",
+    "CREATE        INDEX IF NOT EXISTS idx_files_shadow_parent ON files(parent);",
+    "CREATE        INDEX IF NOT EXISTS idx_files_shadow_mtime  ON files(mtime);",
+];
+
 /// FTS is filled from the finished shadow table in one statement (`:245`), not row by row.
 pub const FTS_POPULATE_SQL: &str =
     "INSERT INTO files_fts_shadow(rowid, name) SELECT id, name FROM files_shadow;";
