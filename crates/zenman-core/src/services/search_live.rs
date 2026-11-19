@@ -791,6 +791,12 @@ impl SearchLane {
         self.deferred = Some(DeferredSearch { query, origin, due });
     }
 
+    /// Forget a refused request without starting it: the widget that asked is gone, and `poll`
+    /// must not resurrect a walk whose rows nobody would paint.
+    pub fn drop_deferred(&mut self) {
+        self.deferred = None;
+    }
+
     /// Take the deferred request if its window has closed.
     pub fn take_due(&mut self, now: Instant) -> Option<DeferredSearch> {
         let due = self.deferred.as_ref().is_some_and(|d| d.due <= now);

@@ -79,6 +79,17 @@ impl JobsUi {
             ctx.request_repaint();
         }
         for event in events {
+            // The quick-find dialog owns this answer (step 11b): it goes to the dialog's lane,
+            // where the stale-origin rule filters it — never to a tab.
+            if let EngineEvent::SearchReady {
+                origin,
+                job,
+                result,
+            } = event
+            {
+                crate::dialogs::quick_find::deliver(app, origin, job, result);
+                continue;
+            }
             let notices = route(&mut app.jobs, &mut app.model, event);
             for (level, text) in notices {
                 app.notices.post(level, text);

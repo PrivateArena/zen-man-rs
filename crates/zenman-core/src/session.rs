@@ -865,6 +865,19 @@ impl Session {
             .reset();
     }
 
+    /// Forget the request the throttle is still holding, without starting it.
+    ///
+    /// [`Self::cancel`] stops the walk that is running and [`Self::reset_search_throttle`] forgets
+    /// the window; this is the third half of tearing a search box down — without it the deferred
+    /// query promotes itself from [`Self::poll`] and walks for a dialog that no longer exists.
+    pub fn drop_pending_search(&self) {
+        self.inner
+            .search_lane
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drop_deferred();
+    }
+
     /// Start a walk, cancelling the one it supersedes. The lane is updated *after* `attach`, so the
     /// registry's `JobStarted` and the lane's `live` agree by construction.
     fn start_search(&self, req: SearchQuery, origin: Origin) -> JobId {

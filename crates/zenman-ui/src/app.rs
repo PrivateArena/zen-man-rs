@@ -638,6 +638,9 @@ impl ZenApp {
     pub fn logic(&mut self, ctx: &egui::Context) {
         self.handle_keys(ctx);
         JobsUi::tick(self, ctx);
+        // The quick-find dialog's keystroke → engine seam (plan §5.8's `tick`), *after* the event
+        // drain so a `SearchReady` never races the request that supersedes it in the same frame.
+        crate::dialogs::quick_find::tick(self, ctx);
         self.reload_stale();
         let now = Instant::now();
         self.last_frame = now;
@@ -1256,10 +1259,12 @@ impl ZenApp {
             Command::Rename => self.start_rename(slot),
             Command::Open => self.open_selection(slot),
             Command::NewFolder => self.open_new_folder_prompt(slot),
-            Command::QuickFind => self.notices.post(
-                toast::Level::Info,
-                "quick find arrives with step 11 (`dialogs/quick_find.rs`)",
-            ),
+            Command::QuickFind => match self.shown_dir_abs(slot) {
+                // Step 11b: the live search dialog, scoped to the pane's directory (Go's
+                // `openQuickFind` reads `getActiveTab().currentPath`, `quick-find.js:26`).
+                Some(dir) => crate::dialogs::quick_find::open(self, slot, dir),
+                None => self.no_directory(command),
+            },
             Command::SearchManager => self.notices.post(
                 toast::Level::Info,
                 "the search manager arrives with step 12 (`dialogs/search_manager.rs`)",
@@ -1369,7 +1374,7 @@ impl ZenApp {
     /// Put a modal up. The context menu comes down first: two foreground layers that both answer the
     /// pointer is how step 10b's overlapping-rect repaint was born, and a dialog is modal in Go's own
     /// sense — `window.prompt` took the whole page down with it.
-    fn open_dialog(&mut self, dialog: dialogs::Dialog) -> bool {
+    pub(crate) fn open_dialog(&mut self, dialog: dialogs::Dialog) -> bool {
         if self.dialogs.is_open() {
             self.notices
                 .post(toast::Level::Warning, "a dialog is already open");
@@ -1534,13 +1539,60 @@ impl ZenApp {
     /// Turn a dialog answer into the command it stands for (plan §4.1). Called after the draw, like
     /// the pane commands, so a dialog can never mutate state another pane is painting from.
     pub fn answer(&mut self, answer: Answer) {
+        // The quick-find answers act on the engine directly (they carry their own subject);
+        // the prompt/confirm surface below is the button-answered half.
+        if let Answer::Quick { outcome, .. } = answer {
+            match outcome {
+                crate::dialogs::QuickOutcome::Activate { slot, path, is_dir } => {
+                    if is_dir {
+                        self.navigate_shown(slot, FsPath::from_abs(path));
+                    } else {
+                        // The D6 branch-and-print convention, same as `open_paths` for a
+                        // selection: files go to the desktop opener, every failure toasts on its
+                        // own, and a directory the report re-routes still navigates.
+                        let paths = vec![path];
+                        match self.session.open_paths(&paths) {
+                            Ok(report) => {
+                                if let Some(dir) = report.navigated.first() {
+                                    self.navigate_shown(slot, FsPath::from_abs(dir.clone()));
+                                }
+                                for (path, e) in &report.failed {
+                                    self.notices.post(
+                                        toast::Level::Error,
+                                        format!(
+                                            "open {}: {}",
+                                            path.as_path().display(),
+                                            e.user_message()
+                                        ),
+                                    );
+                                }
+                            }
+                            Err(e) => self.toast_error("open", e),
+                        }
+                    }
+                }
+                crate::dialogs::QuickOutcome::Closed { job, .. } => {
+                    // Close/teardown honesty: cancel what is still walking (prefer the lane's own
+                    // job — a promoted deferred request is not the one the dialog remembered),
+                    // and forget the window, so the next open is not throttled by this session.
+                    if let Some(job) = self.session.live_search().or(job) {
+                        self.session.cancel(job);
+                    }
+                    self.session.drop_pending_search();
+                    self.session.reset_search_throttle();
+                }
+            }
+            return;
+        }
         let kind = answer.kind().clone();
         let choice = answer.choice();
         let text = match &answer {
             Answer::Text { text, .. } => text.trim().to_string(),
-            Answer::Button { .. } => String::new(),
+            Answer::Button { .. } | Answer::Quick { .. } => String::new(),
         };
         match kind {
+            // The quick-find answer ran above; this arm only keeps the match total.
+            DialogKind::QuickFind { .. } => {}
             DialogKind::NewFolder { slot } => {
                 if self.new_folder_request == Some(slot) {
                     self.new_folder_request = None;

@@ -212,7 +212,7 @@ impl Dialogs {
 }
 
 /// Take a key out of the event list and report whether it was there.
-fn consume_key(ui: &mut Ui, key: Key) -> bool {
+pub(crate) fn consume_key(ui: &mut Ui, key: Key) -> bool {
     ui.input_mut(|input| {
         let pressed = input.key_pressed(key);
         if pressed {

@@ -22,9 +22,11 @@
 
 pub mod confirm;
 pub mod prompt;
+pub mod quick_find;
 
 pub use confirm::{Choice, Confirm, ConfirmButton};
 pub use prompt::{Prompt, Validation};
+pub use quick_find::{QuickFind, QuickOutcome};
 
 use egui::Ui;
 
@@ -56,6 +58,11 @@ pub enum DialogKind {
         slot: PaneSlot,
         /// The paths that would go — frozen when the dialog opened, and printed in it (plan D6).
         paths: Vec<AbsPath>,
+    },
+    /// The quick-find dialog (step 11b) — the subject is the *pane*, and the answer is a row.
+    QuickFind {
+        /// The pane whose directory is the scope and whose tab takes the navigation.
+        slot: PaneSlot,
     },
     /// `Confirm` (overwrite / skip / rename) → `Session::paste`/`paste_clipboard` with the answer's
     /// [`ConflictPolicy`](zenman_core::ops::ConflictPolicy).
@@ -90,6 +97,13 @@ pub enum Answer {
         /// Which button.
         choice: Choice,
     },
+    /// A quick-find answer: a row to act on, or the dismissal (`Escape`).
+    Quick {
+        /// The subject ([`DialogKind::QuickFind`]).
+        kind: DialogKind,
+        /// What the user did.
+        outcome: QuickOutcome,
+    },
 }
 
 impl Answer {
@@ -97,7 +111,7 @@ impl Answer {
     #[must_use]
     pub fn kind(&self) -> &DialogKind {
         match self {
-            Self::Text { kind, .. } | Self::Button { kind, .. } => kind,
+            Self::Text { kind, .. } | Self::Button { kind, .. } | Self::Quick { kind, .. } => kind,
         }
     }
 
@@ -106,6 +120,10 @@ impl Answer {
     pub fn choice(&self) -> Choice {
         match self {
             Self::Text { choice, .. } | Self::Button { choice, .. } => *choice,
+            Self::Quick {
+                outcome: QuickOutcome::Activate { .. } | QuickOutcome::Closed { .. },
+                ..
+            } => Choice::Ok,
         }
     }
 
@@ -123,6 +141,8 @@ pub enum Dialog {
     Prompt(Prompt),
     /// A question.
     Confirm(Confirm),
+    /// The live search (step 11b).
+    QuickFind(QuickFind),
 }
 
 impl Dialog {
@@ -131,6 +151,7 @@ impl Dialog {
         match self {
             Self::Prompt(prompt) => prompt.show(ui, tokens),
             Self::Confirm(confirm) => confirm.show(ui, tokens),
+            Self::QuickFind(find) => find.show(ui, tokens),
         }
     }
 }
