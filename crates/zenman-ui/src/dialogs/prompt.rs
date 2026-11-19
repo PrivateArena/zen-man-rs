@@ -89,7 +89,7 @@ impl Prompt {
         match self.validate {
             Validation::None => {
                 if text.is_empty() {
-                    Some("nothing to do — the field is empty".to_string())
+                    Some("nothing to do: the field is empty".to_string())
                 } else {
                     None
                 }

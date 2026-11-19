@@ -352,6 +352,14 @@ pub fn show(
             Sense::click(),
         );
         push_background_context(&background, bg_rect, &mut out);
+        // An empty pane is still a drop target — the cross-pane case where the other side has
+        // nothing listed yet.
+        if drag.is_some() && background.contains_pointer() && ui.input(|i| i.pointer.any_released())
+        {
+            out.push(PaneCommand::DropOnBackground {
+                copy: ui.input(|i| i.modifiers.ctrl),
+            });
+        }
         return out;
     }
     let order = RowOrder::build(model.tab);
@@ -995,7 +1003,7 @@ fn rename_field(
                 .desired_width((cell.width() - tokens.cell_padding).max(1.0))
                 .font(tokens.font()),
         )
-        .on_hover_text("New name — Enter commits, Escape cancels");
+        .on_hover_text("New name: Enter commits, Escape cancels");
     if editor.fresh {
         // Once, not every frame: re-asking for focus each frame is a repaint that never settles
         // (plan §9.2 step-10b's "a losing hover claim repaints forever", from the other side).

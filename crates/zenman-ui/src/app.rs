@@ -1478,11 +1478,13 @@ impl ZenApp {
         }
         let confirm = Confirm::new(
             DialogKind::PermanentDelete { slot, paths },
-            "Delete permanently",
+            // The heading is not the button's wording: two nodes with one label is a menu the mouse
+            // cannot aim at (`get_by_label` refuses the ambiguity — and so does a screen reader).
+            "Permanent delete",
             format!("Are you sure you want to permanently delete these {count} item(s)?"),
             vec![
                 named.join(", "),
-                "The data is not recoverable — nothing goes to the trash.".to_string(),
+                "The data is not recoverable. Nothing goes to the trash.".to_string(),
             ],
             // Safe answer first: `fresh` focuses the first button, so <kbd>Enter</kbd> and
             // <kbd>Escape</kbd> both leave the bytes alone. Go's `confirm` defaulted to OK, i.e. to
@@ -1518,9 +1520,7 @@ impl ZenApp {
                 "Entry(s) \"{}\" already exist at the destination.",
                 conflicts.join(", ")
             ),
-            vec![
-                "Skip keeps what is there · Rename keeps both · Overwrite replaces it.".to_string(),
-            ],
+            vec!["Skip keeps what is there. Rename keeps both. Overwrite replaces it.".to_string()],
             vec![
                 ConfirmButton::new("Skip", Choice::Skip),
                 ConfirmButton::new("Rename", Choice::Rename),
@@ -1582,7 +1582,7 @@ impl ZenApp {
                     self.notices.post(
                         toast::Level::Info,
                         format!(
-                            "delete permanently: cancelled — {} item(s) left alone",
+                            "delete permanently: cancelled: {} item(s) left alone",
                             paths.len()
                         ),
                     );
@@ -1613,7 +1613,7 @@ impl ZenApp {
             } => {
                 if choice == Choice::Cancel {
                     self.notices
-                        .post(toast::Level::Info, "paste: cancelled — nothing was written");
+                        .post(toast::Level::Info, "paste: cancelled, nothing was written");
                     return;
                 }
                 let policy = match choice {

@@ -117,6 +117,7 @@ impl Answer {
 }
 
 /// The one dialog that is open.
+#[derive(Debug)]
 pub enum Dialog {
     /// A text field.
     Prompt(Prompt),

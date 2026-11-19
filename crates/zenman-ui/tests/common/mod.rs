@@ -313,3 +313,23 @@ fn set_mtime(path: &Path, unix_secs: u64) {
         Err(e) => panic!("setting {} to {unix_secs}: {e}", path.display()),
     }
 }
+
+/// Remove a fixture tree, entry by entry.
+///
+/// `std::fs::remove_dir_all` is banned workspace-wide (plan §5.1: deletion goes through `trash`, with a
+/// log) — and a fixture reset is deliberately *not* a product delete, so it does the unlogged removal
+/// by hand instead of pretending to be one.
+pub fn remove_tree(path: &Path) {
+    let Ok(read) = std::fs::read_dir(path) else {
+        return;
+    };
+    for entry in read.flatten() {
+        let child = entry.path();
+        if child.is_dir() {
+            remove_tree(&child);
+        } else {
+            let _ = std::fs::remove_file(&child);
+        }
+    }
+    let _ = std::fs::remove_dir(path);
+}
