@@ -641,6 +641,9 @@ impl ZenApp {
         // The quick-find dialog's keystroke → engine seam (plan §5.8's `tick`), *after* the event
         // drain so a `SearchReady` never races the request that supersedes it in the same frame.
         crate::dialogs::quick_find::tick(self, ctx);
+        // The Search Manager's poll/debounce (plan §5.8's `tick`, step 12c), same place for the same
+        // reason: after the event drain, so an answer never races the request that superseded it.
+        crate::dialogs::search_manager::tick(self, ctx);
         self.reload_stale();
         let now = Instant::now();
         self.last_frame = now;
@@ -737,6 +740,9 @@ impl ZenApp {
         for answer in answers {
             self.answer(answer);
         }
+        // The manager's non-closing requests (Rebuild / Apply / the watch toggle) run here, after the
+        // draw, exactly like the answers — a dialog still never calls the engine itself.
+        crate::dialogs::search_manager::drain(self);
         // The drag ghost, on the foreground layer, paint-only: it must never claim a click from the row
         // under the pointer (`drag_drop::paint_ghost`).
         if let Some(payload) = self.drag.clone()
@@ -1265,10 +1271,7 @@ impl ZenApp {
                 Some(dir) => crate::dialogs::quick_find::open(self, slot, dir),
                 None => self.no_directory(command),
             },
-            Command::SearchManager => self.notices.post(
-                toast::Level::Info,
-                "the search manager arrives with step 12 (`dialogs/search_manager.rs`)",
-            ),
+            Command::SearchManager => crate::dialogs::search_manager::open(self, slot),
             Command::Properties => self.notices.post(
                 toast::Level::Info,
                 "the properties dialog arrives with step 13 (`dialogs/properties.rs`)",
@@ -1536,40 +1539,61 @@ impl ZenApp {
         self.open_dialog(dialogs::Dialog::Confirm(confirm));
     }
 
+    /// Act on one activated row: a directory navigates its pane, a file takes the desktop open
+    /// (Go's `executeItemAction`). Shared by quick-find and the Search Manager, so both dialogs answer
+    /// through the same seam as the chords and the menus rather than reaching for the engine.
+    fn activate_path(&mut self, slot: PaneSlot, path: AbsPath, is_dir: bool) {
+        if is_dir {
+            self.navigate_shown(slot, FsPath::from_abs(path));
+        } else {
+            // The D6 branch-and-print convention, same as `open_paths` for a
+            // selection: files go to the desktop opener, every failure toasts on its
+            // own, and a directory the report re-routes still navigates.
+            let paths = vec![path];
+            match self.session.open_paths(&paths) {
+                Ok(report) => {
+                    if let Some(dir) = report.navigated.first() {
+                        self.navigate_shown(slot, FsPath::from_abs(dir.clone()));
+                    }
+                    for (path, e) in &report.failed {
+                        self.notices.post(
+                            toast::Level::Error,
+                            format!("open {}: {}", path.as_path().display(), e.user_message()),
+                        );
+                    }
+                }
+                Err(e) => self.toast_error("open", e),
+            }
+        }
+    }
+
     /// Turn a dialog answer into the command it stands for (plan §4.1). Called after the draw, like
     /// the pane commands, so a dialog can never mutate state another pane is painting from.
     pub fn answer(&mut self, answer: Answer) {
+        // The Search Manager's closing answers (a row, or the dismissal); its non-closing requests
+        // are drained by `search_manager::drain`.
+        if let Answer::Index { outcome, .. } = answer {
+            match outcome {
+                crate::dialogs::IndexOutcome::Activate { slot, path, is_dir } => {
+                    self.activate_path(slot, path, is_dir);
+                }
+                crate::dialogs::IndexOutcome::Closed { rebuild } => {
+                    // Escape is Go's `closeSearchManager`: the rebuild it started is cancelled, so a
+                    // dismissed dialog never leaves a walk running behind the shell.
+                    if rebuild.is_some() {
+                        // `true` when a rebuild really was running; a finished one needs nothing more.
+                        let _ = self.session.index_cancel();
+                    }
+                }
+            }
+            return;
+        }
         // The quick-find answers act on the engine directly (they carry their own subject);
         // the prompt/confirm surface below is the button-answered half.
         if let Answer::Quick { outcome, .. } = answer {
             match outcome {
                 crate::dialogs::QuickOutcome::Activate { slot, path, is_dir } => {
-                    if is_dir {
-                        self.navigate_shown(slot, FsPath::from_abs(path));
-                    } else {
-                        // The D6 branch-and-print convention, same as `open_paths` for a
-                        // selection: files go to the desktop opener, every failure toasts on its
-                        // own, and a directory the report re-routes still navigates.
-                        let paths = vec![path];
-                        match self.session.open_paths(&paths) {
-                            Ok(report) => {
-                                if let Some(dir) = report.navigated.first() {
-                                    self.navigate_shown(slot, FsPath::from_abs(dir.clone()));
-                                }
-                                for (path, e) in &report.failed {
-                                    self.notices.post(
-                                        toast::Level::Error,
-                                        format!(
-                                            "open {}: {}",
-                                            path.as_path().display(),
-                                            e.user_message()
-                                        ),
-                                    );
-                                }
-                            }
-                            Err(e) => self.toast_error("open", e),
-                        }
-                    }
+                    self.activate_path(slot, path, is_dir);
                 }
                 crate::dialogs::QuickOutcome::Closed { job, .. } => {
                     // Close/teardown honesty: cancel what is still walking (prefer the lane's own
@@ -1588,11 +1612,13 @@ impl ZenApp {
         let choice = answer.choice();
         let text = match &answer {
             Answer::Text { text, .. } => text.trim().to_string(),
-            Answer::Button { .. } | Answer::Quick { .. } => String::new(),
+            Answer::Button { .. } | Answer::Quick { .. } | Answer::Index { .. } => String::new(),
         };
         match kind {
             // The quick-find answer ran above; this arm only keeps the match total.
             DialogKind::QuickFind { .. } => {}
+            // The Search Manager's answers ran above; its requests are drained by the dialog module.
+            DialogKind::SearchManager { .. } => {}
             DialogKind::NewFolder { slot } => {
                 if self.new_folder_request == Some(slot) {
                     self.new_folder_request = None;

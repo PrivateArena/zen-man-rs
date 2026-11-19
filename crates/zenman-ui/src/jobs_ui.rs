@@ -90,6 +90,11 @@ impl JobsUi {
                 crate::dialogs::quick_find::deliver(app, origin, job, result);
                 continue;
             }
+            // The Search Manager follows the job, not its timer (plan §5.8's 1 s poll stays as the
+            // fallback for a watcher's changes, which are not this session's events).
+            if matches!(event, EngineEvent::IndexChanged { .. }) {
+                crate::dialogs::search_manager::notify(app);
+            }
             let notices = route(&mut app.jobs, &mut app.model, event);
             for (level, text) in notices {
                 app.notices.post(level, text);

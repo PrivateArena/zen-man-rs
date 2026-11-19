@@ -435,6 +435,9 @@ struct Inner {
     /// properties dialog can ask for on every repaint — is a lock read.
     probe: Arc<RwLock<Option<bool>>>,
     config: Mutex<ZenConfig>,
+    /// The live watcher policy — [`SessionOptions::watcher`] at boot, moved by
+    /// [`Self::set_index_config`] (step 12c: the dialog's watcher toggle is the first writer).
+    watch_policy: Mutex<WatchPolicy>,
     /// Step 12a runtime index state (Go's `IndexState` — the config file keeps only the settings).
     index_state: Mutex<IndexRunState>,
     /// The step-12 queueing intent, applied by `poll_at` at the 2 s cadence (plan §5.5's updater row).
@@ -534,6 +537,7 @@ impl Session {
         let source: Arc<dyn FsSource> = Arc::new(OsDirRead);
         let dirs = Arc::new(DirService::new(Arc::clone(&source), Arc::clone(&limits)));
         let search = Arc::new(SearchService::new(source, Arc::clone(&limits)));
+        let watch_policy = Mutex::new(options.watcher);
         let session = Session {
             inner: Arc::new(Inner {
                 paths,
@@ -553,6 +557,7 @@ impl Session {
                 rebuild_job: Mutex::new(None),
                 index_progress,
                 watch: Mutex::new(WatchState::default()),
+                watch_policy,
                 events: Mutex::new(std::collections::VecDeque::new()),
                 clipboard: Mutex::new(None),
                 origins: OriginAlloc::new(),
@@ -609,7 +614,8 @@ impl Session {
         self.intent().note(op);
     }
 
-    /// The config the session booted with. Mutation of it is step 14's settings dialog, not step 6's.
+    /// The config the session booted with. The indexer half of it is written by
+    /// [`Self::set_index_config`]; everything else is still step 14's settings dialog.
     #[must_use]
     pub fn config(&self) -> ZenConfig {
         self.inner
@@ -1571,6 +1577,107 @@ impl Session {
         id.is_some_and(|id| self.inner.jobs.cancel(id))
     }
 
+    /// `GET /api/index/config` (`api/search_index_api.go`, the `config` object of
+    /// `tests/golden/index-status.json`): the persisted indexer settings.
+    #[must_use]
+    pub fn index_config(&self) -> IndexConfig {
+        self.config().indexer
+    }
+
+    /// `POST /api/index/config` (golden `tests/golden/index-config-apply.json` → `{"saved": true}`;
+    /// Go answered that boolean and nothing else, so the port returns the value it actually wrote).
+    ///
+    /// Four things happen, in this order, and a failure in the first two changes nothing at all:
+    ///
+    /// 1. **validation through the real bounds** — [`ZenConfig::validate`] (which is where
+    ///    [`INDEX_MAX_DEPTH`](crate::limits::INDEX_MAX_DEPTH) lives: it is a *config* bound, not a walk
+    ///    default), then [`compile_excludes`](crate::index::walker::compile_excludes) — Go discarded a
+    ///    bad pattern silently, plan §5.4 refuses it — then the two bounds that are the indexer's own:
+    ///    `worker_count ≥ 1` and every root an absolute path. A root that does not parse would otherwise
+    ///    be *dropped* by [`Self::watch_start`], which is the silent half-index this refuses.
+    /// 2. **the write**, through the same atomic tmp+rename [`ZenConfig::save`] every other settings
+    ///    change uses, into [`SessionPaths::config`];
+    /// 3. the live in-memory config, the **policy** (`auto_index` on promotes
+    ///    [`WatchPolicy::Off`] to [`WatchPolicy::Auto`], `auto_index` off demotes `Auto` back — the
+    ///    explicit [`WatchPolicy::On`] toggle is the user's and is never overwritten), and the
+    ///    **watcher**: a watcher that was running is stopped and re-armed on the new root set, and is
+    ///    left stopped when the new config no longer permits watching. A backend refusal there is not
+    ///    a config failure — the settings *are* saved, so it lands in
+    ///    [`IndexStatus::error`](crate::services::search_index::IndexStatus::error), which the dialog
+    ///    paints, rather than turning a successful save into an error.
+    /// 4. an [`EngineEvent::IndexChanged`] tagged with `origin`, so the dialog's status panel refreshes
+    ///    on the event rather than on its poll timer.
+    ///
+    /// # Errors
+    /// As [`ZenConfig::validate`], plus [`CoreError::BadRegex`] for an exclude pattern, and
+    /// [`CoreError::Config`] for a `worker_count` of 0 or a relative root.
+    pub fn set_index_config(
+        &self,
+        next: IndexConfig,
+        origin: Origin,
+    ) -> Result<IndexConfig, CoreError> {
+        let mut candidate = self.config();
+        candidate.indexer = next;
+        candidate.validate()?;
+        crate::index::walker::compile_excludes(&candidate.indexer.excludes)?;
+        if candidate.indexer.worker_count == 0 {
+            return Err(CoreError::Config {
+                msg: "worker_count must be at least 1 (Go's own default is 2)".to_string(),
+            });
+        }
+        for root in &candidate.indexer.roots {
+            if AbsPath::from_path(root).is_err() {
+                return Err(CoreError::Config {
+                    msg: format!("index root {root:?} is not an absolute path"),
+                });
+            }
+        }
+        let roots_changed = candidate.indexer.roots != self.index_config().roots;
+        let was_watching = self.watch_is_running();
+        candidate.save(&self.inner.paths.config)?;
+        let policy = match (candidate.indexer.auto_index, self.watch_policy()) {
+            (true, WatchPolicy::Off) => WatchPolicy::AutoIndex,
+            (false, WatchPolicy::AutoIndex) => WatchPolicy::Off,
+            (_, policy) => policy,
+        };
+        *lock(&self.inner.watch_policy) = policy;
+        *lock(&self.inner.config) = candidate.clone();
+        if roots_changed {
+            // The index no longer describes the configured tree (the golden `is_dirty` flag's meaning).
+            lock(&self.inner.index_state).is_dirty = true;
+        }
+        if was_watching {
+            self.watch_stop();
+            if policy == WatchPolicy::Off {
+                // The config turned watching off; stopping it *is* the re-arm.
+                lock(&self.inner.index_state).last_error = None;
+            } else {
+                let roots: Vec<AbsPath> = candidate
+                    .indexer
+                    .roots
+                    .iter()
+                    .filter_map(|root| AbsPath::from_path(root).ok())
+                    .collect();
+                if let Err(e) = self.watch_start_at(&roots) {
+                    lock(&self.inner.index_state).last_error = Some(e.user_message());
+                } else {
+                    lock(&self.inner.index_state).last_error = None;
+                }
+            }
+        }
+        let st = lock(&self.inner.index_state);
+        let announced = EngineEvent::IndexChanged {
+            total: u64::try_from(st.total_files).unwrap_or(0),
+            dirty: st.is_dirty,
+        };
+        drop(st);
+        // `origin` tags this write: the dialog's status panel refreshes on the event, and the
+        // correlation token is the one it handed over (plan §4.1), not one the engine invented.
+        let _ = origin;
+        self.push(announced);
+        Ok(candidate.indexer)
+    }
+
     /// The rebuild half of `poll`: a finished `IndexRebuild` job lands its state and is announced as
     /// `IndexChanged` (Go updated `IndexState` in the goroutine's tail; the port does it where the
     /// terminal event is seen, so the state and the event can never disagree).
@@ -1688,7 +1795,7 @@ impl Session {
     /// The watcher policy this session was opened with (plan §4.1's `SessionConfig.watcher`).
     #[must_use]
     pub fn watch_policy(&self) -> WatchPolicy {
-        self.inner.options.watcher
+        *lock(&self.inner.watch_policy)
     }
 
     /// Start watching the **index root set**, honouring [`WatchPolicy`]: refused while the policy is
@@ -1702,19 +1809,20 @@ impl Session {
     /// plan §5.5's stub row makes all of those the same typed error).
     pub fn watch_start(&self) -> Result<usize, CoreError> {
         let cfg = self.config();
-        let allowed = match self.inner.options.watcher {
+        let policy = self.watch_policy();
+        let allowed = match policy {
             WatchPolicy::On => true,
             // `Off` and `AutoIndex` agree today because nothing outside the session can set the policy
-            // (`Session::open` derives `SessionOptions` from `Limits`; plan §5.4: the settings store owns
-            // config writes), so the indexer's own `auto_index` flag is the only way a session learns it
-            // should watch. `On` is the explicit toggle step 12c's dialog will set.
+            // except [`Self::set_index_config`], which maps `auto_index` onto it (plan §5.4: the
+            // settings store owns config writes), so the indexer's own `auto_index` flag is the only
+            // way a session learns it should watch. `On` is the explicit toggle step 12c's dialog
+            // sets.
             _ => cfg.indexer.auto_index,
         };
         if !allowed {
             return Err(CoreError::Watcher {
                 msg: format!(
-                    "watch policy {:?} is not enabled and the indexer's auto_index flag is off",
-                    self.inner.options.watcher
+                    "watch policy {policy:?} is not enabled and the indexer's auto_index flag is off"
                 ),
             });
         }
@@ -1791,6 +1899,26 @@ impl Session {
             .watcher
             .as_ref()
             .map_or(0, crate::index::watcher::Watcher::watch_count)
+    }
+
+    /// The roots the backend could not watch, with the reason each failed (`0..n`; empty when nothing
+    /// is running or every root took). Plan §5.5's "report what you did not watch" half.
+    #[must_use]
+    pub fn failed_roots(&self) -> Vec<(AbsPath, String)> {
+        lock(&self.inner.watch)
+            .watcher
+            .as_ref()
+            .map_or_else(Vec::new, crate::index::watcher::Watcher::failed_roots)
+    }
+
+    /// Directories that appeared under a watched root after the descriptor budget ran out: watched
+    /// parents, unwatched subtrees (plan §5.5; empty when nothing is running).
+    #[must_use]
+    pub fn unwatched(&self) -> Vec<AbsPath> {
+        lock(&self.inner.watch)
+            .watcher
+            .as_ref()
+            .map_or_else(Vec::new, crate::index::watcher::Watcher::unwatched)
     }
 
     /// Move everything the watcher thread delivered into the engine's own channels — the two halves plan
@@ -2263,6 +2391,11 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// The persisted index configuration — Go's `IndexConfig` (`api/search_index.go:23`), spelled
+/// [`IndexerSettings`](crate::store::config::IndexerSettings) by this crate's storage type. The alias
+/// exists so the dialog speaks the wire's name (`tests/golden/index-status.json`'s `config`).
+pub type IndexConfig = crate::store::config::IndexerSettings;
+
 /// The session's runtime index state — Go's `IndexConfig.IndexState` (`api/search_index.go:30-34`),
 /// held in memory here because `store::config` keeps the settings file pure (plan §5.5: the config
 /// file is settings, not state). `is_dirty` starts `true` exactly like Go's default.
@@ -2377,6 +2510,135 @@ mod tests {
             dir.join("probe"),
         )
         .with_db_open(1, Duration::ZERO)
+    }
+
+    /// The config the indexer writes, with one root under the fixture directory.
+    fn indexer_cfg(dir: &Path) -> IndexConfig {
+        IndexConfig {
+            roots: vec![dir.join("tree").display().to_string()],
+            excludes: vec!["**/.git".to_string(), "**/build".to_string()],
+            auto_index: true,
+            index_on_startup: false,
+            max_depth: 4,
+            follow_symlinks: false,
+            worker_count: 3,
+        }
+    }
+
+    #[test]
+    fn index_config_round_trips_through_the_settings_file_and_a_refusal_changes_nothing() {
+        // Plan §7 row 12's write path (`index-config-apply.json`): the value lands in `config.json`,
+        // survives a reopen, and an out-of-bound value is refused *before* anything is written.
+        let dir = temp_dir("index-config");
+        let paths = paths(&dir);
+        let (session, _notes) = Session::open(
+            paths.clone(),
+            ZenConfig::default(),
+            Arc::new(Unsupported::new()),
+            crate::limits::Limits::default(),
+        )
+        .expect("a session opens over a fresh directory");
+        assert!(
+            session.index_config().roots.is_empty(),
+            "the default indexes nothing"
+        );
+        let applied = session
+            .set_index_config(indexer_cfg(&dir), session.next_origin())
+            .expect("a sound configuration is accepted");
+        assert_eq!(
+            applied,
+            indexer_cfg(&dir),
+            "the applied value is what was written"
+        );
+        assert_eq!(session.index_config(), applied, "the live config agrees");
+        assert!(
+            session.index_status().is_dirty,
+            "a new root set makes the index dirty (the golden `is_dirty` flag)"
+        );
+        // the file, not just the in-memory copy
+        let on_disk = ZenConfig::load(&paths.config).expect("the written file parses");
+        assert_eq!(on_disk.indexer, applied, "the settings file carries it");
+        // and the policy mapping: `auto_index` on promotes `Off` to `AutoIndex`
+        assert_eq!(session.watch_policy(), WatchPolicy::AutoIndex);
+        assert!(
+            session.failed_roots().is_empty() && session.unwatched().is_empty(),
+            "nothing is running, so nothing failed (the `#[cfg]` stub agrees)"
+        );
+        drop(session);
+        let (again, _notes) = Session::open(
+            paths.clone(),
+            ZenConfig::load(&paths.config).expect("reopen reads what was written"),
+            Arc::new(Unsupported::new()),
+            crate::limits::Limits::default(),
+        )
+        .expect("the session reopens on the saved config");
+        assert_eq!(
+            again.index_config(),
+            applied,
+            "roots/excludes/auto_index survive"
+        );
+
+        // --- refusals: none of these changes a byte
+        let before = fs::read(&paths.config).expect("the file is there");
+        let mut too_deep = applied.clone();
+        too_deep.max_depth = u32::try_from(crate::limits::INDEX_MAX_DEPTH).unwrap_or(u32::MAX) + 1;
+        let err = again
+            .set_index_config(too_deep, again.next_origin())
+            .expect_err("the depth cap is a config bound");
+        assert!(matches!(err, CoreError::CapacityExceeded { .. }));
+        let mut no_threads = applied.clone();
+        no_threads.worker_count = 0;
+        again
+            .set_index_config(no_threads, again.next_origin())
+            .expect_err("zero walk threads is not answerable");
+        let mut bad_glob = applied.clone();
+        bad_glob.excludes.push(String::new());
+        again
+            .set_index_config(bad_glob, again.next_origin())
+            .expect_err("Go discarded a bad exclude; the port refuses it");
+        let mut relative = applied.clone();
+        relative.roots.push("tree/relative".to_string());
+        again
+            .set_index_config(relative, again.next_origin())
+            .expect_err("a root that does not parse would be silently unindexed");
+        assert_eq!(again.index_config(), applied, "a refusal changes no value");
+        assert_eq!(
+            fs::read(&paths.config).expect("the file is still there"),
+            before,
+            "a refusal changes no bytes"
+        );
+        drop(again);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn turning_auto_index_off_moves_the_watch_policy_back() {
+        // The two switches are one decision: `auto_index` is the persisted half, `WatchPolicy` the
+        // runtime half, and `set_index_config` keeps them from disagreeing. `WatchPolicy::On` is the
+        // user's explicit toggle, so it is never overwritten.
+        let dir = temp_dir("watch-policy");
+        let paths = paths(&dir);
+        let (session, _notes) = Session::open(
+            paths,
+            ZenConfig::default(),
+            Arc::new(Unsupported::new()),
+            crate::limits::Limits::default(),
+        )
+        .expect("a session opens over a fresh directory");
+        assert_eq!(session.watch_policy(), WatchPolicy::Off, "the boot default");
+        let on = indexer_cfg(&dir);
+        session
+            .set_index_config(on, session.next_origin())
+            .expect("accepted");
+        assert_eq!(session.watch_policy(), WatchPolicy::AutoIndex);
+        let mut off = session.index_config();
+        off.auto_index = false;
+        session
+            .set_index_config(off, session.next_origin())
+            .expect("accepted");
+        assert_eq!(session.watch_policy(), WatchPolicy::Off, "and back down");
+        drop(session);
+        cleanup(&dir);
     }
 
     #[test]

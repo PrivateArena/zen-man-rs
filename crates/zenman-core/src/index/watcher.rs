@@ -333,6 +333,19 @@ mod stub {
         pub fn add_root(&mut self, _root: &AbsPath) -> Result<(), CoreError> {
             Err(watcher_unavailable())
         }
+
+        /// Always empty — the plan §7 step-16 `#[cfg]`-stub audit: a method the real backend has must
+        /// exist here too, or `Session` would need a `#[cfg]` at the call site.
+        #[must_use]
+        pub fn failed_roots(&self) -> Vec<(AbsPath, String)> {
+            Vec::new()
+        }
+
+        /// Always empty — as [`Self::failed_roots`].
+        #[must_use]
+        pub fn unwatched(&self) -> Vec<AbsPath> {
+            Vec::new()
+        }
     }
 
     /// Always `Err(CoreError::Watcher)`.

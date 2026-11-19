@@ -23,10 +23,12 @@
 pub mod confirm;
 pub mod prompt;
 pub mod quick_find;
+pub mod search_manager;
 
 pub use confirm::{Choice, Confirm, ConfirmButton};
 pub use prompt::{Prompt, Validation};
 pub use quick_find::{QuickFind, QuickOutcome};
+pub use search_manager::{IndexOutcome, SearchManager};
 
 use egui::Ui;
 
@@ -62,6 +64,12 @@ pub enum DialogKind {
     /// The quick-find dialog (step 11b) — the subject is the *pane*, and the answer is a row.
     QuickFind {
         /// The pane whose directory is the scope and whose tab takes the navigation.
+        slot: PaneSlot,
+    },
+    /// The Search Manager (step 12c) — the subject is the *index*; the pane only receives the row a
+    /// row activation navigates to.
+    SearchManager {
+        /// The pane an activated row lands in.
         slot: PaneSlot,
     },
     /// `Confirm` (overwrite / skip / rename) → `Session::paste`/`paste_clipboard` with the answer's
@@ -104,6 +112,14 @@ pub enum Answer {
         /// What the user did.
         outcome: QuickOutcome,
     },
+    /// A Search Manager answer: a row to act on, or the dismissal. Everything else the manager asks
+    /// for is a request it keeps for `search_manager::drain` — a config panel must not close on Save.
+    Index {
+        /// The subject ([`DialogKind::SearchManager`]).
+        kind: DialogKind,
+        /// What the user did.
+        outcome: IndexOutcome,
+    },
 }
 
 impl Answer {
@@ -112,6 +128,7 @@ impl Answer {
     pub fn kind(&self) -> &DialogKind {
         match self {
             Self::Text { kind, .. } | Self::Button { kind, .. } | Self::Quick { kind, .. } => kind,
+            Self::Index { kind, .. } => kind,
         }
     }
 
@@ -124,6 +141,7 @@ impl Answer {
                 outcome: QuickOutcome::Activate { .. } | QuickOutcome::Closed { .. },
                 ..
             } => Choice::Ok,
+            Self::Index { .. } => Choice::Ok,
         }
     }
 
@@ -143,6 +161,9 @@ pub enum Dialog {
     Confirm(Confirm),
     /// The live search (step 11b).
     QuickFind(QuickFind),
+    /// The Search Manager (step 12c). Boxed: it carries the whole config draft, and the plan's
+    /// `Stack(Vec<Dialog>)` would otherwise pay 592 bytes per slot (`clippy::large_enum_variant`).
+    SearchManager(Box<SearchManager>),
 }
 
 impl Dialog {
@@ -152,6 +173,7 @@ impl Dialog {
             Self::Prompt(prompt) => prompt.show(ui, tokens),
             Self::Confirm(confirm) => confirm.show(ui, tokens),
             Self::QuickFind(find) => find.show(ui, tokens),
+            Self::SearchManager(manager) => manager.show(ui, tokens),
         }
     }
 }
