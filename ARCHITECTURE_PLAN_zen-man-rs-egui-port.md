@@ -1093,3 +1093,119 @@ Deliberately deferred to step 9, and visible as such in the UI rather than faked
 * **`contract_ops::cancel_midway_leaves_a_prefix_and_no_log_record` is load-sensitive** (it asserts a paste job is interrupted, and the job wins the race on a busy machine): it failed once inside `cargo test --workspace` on this step's first CI run, passed in isolation 3/3 and on the green run, and is untouched by 12c. Recorded here so a later step does not read it as its own regression — and it is why the cancel test's fixture tree is capped at 3 000 rows rather than 6 000.
 * **Step 12's row-12 criteria, re-read:** `contract_search` green (12 cases, unchanged since 12a) ✓; interrupted rebuild keeps the old index ✓ (12a's `index::rebuild` cases + 12c's `escape_cancels_a_running_rebuild`, which asserts the shadow table never swapped); incremental upsert/delete/prune ✓ (12a's `index::updater` cases + 12b's watcher→intent wiring); watcher feature compiles on and off ✓ (both halves of the gate, plus the stub audit above).
 * **Handed to step 13 (archives).** `SearchManager::open`/`tick`/`drain`/`notify` are the pattern for any dialog that polls the engine; `Dialog::` boxing is the price of a fat state struct; `ZenApp::activate_path(slot, path, is_dir)` is now the shared row-activation seam quick-find and the manager both use — an archive row's "open" must join it, and the archive's `FsPath` is *not* an `AbsPath`, so `SearchManager::activate_target`'s `AbsPath::from_path` shortcut does not generalise. Properties (row 13) wants `Session::index_search` for the "file is inside an indexed archive" hint: the index stores no mode and no archive membership, so that half is a live lookup, not an index read.
+
+
+### Step 13a (archives in `zenman-core`) — execution log
+
+Files: `crates/zenman-core/src/archive/{mod,reader,vfs,extract}.rs`, `src/services/archive.rs`,
+`tests/contract_archive.rs`, plus `CoreError::ArchiveCorrupt`, `ops::guard::safe_join`,
+`FsPath::{as_store, enter, store_depth}`, `VirtualNode.encrypted`. **No UI** — the VFS browsing pane and
+`dialogs/properties` are 13b. Workspace test count **589 → 621** (22 lib + 10 contract), `cargo xtask ci`
+exit 0.
+
+* **Licence deltas — none, which is the finding.** `zip` 9.7.2 (MIT, `default-features = false,
+  features = ["deflate"]`) and `sevenz-rust` 0.6.1 (Apache-2.0, `default-features = false`) land in the
+  default build exactly as §10 item 3 planned; the plan's "9.7.0" resolved to 9.7.2 (same minor, MIT).
+  `cargo xtask licenses` moved **515 → 545 accepted expressions with the same 21 allowlisted ids and the
+  same 1 waiver** — no new licence id, no new waiver, no `deny.toml` edit was needed. `xtask deps`
+  unchanged (still one rev per git source, `zenman-core` still UI-free). Two facts worth recording: (a)
+  `nix 0.32.0` appears in the +30 because `cargo metadata` resolves the *union* of optional dependencies,
+  and `cargo tree -i nix` prints "nothing to print" — it is not in the compiled graph; (b) `rar`/`unrar`
+  remain in `[bans]`, and the `rar` feature is `[]` — it adds **no dependency**, and both the
+  `#[cfg(feature = "rar")]` and non-feature paths return `CoreError::Unsupported` carrying
+  `archive::RAR_UNSUPPORTED` (the clean-room licence sentence). `cargo check -p zenman-core --features rar`
+  is clean, so the feature rung cannot silently widen the licence graph — that is the point of the design.
+* **The path syntax is a triple, not a `!`.** There is no `archive!inner` form anywhere in Go: the wire
+  shape is `archive=<host>&nested=<member>&path=<member>` (`api/archive_handlers.go:29-34`, repeated at
+  `api/archive_extract.go:93-98`), and the string form is the slash path `cut` twice by
+  `parseVfsPath` (`frontend/js/utils.js:45-90`) — first at the first component whose *name* ends in
+  `.zip`/`.rar`/`.7z`, then again in the remainder. Step 3 already had both halves (`split_archive_path` →
+  `ArchiveParts{host, nested, inner}`, `vfs_uri`, `VfsKind::Archive{host, nested}`), so 13a added no new
+  syntax, only navigation. The plan's §5.5 `build_cache_key` (`clean(host) + "::" + trimmed(nested)`) is
+  implemented literally in `archive::vfs`; `FsPath::canonical_key` (step 3) is the same idea for a whole
+  path, and the two agree because both go through `clean_internal_path`.
+* **Depth 2 is structural, not a counter.** `VfsKind::Archive` has room for exactly one `nested`, which is
+  precisely what Go's two-pass parser could express — a *third* `.zip` component is an ordinary member name
+  (`contract_archive::nested_archive` proves `nested.zip → inner.zip → inner-file.txt` at depth 2, then that
+  `inner.zip/deeper.zip` stays a member at depth 2). `archive::MAX_NEST_DEPTH = 2` documents the number;
+  `FsPath::store_depth` reports it; `FsPath::as_store`/`enter` are the two ways a pane reaches a store.
+  **Trap found the hard way:** the first `enter` draft joined the row name onto a path that *already was*
+  the archive file, producing `/a/plain.zip/plain.zip`. `as_store()` (activate this row) and `enter(name)`
+  (activate a child row) are therefore separate calls, and the host-identity assertion in
+  `contract_archive::store_of` exists to keep that from coming back.
+* **§5.5's signatures, where reality moved them.** `ArchiveFormat` was *not* re-declared in
+  `archive/mod.rs` — step 3 owns it in `path.rs`, and `archive::ArchiveKind` is a type alias (two format
+  enums would be a divergence waiting to happen). `detect(path)` is extension-only, Go parity including the
+  case-fold (`archive::tests::detect_is_extension_only_and_case_folded_like_go`); the magic-byte check
+  (`archive::sniff`) is a *separate* helper, because Go's router never looked at content and its three
+  parsers each checked the signature themselves. `read_to_vec` is a default method on `ArchiveReader` over
+  `write_stream` (one cap implementation, `copy_capped`, shared by both backends). `open` takes a fourth
+  `name: &str` argument — every backend error names the archive it came from, and Go's did too.
+  `ExtractStrategy{Ask, Merge, Rename}` from the plan is **gone**: `ExtractReq` carries
+  `ops::ConflictPolicy` (the paste path's enum) instead, `Ask` is the dialog's business before the call, and
+  dir-onto-dir is `ConflictDecision::Merge` under every policy — a second collision enum would only let the
+  two paths disagree. `ManifestCache` spawns no thread (Go's 5-minute eviction goroutine became
+  `evict_stale()`, called from the session tick); `ExtractService` keeps the plan's `jobs`/`status`/`gc`
+  trio and its three-at-a-time rule became a token channel, so a fourth request **queues** (Go's
+  `extractSem` behaved the same and had no way to show it).
+* **What the goldens proved, and what had to be synthesised.** The archive goldens in `tests/golden/` are
+  API *captures* (JSON + one stream body), not containers — the real archives are `make-fixtures.py`'s
+  output, so `contract_archive.rs` shells out to the same generator and opens what it wrote. That bought:
+  `zip_browse` compares field-by-field against `archive-list-plain.json` (names, `is_dir`, sizes, the
+  `-r--r--r--` mode, `rel_path` = internal path, the 2026-01-01 mtime) and against
+  `archive-stream-plain.txt` byte-for-byte. `zipslip.zip` and `symlink.zip` are captured hostile fixtures,
+  so the zip-slip and symlink-extract tests run against real attack payloads, not inventions. What had to
+  be synthesised, and how: **`nested.zip`'s `inner.7z` is a 7z *stub*** (signature + 20 zero bytes) because
+  the generator records that no `7z`/`7za`/`p7zip` exists on the capture host and it must not download one —
+  so **no real 7z container is tested anywhere in this step**, and depth 2 is proven through `inner.zip`
+  (a real zip). The stub is therefore used as the corrupt-container case, and `sevenz-rust`'s read path is
+  exercised only as far as its header parse and error mapping — **no test decodes a real 7z member stream**. A genuine 7z golden is 13b-or-later homework (capture
+  one on a host that has `7zz`, or vendor one with a licence note). The encrypted zip is a **byte-level edit
+  of a captured file** (the general-purpose encrypted bit flipped in every local and central header), not a
+  writer's output — python's `zipfile` has no encryption support and the crate under test must not author its
+  own adversarial input. Same for the truncated zip (first half of `plain.zip`).
+* **`ArchiveEncrypted` needed a new node field.** Go's `VirtualNode` stored only `IsDir`
+  (`api/archive_vfs.go:13-20`), so `props` had nothing to count; `VirtualNode.encrypted` is a documented
+  port addition, and the zip backend lists through `by_index_raw` precisely so an encrypted member *lists*
+  (and can be greyed out) instead of failing the whole manifest. Mapping `zip`'s errors is variant-first
+  with one exception the tests pin: the backend reports a password-protected entry as
+  `ZipError::UnsupportedArchive("Password required to decrypt file")`, so that variant's text is inspected
+  before its name — otherwise an encrypted archive would arrive as `unsupported_archive`.
+* **Two behaviours were tightened past Go, both typed.** (1) Listing an archive *member* (or an absent
+  name) used to answer an empty page; it now returns `NotFound`, because Go's
+  `err-archive-baddir.json` is an error and an empty page is a lie. (2) Extraction runs a **plan pass**
+  before it writes a single byte: every member goes through `ops::guard::safe_join` (component-wise,
+  containment asserted on the resolved `AbsPath` — never a string prefix — plus a `symlink_metadata` check
+  on every existing intermediate). So `zipslip.zip` extracts to *nothing*: the destination directory is not
+  even created. Go checked per member with a substring rule that both over- and under-matched
+  (`archive-extract-dotdot-falsepositive.json`), and a hostile archive could leave a partial tree behind.
+  Symlink members materialise as ordinary files holding their target text (Go parity,
+  `archive-list-symlink.json`) — and the test asserts `symlink_metadata` says "not a link".
+* **Archive members are not indexed — the written decision.** Plan §5.10 asked for a ruling on the
+  `path` unique index. It is in `services/archive.rs`'s module doc: the SQLite `files.path` index is over
+  *filesystem* paths, and a member is a `(host, internal)` pair with no `parent` row, no `stat`, and no
+  `open` target — indexing 50 000 zip members would also blow past the walker's own caps for rows nobody
+  can navigate to. `contract_archive::archive_members_are_never_indexed` proves both halves: list/read/props
+  over a host *and* a nested store record **zero** `IndexOp`s, while an extraction records `Created` for
+  every file it really wrote, each under the destination. Extraction also emits `DirChanged{origin}` for the
+  destination (F13), which the same test's `finish` helper waits for.
+* **§7 row 13 status.** `contract_archive` green ✓; `a.zip/b.7z` browses to depth 2 — **partially met**:
+  depth 2 is proven against the *captured* nesting (`nested.zip` → `inner.zip`), and the `b.7z` half is a
+  signature stub by fixture-provenance necessity, so the criterion "matching golden fixtures" is met with
+  the goldens that exist and the real-7z case is open. Zip-slip refused ✓. **Extract shows progress + cancel
+  is engine-side only** — `Progress`/`CancelToken` are wired and `archive_cancel` reaches the worker's token,
+  but no dialog draws the bar until 13b. **Properties on Alt+Enter for archive entries** — the payload
+  (`ArchiveProps`, `Session::archive_props`) exists, the dialog does not: that is 13b, together with the
+  VFS browsing pane.
+* **Handed to 13b.** `Session::{archives, archive_list, archive_read, archive_stream, archive_props,
+  archive_extract, archive_extract_status, archive_cancel, archive_gc}`; `FsPath::{as_store, enter,
+  store_depth, is_archive_file}` for row activation; `ArchiveStore::{list, read, stream, stat}` as the
+  `FsSource`-shaped store (the pane needs no archive branch: rows are plain `FileEntry`s whose `rel_path`
+  is the internal path and whose mode is `-r--r--r--`); `ExtractJob::{state, report}` for the progress dialog
+  (`state.bytes_done/bytes_total`, `report.skipped`/`renamed` for the toast); `archive::vfs::build_cache_key`
+  + `CoreError::ArchiveModified` (409) for the "reload and say so" notice (F7). `archive_gc` should ride the
+  same shell tick as `evict_stale`.
+* **Deviation from the brief, stated:** the plan's `ExtractJob.state`/`Mutex` pair is kept, but the *job
+  table* is the single source of truth for liveness — `ExtractJob` is the status record, not a second
+  scheduler, so `Session::archive_extract` returns `Receipt::Running` with the same `JobId` the jobs pane
+  shows. Go had two ids (its extract job id and nothing else); the port has one.
