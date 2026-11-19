@@ -1608,3 +1608,70 @@ are 15b and are *not* in this commit.
   12. **Batch rename is a form, not a table**: "Batch rename — 3 item(s)" with a 3-line summary where Go
       has an `Original Name / New Name / Status` table with `UNCHANGED` rows; and the summary's new name
       reads `a.txt→a`, which looks truncated at the frame's width — worth a direct look in 15b.
+
+### Step 15b (the side panels — the last §5.8 surface) — execution log
+
+Files: `crates/zen-man-rs`-side — new `crates/zenman-core/src/services/places.rs` (declared), new
+`crates/zenman-ui/src/panels/side_panel.rs` (declared in `panels/mod.rs`); `platform/mod.rs`
+(`home_dir`), `session.rs` (`places`/`favourites`/`add_favourite`/`remove_favourite`/`write_bookmarks`),
+`metrics.rs` (`format_relative_time`), `services/action_log.rs` (`LogRow::ago`), `app.rs` (both drawers,
+`Command::AddToFavorites`), `panels/action_log.rs` (Go vocabulary), `tests/{side_panel,snapshots,shell}.rs`.
+
+* **Places source of truth — the plan's XDG hypothesis is wrong, retired here.** Go's Places list is
+  **hardcoded in the frontend**: `frontend/js/sidebar.js:9-15` = `Home (~)`, `Root (/)`,
+  `~/Downloads`, `~/Documents`, `~/Desktop`. Go never read `~/.config/user-dirs.dirs`, so there is no
+  user-dirs port; `places::GO_USER_DIRS` is that list verbatim. Favourites = Go's *bookmarks*:
+  `api/places.go:120-197` (`config.json` `bookmarks: ["/path"]`, POST add/remove, dedup on add, label =
+  last component `sidebar.js:66`) → `ZenConfig::bookmarks`, persisted through the *same* atomic
+  `ZenConfig::save` step 12c uses for the index config (`Session::add_favourite`/`remove_favourite`).
+  Mounted drives = `api/places.go:236-291` (`/media`, `/run/media`); the port asks
+  `Env::mount_entries` and keeps Go's visibility rule (`places::visible_mount`) plus the root
+  filesystem, with `Env::disk_space` per mount. The home directory is answered in **`platform`**
+  (`platform::home_dir`, `platform/mod.rs`), not in `services/` — `services/mod.rs` forbids env reads —
+  and `Places::build` takes it as an argument, so `zenman-ui` still touches no `std::fs` (IO guard green).
+* **D8 — fixed.** The left drawer is Go's three sections in Go's order (`index.html:24-34`):
+  `PLACES` / `BOOKMARKS` (with the `+` of `index.html:29` and the hover-revealed `×` of
+  `sidebar.js:78-92`) / `MOUNTED DRIVES`, with Go's empty states ("No bookmarks", "No mounted drives").
+  Rows are one flat `Button` each (the only click target), a paint-only `Sense::hover` icon rect beside
+  it (rule 10), Go's uppercase muted section titles. A place that is not reachable keeps its row, keeps
+  its `Navigate` answer (the pane then shows core's own typed directory error) and prints
+  `unreachable — <reason>`: `Place::{exists, unavailable}` is the typed state,
+  `side_panel::place_note` renders it. Navigation goes through `PaneCommand::Navigate` for
+  `model.active_pane` — the breadcrumb's seam, not a second one.
+* **D9 — fixed, and the disks moved.** `docs/parity/06-right-drawer.png` is **not** a disk panel: it
+  (and `07-action-log-drawer.png`, byte-identical but for its minute stamps) is Go's **Action History**
+  slide-in over the Search Manager. Go's *right* sidebar (`index.html:425-487`) is the **Custom Actions
+  manager** — that is what the right drawer now is (`CUSTOM ACTIONS` + `+` → `ZenApp::open_action_editor`,
+  one row per configured action with its role and glob, `No custom actions` empty state). The disks went
+  where Go has them: the left drawer's `MOUNTED DRIVES`. Row text is ellipsised to the width the panel
+  actually has (`side_panel::ellipsize_to_width`) and the free/total string is **painted** right-aligned
+  inside the same rect, so it can never reach the window edge; the accessible name stays the volume
+  name, which is what makes the rect assertion possible. `drive_drawer` now asserts, for every mount,
+  that a node inside the panel's x-range exists and `rect.max.x <= tokens.left_drawer_width`.
+  *Still owed by 15c/16:* executing a custom action from the drawer (Go runs them only from the file
+  menu) and the per-row delete/reorder of Go's action manager.
+* **D10 — fixed, and the step-14b deviation is retired.** The relative text is computed in **core**
+  (`metrics::format_relative_time`, Go's `action-log.js:34-43` buckets `Ns/Nm/Nh/Nd ago`) and exposed as
+  `LogRow::ago`; the panel prints Go's `TITLE` "Action History" (`index.html:628`), Go's `DESCRIPTION`
+  (`:631`), the per-type icon (`ACTION_META`, `:17-24`) mapped onto **this port's icon set** (the
+  reference's emoji are not in our font stack — rule 11), and the red italic `permanent`
+  (`:105-108`) exactly where Go puts it (no undo possible, not already reverted). The RFC 3339 stamp
+  stays on `LogRow::timestamp` for the wire/golden tests; it is simply no longer what the row prints.
+* **Baselines re-rendered in this commit** (`06-left-drawer`, `07-right-drawer`, `08-action-log-drawer`);
+  byte-reproducibility re-proved the 15a way: two independent `ZENMAN_SNAPSHOT_WRITE=1` runs, `diff -r`
+  of the whole artefact directory → identical. `FIXED_AGO = "1m ago"` joins `FIXED_RFC3339` in
+  `freeze_log_panel` (both stamped, both re-stamped after the frame, both asserted) because `ago` is
+  `now - ts` like the stamp is. The drawer artefacts stay **machine-specific by nature** (real
+  `statvfs` numbers, real `$HOME`), as 15a recorded.
+* **Traps hit, for the next contributor.** (1) `CARGO_TARGET_TMPDIR` is not available to a *lib* test —
+  core's unit tests use `std::env::temp_dir()`. (2) This fork has **no `RichText::uppercase()`**, so the
+  section titles really are upper-cased strings and the accessible names are `"PLACES"` etc. (3) A mount
+  volume name can collide with a breadcrumb chip (`home` under `/media/jang/…`) — filter the kittest
+  nodes by the panel's x-range rather than trusting a label to be unique. (4) The old
+  `drawers_toggle_from_their_header_buttons` asserted the step-7 headings and was updated, not deleted.
+* **15c must record:** the parity command (`xtask parity`) still does not exist — it is the whole of
+  15c, and it should diff *our* drawer/log text against `docs/parity/{05,06,07}` and the `contracts.md`
+  sweep; the remaining 15a defects 1,2,3,4,5,6,7,11,12 are untouched by this step and still open; the
+  drawer artefacts must stay excluded from cross-machine pixel comparison; the Go reference set has **no
+  capture of the left drawer open** (`05-left-drawer.png` shows it closed — the drawer is hover-triggered
+  off-canvas), so D8's verdict rests on `index.html`/`sidebar.js`, not on a screenshot.
