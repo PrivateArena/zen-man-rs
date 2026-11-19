@@ -9,9 +9,28 @@ so an existing data directory keeps its history across the port.
 ## Build, run, test
 
 ```sh
+./scripts/build.sh                                 # preflight + fetch --locked + release build
+./scripts/build.sh --check                         # "can this machine build it?", nothing compiled
+./scripts/build.sh --smoke                         # ... and prove it boots (--safe-gpu --smoke 1)
+./scripts/build.sh --install                       # -> $PREFIX/bin/zenman (default ~/.local/bin)
+./scripts/build.sh --dist                          # -> target/dist/zenman-<ver>-<triple>.tar.gz
+```
+
+The script is the short path; the underlying commands are all ordinary cargo:
+
+```sh
+cargo build --release -p zenman                    # -> target/release/zenman (~31 MB, single file)
 cargo build -p zenman
 cargo run  -p zenman                     # opens the window on a real GPU; falls back per gpu_startup
 ```
+
+What a build machine needs (the script checks each of these and says which one failed): a Rust
+toolchain at the declared MSRV with `rustfmt`/`clippy`, and a **C compiler** — `rusqlite` is `bundled`
+so the SQLite amalgamation (FTS5 + trigrams) compiles in, which is why the binary needs no distro
+`libsqlite3`. Nothing else: every `-sys` crate in the graph is `dlopen`-based (`x11-dl`, `xkbcommon-dl`,
+`wayland-sys`, `ash`), so the X11/Wayland/GPU libraries are **runtime** requirements, not build ones.
+The fonts and icons ship embedded (`include_bytes!`), so the executable is self-contained; the
+`ATTRIBUTION.md` that goes with it ships in the `--dist` tarball.
 
 Headless / CI:
 
