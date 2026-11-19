@@ -342,7 +342,9 @@ pub fn show(
     // *background* variant (Go cleared the selection there and showed Paste / New Folder,
     // `context-menu.js:108-124`). See the band computation under [`PaneCommand::Context`].
     let bg_rect = ui.available_rect_before_wrap();
-    if model.tab.entries.entries.is_empty() {
+    // An error is its own state: printing "Directory is empty" underneath it would claim the
+    // archive was empty, which is the failure mode §7 row 13 names (step 13b).
+    if model.tab.entries.entries.is_empty() && model.tab.error.is_none() {
         empty_row(ui, tokens, model.loading);
         // Nothing else in the body is interactive, so all of it is the background — allocated after
         // the placeholder's own labels, so exactly one rect owns the pointer (see below).

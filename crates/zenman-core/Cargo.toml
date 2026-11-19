@@ -52,3 +52,10 @@ rusqlite = { workspace = true }
 # Plan §5.5 step 13a: the two default-build archive readers (licence note in the root table).
 zip = { workspace = true }
 sevenz-rust = { workspace = true }
+
+[dev-dependencies]
+# Step 13b's 7z round trip (`tests/archive_sevenz.rs`) needs the **writer** half of `sevenz-rust`,
+# which the crate spells `compress` (there is no feature called `write`). Dev-only on purpose: the
+# shipped build reads 7z and never writes one, so `cargo build` still compiles the reader-only feature
+# set. This adds no package to the graph — `sevenz-rust` is already a dependency above.
+sevenz-rust = { workspace = true, features = ["compress"] }

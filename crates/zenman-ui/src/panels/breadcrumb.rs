@@ -99,30 +99,29 @@ pub struct Crumb {
 /// The trail of one path: the store root first, then one crumb per [`FsPath::components`] segment.
 ///
 /// The store root is `path.store`'s own root, not the filesystem's: inside an archive (step 13)
-/// `Root` is the archive, and the host segments that lead to it stay clickable as *filesystem*
-/// paths, which is what Go's accumulated `data-path` did.
+/// `Root` is the archive, the host segments that lead to it stay clickable as *filesystem* paths,
+/// and the container's own chip — plus a nested member's — is the *store* it opens, which is what
+/// Go's `data-path` + archive query triple did (`navigation.js:190`, step 13b).
 #[must_use]
 pub fn trail(path: &FsPath) -> Vec<Crumb> {
     let mut out = vec![Crumb {
         label: ROOT_LABEL.to_owned(),
         target: path.store.root_path(),
     }];
-    // How many leading components belong to the archive's *host* (its own path, plus the nested
-    // member): those accumulate on the filesystem, the ones after it on the archive store.
-    let host = path.store.host().map_or(0, |host| {
-        host.components_clean().count()
-            + path
-                .store
-                .nested()
-                .unwrap_or_default()
-                .split('/')
-                .filter(|s| !s.is_empty())
-                .count()
+    // How many leading components belong to the archive's *host* (its own path), and how many to the
+    // nested member: those accumulate on the filesystem, the ones after them on the archive store.
+    let host_len = path
+        .store
+        .host()
+        .map_or(0, |host| host.components_clean().count());
+    let nested_len = path.store.nested().map_or(0, |nested| {
+        nested.split('/').filter(|s| !s.is_empty()).count()
     });
+    let boundary = host_len + nested_len;
     let mut current = FsPath::ROOT;
     let mut crossed = false;
     for (ix, segment) in path.components().into_iter().skip(1).enumerate() {
-        if !crossed && ix >= host {
+        if !crossed && ix >= boundary {
             current = path.store.root_path();
             crossed = true;
         }
@@ -131,9 +130,22 @@ pub fn trail(path: &FsPath) -> Vec<Crumb> {
         if let Ok(joined) = current.join(&segment) {
             current = joined;
         }
+        // Go's chip trail made the container itself clickable *as a store* (`navigation.js`'s
+        // `data-path` plus the archive query triple), so the two boundary chips target the stores
+        // they open and not the bytes on disk: the host chip opens the container, the nested
+        // member's chip the inner store (depth 2, the cap). Step 13b.
+        let store_target = if host_len > 0 && ix == host_len - 1 {
+            path.store
+                .host()
+                .and_then(|host| FsPath::from_abs(host.clone()).as_store().ok())
+        } else if nested_len > 0 && ix == boundary - 1 {
+            Some(path.store.root_path())
+        } else {
+            None
+        };
         out.push(Crumb {
             label: segment,
-            target: current.clone(),
+            target: store_target.unwrap_or_else(|| current.clone()),
         });
     }
     out

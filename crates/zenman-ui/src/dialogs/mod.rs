@@ -21,12 +21,16 @@
 //! travels inside [`DialogKind`].
 
 pub mod confirm;
+pub mod extract;
 pub mod prompt;
+pub mod properties;
 pub mod quick_find;
 pub mod search_manager;
 
 pub use confirm::{Choice, Confirm, ConfirmButton};
+pub use extract::ExtractProgress;
 pub use prompt::{Prompt, Validation};
+pub use properties::{PropertiesDialog, Subject as PropertiesSubject};
 pub use quick_find::{QuickFind, QuickOutcome};
 pub use search_manager::{IndexOutcome, SearchManager};
 
@@ -83,6 +87,13 @@ pub enum DialogKind {
         mode: Option<PasteMode>,
         /// A drag's sources; empty for a clipboard paste, which reads the live clipboard.
         sources: Vec<AbsPath>,
+    },
+    /// `Properties` (step 13b) — the subject is the path it printed, and the only answer is "close".
+    Properties {
+        /// The pane the dialog was opened from.
+        slot: PaneSlot,
+        /// What it is about, in display form (a filesystem path, or an archive member path).
+        path: String,
     },
 }
 
@@ -164,6 +175,8 @@ pub enum Dialog {
     /// The Search Manager (step 12c). Boxed: it carries the whole config draft, and the plan's
     /// `Stack(Vec<Dialog>)` would otherwise pay 592 bytes per slot (`clippy::large_enum_variant`).
     SearchManager(Box<SearchManager>),
+    /// Properties (step 13b) — local **and** archive subjects, one dialog, two engines.
+    Properties(PropertiesDialog),
 }
 
 impl Dialog {
@@ -174,6 +187,7 @@ impl Dialog {
             Self::Confirm(confirm) => confirm.show(ui, tokens),
             Self::QuickFind(find) => find.show(ui, tokens),
             Self::SearchManager(manager) => manager.show(ui, tokens),
+            Self::Properties(dialog) => dialog.show(ui, tokens),
         }
     }
 }
@@ -205,6 +219,19 @@ impl Dialogs {
     /// Close whatever is up (`Escape` from the shell, a pane going away).
     pub fn close(&mut self) {
         self.active = None;
+    }
+
+    /// Lift the open dialog out (the frame's owner is `ZenApp`, and a dialog that needs the session
+    /// must be handed both without aliasing — see [`properties::tick`](properties::tick)).
+    pub fn take(&mut self) -> Option<Dialog> {
+        self.active.take()
+    }
+
+    /// Put a lifted dialog back (a no-op if something else opened in between).
+    pub fn put(&mut self, dialog: Dialog) {
+        if self.active.is_none() {
+            self.active = Some(dialog);
+        }
     }
 
     /// What is open, for the tests and for a redraw of the *same* dialog.

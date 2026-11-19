@@ -101,6 +101,13 @@ pub struct ZenApp {
     pub new_folder_request: Option<PaneSlot>,
     /// The modal stack (step 10c): one prompt or one confirm, and its answer is a command.
     pub dialogs: dialogs::Dialogs,
+    /// The extractions this shell started (step 13b): one modeless progress panel each, polled from
+    /// the shell's tick, kept after they finish so the summary can be read (and closed).
+    pub extracts: Vec<crate::dialogs::extract::ExtractProgress>,
+    /// Has this session opened an archive store at all? The teardown pair (13a's handover) is worth
+    /// running once a frame only while the answer is yes — an archive-free shell frame does not
+    /// touch either cache.
+    pub archives_touched: bool,
     /// The file drag in flight (step 10c, `drag_drop`): `None` when the pointer is not dragging rows.
     pub drag: Option<crate::drag_drop::DragPayload>,
     /// When the next debounced persist is due (plan §5.7 `persist_at`).
@@ -132,6 +139,8 @@ impl ZenApp {
             keys: KeyMap::default(),
             new_folder_request: None,
             dialogs: dialogs::Dialogs::default(),
+            extracts: Vec::new(),
+            archives_touched: false,
             drag: None,
             persist_at: None,
             last_frame: Instant::now(),
@@ -158,6 +167,8 @@ impl ZenApp {
             keys: KeyMap::default(),
             new_folder_request: None,
             dialogs: dialogs::Dialogs::default(),
+            extracts: Vec::new(),
+            archives_touched: false,
             drag: None,
             persist_at: None,
             last_frame: Instant::now(),
@@ -249,6 +260,47 @@ impl ZenApp {
             flat: tab.flat.to_core(),
         };
         tab.loading_more = append;
+        // Step 13b: an archive listing does not go through the directory cache. The manifest is the
+        // listing (`Session::archive_list`, cached per host mtime inside core), it is whole — no
+        // cursor, no `has_more`, no page job — and its failures are typed, so they become an inline
+        // pane state *and* a toast rather than an empty pane (§7 row 13).
+        if matches!(tab.path.store, zenman_core::path::VfsKind::Archive { .. }) {
+            self.archives_touched = true;
+            let path = tab.path.clone();
+            match self.session.archive_list(&path) {
+                Ok(entries) => {
+                    let total = entries.len();
+                    let page = std::sync::Arc::new(zenman_core::entry::DirPage {
+                        path,
+                        entries,
+                        cursor: zenman_core::cursor::Cursor(0),
+                        has_more: false,
+                        total_count: total,
+                        loaded_so_far: total,
+                    });
+                    if let Some(tab) = self.model.tab_at_mut((slot, ix)) {
+                        if append {
+                            tab.append_page(page);
+                        } else {
+                            tab.set_page_keeping_selection(page);
+                        }
+                        tab.error = None;
+                        tab.loading_more = false;
+                    }
+                }
+                Err(e) => {
+                    let text = e.user_message();
+                    if let Some(tab) = self.model.tab_at_mut((slot, ix)) {
+                        let empty = std::sync::Arc::new(crate::state::empty_page(tab.path.clone()));
+                        tab.entries = empty;
+                        tab.error = Some(std::sync::Arc::new(e));
+                        tab.loading_more = false;
+                    }
+                    self.notices.post(toast::Level::Error, text);
+                }
+            }
+            return;
+        }
         let receipt = self.session.page_dir(&req, origin);
         match receipt {
             Ok(Receipt::Done(page)) => {
@@ -339,17 +391,39 @@ impl ZenApp {
                     .tab_mut_of(slot)
                     .and_then(|tab| tab.entries.entries.get(ix).cloned());
                 let Some(entry) = entry else { return };
+                // Step 13b: entering a row can change **store**. `FsPath::enter`/`as_store` own the
+                // rule (an archive-named row opens its container), and the cap is structural:
+                // `MAX_NEST_DEPTH` is 2, so at depth 2 an archive-named member is a member and the
+                // row activates as a file — "a third level does not open" (§7 row 13).
+                let depth = self
+                    .tab_mut_of(slot)
+                    .map(|tab| tab.path.store_depth())
+                    .unwrap_or_default();
+                let opens_store = entry.is_dir
+                    || (zenman_core::path::is_archive_name(&entry.name)
+                        && depth < zenman_core::archive::MAX_NEST_DEPTH);
                 let child = {
                     let Some(tab) = self.tab_mut_of(slot) else {
                         return;
                     };
-                    tab.path
-                        .join_rel(&entry.rel_path)
-                        .ok()
-                        .or_else(|| tab.path.join(&entry.name).ok())
+                    let joined = if entry.rel_path.is_empty() {
+                        tab.path.enter(&entry.name).ok()
+                    } else {
+                        tab.path.join_rel(&entry.rel_path).ok()
+                    };
+                    let joined = joined.or_else(|| tab.path.enter(&entry.name).ok());
+                    joined.map(|joined| {
+                        // `as_store` is the store switch; anything it refuses (a plain file, a
+                        // depth-2 member) stays the plain joined path.
+                        if opens_store {
+                            joined.as_store().unwrap_or(joined)
+                        } else {
+                            joined
+                        }
+                    })
                 };
                 let Some(child) = child else { return };
-                if entry.is_dir {
+                if opens_store {
                     self.remember_selection(slot);
                     if let Some(tab) = self.tab_mut_of(slot) {
                         tab.navigate_to(child, entry.name.clone());
@@ -638,6 +712,17 @@ impl ZenApp {
     pub fn logic(&mut self, ctx: &egui::Context) {
         self.handle_keys(ctx);
         JobsUi::tick(self, ctx);
+        // Step 13b: the two archive polls, once per frame each (`Dialog::show` never touches the
+        // engine, so the size answer and the extract progress are collected here).
+        crate::dialogs::properties::tick(self);
+        crate::dialogs::extract::tick(self);
+        // 13a's teardown handover: collect finished extractions past the retention window and drop
+        // stale manifests. Bounded work (both caches are capped by `Limits`), and only once the
+        // session has actually opened a store.
+        if self.archives_touched {
+            self.session.archive_gc();
+            self.session.archives().store().cache().evict_stale();
+        }
         // The quick-find dialog's keystroke → engine seam (plan §5.8's `tick`), *after* the event
         // drain so a `SearchReady` never races the request that supersedes it in the same frame.
         crate::dialogs::quick_find::tick(self, ctx);
@@ -732,6 +817,9 @@ impl ZenApp {
         // **Last**, on the foreground layer: in this egui fork the last-allocated overlapping rect
         // wins hover and click (plan §9.2 step 8), so the menu is drawn after every panel, the dock
         // and the toast stack, and nothing can steal its rows.
+        // The extraction panels, on the foreground layer but **modeless** (see `dialogs/extract`'s
+        // module doc): a modal would block the pane the extraction repopulates.
+        crate::dialogs::extract::show(self, ui, &tokens);
         self.draw_menu(ui.ctx());
         // **Last**, above the menu: a modal is the only thing on screen that may answer a key, and
         // `handle_keys` has already stood down for it. Its answers run here, after the draw, exactly
@@ -1154,6 +1242,32 @@ impl ZenApp {
     /// Every command that needs a tab, a selection or a clipboard and does not find one is a
     /// **no-op with a toast** — never a panic, never silence.
     pub fn dispatch(&mut self, slot: PaneSlot, command: Command, ctx: &egui::Context) {
+        // Step 13b: inside an archive the write ladder is refused **here**, with the reason. The menus
+        // already grey these rows out (`MenuContext::on_archive`), but a chord, a menu row or a drag
+        // that still arrives gets an answer rather than a silent no-op or an engine error several
+        // frames later — plan §5.8's named Go bug was Delete offered over a read-only VFS.
+        const READ_ONLY_REFUSED: &[Command] = &[
+            Command::NewFolder,
+            Command::Paste,
+            Command::PasteInside,
+            Command::PasteLink,
+            Command::Cut,
+            Command::CutInside,
+            Command::Delete,
+            Command::PermanentDelete,
+            Command::Rename,
+            Command::Chmod,
+        ];
+        if READ_ONLY_REFUSED.contains(&command) && self.in_archive(slot) {
+            self.notices.post(
+                toast::Level::Warning,
+                format!(
+                    "{}: an archive listing is read-only — extract it first",
+                    self.keys.hint_text(command)
+                ),
+            );
+            return;
+        }
         match command {
             Command::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             Command::ActionLog => self.model.log_panel = !self.model.log_panel,
@@ -1272,10 +1386,10 @@ impl ZenApp {
                 None => self.no_directory(command),
             },
             Command::SearchManager => crate::dialogs::search_manager::open(self, slot),
-            Command::Properties => self.notices.post(
-                toast::Level::Info,
-                "the properties dialog arrives with step 13 (`dialogs/properties.rs`)",
-            ),
+            Command::Properties => crate::dialogs::properties::open(self, slot),
+            // Step 13b: "extract shows progress + cancel". The panel is the progress; the cancel is
+            // in it. Go's default (`ConflictPolicy::DEFAULT`, the same rule the paste path uses).
+            Command::Extract => self.extract_here(slot, zenman_core::ops::ConflictPolicy::DEFAULT),
             Command::AddToFavorites => self.notices.post(
                 toast::Level::Info,
                 "favorites are written by step 14's places service",
@@ -1326,6 +1440,50 @@ impl ZenApp {
     /// (plan §4.2: only a local path can be written to).
     fn shown_dir_abs(&self, slot: PaneSlot) -> Option<AbsPath> {
         self.shown_tab(slot)?.path.host_abs()
+    }
+
+    /// Is the shown tab inside an archive store? (The read-only predicate for the whole shell —
+    /// `on_archive` in the menus, the guard in [`Self::dispatch`], the extract command.)
+    #[must_use]
+    pub fn in_archive(&self, slot: PaneSlot) -> bool {
+        self.shown_tab(slot)
+            .is_some_and(|tab| matches!(tab.path.store, zenman_core::path::VfsKind::Archive { .. }))
+    }
+
+    /// Extract the shown archive (or its selection) into the directory that holds it.
+    ///
+    /// The conflict policy is the caller's, because `ops::ConflictPolicy` is the engine's own answer
+    /// to a collision at the destination and the UI must not invent a second one.
+    pub fn extract_here(&mut self, slot: PaneSlot, policy: zenman_core::ops::ConflictPolicy) {
+        let Some(tab) = self.shown_tab(slot).cloned() else {
+            self.notices
+                .post(toast::Level::Warning, "nothing to extract");
+            return;
+        };
+        if !self.in_archive(slot) {
+            self.notices.post(
+                toast::Level::Warning,
+                "extract works on an archive listing — open one first",
+            );
+            return;
+        }
+        self.archives_touched = true;
+        // The selection's internal paths; nothing selected means the whole container (Go's
+        // `sources: []` rule, `api/archive_extract.go:96`).
+        let sources: Vec<String> = tab
+            .entries
+            .entries
+            .iter()
+            .filter(|e| tab.sel.keys().contains(crate::state::Tab::row_key(e)))
+            .map(|e| {
+                if e.rel_path.is_empty() {
+                    e.name.clone()
+                } else {
+                    e.rel_path.clone()
+                }
+            })
+            .collect();
+        crate::dialogs::extract::start(self, slot, &tab.path, sources, policy);
     }
 
     /// The selection's absolute paths, in listing order (plan §5.8's display-order fix). Archive
@@ -1617,6 +1775,9 @@ impl ZenApp {
         match kind {
             // The quick-find answer ran above; this arm only keeps the match total.
             DialogKind::QuickFind { .. } => {}
+            // Properties is informational: closing it is the only answer it has, and it changes
+            // nothing (step 13b).
+            DialogKind::Properties { .. } => {}
             // The Search Manager's answers ran above; its requests are drained by the dialog module.
             DialogKind::SearchManager { .. } => {}
             DialogKind::NewFolder { slot } => {

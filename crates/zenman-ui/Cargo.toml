@@ -45,3 +45,8 @@ wgpu = { workspace = true }
 pollster = { workspace = true }
 image = { workspace = true }
 
+# Step 13b's archive tests write real containers to browse, extract and break. `zip` is already in
+# the graph through `zenman-core` (plan §5.5's two default-build readers); this is a second edge to
+# the same pinned package, not a new dependency.
+[dev-dependencies.zip]
+workspace = true

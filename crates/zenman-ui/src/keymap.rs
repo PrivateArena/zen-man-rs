@@ -119,6 +119,9 @@ pub enum Command {
     /// `Alt+Enter` — the properties dialog (plan §5.8's `properties` row names the chord; Go had
     /// neither a key nor a dialog — its `/api/props` was never called).
     Properties,
+    /// <kbd>Ctrl+E</kbd> — extract the archive the pane is listing into the directory that holds it
+    /// (step 13b). **No Go binding**: Go shipped `/api/archive/extract` and never wired a caller.
+    Extract,
     /// Bookmark the shown directory. **No Go binding** — menu-only (the places service is step 14).
     AddToFavorites,
     /// Focus the address bar. **No Go binding** — Go's address bar was clicked.
@@ -184,6 +187,7 @@ impl Command {
         Self::InvertSelection,
         Self::Refresh,
         Self::Properties,
+        Self::Extract,
         Self::AddToFavorites,
         Self::FocusSearch,
         Self::OpenContextMenu,
@@ -250,6 +254,7 @@ impl Command {
             Self::MoveBottom => "Last row",
             Self::PageUp => "Page up",
             Self::PageDown => "Page down",
+            Self::Extract => "Extract here",
         }
     }
 }
@@ -619,6 +624,7 @@ const TABLE: &[(Command, &[Chord])] = &[
     (Command::Refresh, &[Chord::key(Key::F5)]),
     (Command::ToggleRightDrawer, &[Chord::ctrl(Key::J)]),
     (Command::Properties, &[Chord::alt(Key::Enter)]),
+    (Command::Extract, &[Chord::ctrl(Key::E)]),
     (Command::MoveUp, &[Chord::key(Key::ArrowUp)]),
     (Command::MoveDown, &[Chord::key(Key::ArrowDown)]),
     (Command::MoveTop, &[Chord::key(Key::Home)]),

@@ -333,9 +333,11 @@ impl Tab {
         let empty = Arc::new(empty_page(path.clone()));
         Self {
             id,
-            path,
+            path: path.clone(),
             title,
-            history: Vec::new(),
+            // The trail *includes* the path the tab starts on, so `hist_ix` always addresses the
+            // current entry (step 13b: that is what makes `go_forward` able to return anything).
+            history: vec![path],
             hist_ix: 0,
             sel: Selection::new(),
             sel_by_path: BTreeMap::new(),
@@ -416,12 +418,13 @@ impl Tab {
     pub fn navigate_to(&mut self, path: FsPath, title: impl Into<String>) -> Option<FsPath> {
         let previous = self.path.clone();
         // Anything the user had gone *forward* past is gone: a new navigation from the middle of
-        // the trail truncates it (plan §5.8's breadcrumb Done-when).
-        self.history.truncate(self.hist_ix);
+        // the trail truncates it (plan §5.8's breadcrumb Done-when). `hist_ix + 1` keeps the current
+        // entry, which is the last thing the forward step may return to.
+        self.history.truncate(self.hist_ix + 1);
         if previous != path {
-            self.history.push(previous.clone());
+            self.history.push(path.clone());
         }
-        self.hist_ix = self.history.len();
+        self.hist_ix = self.history.len().saturating_sub(1);
         self.title = title.into();
         self.path = path;
         self.sel.reset();
@@ -439,7 +442,7 @@ impl Tab {
     /// `true` when there is somewhere to go forward to.
     #[must_use]
     pub fn can_go_forward(&self) -> bool {
-        self.hist_ix < self.history.len()
+        self.hist_ix + 1 < self.history.len()
     }
 
     /// Step back one entry, returning the path to list.
@@ -458,8 +461,8 @@ impl Tab {
         if !self.can_go_forward() {
             return None;
         }
-        let path = self.history.get(self.hist_ix).cloned()?;
         self.hist_ix += 1;
+        let path = self.history.get(self.hist_ix).cloned()?;
         self.title = path.last_segment().unwrap_or("/").to_string();
         Some(path)
     }
