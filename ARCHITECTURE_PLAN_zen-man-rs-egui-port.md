@@ -1502,3 +1502,109 @@ test count **621 → 631** (9 archive UI + 1 core 7z), `cargo xtask ci` exit 0, 
   made every later X client fail with "Maximum number of clients reached", which surfaces as a
   *gpu_fallback* failure and looks like a code regression. `pkill -f "[k]ate -b /tmp/zenman-contract"`
   clears it; step 15 should make the opener test reap what it spawns.
+
+### Step 15a (the snapshot scene set — part 1 of row 15) — execution log
+
+Row 15's first half: `crates/zenman-ui/tests/snapshots.rs` now has a `Scene` per frozen Go reference, so
+**every** `docs/parity/*.png` has a named counterpart. `xtask parity` and the `contracts.md` quirk sweep
+are 15b and are *not* in this commit.
+
+* **Reference → baseline mapping.** Our numbering keeps its own monotone `NN-<slug>` sequence (it starts
+  with an empty-shell frame Go has no reference for), so the two numbers differ by one until the
+  references renumber:
+
+  | `docs/parity/` | `tests/snapshots/` | scene | verdict |
+  |---|---|---|---|
+  | — | `01-empty.png` | `Scene::Empty` | ours only (the two-pane default with no tabs) |
+  | `01-main-list.png` | `02-file-list.png` | `Listing{List}` | matches (step 8) |
+  | `02-grid-view.png` | `03-file-grid.png` | `Listing{Grid}` | matches (step 8) |
+  | `03-split-view.png` | `04-split-view.png` | `Split` | matches; ours has a live selection |
+  | `04-quad-view.png` | `05-quad-view.png` | `Quad` | deviates: pane chrome overflows (see below) |
+  | `05-left-drawer.png` | `06-left-drawer.png` | `Drawer{Left}` | deviates: still the placeholder |
+  | `06-right-drawer.png` | `07-right-drawer.png` | `Drawer{Right}` | deviates: one clipped disk row |
+  | `07-action-log-drawer.png` | `08-action-log-drawer.png` | `ActionLog` | deviates: wording + absolute stamps |
+  | `08-search-manager.png` | `09-search-manager.png` | `Index{running:false}` | deviates: no table, translucent frame |
+  | `16-index-running.png` | `10-index-running.png` | `Index{running:true}` | deviates: no progress bar, no settings |
+  | `09-context-menu-file.png` | `11-context-menu-file.png` | `Menu{Row}` | matches (Go's item set + chords) |
+  | `10-context-menu-background.png` | `12-context-menu-background.png` | `Menu{Background}` | deviates: no selection block |
+  | `14-batch-rename.png` | `13-batch-rename.png` | `BatchRename` | deviates: form, not a table |
+  | `15-quick-find.png` | `14-quick-find.png` | `QuickFind` | deviates: overlapping row text, one visible row |
+
+* **Staging per scene.** `Split`/`Quad` go through `ZenApp::set_layout` with `panes_for(Split)` /
+  `quad_slots()` (the four-pane grid has no `LayoutMode` spelling) and one real tab per slot; the two
+  panes list *different* directories so `get_by_label` stays unambiguous. `Drawer{Left,Right}` dispatch
+  `Command::ToggleLeftDrawer`/`ToggleRightDrawer` — the real command, never the flag. `ActionLog` does two
+  real `Session::mkdir`s (so the undo log holds two real records), then `Command::ActionLog`.
+  `Menu{Row}` is `Queryable::click_secondary` on a file row, `Menu{Background}` a raw
+  `Event::PointerButton{Secondary}` in the empty band — so the scene uses `nested_tree` (three rows) rather
+  than the 457-row page, which has no background band to click. `BatchRename` selects `a.txt…c.md` with a
+  real click + shift-click and opens the dialog on those rows. `QuickFind` is <kbd>Ctrl</kbd>+<kbd>F</kbd>
+  and six typed `Event::Text` keystrokes, settled with `common::settle_until` on `!busy && job.is_none()`.
+  `Index{false}` presses the dialog's own `ManagerRequest::Rebuild` and waits for the engine's
+  `index_is_running()` to fall; `Index{true}` starts a real `Session::index_rebuild` job, asserts
+  `index_is_running()`, then **stamps** `is_indexing` + `progress.indexed = 200` — a live count is wherever
+  the worker had got to, so the count is the one number in the set that is staged rather than observed.
+
+* **Byte-reproducibility — three clock sources found, and one that was not a clock.** The set renders
+  twice to identical bytes (`cmp`, all 14) across a **minute boundary**, which is what step 8e promised
+  and what a minute-precision stamp can hide.
+  1. `index-status`'s `last_indexed` is `now` after a real rebuild → frozen to the fixture's
+     `MTIME_BASE` (`FIXED_UNIX = 1_700_000_000`), and *re*-frozen after a frame so the dialog's own 1 s
+     status poll cannot land between the freeze and the render; `drive_index` asserts the frozen value
+     survived into the paint source.
+  2. `action.log`'s RFC 3339 stamps → rewritten on the painted page (`FIXED_RFC3339`), same
+     freeze-frame-refreeze dance, asserted twice: once before the render and once *after* it (the second
+     one is the guard that a poll did not replace the page mid-render).
+  3. **Fixture mtimes that were never pinned.** `common::listing_tree` pins the mtimes of the rows of the
+     `listing` directory *only*: the files inside `docs/`, the one file inside `reports/`, every row of
+     `common::nested_tree`, and the two directories this step `mkdir`s are all created *now*. Four
+     baselines were therefore painting the wall clock in their date columns. `freeze_mtime`/`pin_mtime`
+     (tests-side IO, allowed) now pin every tree a scene lists. This is a **fixture defect that predates
+     step 15a**: a scene that lists `docs/` or the nested tree could never have been reproducible.
+  4. The last remaining difference was *not* data: the state dumps of two runs 66 s apart were
+     byte-identical, yet 08 differed inside the log panel. egui computes animated widget visuals (and the
+     scrollbar fade) from the **wall clock**, so a frame taken while an animation is in flight is not
+     reproducible. `park()` sleeps past it and *then* runs the frames; every animation lands on its final
+     value. Any future scene that ends on a click needs it.
+  *Machine-specific by nature:* the right drawer's disk meter reads real `statvfs` numbers, so
+  `07-right-drawer.png` is reproducible per machine, not across machines (like `01-03`'s header disk
+  line, which the same code path already put in the step-8 baselines).
+
+* **New tests (11, workspace 684 → 695).** `{split,quad,left,right}_drawer`… — precisely:
+  `split_view_snapshot_renders_or_skips_with_a_reason`, `quad_view_snapshot_…`, `left_drawer_snapshot_…`,
+  `right_drawer_snapshot_…`, `action_log_drawer_snapshot_…`, `search_manager_snapshot_…`,
+  `index_running_snapshot_…`, `context_menu_file_snapshot_…`, `context_menu_background_snapshot_…`,
+  `batch_rename_snapshot_…`, `quick_find_snapshot_…`. None of them calls `harness.snapshot()` and none
+  pixel-diffs: each asserts non-degeneracy from *state* (pane/row counts, drawer flags, `MenuTarget`,
+  dialog rows, `IndexStatus` fields) and the test then checks the frame is not blank.
+
+* **Defect list for 15b's parity report** (seen while comparing; all real, none hidden):
+  1. **The Search Manager's frame is not opaque** — the listing's `Modified` column paints *through* the
+     dialog body in `09`/`10`. The reference dims the shell instead.
+  2. **No results table when the query is empty**: the reference shows the `Name/Path/Size/Modified`
+     headers and "No items matched your query"; we show only the status line.
+  3. **`last indexed 1700000000`** — `last_indexed_text` prints the raw unix second (the port's documented
+     choice); Go rendered a locale string. It is also the *frozen* value in the baseline, so 15b must
+     not read it as a live timestamp.
+  4. **No progress bar and no settings view** in the running frame; the reference's
+     `16-index-running.png` is the *settings* view (INDEX ROOTS / EXCLUDE PATTERNS / Auto index / Follow
+     symlinks) with a progress bar. Ours is one status line, `indexing (200 indexed)`.
+  5. **A stale completion toast** ("462 row(s) indexed") sits in the bottom-right of `10-index-running`
+     while the same frame says "indexing" — the toast is the finished rebuild's, the state is the frozen
+     one.
+  6. **Quick-find result rows overlap**: the row paints the name and the (identical, non-recursive)
+     relative path at the same origin — `row-0000txt0000.txt`. Only one row is visible in the frame; the
+     reference shows a list.
+  7. **Quad layout overflows**: `Select all`/`Select none`, the pagination banner and the `Modified`
+     column are all clipped in the 720 px panes; the reference's four panes each show their full toolbar.
+  8. **The left drawer is still the step-7 placeholder** ("no bookmarks yet — add them in step 14") while
+     step 14b landed workspaces; the reference shows a Places list.
+  9. **The right drawer shows one disk, clipped** ("/: 19.7 G…" at the window edge) where the reference
+     lists several mounts with their sizes.
+  10. **Action-log wording and shape**: "Action log / N record(s)" + an absolute minute stamp, where Go
+      says "Action History" and prints "N ago" with per-row icons and a red `permanent`.
+  11. **The background context menu has no selection block** (`Paste`/`Paste link`/`New folder` only);
+      Go's has Select all / Invert selection. Ours put those on the toolbar instead.
+  12. **Batch rename is a form, not a table**: "Batch rename — 3 item(s)" with a 3-line summary where Go
+      has an `Original Name / New Name / Status` table with `UNCHANGED` rows; and the summary's new name
+      reads `a.txt→a`, which looks truncated at the frame's width — worth a direct look in 15b.
