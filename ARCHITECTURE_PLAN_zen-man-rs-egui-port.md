@@ -622,7 +622,7 @@ Legend for the table: **Depends** = other rows (by file) *and* build steps (§7 
 | Change | Why | Guard test |
 |---|---|---|
 | `files_count` typed as `Option` → renders `--` | `undefined files` bug (`file-list.js:159`) | `widgets/entry_row.rs` snapshot |
-| Symlinked directories report `is_dir: true` | Go's `entry.Info()` is `lstat`, so `cd` into a symlinked dir showed files but the row said file | `ops/list.rs` test with `FollowSymlinks` on |
+| Symlinked directories report `is_dir: true` | Go's `entry.Info()` is `lstat`, so `cd` into a symlinked dir showed files but the row said file | `entry.rs::symlink_to_a_directory_is_a_directory_and_a_link` (the row this table cited as an "`ops/list.rs` test" names a file this port never grew — corrected by step 15d) |
 | `copyFile` collisions reported | silent skip = data loss | `ops/copy.rs` test |
 | Errors are typed `CoreError`, no `text/plain` JSON | Go emitted JSON bodies with a `text/plain` content type and unescaped `%v` (could emit invalid JSON) | `contract.rs::assert_matches` |
 | Paste conflict is an enum variant, not `status:"conflict"` in a 200 | Go used HTTP 200 + magic string | `contract_ops.rs::paste_conflict` |
@@ -630,7 +630,7 @@ Legend for the table: **Depends** = other rows (by file) *and* build steps (§7 
 | Bookmarks percent-decoded on save | Go stored raw text, so `%20` stayed forever | `services/places.rs` test |
 | Index status distinguishes dead root vs corrupt DB | identical error strings today | `search_index.rs` test |
 | Revert refreshes the pane immediately | `zen-refresh-filelist` has no subscriber in the JS app | `panels/action_log.rs` test |
-| `PRAGMA journal_mode=WAL` actually applied | the Go code ran `wal_checkpoint` without ever enabling WAL (no-op) | `store/sql.rs` pragma assert |
+| `journal_mode = DELETE`, explicitly asserted, and WAL is never enabled | Go ran `PRAGMA wal_checkpoint(PASSIVE)` without ever enabling WAL (a no-op); the port deliberately keeps Go's on-disk `delete` journal because WAL leaves `-wal`/`-shm` sidecars the Go app cannot fold away in a shared data directory (step 5's rule) | `store/sql.rs` pragma assert |
 | Sort is clickable | `data-sort` existed with zero handlers | `panels/file_pane.rs` snapshot |
 | Arrow/Home/End/PageUp/PageDown/Esc added | absent in the JS app; a desktop file manager without them is not usable | `keymap.rs` table test |
 | **OPEN DECISION — an unterminated `"` in a query filter, and interior quotes in a word** (a behaviour *difference*, not one of this table's bug fixes) | Go's filter regex `(\bext|\bin|\btype):(?:"([^"]+)"|(\S+))` (`api/search_index.go:44`) falls back to `(\S+)` when the quote never closes, so `in:"/a/b` yields the folder `"/a/b` **with** the leading quote (`:246-262`); the port's scanner consumes the opening quote and yields `/a/b`. Same family: for an unquoted token, Go's `strings.Trim(w, '"')` keeps an interior quote (`ab"cd`), the port's word scanner strips it (`abcd`). Neither side is wrong — parity-with-Go would reproduce a quote-eating artefact, the port's reading is the cleaner one; the choice is **not made**, so do not silently "fix" either side. | `services/search_index.rs::an_unterminated_quote_keeps_the_path_clean_the_port_side_of_a_known_divergence` pins the **port** side until the decision is taken |
@@ -1684,8 +1684,76 @@ Files: `crates/zen-man-rs`-side — new `crates/zenman-core/src/services/places.
 | D2 Search Manager result header | **fixed** | `result_header` added, Go's empty-query copy reproduced. |
 | D3 raw-unix stamp | **fixed** | `metrics::format_mtime`; pinned by `the_last_indexed_stamp_is_a_date_and_never_a_raw_unix_second`. |
 | D4 rebuild progress | **fixed** | `shows_settings` + `ProgressBar` driven from `Session::job_info`. |
-| D5 stale terminal toast | **partial** | The transition-based dismissal is right for real use; the `10-index-running.png` frame still carries the stale toast because the scene stamps `is_indexing` after a completed rebuild — unfinished, owed by 15d. |
-| D6 QuickFind list height | **paint fixed, list height owed** | One visible row remains; a clip is not observable from kittest, needs a pixel-side assertion — owed by 15d. |
-| D7 quad-pane band layout | **partial** | Band layout fixed via `file_pane::band`; residual: the quad pane's body is ~35 px wider than its visible rect ⇒ a dock/content-width overflow, still owed. |
-| D11 background context menu | **not a bug** | `context-menu.js:112-131` has only Paste / Paste Link / New Folder in the background arm, no `selectAll` row exists anywhere in `frontend/`, and `docs/parity/10-context-menu-background.png` actually shows the Search Manager empty-query frame (**the reference capture itself is mislabelled** → 15d re-shoots it). Pinned by `background_menu_is_go_three_rows_and_carries_no_selection_block`. |
+| D5 stale terminal toast | **fixed** (15d verified) | The transition-based dismissal (`search_manager.rs`, `notices.dismiss_containing`) plus the scene's own withdrawal; re-rendering `10-index-running.png` at HEAD produced **byte-identical** bytes to the committed artefact, so the frame no longer carries the "N row(s) indexed" toast beside "indexing". Pinned by `parity_defects.rs:149-156` and `snapshots.rs` (`index-running frame: withdrew 1 stale completion notice(s)`). |
+| D6 QuickFind list height | **fixed** | `7f661be` gave the result list a reserved band (`widgets::in_rect`) so all ten rows realise; `14-quick-find.png` re-rendered in that commit. |
+| D7 quad-pane band layout | **partial — carried to step 16** | Band layout fixed via `file_pane::band` (the toolbar and the pagination banner are both reserve-then-fill now, and `a_bands_two_halves_are_disjoint_and_the_right_one_hugs_the_pane_edge` pins it at the 720 px quad width). Residual, unfixed by 15d and *not* a `file_pane` bug: the quad pane's **body** still measures ~35 px wider than the rect the dock gave it, i.e. the overflow comes from the content width the dock/`PaneDock::body` negotiates, not from a control that failed to reserve its band. A reserve-before-fill edit inside `file_pane` cannot reach it; it needs the dock's width arithmetic, which is step 16's to take (the frame is a human gate; `05-quad-view.png` is paired and reviewable meanwhile). |
+| D11 background context menu | **not a bug; the reference is** | `context-menu.js:112-131` has only Paste / Paste Link / New Folder in the background arm and no `selectAll` row exists anywhere in `frontend/`, and `docs/parity/10-context-menu-background.png` actually shows the Search Manager empty-query frame. 15c's "15d re-shoots it" is **not possible**: the Go instance was retired at step 2 (plan §7's "the Go server can be shut down forever"), so the frozen capture stays as-is and the mislabelling is recorded where reviewers meet it — `xtask/src/parity.rs`'s `MISLABELLED_REFERENCES` (printed by `cargo xtask parity`) and `docs/contracts.md`'s verdict section. Pinned by `background_menu_is_go_three_rows_and_carries_no_selection_block`. |
 | D12 batch-rename preview | **fixed** | 3-column table; `a.txt→a` verified legitimate per `batch-rename.js:281` and now labelled `RENAMED (extension dropped)`. |
+
+### Step 15d (`xtask parity` + the §2.3 verdict sweep) — execution log — **step 15 COMPLETE**
+
+Row 15's remaining half, and with it the whole row: `cargo xtask parity` exists (the last `stub` in
+`xtask/src/main.rs` is gone, along with the helper), and `docs/contracts.md` now opens with a single
+**Quirk verdicts** table carrying all fourteen §2.3 behaviours, one line each, each with the test that
+pins it if the claim is a test.
+
+* **The parity command is a gate for the pairing and a report for the verdict** (`xtask/src/parity.rs`,
+  declared). The pairing lives in **`snapshots.rs`'s own `REFERENCE_MAP`** — `(baseline, reference,
+  note)` triples beside the `Scene` variants that draw them — read out of that source by
+  `parity::reference_map`, the same discipline as `harness_size`/`harness_snapshot_names`. `run` prints
+  the summary line, then one block per pair (both files' `WxH px` and byte size, the scene's own note,
+  the reviewer's warning when the reference is mislabelled), writes the review index page to
+  `target/parity-review/index.md` (git-ignored by step 1's `/target` rule), and prints why it composes
+  no stitched image. `check` is the cheap half and `cargo xtask ci` now calls it after the artefact gate:
+  it fails on **missing snapshot**, **orphan snapshot**, **unmatched reference**, a map row naming a
+  scene that does not exist, and a mapped reference that has left `docs/parity/`. O(files), no GPU, no
+  display probe, no network.
+* **Composing the side-by-side images is deliberately not shipped.** `xtask`'s PNG layer reads chunk
+  headers only (`png.rs`, no inflate, by design); a hand-rolled compositor is what mis-rendered our own
+  8-bit RGBA as stripes in step 15a, and a half-right review image is worse than none. The printed
+  reason is in `compose_skip_reason()`, and the index page carries the same sentence, so the human step
+  is "open these two files", not "trust my tiling".
+* **The exception list is real but empty**: `UNRENDERABLE_REFERENCES` is `&[]`, every entry shape
+  requiring its reason, and one test asserts exactly that ("an exception without a reason is not an
+  exception"). All 13 frozen references have a scene. `MISLABELLED_REFERENCES` is the other list — three
+  references whose *content* is not their file name (`05` shows the left drawer closed, `06` is Go's
+  Action History and not a disk panel, `10` is the Search Manager and not a context menu) — printed as
+  notes, never as failures, because the pairing itself is correct.
+* **Coverage, measured (row 15's criterion): `13 matched, 0 missing snapshot, 0 orphan snapshot,
+  0 unmatched reference, 1 port-side baseline, 0 declared exception, 3 mislabelled reference`.** The
+  port-side baseline is `01-empty.png`, which no reference can name: the Go app restores a workspace on
+  every start, so no empty-window capture exists.
+* **Trap for the next contributor:** putting the map in `snapshots.rs` initially broke the artefact
+  gate, because `harness_snapshot_names` scans that file for *every* `"….png"` literal and so started
+  demanding `01-main-list.png` **inside `tests/snapshots/`**. `without_reference_map` now cuts the block
+  before the scan (`the_parity_reference_block_is_not_an_artefact_set` pins the 14/13 split).
+* **New tests (7 in `xtask`, workspace 715 → 722):** the matcher's own cases —
+  `every_committed_reference_has_a_named_baseline` (the real tree, counting every category),
+  `a_missing_baseline_fails_the_gate`,
+  `an_orphaned_artefact_and_its_unmatched_reference_both_fail` (one deleted map row shows both),
+  `an_unmatched_reference_fails_and_declared_exceptions_have_reasons`,
+  `a_map_row_must_name_a_scene_the_harness_renders`, `a_malformed_map_is_an_error_not_a_shrug`, plus
+  `main.rs::the_parity_reference_block_is_not_an_artefact_set`.
+* **Verdict-sweep corrections** (things the later steps had made wrong, now fixed in place):
+  §6.2's symlink row cited an `ops/list.rs` test — that file does not exist; the real one is
+  `entry.rs::symlink_to_a_directory_is_a_directory_and_a_link`. §6.2's journal row claimed
+  "`PRAGMA journal_mode=WAL` actually applied", which step 5 decided *against* and `store/sql.rs`
+  contradicts on its line 19 — it now says `DELETE`, with the reason (WAL leaves `-wal`/`-shm` the Go app
+  cannot fold away). `contracts.md`'s "index query grammar" gap row and its `/api/index/*` note implied
+  the port owed `size:`/`mtime:`/`-negation`: Go's filter regex has only `ext|in|type`, so those are
+  absent **by contract**, not by omission (step 12's operator set is `ext:`/`in:`/`type:`, `limit`
+  default 200). `/api/props`'s section now records that step 13 built Properties the only way it could
+  (`page_dir` + `dir_size` + entry stat) and that Go's frontend never called the route.
+  The 15c defect table is re-verdicted: **D5 fixed** (re-rendering `10-index-running.png` at HEAD gave
+  byte-identical artefact bytes, so the stale "N row(s) indexed" toast is gone; pinned by
+  `parity_defects.rs:149-156`), **D6 fixed** (the reserved band landed in `7f661be`), and **D11's "15d
+  re-shoots it" is impossible** — the Go instance was retired at step 2, so the mislabelling is recorded
+  in `MISLABELLED_REFERENCES` and `contracts.md` instead. **D7 stays open** and is the one item 16
+  inherits from this row: the residual is not a control that failed to reserve its band (that half is
+  fixed and tested) but the ~35 px by which the quad pane's *body* exceeds the rect the dock handed it,
+  i.e. the dock/content width arithmetic.
+* **What step 16 inherits from step 15:** D7's dock width overflow; the > 100 `reload_required` side
+  with no test (quirk 12, golden-only evidence); the unterminated-`"` filter decision (§6.2's open row);
+  the machine-specific drawer artefacts (`06`/`07`, real `statvfs` + real `$HOME`), which must stay out
+  of any cross-machine pixel comparison; and the custom-action drawer's two unfinished halves (executing
+  an action from the right drawer, per-row delete/reorder).
