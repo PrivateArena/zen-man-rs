@@ -30,6 +30,7 @@ cmd/*.mid
 cmd/json.mid
 zenrender
 bin/
+dist/
 lilypond/
 vendor/
 build/
