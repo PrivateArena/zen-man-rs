@@ -116,6 +116,10 @@ impl Confirm {
     }
 
     /// Draw it; `Some(answer)` once it has one.
+    ///
+    /// Every string is cloned out of `self` before the `Area` closure opens: the closure needs `&Ui`
+    /// while the card is being built, and a `&mut self` borrow that spans it is the reason this file
+    /// returns its answer instead of writing it into the dialog.
     pub fn show(&mut self, ui: &mut Ui, tokens: &Tokens) -> Option<Answer> {
         let enter = consume_key(ui, Key::Enter);
         let escape = consume_key(ui, Key::Escape);

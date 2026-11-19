@@ -26,7 +26,7 @@ pub mod prompt;
 pub use confirm::{Choice, Confirm, ConfirmButton};
 pub use prompt::{Prompt, Validation};
 
-use egui::{Ui, Vec2};
+use egui::Ui;
 
 use zenman_core::ops::paste::PasteMode;
 use zenman_core::path::AbsPath;
@@ -186,12 +186,5 @@ impl Dialogs {
             self.active = None;
         }
         out
-    }
-
-    /// The blank corner the dialogs sit in — a `Vec2` only so the geometry guard keeps its hands
-    /// off the anchor (the values are `theme::Tokens`' by construction).
-    #[must_use]
-    pub fn centre(tokens: &Tokens) -> Vec2 {
-        Vec2::new(0.0, tokens.dialog_gap * 0.0)
     }
 }
