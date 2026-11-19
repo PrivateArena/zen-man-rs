@@ -1675,3 +1675,17 @@ Files: `crates/zen-man-rs`-side — new `crates/zenman-core/src/services/places.
   drawer artefacts must stay excluded from cross-machine pixel comparison; the Go reference set has **no
   capture of the left drawer open** (`05-left-drawer.png` shows it closed — the drawer is hover-triggered
   off-canvas), so D8's verdict rests on `index.html`/`sidebar.js`, not on a screenshot.
+
+### Step 15c (parity defect fixes D1-D7, D11, D12) — defect verdict table
+
+| Defect | Verdict | Evidence / note |
+|---|---|---|
+| D1 modal card translucency | **fixed** | Opaque `modal_fill` + non-opaque `modal_backdrop` in `theme.rs`, card shown at `Order::Middle` (this egui has no `Middleware`). Opacity is NOT observable from kittest — pinned by `the_modal_card_fill_is_opaque_and_the_backdrop_is_not` + the re-rendered baselines. |
+| D2 Search Manager result header | **fixed** | `result_header` added, Go's empty-query copy reproduced. |
+| D3 raw-unix stamp | **fixed** | `metrics::format_mtime`; pinned by `the_last_indexed_stamp_is_a_date_and_never_a_raw_unix_second`. |
+| D4 rebuild progress | **fixed** | `shows_settings` + `ProgressBar` driven from `Session::job_info`. |
+| D5 stale terminal toast | **partial** | The transition-based dismissal is right for real use; the `10-index-running.png` frame still carries the stale toast because the scene stamps `is_indexing` after a completed rebuild — unfinished, owed by 15d. |
+| D6 QuickFind list height | **paint fixed, list height owed** | One visible row remains; a clip is not observable from kittest, needs a pixel-side assertion — owed by 15d. |
+| D7 quad-pane band layout | **partial** | Band layout fixed via `file_pane::band`; residual: the quad pane's body is ~35 px wider than its visible rect ⇒ a dock/content-width overflow, still owed. |
+| D11 background context menu | **not a bug** | `context-menu.js:112-131` has only Paste / Paste Link / New Folder in the background arm, no `selectAll` row exists anywhere in `frontend/`, and `docs/parity/10-context-menu-background.png` actually shows the Search Manager empty-query frame (**the reference capture itself is mislabelled** → 15d re-shoots it). Pinned by `background_menu_is_go_three_rows_and_carries_no_selection_block`. |
+| D12 batch-rename preview | **fixed** | 3-column table; `a.txt→a` verified legitimate per `batch-rename.js:281` and now labelled `RENAMED (extension dropped)`. |
