@@ -121,6 +121,44 @@ enum MenuAt {
     Background,
 }
 
+/// Every baseline against the `docs/parity/` Go reference it is reviewed against, and the one line a
+/// reviewer needs to know about the pairing (plan §7 step 15: *every reference screenshot has a named
+/// snapshot*). `""` in the middle column means the baseline has no Go counterpart.
+///
+/// This is the single source of truth for the pairing and `cargo xtask parity` reads it out of this
+/// file's own source — the same discipline as [`SIZE`] and the baseline names — so a new scene without
+/// a row is a gate failure rather than a silent gap, and a renumbered reference cannot drift unnoticed.
+/// The notes are printed verbatim by `cargo xtask parity` and by its review index page.
+#[rustfmt::skip]
+const REFERENCE_MAP: &[(&str, &str, &str)] = &[
+    ("01-empty.png", "", "the empty two-pane shell — ours alone: the Go app always restores a workspace, so no reference exists"),
+    ("02-file-list.png", "01-main-list.png", "the list view over the deterministic fixture tree (step 8)"),
+    ("03-file-grid.png", "02-grid-view.png", "the grid view over the same tree"),
+    ("04-split-view.png", "03-split-view.png", "two panes with a live tab each, plus a selection"),
+    ("05-quad-view.png", "04-quad-view.png", "the four-pane grid — the narrow pane is D7's clipping test"),
+    ("06-left-drawer.png", "05-left-drawer.png", "Places / bookmarks / mounted drives (D8)"),
+    ("07-right-drawer.png", "06-right-drawer.png", "the custom-actions drawer (D9)"),
+    ("08-action-log-drawer.png", "07-action-log-drawer.png", "Go's Action History slide-in over real log records (D10)"),
+    ("09-search-manager.png", "08-search-manager.png", "the Search Manager on a terminal index, empty query (D2/D3)"),
+    ("10-index-running.png", "16-index-running.png", "the same dialog mid-rebuild: settings + progress, no stale toast (D4/D5)"),
+    ("11-context-menu-file.png", "09-context-menu-file.png", "the row context menu, Go's item set with our chords"),
+    ("12-context-menu-background.png", "10-context-menu-background.png", "the background context menu, Go's three rows (D11)"),
+    ("13-batch-rename.png", "14-batch-rename.png", "the batch-rename preview table (D12)"),
+    ("14-quick-find.png", "15-quick-find.png", "quick-find over a finished walk (D6)"),
+];
+
+/// The `REFERENCE_MAP` row of one baseline: its Go reference (empty when it has none) and the note.
+/// An unmapped baseline is reported rather than hidden — `cargo xtask parity` fails on it.
+fn reference_for(baseline: &str) -> (&'static str, &'static str) {
+    REFERENCE_MAP
+        .iter()
+        .find(|(name, _, _)| *name == baseline)
+        .map_or(
+            ("", "UNMAPPED — `cargo xtask parity` fails on this row"),
+            |(_, reference, note)| (*reference, *note),
+        )
+}
+
 impl Scene {
     /// The committed artefact's name. The scheme is `NN-<what>.png`, ordered so the populated
     /// baselines read next to the empty one and echo `docs/parity/01-main-list.png` /
@@ -459,7 +497,17 @@ fn render(scene: &Scene) -> Option<RgbaImage> {
         image
             .save(&out)
             .unwrap_or_else(|e| panic!("writing {}: {e}", out.display()));
+        let (reference, note) = reference_for(scene.file_name());
         println!("wrote {}", out.display());
+        println!(
+            "  reviewed against {} — {}",
+            if reference.is_empty() {
+                "(no Go reference)"
+            } else {
+                reference
+            },
+            note
+        );
     } else {
         println!(
             "render OK ({}x{}); set ZENMAN_SNAPSHOT_WRITE=1 (or run `cargo xtask snapshots`) to write {}",

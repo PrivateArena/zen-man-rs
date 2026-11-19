@@ -9,7 +9,10 @@
 //! snapshot-artefact check (step 8c: *every* PNG under `crates/zenman-ui/tests/snapshots/` must
 //! exist, decode, and be the size the test's own `SIZE` implies, and no PNG may sit there that the
 //! test does not render). `snapshots` renders them (or prints a skip reason when no adapter
-//! exists); `parity` is the one remaining stub, landing with the human review in step 15.
+//! exists); `parity` (step 15) is the human reference review — it pairs every `docs/parity/*.png`
+//! with the baseline that reviews it, prints each pair's sizes and what the scene asserts, writes a
+//! review index page under `target/parity-review/`, and its *pairing* half runs inside `ci` while the
+//! verdict on each frame stays a human's.
 //! `contracts` is real since step 2: it guards the frozen Go golden capture in
 //! `tests/golden/` (`xtask/src/contracts.rs`), and since step 2 it also runs the two completeness
 //! gates: `golden-index` (every file in `tests/golden/` is accounted for in `INDEX.json`) and
@@ -32,6 +35,7 @@ use serde_json::Value;
 mod assets;
 mod contracts;
 mod fixture_tree;
+mod parity;
 mod png;
 mod source_guards;
 
@@ -52,11 +56,10 @@ fn run() -> Result<(), Box<dyn Error>> {
         "licenses" => licenses(),
         "assets" => assets::assets(),
         "snapshots" => snapshots(),
-        "parity" => stub(
-            "parity",
-            15,
-            "the human reference review over `docs/parity/*.png` (plan §7 step 15)",
-        ),
+        "parity" => {
+            let root = workspace_root()?;
+            parity::run(&root, &harness_snapshot_names(&root)?)
+        }
         "contracts" => contracts::contracts(),
         "fixture-tree" => fixture_tree::fixture_tree(),
         "golden-index" => contracts::golden_index(&workspace_root()?.join("tests/golden")),
@@ -65,17 +68,15 @@ fn run() -> Result<(), Box<dyn Error>> {
                 "usage: cargo xtask <ci|deps|licenses|assets|snapshots|parity|contracts|fixture-tree|golden-index>"
             );
             println!(
+                "  parity is plan §7 step 15's human gate: it pairs docs/parity/*.png with the snapshots/ baselines"
+            );
+            println!(
                 "  fixture-tree and golden-index are the two step-2 gates that `contracts` also runs"
             );
             Ok(())
         }
         other => Err(format!("unknown task {other:?} (try `cargo xtask help`)").into()),
     }
-}
-
-fn stub(name: &str, step: u32, why: &str) -> Result<(), Box<dyn Error>> {
-    println!("xtask {name}: stub — this task lands in step {step} of the plan: {why}");
-    Ok(())
 }
 
 /// The full gate: format, lints, tests, then the two provenance/licence linters.
@@ -99,6 +100,7 @@ fn ci() -> Result<(), Box<dyn Error>> {
     // that `licenses` stays the one thing its name says — cargo metadata against `deny.toml`.
     assets::assets()?;
     snapshot_artefact_gate()?;
+    parity_gate()?;
     println!("xtask ci: all gates green");
     Ok(())
 }
@@ -304,6 +306,18 @@ fn check_snapshot_artefacts(root: &Path) -> Result<String, Box<dyn Error>> {
     ))
 }
 
+/// Plan §7 row 15's checkable half, run inside `ci`: every `docs/parity/*.png` reference has a named
+/// baseline and every baseline has a row (see `xtask/src/parity.rs`). The *verdict* on each pair is a
+/// human's — `cargo xtask parity` is the command that presents it — but the pairing is a gate.
+fn parity_gate() -> Result<(), Box<dyn Error>> {
+    let root = workspace_root()?;
+    println!(
+        "xtask ci: parity — {}",
+        parity::check(&root, &harness_snapshot_names(&root)?)?
+    );
+    Ok(())
+}
+
 /// The `NN-<what>.png` baseline scheme: two digits, a `-`, a lowercase slug of letters, digits and
 /// inner hyphens, and the `.png` extension in lower case.
 fn snapshot_name_is_recognised(name: &str) -> bool {
@@ -325,7 +339,7 @@ fn snapshot_name_is_recognised(name: &str) -> bool {
 
 /// The `const SIZE: egui::Vec2 = egui::vec2(w, h)` of the snapshot test — the size the token
 /// geometry (48 px header + 38 px strip + 30 px status bar at the reference window size) implies.
-fn harness_size(root: &Path) -> Result<(u32, u32), Box<dyn Error>> {
+pub(crate) fn harness_size(root: &Path) -> Result<(u32, u32), Box<dyn Error>> {
     let file = root.join("crates/zenman-ui/tests/snapshots.rs");
     let text = std::fs::read_to_string(&file)?;
     let shown = file.strip_prefix(root).unwrap_or(file.as_path()).display();
@@ -354,17 +368,42 @@ fn harness_size(root: &Path) -> Result<(u32, u32), Box<dyn Error>> {
 }
 
 /// The baseline file names `crates/zenman-ui/tests/snapshots.rs` renders: every `"….png"` string
-/// literal outside its comments. The test is the only place a baseline is named, so the artefact
-/// set is derived from it — a scene added there is demanded here, and a PNG left there is refused.
-fn harness_snapshot_names(root: &Path) -> Result<Vec<String>, Box<dyn Error>> {
+/// literal outside its comments and outside the step-15 `REFERENCE_MAP`. The test is the only place a
+/// baseline is named, so the artefact set is derived from it — a scene added there is demanded here,
+/// and a PNG left there is refused.
+pub(crate) fn harness_snapshot_names(root: &Path) -> Result<Vec<String>, Box<dyn Error>> {
     let file = root.join("crates/zenman-ui/tests/snapshots.rs");
     let text = std::fs::read_to_string(&file)?;
     let shown = file.strip_prefix(root).unwrap_or(file.as_path()).display();
-    let names = png_string_literals(&text);
+    let names = png_string_literals(&without_reference_map(&text));
     if names.is_empty() {
         return Err(format!("{shown}: no `\"NN-<what>.png\"` baseline to validate").into());
     }
     Ok(names)
+}
+
+/// The harness source with its `REFERENCE_MAP` block cut out. Those literals name the **Go references**
+/// (and repeat each baseline name), so the artefact set must come from the `Scene::file_name` arms
+/// alone — without this cut the artefact gate would demand `docs/parity/01-main-list.png` inside
+/// `tests/snapshots/` (step 15).
+fn without_reference_map(text: &str) -> String {
+    let mut out = String::new();
+    let mut cutting = false;
+    for line in text.lines() {
+        let code = line.trim_start();
+        if !cutting {
+            if code.starts_with("const REFERENCE_MAP") {
+                cutting = true;
+            }
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        if code.starts_with("];") {
+            cutting = false;
+        }
+    }
+    out
 }
 
 /// The `"….png"` string literals of a Rust source text, ignoring comment lines (a doc comment that
@@ -1004,6 +1043,19 @@ mod tests {
                 .contains("the shell geometry says 640x480"),
             "the expected size must come from the test's SIZE"
         );
+    }
+
+    /// Step 15: the `REFERENCE_MAP` block names the Go references, and must not leak into the
+    /// artefact set the gate demands (nor into the parity orphan check, which reads it separately).
+    #[test]
+    fn the_parity_reference_block_is_not_an_artefact_set() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask is a workspace member");
+        let names = harness_snapshot_names(root).expect("the harness names its baselines");
+        assert_eq!(names.len(), 14, "one artefact per scene: {names:?}");
+        assert!(!names.iter().any(|n| n == "01-main-list.png"), "{names:?}");
+        assert!(names.iter().any(|n| n == "02-file-list.png"), "{names:?}");
     }
 
     #[test]

@@ -7,6 +7,39 @@ intent. Cross-references: the plan is
 its **§2.4** table is the authoritative measured-deltas list, §2.3 the behaviour contract,
 §5.2–§5.6 the `zenman-core` blueprint rows this document is meant to unambiguous-ise.
 
+## Quirk verdicts — plan §2.3's fourteen behaviours, one line each
+
+Step 15d's sweep. This table is the **verdict list** row 15 asks for; the *evidence* (which golden
+proves the Go side) is the [Deviation ledger](#deviation-ledger) further down, and the port-side bug
+fixes beyond these fourteen are plan §6.2. Verdicts are `kept` (we behave like Go), `fixed` (we do not,
+because Go is wrong), `deviated (reason)`, `not built`.
+
+All fourteen are built and all but two are pinned by a named test; where the claim is a test, the test
+name is real and greppable. Two of them changed shape since steps 5-13 wrote the prose below, and those
+rows now say so.
+
+| # | Quirk | Verdict | Pinned by |
+|---|---|---|---|
+| 1 | Dirs first, regardless of `order` | **kept** | `services/dirs.rs::listing_is_sorted_dirs_first_by_lowercased_name`, `descending_keeps_dirs_first_and_pages_advance` |
+| 2 | Name sort = byte compare of **lowercased** names (`a10 < a9`) | **kept** | same test (its name half) + `contract_dirs::dir_listing_matches_go` against `dir-sortcase-asc/desc` |
+| 3 | Cursor = decimal index into a list re-read and re-sorted per request | **kept**, documented as a flaw (O(n) per page; concurrent edits shift the index) | `services/dirs.rs::the_second_page_hit_reads_the_directory_once`, `a_flat_page_is_never_served_to_a_plain_request` |
+| 4 | Flat walk caps at 10 000 | **kept** | `services/dirs.rs::the_flat_cap_counts_kept_rows_and_truncates_lexically`, `the_walk_cap_reports_instead_of_undercounting` |
+| 5 | Symlink-to-dir reports `is_dir:false` | **fixed** — `is_dir:true` **and** `is_symlink:true`; `open` still follows, the walker still does not descend | `entry.rs::symlink_to_a_directory_is_a_directory_and_a_link` (plan §6.2 cited `ops/list.rs`, a file this port never grew — corrected) |
+| 6 | Hidden files never filtered by the backend | **kept** at the engine boundary (hiding is a UI toggle) | `services/search_live.rs::hidden_and_scope_filters`, `live_search_hidden_file_policy` |
+| 7 | `chmod` is bare octal | **kept as measured, not as the plan said**: Go takes `^[0-7]{3,4}$` (`"0644"` is 200), the port validates exactly that; symbolic modes (`u+x`) are a port addition, not parity | `mode.rs::parse_octal_follows_the_measured_chmod_rule`, `session::chmod_round_trips_octal_to_symbolic_and_logs_the_text_as_typed` |
+| 8 | Paste conflict is dir-into-dir only, HTTP 200 + magic string | **fixed** — `PasteOutcome::Conflict` (+ `ConflictPolicy::{SkipExisting, Overwrite, Rename}`); the HTTP envelope does not exist here | `contract_ops.rs::merge_dir_onto_dir_merges_and_names_the_conflict`, `error.rs::conflict_is_go_http_200_with_names` |
+| 9 | `copyFile` silently skips an existing destination | **fixed** — every collision is reported per file (`PasteReport::outcomes`), and Go's skip is reachable only as `ConflictPolicy::SkipExisting` | `contract_ops.rs::each_collision_policy_answers_a_taken_name` |
+| 10 | `moveItem` errors on collision | **kept** (it is the correct behaviour), typed instead of HTTP 500 text | `error.rs::already_exists_is_go_http_500` + the `Overwrite`/`Rename` halves of the test above |
+| 11 | Batch rename smuggled as a JSON string in `name` | **fixed** on the wire (`RenameTarget::Batch`); the undo log still stores Go's name-array text, byte-identically | `contract_ops.rs::a_batch_rename_renames_a_parent_and_its_children_and_logs_the_name_array` |
+| 12 | `track_entries` only when ≤ 100, else `reload_required` | **kept** — `ops/paste.rs::TRACK_ENTRIES_CAP = 100` | the small-paste half is asserted (`contract_ops.rs:406`, `!report.reload_required`); the > 100 side has **no test** — the `op-paste-bulk.json` golden (104 sources) is the only evidence. Honest gap, step 16 |
+| 13 | VFS write guard is a `.zip/` **substring** test | **fixed** — component-wise, so a real `fake.zip/` directory stays writable | `ops/guard.rs::archive_source_is_vfs_readonly`, `dest_text_guard_is_component_wise` |
+| 14 | `validateDest` rejects any `..` **substring** | **fixed** — normalise, then test containment (so `dotdot..name` is allowed and `../escape` is not) | `path.rs::dotdot_substring_is_fine`, `resolve_rejects_escaping_and_accepts_dotdot_inside`, `archive/extract.rs::plan_resolves_a_dot_dot_inside_a_name_the_way_go_s_false_positive_did_not` |
+
+Two open items sit *beside* the fourteen and are not verdicts on them: the unterminated-`"` filter
+question (plan §6.2's last row, still undecided, pinned on the port side by
+`services/search_index.rs::an_unterminated_quote_keeps_the_path_clean_the_port_side_of_a_known_divergence`),
+and the `xtask parity` defect list (plan §9.2 step-15a/15c), which is about rendering, not behaviour.
+
 ## How these goldens were produced
 
 * `scripts/capture-golden.sh` builds a fixture tree with `scripts/make-fixtures.py`, starts a
@@ -196,7 +229,9 @@ POST only (`:151-152`). Body `{id, paths, dir}`; unknown id 404 (`:182`). Placeh
 
 ### `/api/props` — capability probe (misnamed)
 
-`main.go:141-147`. Returns `{"platform":"linux","symlink_supported":true}` and **ignores `path` completely** — `props-file`, `props-dir`, `props-symlink`, `props-crlf-name` are byte-identical. It performs **no method check at all**, so PUT/DELETE are answered too. The Properties dialog therefore cannot be built from this endpoint; it needs `page_dir` + `dir_size` + entry stat.
+`main.go:141-147`. Returns `{"platform":"linux","symlink_supported":true}` and **ignores `path` completely** — `props-file`, `props-dir`, `props-symlink`, `props-crlf-name` are byte-identical. It performs **no method check at all**, so PUT/DELETE are answered too. The Properties dialog therefore cannot be built from this endpoint; it needs `page_dir` + `dir_size` +
+entry stat — which is exactly what step 13 built (`dialogs/properties.rs`), and why no `/api/props`
+counterpart exists in the port: Go's own frontend never called this route at all (plan §9.2 step-13).
 
 ### `/api/log`, `/api/log/revert`
 
@@ -217,7 +252,12 @@ GET only (`api/diskspace.go:25`); `{free, total}` (key order verified in the gol
 | `/api/index/config` | POST only (`:142-143`) | `{saved:true}` | decodes **only** `roots, excludes, auto_index, worker_count, follow_symlinks` (`:147-154`); `schema_version`, `max_depth`, `index_on_startup`, `index_state` are never read, so **omitted fields are zeroed on save** — the mechanism behind plan §5.3's note |
 | `/api/index/cancel` | POST only (`:192-193`) | `{cancelled:true}` | |
 
-Query forms **not** captured: `size:`, `mtime:`, `-negation`, quoted values, and `type:file`.
+Query forms **not** captured: `size:`, `mtime:`, `-negation`, quoted values, and `type:file`. Step 12
+corrects the framing: Go's filter regex is `(\bext|\bin|\btype):(?:"([^"]+)"|(\S+))`
+(`api/search_index.go:44`), so **`size:` and `mtime:` were never operators on either side** — the
+capture list above is about what the harness did not send, not about a grammar the port skipped. The
+port implements the same three operators (`ext:`, `in:`, `type:`, `type:file` included) plus quoted
+values, and the only real divergence is the unterminated-quote case in plan §6.2's last row.
 
 ### `/api/archive/*`
 
@@ -345,7 +385,7 @@ Plan §2.3's fourteen behaviours, each against its golden:
 | Real `.7z` and `.rar` decoding; encrypted-archive refusal; archive symlink mode bits | 13 | `archive/reader.rs` (needs the tools installed, or committed fixtures with an attribution/licence review) |
 | Archive listing pagination (an improvement with **no Go counterpart**, so nothing to compare) | 13 | `services/archive.rs` |
 | `/api/op` `open`, `copy_inside`, `cut_inside`; batch rename partial-failure; `action/exec` `show_output:false` and non-zero exit; `/api/workspaces` `delete`; `/api/actions` `update`/`reorder`/404 | 9, 14 | `contract_ops.rs`, `services/actions.rs` |
-| Index query grammar: `size:`, `mtime:`, `-negation`, quoted values, `type:file` | 12 | `services/search_index.rs` |
+| Index query grammar: `size:`, `mtime:`, `-negation`, quoted values, `type:file` | 12 | `services/search_index.rs` — **closed by step 12 for what Go actually has**: `ext:`/`in:`/`type:` + quoted values are implemented and tested; `size:`/`mtime:`/`-negation` are not operators in Go's regex either, so they are absent by contract, not by omission |
 
 ## Addenda beyond plan §2.4
 
