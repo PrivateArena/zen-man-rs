@@ -84,3 +84,4 @@ tests/fixtures/
 !tests/golden/
 !tests/golden/**
 .bash_history
+!.scratch/finished_plans/
