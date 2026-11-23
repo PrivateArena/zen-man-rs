@@ -685,3 +685,201 @@ fn select_two(harness: &mut Harness<'static, ZenApp>) {
         entries.entries.get(ix).map(Tab::row_key)
     });
 }
+
+/// Press and release at `at` in **one** frame, then stop: the frame's own platform output is what the
+/// next assertion reads, and `Harness::run` would settle past it and flush the copy command.
+fn one_frame_click(harness: &mut Harness<'static, ZenApp>, at: Pos2) {
+    for pressed in [true, false] {
+        harness.input_mut().events.push(Event::PointerButton {
+            pos: at,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::default(),
+        });
+    }
+    harness.step();
+}
+
+/// What the last frame put on the clipboard — egui's `CopyText` output command, the port's answer to
+/// Go's `navigator.clipboard.writeText` (`context-menu.js:582-591`).
+fn copied(harness: &Harness<'static, ZenApp>) -> Option<String> {
+    harness
+        .output()
+        .platform_output
+        .commands
+        .iter()
+        .find_map(|command| match command {
+            egui::OutputCommand::CopyText(text) => Some(text.clone()),
+            _ => None,
+        })
+}
+
+/// The centre of a breadcrumb chip. The chips are buttons in the accessibility tree (`path_chips`
+/// gives each one a `WidgetInfo`), so a crumb is clickable by name exactly the way a row is.
+fn crumb(harness: &mut Harness<'static, ZenApp>, label: &str) -> Pos2 {
+    harness.get_by_label(label).rect().center()
+}
+
+// ------------------------------------------------------------------- the menu's screen position
+
+/// The box the open menu actually painted: the union of the a11y nodes of the rows it drew. A
+/// remembered-position `Area` moves this; a clamped one does not, so it is the only honest way to
+/// assert *where* the menu landed.
+fn drawn_menu(harness: &Harness<'static, ZenApp>) -> egui::Rect {
+    let mut box_ = egui::Rect::NOTHING;
+    for label in ["Open", "Copy path", "Delete permanently"] {
+        for node in harness.query_all_by_label(label) {
+            box_ = box_.union(node.rect());
+        }
+    }
+    box_
+}
+
+/// The menu has to open where the pointer was — every time. `Area` remembers the position of a known
+/// id, and this egui fork's `Id::unique` hashes its source with fixed seeds rather than counting, so
+/// the same layer id comes back for every opening: with `Area::default_pos` the second, third and
+/// hundredth menu all drew at the first one's spot (the parity defect, plan §9.2 step-10b's seam).
+#[test]
+fn the_context_menu_opens_under_the_pointer_wherever_the_pointer_was() {
+    let dir = tree("menus-where", &["a.txt", "b.txt", "c.md"]);
+    let mut harness = pane_harness("menus-where", &dir);
+    let mut offsets = vec![];
+    let mut tops = vec![];
+    for at in [
+        Pos2::new(150.0, 260.0),
+        Pos2::new(480.0, 340.0),
+        Pos2::new(90.0, 300.0),
+    ] {
+        click_at(&mut harness, at, PointerButton::Secondary);
+        let open = harness
+            .state()
+            .menu
+            .clone()
+            .expect("the right-click opened nothing");
+        assert_eq!(open.at, at, "the request kept the wrong anchor");
+        let drawn = drawn_menu(&harness);
+        assert!(
+            !drawn.is_negative(),
+            "the menu painted nothing for a click at {at:?}"
+        );
+        // The rows' own boxes sit one border inside the frame, so the *offset* is the invariant and
+        // the absolute point is not: same click shape, same offset, every time.
+        offsets.push(drawn.min - at.to_vec2());
+        tops.push(drawn.min);
+        harness.key_press(egui::Key::Escape);
+        harness.run();
+    }
+    assert!(
+        offsets.windows(2).all(|pair| pair[0] == pair[1]),
+        "the same click drew the menu at differing offsets: {offsets:?}"
+    );
+    for pair in tops.windows(2) {
+        assert_ne!(
+            pair[0], pair[1],
+            "three clicks, one menu position: {tops:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------- the breadcrumb folder menu
+
+/// `common::nested_tree` lists `<tag>/nested`; opening `nested/beta/inner` puts `beta` in the trail as
+/// a chip that is neither the store root nor the current segment, and leaves `b2.txt` the only row.
+fn inner_harness(tag: &str) -> (Harness<'static, ZenApp>, PathBuf, PathBuf) {
+    let nested = common::nested_tree(tag);
+    let beta = nested.join("beta");
+    let inner = beta.join("inner");
+    let mut harness = pane_harness(tag, &inner);
+    // A row is selected first: nothing a crumb menu does may touch it, and nothing may copy it.
+    harness.get_by_label("b2.txt").click();
+    harness.run();
+    assert_eq!(shown(&harness, PaneSlot::Left).sel.len(), 1, "fixture");
+    (harness, beta, inner)
+}
+
+/// Go's `showFolderContextMenu` (`context-menu.js:134-156`), reached from `navigation.js:211-215`:
+/// right-clicking a breadcrumb segment opens *its own* three-row menu over *that path*.
+#[test]
+fn right_clicking_a_breadcrumb_chip_opens_the_folder_menu() {
+    let (mut harness, beta, _) = inner_harness("menus-crumb");
+    let at = crumb(&mut harness, "beta");
+    click_at(&mut harness, at, PointerButton::Secondary);
+    assert!(is_open(&harness), "the crumb right-click opened nothing");
+
+    assert_eq!(
+        labels(&harness),
+        ["Open in new tab", "Copy path", "Copy name"],
+        "`showFolderContextMenu`'s three rows, and nothing of the row menu's ladder"
+    );
+    let open = harness.state().menu.clone().unwrap();
+    assert_eq!(
+        open.target,
+        MenuTarget::Folder,
+        "a crumb is not a row of the listing"
+    );
+    let folder = open.folder.expect("a folder menu names its folder");
+    assert_eq!(
+        folder.host_abs().map(|p| p.to_string_lossy()),
+        Some(beta.display().to_string()),
+        "the menu must act on the chip's own path"
+    );
+    assert_eq!(
+        shown(&harness, PaneSlot::Left).sel.len(),
+        1,
+        "a crumb is not a row: Go's `stopPropagation` (`navigation.js:213`) left the selection alone"
+    );
+}
+
+/// The rows of that menu answer to the chip, not to the pane's selection — the `data-target-path`
+/// half of Go's dispatcher (`context-menu.js:636-656`).
+#[test]
+fn the_folder_menu_copies_the_chip_and_not_the_selection() {
+    let (mut harness, beta, inner) = inner_harness("menus-crumb-copy");
+    let at = crumb(&mut harness, "beta");
+    click_at(&mut harness, at, PointerButton::Secondary);
+    let row = harness.get_by_label("Copy path").rect().center();
+    one_frame_click(&mut harness, row);
+    assert_eq!(
+        copied(&harness),
+        Some(format!("{}\n", beta.display())),
+        "`Copy path` copied the crumb"
+    );
+    assert!(
+        !copied(&harness).is_some_and(|text| text.contains("b2.txt")),
+        "the selection leaked into a folder menu"
+    );
+
+    // …and `Copy name` is the same row's last segment.
+    let at = crumb(&mut harness, "beta");
+    click_at(&mut harness, at, PointerButton::Secondary);
+    let row = harness.get_by_label("Copy name").rect().center();
+    one_frame_click(&mut harness, row);
+    assert_eq!(
+        copied(&harness),
+        Some("beta\n".to_string()),
+        "the listed path is still {inner:?}"
+    );
+}
+
+/// `Open in new tab` on a crumb is Go's `open-path-in-new-tab` → `createTab(paneId, targetPath)`:
+/// a **new** tab in the pane that owns the strip, listing the chip — where a left-click on the same
+/// chip navigates the tab that is already there.
+#[test]
+fn the_folder_menu_opens_the_chip_in_a_new_tab() {
+    let (mut harness, beta, inner) = inner_harness("menus-crumb-tab");
+    let before = harness.state().model.panes[&PaneSlot::Left].tabs.len();
+    let at = crumb(&mut harness, "beta");
+    click_at(&mut harness, at, PointerButton::Secondary);
+    harness.get_by_label("Open in new tab").click();
+    harness.run();
+    assert!(!is_open(&harness), "a chosen item always closes the menu");
+
+    let pane = &harness.state().model.panes[&PaneSlot::Left];
+    assert_eq!(pane.tabs.len(), before + 1, "no tab was added");
+    let tab = pane.active_tab().expect("the new tab is shown");
+    assert_eq!(
+        tab.path.host_abs().map(|p| p.to_string_lossy()),
+        Some(beta.display().to_string()),
+        "the new tab lists the chip, not the tab that was open ({inner:?})"
+    );
+}

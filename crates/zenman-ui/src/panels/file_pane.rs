@@ -67,6 +67,15 @@ pub enum PaneCommand {
         /// Where the menu should open.
         at: Pos2,
     },
+    /// Right-click on a **folder that is not a row** — a breadcrumb chip (Go's
+    /// `showFolderContextMenu`, wired at `navigation.js:211-215`). The menu acts on `path`, not on the
+    /// pane's selection.
+    FolderContext {
+        /// The chip's path (Go's `data-target-path`).
+        path: FsPath,
+        /// Where the menu should open.
+        at: Pos2,
+    },
     /// A column header was clicked.
     Sort(SortColumn),
     /// List ⇄ grid.

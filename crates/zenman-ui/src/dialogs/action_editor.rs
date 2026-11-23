@@ -345,6 +345,13 @@ impl ZenApp {
     /// Run a *saved* action on `slot`'s selection, with the two safety gates (module docs).
     pub fn run_action(&mut self, slot: PaneSlot, draft: &CustomAction) {
         let context = self.action_context(slot);
+        self.run_action_in(slot, draft, context);
+    }
+
+    /// …on a caller-supplied context, which is what lets the **folder** menu run an action against the
+    /// path it was opened over — Go's `custom-action-for-path` (`context-menu.js:710-716`) — under the
+    /// same two gates.
+    pub fn run_action_in(&mut self, slot: PaneSlot, draft: &CustomAction, context: ActionContext) {
         let Some(dir) = context
             .target_dir()
             .and_then(|d| AbsPath::from_path(&d).ok())

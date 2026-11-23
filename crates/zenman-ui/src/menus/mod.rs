@@ -16,7 +16,7 @@
 //! | Go (`frontend/js/context-menu.js`, `tabs.js`) | Here |
 //! |---|---|
 //! | `showContextMenu` (`context-menu.js:42-131`) — a row, or the empty pane | [`file_menu`] (`MenuTarget::Row` / `Background`) |
-//! | `showFolderContextMenu` (`:134-156`), the breadcrumb (`navigation.js:215`) and sidebar (`sidebar.js:36,93,131`) | [`folder_menu`] |
+//! | `showFolderContextMenu` (`:134-156`), the breadcrumb (`navigation.js:215`) and sidebar (`sidebar.js:36,93,131`) | [`folder_menu`], wired to the breadcrumb chips by [`crate::panels::breadcrumb`] |
 //! | `showTabContextMenu` (`tabs.js:351-386`) | [`tab_menu`] |
 //! | `showSearchResultContextMenu` (`:159-177`) | [`search_menu`] |
 //! | *no header/tray menu exists in Go at all* (`index.html:623` is the single `#context-menu` div) | none built |
@@ -101,6 +101,12 @@ pub enum MenuTarget {
         /// The row is a directory (or the selection is all directories).
         on_dir: bool,
     },
+    /// A folder that is **not** a row of this listing — a breadcrumb chip (Go's
+    /// `showFolderContextMenu` from `navigation.js:215`). Which folder is not in the variant: a path
+    /// is not `Copy`, and this enum is carried inside the `Copy` [`MenuContext`], so
+    /// [`crate::app::OpenMenu::folder`] names it. Go spelled the same thing as a DOM attribute
+    /// (`data-target-path`, `context-menu.js:148-156`).
+    Folder,
 }
 
 /// Everything a builder may ask about. Every field is derived by
@@ -286,7 +292,9 @@ pub fn file_menu(
 ) -> Vec<Vec<MenuSpec>> {
     let custom = custom_specs(actions, sel);
     let groups = match ctx.target {
-        MenuTarget::Background => {
+        // [`menu_for`] routes [`MenuTarget::Folder`] to [`folder_menu`]; sharing the background shape
+        // here is only what keeps this match total, not a second answer for a folder click.
+        MenuTarget::Background | MenuTarget::Folder => {
             let mut groups = vec![vec![
                 item(Command::Paste, paste_here, icon_paste(ctx)),
                 item(Command::PasteLink, paste_link_here, Some("link")),
@@ -359,11 +367,29 @@ pub fn background_menu(
     file_menu(&ctx, sel, actions)
 }
 
-/// The breadcrumb / sidebar folder menu (Go's `showFolderContextMenu`, `context-menu.js:134-156`).
+/// The menu a target asks for — the one place [`MenuTarget`] picks a builder, so the shell cannot
+/// draw the listing menu over a breadcrumb chip and vice versa.
+#[must_use]
+pub fn menu_for(
+    ctx: &MenuContext,
+    sel: &ActionContext,
+    actions: &[CustomAction],
+) -> Vec<Vec<MenuSpec>> {
+    if ctx.target == MenuTarget::Folder {
+        folder_menu(actions, sel)
+    } else {
+        file_menu(ctx, sel, actions)
+    }
+}
+
+/// The breadcrumb / sidebar folder menu (Go's `showFolderContextMenu`, `context-menu.js:134-156`),
+/// drawn over a [`MenuTarget::Folder`].
 ///
 /// Go's `Copy Path` / `Copy Name` here carry *no* chord span (`:143-149`) even though the commands
 /// have chords; we print the real ones (D7). Its folder-scoped custom actions (`:151-155`, which
-/// execute against the clicked path rather than the selection) are step 14's.
+/// execute against the clicked path rather than the selection) arrive as the `custom_specs` group —
+/// filtered by Go's own `getActionsForContext(true, true, folderPath)`, and answered against
+/// `folderPath` by [`crate::app::ZenApp`] rather than against the pane's selection.
 #[must_use]
 pub fn folder_menu(actions: &[CustomAction], sel: &ActionContext) -> Vec<Vec<MenuSpec>> {
     let groups = vec![
@@ -508,8 +534,13 @@ pub struct MenuOutcome {
 /// [`Ui::allocate_exact_size`], and every glyph and glyph of text in it is *painted* (`Painter`), so
 /// nothing allocates over it.
 ///
-/// `id` must be fresh per opening: an [`Area`] remembers the position of a known id, and a second
-/// right-click elsewhere would otherwise redraw at the first one.
+/// The position is set with [`Area::fixed_pos`], **not** [`Area::default_pos`]: an [`Area`] keeps the
+/// position of a known id in memory, and this fork's [`Id::unique`] is a stable hash of its source and
+/// not a per-call counter, so `default_pos` is read on the *first* opening of the session only — every
+/// later menu then drew at the first one's spot (the parity defect this function's `at` exists to
+/// avoid). `fixed_pos` overrides the stored position every frame and keeps `constrain(true)`, so the
+/// menu still cannot leave the screen.
+///
 /// What a menu is drawn with — the two things a row needs beyond its own spec, kept together so
 /// [`show`] stays under the argument ceiling: the chord table the hints come from (D7) and the token
 /// table the colours and the geometry come from.
@@ -534,7 +565,7 @@ pub fn show(
     let area = Area::new(id)
         .order(Order::Foreground)
         .movable(false)
-        .default_pos(at)
+        .fixed_pos(at)
         .constrain(true)
         .show(ctx, |ui| {
             Frame::new()
@@ -1290,6 +1321,43 @@ mod tests {
                 .flatten()
                 .all(|spec| spec.enabled(&ctx))
         );
+    }
+
+    /// The routing rule [`crate::app::ZenApp::menu_specs`] relies on: a [`MenuTarget::Folder`]
+    /// answers with [`folder_menu`] and never with the listing ladder, and neither listing target ever
+    /// answers with the folder's three rows. Get this wrong and a crumb right-click shows the
+    /// *selection's* menu — which is what Go's `data-target-path` exists to prevent.
+    #[test]
+    fn only_a_folder_target_gets_the_folder_menu() {
+        let labels = |groups: &[Vec<MenuSpec>]| -> Vec<String> {
+            groups
+                .iter()
+                .flatten()
+                .map(|spec| spec.label.clone())
+                .collect()
+        };
+        let sel = ActionContext::background(None);
+        let folder = at(0x00, MenuTarget::Folder);
+        assert_eq!(
+            labels(&menu_for(&folder, &sel, &[])),
+            labels(&folder_menu(&[], &sel)),
+            "a folder target must answer with `showFolderContextMenu`'s rows"
+        );
+        for listing in [
+            at(0x01, MenuTarget::Row { on_dir: false }),
+            at(0x00, MenuTarget::Background),
+        ] {
+            let got = labels(&menu_for(&listing, &sel, &[]));
+            assert_eq!(
+                got,
+                labels(&file_menu(&listing, &sel, &[])),
+                "a listing target must not reach `folder_menu`"
+            );
+            assert!(
+                !got.contains(&"Open in new tab".to_string()),
+                "a file row's menu grew the folder's row: {got:?}"
+            );
+        }
     }
 
     #[test]

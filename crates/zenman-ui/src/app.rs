@@ -28,6 +28,7 @@ use zenman_core::ops::mkdir::MkdirReq;
 use zenman_core::ops::paste::{PasteMode, PasteReq};
 use zenman_core::ops::rename::RenameReq;
 use zenman_core::path::{AbsPath, FsPath};
+use zenman_core::services::actions::ActionContext;
 use zenman_core::services::dirs::ListDir;
 use zenman_core::session::Origin;
 use zenman_core::session::{Receipt, Session, StartupNote};
@@ -62,11 +63,39 @@ pub struct OpenMenu {
     pub slot: PaneSlot,
     /// Row or background, and for a row whether it was a directory (Go's `isDir`).
     pub target: MenuTarget,
+    /// Set only when [`Self::target`] is [`MenuTarget::Folder`]: the folder the menu acts on, which is
+    /// Go's `data-target-path` (`context-menu.js:148`) — the breadcrumb chip's path, *never* the pane's
+    /// selection. One field per live variant, so a folder menu cannot be drawn with row semantics.
+    pub folder: Option<FsPath>,
     /// Where its top-left was asked to sit, in screen points.
     pub at: egui::Pos2,
-    /// A fresh `Id` per opening: an `Area` remembers the position of a known id, so reusing one would
-    /// redraw the second right-click at the first one's spot.
+    /// The menu layer's id. It is **stable** across openings — this fork's [`egui::Id::unique`] hashes
+    /// its source with fixed seeds, so it answers the same id every time. That is why
+    /// [`crate::menus::show`] pins the area with `fixed_pos`: an `Area` remembers the position of a
+    /// known id, and one right-click elsewhere used to redraw at the first one's spot.
     pub id: egui::Id,
+}
+
+/// What a context menu was opened over — the half of a [`MenuRequest`] that says *which* thing the
+/// rows act on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MenuSubject {
+    /// The pane's listing: one row (`Some(ix)`, Go's `isItem`) or its empty space (`None`).
+    Listing(Option<usize>),
+    /// A folder that is not a row — a breadcrumb chip (Go's `showFolderContextMenu` + `data-path`).
+    Folder(FsPath),
+}
+
+/// A context menu a panel asked for, waiting one frame to be drawn (see
+/// [`ZenApp::open_requested_menu`] for why the frame matters).
+#[derive(Clone, Debug, PartialEq)]
+pub struct MenuRequest {
+    /// The pane the request came from.
+    pub slot: PaneSlot,
+    /// Rows, background, or one explicit folder path.
+    pub subject: MenuSubject,
+    /// Where to open it.
+    pub at: egui::Pos2,
 }
 
 /// The whole shell.
@@ -89,8 +118,9 @@ pub struct ZenApp {
     pub tokens: Tokens,
     /// The boot report lines (GPU profile, startup notes) shown in the header tooltip/status area.
     pub boot_lines: Vec<String>,
-    /// The context menu the panes asked for, waiting for step 10's `menus::Registry` to draw it.
-    pub context_request: Option<(PaneSlot, Option<usize>, egui::Pos2)>,
+    /// The context menu a panel asked for last frame, waiting to be adopted by
+    /// [`Self::open_requested_menu`].
+    pub context_request: Option<MenuRequest>,
     /// The menu that is open *now* — the drawn half of `context_request` (step 10b).
     pub menu: Option<OpenMenu>,
     /// The keymap — **the** single source of truth for dispatch and for the menu hints 10b draws
@@ -448,10 +478,25 @@ impl ZenApp {
                     );
                 }
             }
+            PaneCommand::FolderContext { path, at } => {
+                // Go's breadcrumb `contextmenu` handler passed the chip's `data-path` to
+                // `showFolderContextMenu` and stopped propagation (`navigation.js:211-215`). The
+                // selection stays as it was: a chip is not a row.
+                self.context_request = Some(MenuRequest {
+                    slot,
+                    subject: MenuSubject::Folder(path),
+                    at,
+                });
+            }
             PaneCommand::Context { ix, at } => {
-                // Recorded, not drawn: `menus::Registry` is step 10's, and a right-click that
-                // selects its row is already half the behaviour.
-                self.context_request = Some((slot, ix, at));
+                // Recorded, not drawn: the menu is adopted next frame (`open_requested_menu`), and a
+                // right-click that selects its row is already half the behaviour (Go's
+                // `handlePaneContextMenu:19-27`).
+                self.context_request = Some(MenuRequest {
+                    slot,
+                    subject: MenuSubject::Listing(ix),
+                    at,
+                });
                 if let Some(ix) = ix
                     && let Some(tab) = self.tab_mut_of(slot)
                 {
@@ -1111,25 +1156,29 @@ impl ZenApp {
     /// previous frame (the panes' commands run after the dock, [`crate::dock_content::show`]) — which
     /// is also what keeps the opening right-click from being the click-away that closes it.
     fn open_requested_menu(&mut self) {
-        let Some((slot, ix, at)) = self.context_request.take() else {
+        let Some(MenuRequest { slot, subject, at }) = self.context_request.take() else {
             return;
         };
-        let target = match ix {
-            Some(ix) => {
-                let on_dir = self
-                    .model
-                    .panes
-                    .get(&slot)
-                    .and_then(|pane| pane.active_tab())
-                    .and_then(|tab| tab.entries.entries.get(ix))
-                    .is_some_and(|entry| entry.is_dir);
-                MenuTarget::Row { on_dir }
-            }
-            None => MenuTarget::Background,
+        let (target, folder) = match subject {
+            MenuSubject::Listing(ix) => match ix {
+                Some(ix) => {
+                    let on_dir = self
+                        .model
+                        .panes
+                        .get(&slot)
+                        .and_then(|pane| pane.active_tab())
+                        .and_then(|tab| tab.entries.entries.get(ix))
+                        .is_some_and(|entry| entry.is_dir);
+                    (MenuTarget::Row { on_dir }, None)
+                }
+                None => (MenuTarget::Background, None),
+            },
+            MenuSubject::Folder(path) => (MenuTarget::Folder, Some(path)),
         };
         self.menu = Some(OpenMenu {
             slot,
             target,
+            folder,
             at,
             id: egui::Id::unique("zenman-menu"),
         });
@@ -1144,8 +1193,34 @@ impl ZenApp {
         };
         let ctx = self.menu_context(open.slot, open.target);
         let actions = self.session.config().custom_actions;
-        let sel = self.action_context(open.slot);
-        menus::file_menu(&ctx, &sel, &actions)
+        menus::menu_for(&ctx, &self.menu_target(open), &actions)
+    }
+
+    /// What the open menu's rows act on, as the [`ActionContext`] the custom-action filter reads:
+    /// the pane's selection for a listing menu, the clicked folder for a [`MenuTarget::Folder`] one
+    /// (Go kept the two apart with `data-target-path`, `context-menu.js:148-156`).
+    fn menu_target(&self, open: &OpenMenu) -> ActionContext {
+        match &open.folder {
+            Some(folder) => self.folder_action_context(open.slot, folder),
+            None => self.action_context(open.slot),
+        }
+    }
+
+    /// Go's `getActionsForContext(true, true, folderPath)` (`context-menu.js:161`): the folder is the
+    /// target and the pane's directory is `{dir}`.
+    ///
+    /// A crumb inside an archive has no [`AbsPath`] of its own — `host_abs` answers the *container* —
+    /// so it gets the context of a background click rather than one whose target is the `.zip`.
+    #[must_use]
+    pub fn folder_action_context(&self, slot: PaneSlot, folder: &FsPath) -> ActionContext {
+        let dir = self.shown_dir_abs(slot);
+        match &folder.store {
+            zenman_core::path::VfsKind::Fs => match folder.host_abs() {
+                Some(abs) => ActionContext::rows(dir, vec![abs], true),
+                None => ActionContext::background(dir),
+            },
+            zenman_core::path::VfsKind::Archive { .. } => ActionContext::background(dir),
+        }
     }
 
     /// The context the builders ask about, derived from live state field by field — the plan row's
@@ -1229,9 +1304,21 @@ impl ZenApp {
         }
         for action in clicked {
             self.menu = None;
-            match action {
-                MenuAction::Command(command) => self.dispatch(open.slot, command, ctx),
-                MenuAction::Custom(action) => self.run_action(open.slot, &action),
+            match (action, open.folder.clone()) {
+                (MenuAction::Command(command), Some(folder)) => {
+                    self.dispatch_folder(open.slot, command, &folder, ctx);
+                }
+                (MenuAction::Command(command), None) => self.dispatch(open.slot, command, ctx),
+                // Go's `custom-action-for-path` (`context-menu.js:710`): a folder menu's rows carry
+                // their own target, filtered *and* executed against the clicked path rather than
+                // against the pane's selection.
+                (MenuAction::Custom(action), folder) => {
+                    let context = match &folder {
+                        Some(folder) => self.folder_action_context(open.slot, folder),
+                        None => self.action_context(open.slot),
+                    };
+                    self.run_action_in(open.slot, &action, context);
+                }
             }
         }
     }
@@ -1336,27 +1423,12 @@ impl ZenApp {
             Command::CutInside => self.clipboard_store(slot, ClipOp::Cut, ClipScope::Inside),
             Command::CopyPath | Command::CopyName => {
                 let named = command == Command::CopyName;
-                let text = self
+                let lines: Vec<String> = self
                     .selection_abs(slot)
                     .iter()
-                    .map(|path| {
-                        let path = path.as_path();
-                        if named {
-                            path.file_name()
-                                .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
-                        } else {
-                            path.to_string_lossy().into_owned()
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                if text.is_empty() {
-                    self.nothing_selected("copy");
-                } else {
-                    // Go's `navigator.clipboard.writeText` (`context-menu.js:582-591`); egui's way
-                    // out is the `CopyText` output command, which the shell's backend answers.
-                    ctx.copy_text(format!("{text}\n"));
-                }
+                    .map(|path| path_text(path.as_path(), named))
+                    .collect();
+                self.copy_lines(&lines, ctx);
             }
             Command::Paste => match self.shown_dir_abs(slot) {
                 Some(dest) => self.run_paste(slot, dest, None),
@@ -1408,7 +1480,11 @@ impl ZenApp {
             Command::OpenContextMenu => {
                 let at = ctx.input(|i| i.pointer.hover_pos());
                 if let Some(at) = at {
-                    self.context_request = Some((slot, None, at));
+                    self.context_request = Some(MenuRequest {
+                        slot,
+                        subject: MenuSubject::Listing(None),
+                        at,
+                    });
                 }
             }
             Command::CancelJob => {
@@ -1532,6 +1608,48 @@ impl ZenApp {
     pub(crate) fn nothing_selected(&mut self, what: &str) {
         self.notices
             .post(toast::Level::Warning, format!("{what}: nothing selected"));
+    }
+
+    /// Put `lines` on the clipboard as one block — Go's `navigator.clipboard.writeText`
+    /// (`context-menu.js:582-591`); egui's way out is the `CopyText` output command, which the
+    /// shell's backend answers. An empty block is the loud no-op, never silence.
+    fn copy_lines(&mut self, lines: &[String], ctx: &egui::Context) {
+        let text = lines.join("\n");
+        if text.is_empty() {
+            self.nothing_selected("copy");
+        } else {
+            ctx.copy_text(format!("{text}\n"));
+        }
+    }
+
+    /// Run one **folder menu** row against the folder it was opened over — the third front end on
+    /// [`Self::dispatch`]'s table (plan **D7**). The chord has no path to name, so the menu supplies
+    /// one; Go spelled the same difference as `data-target-path` (`context-menu.js:636-656`).
+    ///
+    /// Every other command is a row [`crate::menus::folder_menu`] does not draw, and is refused here
+    /// rather than run against the pane's selection by accident.
+    fn dispatch_folder(
+        &mut self,
+        slot: PaneSlot,
+        command: Command,
+        folder: &FsPath,
+        ctx: &egui::Context,
+    ) {
+        match command {
+            // Go's `open-path-in-new-tab` → `createTab(paneId, targetPath)` (`:636-638`): a *new*
+            // tab, not the navigation a left-click on the same chip does.
+            Command::OpenInNewTab => {
+                self.open_tab(slot, folder.clone());
+            }
+            Command::CopyPath | Command::CopyName => {
+                let named = command == Command::CopyName;
+                self.copy_lines(&[folder_text(folder, named)], ctx);
+            }
+            other => self.notices.post(
+                toast::Level::Warning,
+                format!("{}: not a folder command", other.label()),
+            ),
+        }
     }
 
     fn no_directory(&mut self, command: Command) {
@@ -2461,6 +2579,26 @@ pub fn tab_title(path: &FsPath) -> String {
     match path.last_segment() {
         Some(name) if !name.is_empty() => name.to_string(),
         _ => "/".to_string(),
+    }
+}
+
+/// One line of `Copy path` / `Copy name` for a listing row.
+fn path_text(path: &std::path::Path, named: bool) -> String {
+    if named {
+        path.file_name()
+            .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
+    } else {
+        path.to_string_lossy().into_owned()
+    }
+}
+
+/// …for a folder chip: [`FsPath`]'s own [`std::fmt::Display`] rule, so a crumb inside an archive copies
+/// its `host/member/relative` spelling and not the container's.
+fn folder_text(folder: &FsPath, named: bool) -> String {
+    if named {
+        folder.last_segment().unwrap_or_default().to_owned()
+    } else {
+        folder.to_string()
     }
 }
 

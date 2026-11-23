@@ -348,7 +348,16 @@ fn path_chips(
         if response.clicked() && target != *path {
             // The pane's own navigate command — the same one the address field and the history
             // buttons use; there is no second mechanism and there must not be one.
-            out.push(PaneCommand::Navigate(target));
+            out.push(PaneCommand::Navigate(target.clone()));
+        }
+        if response.secondary_clicked() {
+            // Go's own handler on `.breadcrumb-segment` (`navigation.js:211-215`) called
+            // `stopPropagation` so the *pane's* `contextmenu` never fired for the same click; a chip's
+            // rect is disjoint from every row's, so nothing here can double-answer either.
+            out.push(PaneCommand::FolderContext {
+                path: target.clone(),
+                at: response.interact_pointer_pos().unwrap_or(rect.min),
+            });
         }
     }
     // The free space after the trail, up to the room reserved for the trailing button.
