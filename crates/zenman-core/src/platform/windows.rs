@@ -444,7 +444,19 @@ pub fn trash(path: &Path) -> Result<bool, CoreError> {
 /// `explorer` is Windows' default-handler entry point (`open` 5.4 uses `cmd /C start` internally on that
 /// target); `open::commands` being empty means no handler is registered at all, which is named rather
 /// than swallowed (plan F10's "never an empty success").
+///
+/// The cross-target audit compiles and calls this on a **linux** host, and the `open` crate is itself
+/// cross-platform — so unguarded it runs `xdg-open`/`gio` there and opens the path in the developer's
+/// desktop. That is wrong twice over: the answer is not the one a Windows user would get, and a test
+/// that asks the question launches real applications (with a *directory* argument, it asks the desktop
+/// for its default file manager — and if this program is that file manager, it has just been spawned
+/// by its own test suite). Off Windows the honest answer is the typed refusal.
 pub fn open_with(path: &AbsPath) -> Result<(), CoreError> {
+    if !cfg!(target_os = "windows") {
+        return Err(CoreError::Unsupported {
+            what: "explorer: the Windows opener has no handler to reach on a non-windows host",
+        });
+    }
     if open::commands(path.as_path()).is_empty() {
         return Err(CoreError::Shell {
             cmd: "explorer".to_string(),

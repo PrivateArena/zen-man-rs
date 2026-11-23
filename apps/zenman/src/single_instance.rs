@@ -45,6 +45,47 @@ pub type BoxError = Box<dyn Error + Send + Sync>;
 /// terminates.
 pub const FOCUS_MESSAGE: &str = "focus";
 
+/// …and the file-manager hand-off: `open <app_id> <path>`, one line per requested folder.
+///
+/// The path is the sender's *resolved* absolute path, put on the wire by `Cli::targets` rather than
+/// handed over raw: the instance that opens a folder must not be the one to decide what an arbitrary
+/// string meant, and plan §4.2's guard has already been paid for by the time a request is written.
+pub const OPEN_MESSAGE: &str = "open";
+
+/// One request from a second invocation of the same data directory.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Request {
+    /// "Raise your window" — the whole of the protocol before a file manager needed one.
+    Focus,
+    /// "List this folder": the desktop asked a *file manager* to open something, and this is the
+    /// instance that is already running being asked to do it instead of a second window opening
+    /// beside it (a second window is the corruption bug the claim exists to prevent).
+    Open(String),
+}
+
+impl Request {
+    /// The line this request is written as.
+    fn line(&self, app_id: &str) -> String {
+        match self {
+            Self::Focus => format!("{FOCUS_MESSAGE} {app_id}"),
+            Self::Open(path) => format!("{OPEN_MESSAGE} {app_id} {path}"),
+        }
+    }
+
+    /// Parse one wire line. Anything this build cannot read is taken for the focus request the protocol
+    /// used to consist of entirely: a newer sender must at least raise the window.
+    fn parse(line: &str) -> Self {
+        let mut fields = line.splitn(3, ' ');
+        if fields.next() == Some(OPEN_MESSAGE) {
+            let _owner = fields.next();
+            if let Some(path) = fields.next().filter(|p| !p.is_empty()) {
+                return Self::Open(path.to_owned());
+            }
+        }
+        Self::Focus
+    }
+}
+
 /// The result of [`claim_or_focus`].
 #[derive(Debug)]
 pub enum Claim {
@@ -92,32 +133,28 @@ impl SingleInstanceGuard {
         self.owns_socket.then_some(self.socket.as_path())
     }
 
-    /// The pending focus request, if one arrived while the window was opening: the drain is what makes
-    /// a second invocation actually raise the first window instead of merely exiting.
+    /// The pending requests from second invocations, if any arrived: the drain is what makes a second
+    /// invocation actually raise the first window (and open its folder) instead of merely exiting.
     ///
     /// Non-blocking and best-effort by design — the caller polls it from the event loop, and an
     /// `accept()` here would park the UI thread.
     #[must_use]
-    pub fn take_focus_requests(&self) -> usize {
+    pub fn take_requests(&self) -> Vec<Request> {
         #[cfg(unix)]
         {
-            let mut n = 0;
+            let mut out = Vec::new();
             loop {
                 match self.accept_pending() {
-                    Ok(stream) => {
-                        // Read the request (one line, or until EOF) so the sender sees a clean close.
-                        read_focus_line(stream);
-                        n += 1;
-                    }
+                    Ok(stream) => out.extend(read_requests(stream)),
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                     Err(_) => break,
                 }
             }
-            n
+            out
         }
         #[cfg(not(unix))]
         {
-            0
+            Vec::new()
         }
     }
 }
@@ -201,17 +238,27 @@ fn fnv1a(raw: &str) -> u64 {
     hash
 }
 
-/// Claim the instance slot, or focus whoever holds it.
+/// Claim the instance slot, or hand a request to whoever holds it.
 ///
 /// `no_daemon` (the `--no-daemon`/`--new-instance` escape hatch) skips the whole mechanism: the caller
 /// gets [`Claim::First`] with a guard that owns nothing. That flag exists because the acceptance criterion
 /// is "two instances run", and because a developer debugging a locked database needs a way in.
 ///
+/// `targets` are the folders this invocation was asked to open, already resolved to absolute paths: a
+/// non-empty list is written as an [`Request::Open`] per folder, an empty one as the bare focus request.
+/// Either way the second process exits 0 — it succeeded, in the sense that the user's request reached
+/// the window that is going to serve it.
+///
 /// # Errors
 /// A [`BoxError`] describing the I/O failure when the run directory cannot be created, the socket cannot
 /// be bound, or a socket whose owner is *alive* refuses connections. The last case is deliberate: it is
 /// the one situation where deleting the socket would let two processes write the same undo log.
-pub fn claim_or_focus(app_id: &str, paths: &AppPaths, no_daemon: bool) -> Result<Claim, BoxError> {
+pub fn claim_or_focus(
+    app_id: &str,
+    paths: &AppPaths,
+    no_daemon: bool,
+    targets: &[String],
+) -> Result<Claim, BoxError> {
     let socket = socket_path(app_id, paths);
     if no_daemon {
         return Ok(Claim::First(SingleInstanceGuard {
@@ -222,7 +269,7 @@ pub fn claim_or_focus(app_id: &str, paths: &AppPaths, no_daemon: bool) -> Result
     }
     #[cfg(unix)]
     {
-        claim_or_focus_unix(app_id, &socket)
+        claim_or_focus_unix(app_id, &socket, targets)
     }
     #[cfg(not(unix))]
     {
@@ -241,28 +288,59 @@ pub fn claim_or_focus(app_id: &str, paths: &AppPaths, no_daemon: bool) -> Result
     }
 }
 
-/// Write the focus request on an accepted connection, best-effort.
+/// Write the request on an accepted connection, best-effort.
 ///
 /// The caller reports a failure but still treats it as "someone else owns the data directory": the
 /// second process must not open a window either way.
-fn write_focus(stream: &mut std::os::unix::net::UnixStream, app_id: &str) -> std::io::Result<()> {
+fn write_request(
+    stream: &mut std::os::unix::net::UnixStream,
+    app_id: &str,
+    targets: &[String],
+) -> std::io::Result<()> {
     use std::io::Write as _;
-    stream.write_all(format!("{FOCUS_MESSAGE} {app_id}\n").as_bytes())?;
+    // One line per requested folder; a bare second invocation still asks for focus alone.
+    let requests: Vec<Request> = match targets {
+        [] => vec![Request::Focus],
+        wanted => wanted.iter().cloned().map(Request::Open).collect(),
+    };
+    let text: String = requests
+        .iter()
+        .map(|r| format!("{}\n", r.line(app_id)))
+        .collect();
+    stream.write_all(text.as_bytes())?;
     stream.flush()
 }
 
+/// Read the request (or requests) one connection carried, so the sender sees a clean close.
 #[cfg(unix)]
-fn read_focus_line(mut stream: std::os::unix::net::UnixStream) {
+fn read_requests(mut stream: std::os::unix::net::UnixStream) -> Vec<Request> {
     use std::io::Read as _;
-    let mut buf = [0u8; 256];
-    let _ = stream.read(&mut buf);
+    // Long enough for a folder path plus the verb and the app id; a request that overruns it still
+    // parses as the focus request it began as.
+    let mut buf = [0u8; 4096];
+    let Ok(n) = stream.read(&mut buf) else {
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(&buf[..n]);
+    let found: Vec<Request> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| Request::parse(line.trim()))
+        .collect();
+    // One connection is one invocation: fold its folder requests in order, and never report an empty
+    // list — a request that could not be read still means "someone is there".
+    (!found.is_empty())
+        .then_some(found)
+        .unwrap_or(vec![Request::Focus])
 }
 
 #[cfg(not(unix))]
-fn read_focus_line(_stream: ()) {}
+fn read_requests(_stream: ()) -> Vec<Request> {
+    vec![Request::Focus]
+}
 
 #[cfg(unix)]
-fn claim_or_focus_unix(app_id: &str, socket: &Path) -> Result<Claim, BoxError> {
+fn claim_or_focus_unix(app_id: &str, socket: &Path, targets: &[String]) -> Result<Claim, BoxError> {
     if let Some(dir) = socket.parent() {
         std::fs::create_dir_all(dir)
             .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
@@ -273,7 +351,7 @@ fn claim_or_focus_unix(app_id: &str, socket: &Path) -> Result<Claim, BoxError> {
     match try_connect(socket) {
         Connect::Listening(mut stream) => {
             // Ours: hand it the focus request and step aside.
-            if let Err(e) = write_focus(&mut stream, app_id) {
+            if let Err(e) = write_request(&mut stream, app_id, targets) {
                 eprintln!(
                     "zenman: could not deliver the focus request to {}: {e}",
                     socket.display()
@@ -325,7 +403,7 @@ fn claim_or_focus_unix(app_id: &str, socket: &Path) -> Result<Claim, BoxError> {
         Err(e) if e.raw_os_error() == Some(libc_eaddrinuse()) => {
             // Someone won the race; become the process that focuses them.
             if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(socket) {
-                if let Err(err) = write_focus(&mut stream, app_id) {
+                if let Err(err) = write_request(&mut stream, app_id, targets) {
                     eprintln!("zenman: could not deliver the focus request: {err}");
                 }
                 return Ok(Claim::AlreadyRunning {
@@ -466,7 +544,7 @@ mod tests {
     fn the_first_claim_wins_and_the_second_focuses_it() {
         let p = paths("two");
         let app = "ZenMan-claimtest";
-        let first = claim_or_focus(app, &p, false).expect("first claims");
+        let first = claim_or_focus(app, &p, false, &[]).expect("first claims");
         let Claim::First(guard) = first else {
             panic!("the first claim must own the socket");
         };
@@ -482,22 +560,63 @@ mod tests {
         );
 
         // Second process, same data directory: it must find the owner and hand it a focus request.
-        let second = claim_or_focus(app, &p, false).expect("second resolves");
+        let second = claim_or_focus(app, &p, false, &[]).expect("second resolves");
         assert!(
             matches!(second, Claim::AlreadyRunning { .. }),
             "the second claim must not own anything: {second:?}"
         );
         assert_eq!(
-            guard.take_focus_requests(),
-            1,
+            guard.take_requests(),
+            vec![Request::Focus],
             "the focus request arrives at the owner"
         );
 
         // A different variant is a different instance, and claims its own socket.
         assert!(matches!(
-            claim_or_focus("ZenMan-othervariant", &p, false).expect("independent"),
+            claim_or_focus("ZenMan-othervariant", &p, false, &[]).expect("independent"),
             Claim::First(_)
         ));
+        drop(guard);
+    }
+
+    #[test]
+    fn a_second_invocation_hands_over_the_folders_it_was_asked_to_open() {
+        // The file-manager contract, in the one place it can be tested without a desktop:
+        // `xdg-open <dir>` runs a second `zenman`, which must not open a second window (that is the
+        // corruption bug the claim exists to prevent) and must not lose the folder either.
+        let p = paths("open-request");
+        let app = "ZenMan-openrequest";
+        let Claim::First(guard) = claim_or_focus(app, &p, false, &[]).expect("first claims") else {
+            panic!("the first claim must own the socket");
+        };
+        assert!(
+            guard.take_requests().is_empty(),
+            "nothing has asked for anything yet"
+        );
+
+        let asked = ["/tmp/one".to_string(), "/tmp/two with spaces".to_string()];
+        let Claim::AlreadyRunning { .. } =
+            claim_or_focus(app, &p, false, &asked).expect("second resolves")
+        else {
+            panic!("the second invocation must not claim a live socket")
+        };
+        assert_eq!(
+            guard.take_requests(),
+            vec![
+                Request::Open(asked[0].clone()),
+                Request::Open(asked[1].clone())
+            ],
+            "both folders arrive, in order, spaces and all"
+        );
+
+        // And the path is handed over exactly as the sender resolved it — not re-derived from a cwd the
+        // receiving instance does not share.
+        let Claim::AlreadyRunning { .. } =
+            claim_or_focus(app, &p, false, &["/x".to_string()]).expect("third resolves")
+        else {
+            panic!("");
+        };
+        assert_eq!(guard.take_requests(), vec![Request::Open("/x".to_string())]);
         drop(guard);
     }
 
@@ -505,7 +624,7 @@ mod tests {
     fn releasing_the_guard_lets_the_next_claim_win() {
         let p = paths("release");
         let app = "ZenMan-release";
-        let claim = claim_or_focus(app, &p, false).expect("claims");
+        let claim = claim_or_focus(app, &p, false, &[]).expect("claims");
         let Claim::First(guard) = claim else {
             panic!("expected First");
         };
@@ -514,7 +633,7 @@ mod tests {
         assert!(!socket.exists(), "the drop released the socket");
         assert!(!pid_file_path(&socket).exists(), "and the pid file");
         assert!(matches!(
-            claim_or_focus(app, &p, false).expect("re-claims"),
+            claim_or_focus(app, &p, false, &[]).expect("re-claims"),
             Claim::First(_)
         ));
     }
@@ -523,13 +642,13 @@ mod tests {
     fn no_daemon_claims_nothing_and_writes_no_socket() {
         let p = paths("nodaemon");
         let app = "ZenMan-nodaemon";
-        let claim = claim_or_focus(app, &p, true).expect("bypassed");
+        let claim = claim_or_focus(app, &p, true, &[]).expect("bypassed");
         let Claim::First(guard) = claim else {
             panic!("--no-daemon must still produce a First so the app runs");
         };
         assert_eq!(guard.socket_path(), None, "nothing was claimed");
         assert!(!socket_path(app, &p).exists(), "and nothing was written");
-        assert_eq!(guard.take_focus_requests(), 0);
+        assert!(guard.take_requests().is_empty());
     }
 
     #[cfg(unix)]
@@ -565,7 +684,7 @@ mod tests {
         assert!(socket.exists(), "the stale file is left behind");
         // Bound to a name: dropping the guard at the end of an `assert!` would remove the very socket
         // this assertion is about.
-        let claim = claim_or_focus(app, &p, false).expect("clears it");
+        let claim = claim_or_focus(app, &p, false, &[]).expect("clears it");
         assert!(
             matches!(claim, Claim::First(_)),
             "an unowned stale socket is cleared and claimed"
@@ -588,7 +707,7 @@ mod tests {
         std::fs::write(&socket, b"not a zenman socket").expect("planted file");
         std::fs::write(pid_file_path(&socket), format!("{}", std::process::id()))
             .expect("live pid");
-        let err = claim_or_focus(app, &p, false)
+        let err = claim_or_focus(app, &p, false, &[])
             .expect_err("a live owner's socket must refuse the claim");
         assert!(
             err.to_string().contains("not removing it"),

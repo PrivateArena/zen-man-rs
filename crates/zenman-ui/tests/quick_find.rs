@@ -99,6 +99,24 @@ fn pane_harness(tag: &str, dir: &Path) -> Harness<'static, ZenApp> {
     build_harness(app)
 }
 
+/// …and the same shell over the **recording** launcher, for the test that takes the open branch: it
+/// asserts what was handed to the desktop instead of launching an editor during the test run
+/// (`common::NoDesktopEnv`; a directory argument there would have asked the session manager for the
+/// default file manager — this project's own binary on an installed machine).
+fn pane_harness_logging(
+    tag: &str,
+    dir: &Path,
+) -> (
+    Harness<'static, ZenApp>,
+    std::sync::Arc<common::NoDesktopEnv>,
+) {
+    let (session, env) = common::session_with_launcher(tag);
+    let mut app = ZenApp::new(session, Vec::new());
+    app.set_layout(panes_for(LayoutMode::Single));
+    app.open_tab(PaneSlot::Left, FsPath::from_abs(abs(dir)));
+    (build_harness(app), env)
+}
+
 // --------------------------------------------------------------------- driving the dialog
 
 /// `Ctrl+F` — the step-10a chord (the dispatch seam is the same one the keyboard reaches).
@@ -391,7 +409,7 @@ fn enter_on_a_directory_hit_navigates_the_pane_and_closes_the_dialog() {
 #[test]
 fn enter_on_a_file_hit_takes_the_open_path_and_leaves_the_pane_alone() {
     let root = tree("qf-file");
-    let mut harness = pane_harness("qf-file", &root);
+    let (mut harness, launcher) = pane_harness_logging("qf-file", &root);
     open_find(&mut harness);
     type_word(&mut harness, "notes");
     common::settle_until(&mut harness, "the file row", |h| {
@@ -409,21 +427,24 @@ fn enter_on_a_file_hit_takes_the_open_path_and_leaves_the_pane_alone() {
     common::settle_until(&mut harness, "the dismissal", |h| {
         !h.state().dialogs.is_open()
     });
-    // D6 branch-and-print: the branch is asserted above; the *outcome* of the desktop open is
-    // platform's (no handler for `.zzzq` here, so the report's `failed` toasts) — print it.
+    // D6 branch-and-print: the branch is asserted above, and the *hand-over* is asserted here — the
+    // one path the launcher was asked about, the file and not its directory. Whether the desktop has a
+    // handler for `.zzzq` is the platform's business, and `contract_ops` answers it with the real one.
+    assert_eq!(
+        launcher.opened(),
+        vec![
+            abs(&root)
+                .join("notes.zzzq")
+                .expect("joins")
+                .to_string_lossy()
+        ],
+        "the open branch handed the file to the launcher"
+    );
     assert_eq!(
         shown(&harness).path,
         FsPath::from_abs(abs(&root)),
         "a file open never moves the pane"
     );
-    let notices: Vec<String> = harness
-        .state()
-        .notices
-        .queued()
-        .iter()
-        .map(|n| n.text.clone())
-        .collect();
-    println!("open-path notices: {notices:?}");
 }
 
 #[test]

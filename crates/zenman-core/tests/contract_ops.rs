@@ -2671,11 +2671,15 @@ fn every_write_op_notes_the_index_and_invalidates_the_directories_it_changed() {
         IndexOp::Deleted { path: copy.clone() },
     );
 
-    // open changes nothing, so it owes nothing: no invalidation, no index op, no record.
+    // open changes nothing, so it owes nothing: no invalidation, no index op, no record. The
+    // *directory* is the honest argument here — a directory is routed, never handed to the launcher
+    // (`open::route`), so the assertion costs no spawned desktop application — and the launched-file
+    // lane of the same promise is asserted by
+    // `open_launches_files_routes_directories_and_reports_a_missing_opener`, on a recording env.
     let before = intent.len();
     session
-        .open_paths(std::slice::from_ref(&file))
-        .expect("the launcher was asked, not the filesystem");
+        .open_paths(std::slice::from_ref(&dest))
+        .expect("a directory open is a route, and needs no launcher");
     let _ = session.poll();
     assert!(dir_changed(&session.dirs().flush_invalidations()).is_empty());
     assert_eq!(

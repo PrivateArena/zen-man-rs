@@ -44,10 +44,21 @@ use crate::theme::Tokens;
 use crate::widgets::{disk_meter, toast};
 
 /// What a click in either drawer means. The shell answers it; the panel never touches the engine.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum SidePanelCommand {
     /// List this place in the active pane.
     Navigate(FsPath),
+    /// Right-click on a place / favourite / drive row: the folder menu for **that** row's path.
+    ///
+    /// Go attaches one handler to every `.sidebar-item` — places (`sidebar.js:32-37`), bookmarks
+    /// (`:90-95`), mounts (`:129-134`) — and all three call the same `showFolderContextMenu(e, path,
+    /// pane, 'sidebar')`, so the drawer's menu is the breadcrumb chip's menu and not the listing's.
+    FolderContext {
+        /// The row's path.
+        path: FsPath,
+        /// Where the pointer was.
+        at: egui::Pos2,
+    },
     /// Favourite the active pane's directory (Go's `addCurrentToBookmarks`, `sidebar.js:135-150`).
     AddCurrent,
     /// Drop one favourite (Go's `{"action":"remove"}`, `api/places.go:176-186`).
@@ -76,6 +87,9 @@ struct RowSpec {
     muted: bool,
     activate: Option<SidePanelCommand>,
     remove: Option<SidePanelCommand>,
+    /// The path a right-click on this row opens the folder menu for — `Some` for a row that **is** a
+    /// folder (place, favourite, mount), `None` for the right drawer's custom-action rows.
+    folder: Option<FsPath>,
 }
 
 impl RowSpec {
@@ -90,7 +104,15 @@ impl RowSpec {
             muted: false,
             activate: None,
             remove: None,
+            folder: None,
         }
+    }
+
+    /// Ask for the folder menu on right-click, on the same path the row navigates to. A path that will
+    /// not parse gets no menu, which is also what `activate` means for the row (`navigate` refuses it).
+    fn for_folder(mut self, path: &str) -> Self {
+        self.folder = SidePanelCommand::folder(path);
+        self
     }
 }
 
@@ -340,6 +362,14 @@ fn show_row(ui: &mut Ui, tokens: &Tokens, spec: &RowSpec, out: &mut Vec<SidePane
         if remove.clicked() {
             out.push(command.clone());
         }
+        // Go's delete button has no `contextmenu` handler of its own, so the event bubbles to the row
+        // and the folder menu opens from over the `×` too.
+        if remove.secondary_clicked()
+            && let Some(command) =
+                folder_menu(spec, remove.interact_pointer_pos().unwrap_or(hit.min))
+        {
+            out.push(command);
+        }
     }
 
     let label = spec.label.clone();
@@ -356,6 +386,15 @@ fn show_row(ui: &mut Ui, tokens: &Tokens, spec: &RowSpec, out: &mut Vec<SidePane
         && let Some(command) = &spec.activate
     {
         out.push(command.clone());
+    }
+    // Right-click is the folder menu (`sidebar.js:32-37`). It is the row's own gesture, not a variant of
+    // `activate`: the selection and the listing are left exactly as they were, and the menu is about the
+    // row's path — which is not necessarily the pane's directory.
+    if response.secondary_clicked()
+        && let Some(command) =
+            folder_menu(spec, response.interact_pointer_pos().unwrap_or(rect.min))
+    {
+        out.push(command);
     }
 
     // Go reveals the `×` on hover with `opacity: 0 → 1` (`sidebar.js:93-100`); the slot is always
@@ -574,6 +613,7 @@ fn place_spec(place: &Place) -> RowSpec {
     spec.note = place_note(place);
     spec.muted = !place.exists;
     spec.hover = Some(place.path.clone());
+    spec = spec.for_folder(&place.path);
     spec.activate = SidePanelCommand::navigate(&place.path);
     spec
 }
@@ -605,6 +645,9 @@ fn disk_spec(disk: &Disk) -> RowSpec {
         }
     }
     spec.muted = disk.unavailable.is_some();
+    // An unreadable volume still answers a right-click: `Copy Path` is the one thing that is useful
+    // when the drive cannot be entered, and Go's row carries its path regardless.
+    spec = spec.for_folder(&disk.mount_point);
     spec.activate = SidePanelCommand::navigate(&disk.mount_point);
     spec
 }
@@ -641,10 +684,23 @@ impl SidePanelCommand {
     /// does not produce a row command at all.
     #[must_use]
     pub fn navigate(path: &str) -> Option<Self> {
+        Self::folder(path).map(Self::Navigate)
+    }
+
+    /// A path from a settings file or a mount table, typed or refused (plan §4.2's boundary rule: the
+    /// string becomes an `FsPath` here, and a row whose path will not parse simply has no menu).
+    fn folder(path: &str) -> Option<FsPath> {
         zenman_core::path::AbsPath::from_path(path)
-            .map(|abs| Self::Navigate(FsPath::from_abs(abs)))
+            .map(FsPath::from_abs)
             .ok()
     }
+}
+
+/// The command a right-click on `spec`'s row raises, or `None` for a row that is not a folder.
+fn folder_menu(spec: &RowSpec, at: egui::Pos2) -> Option<SidePanelCommand> {
+    spec.folder
+        .clone()
+        .map(|path| SidePanelCommand::FolderContext { path, at })
 }
 
 impl ZenApp {
@@ -660,6 +716,16 @@ impl ZenApp {
                 self.add_current_to_favourites(slot);
             }
             SidePanelCommand::RemoveFavourite(path) => self.remove_favourite_path(&path),
+            SidePanelCommand::FolderContext { path, at } => {
+                // Recorded exactly as a breadcrumb chip records it, so one folder menu
+                // (`open_requested_menu` → `menus::menu_for`) answers both entries.
+                let slot = self.model.active_pane;
+                self.context_request = Some(crate::app::MenuRequest {
+                    slot,
+                    subject: crate::app::MenuSubject::Folder(path),
+                    at,
+                });
+            }
             SidePanelCommand::NewAction => {
                 let slot = self.model.active_pane;
                 self.open_action_editor(slot, None);

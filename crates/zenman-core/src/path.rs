@@ -713,6 +713,54 @@ pub enum ResolveKind {
     Relative,
 }
 
+/// The `%u` half of the desktop's file-manager contract: a `file:` URI's local path, or `None` when it
+/// does not name one this program can list.
+///
+/// Why this belongs to the path layer and not to the CLI: a desktop file manager is *launched at a
+/// target* (`Exec=… %u`; `exo-open --launch FileManager <uri>` is what runs it here), and that target
+/// arrives percent-encoded — the only entry point in the port that does. Decoding runs **before**
+/// [`AbsPath::resolve`] for that reason: `file:///home/zm/%2e%2e/etc` names an escape, and decoding is
+/// what turns it into the `..` the resolver already clamps at the root (`filepath.Clean`, `api/dir.go:63`,
+/// reproduced by [`AbsPath::clean`]). The listing is then offered the same path the user could have typed,
+/// and the plan §4.2 guard is asked about it. Handing the URI over undecoded instead would have made
+/// `%2e%2e` a literal directory name — and no guard would ever have been asked about the escape at all.
+///
+/// `None` is a foreign scheme (`http:` is not a folder), a remote authority (`file://server/share`
+/// cannot be listed from here), or an escape that does not form UTF-8.
+#[must_use]
+pub fn decode_file_uri(raw: &str) -> Option<String> {
+    let rest = raw.strip_prefix("file://")?;
+    // The authority: empty (`file:///tmp`) or `localhost` is this machine; anything else is not.
+    let (authority, path) = match rest.find('/') {
+        Some(slash) => (&rest[..slash], &rest[slash..]),
+        None => (rest, ""),
+    };
+    if !(authority.is_empty() || authority.eq_ignore_ascii_case("localhost")) {
+        return None;
+    }
+    (!path.is_empty()).then(|| percent_decode(path))?
+}
+
+/// Percent-decode a URI path (`%20` → space, `%25` → `%`). Bytes, not chars: one escape can carry a
+/// single byte of a multi-byte sequence, so validity is checked once over the whole result — and an
+/// invalid one is `None`, never a lossy path that would then be *listed*.
+fn percent_decode(raw: &str) -> Option<String> {
+    let bytes = raw.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] == b'%' {
+            let hex = std::str::from_utf8(bytes.get(at + 1..at + 3)?).ok()?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            at += 3;
+        } else {
+            out.push(bytes[at]);
+            at += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
 /// Classify a raw input string into `Resolve` rows 1-5.
 #[must_use]
 pub fn resolve_kind(raw: &str) -> ResolveKind {
@@ -1620,6 +1668,67 @@ mod tests {
         assert_eq!(resolve_kind(""), ResolveKind::Empty);
         assert_eq!(resolve_kind("~/x"), ResolveKind::Tilde);
         assert_eq!(resolve_kind("a/b"), ResolveKind::Relative);
+    }
+
+    /// The desktop's `%u`: a URI, percent-encoded, and the only path input in the port that arrives that
+    /// way. `decode_file_uri` is what lets a file manager accept it — and the decode runs **before**
+    /// `resolve`, so an escaped traversal meets the same guard as a typed one.
+    #[test]
+    fn a_file_uri_is_a_path_spelled_the_way_a_desktop_sends_it() {
+        assert_eq!(decode_file_uri("file:///tmp").as_deref(), Some("/tmp"));
+        assert_eq!(
+            decode_file_uri("file:///home/zm/My%20Docs").as_deref(),
+            Some("/home/zm/My Docs"),
+            "%20 is a space, and a folder name may contain one"
+        );
+        assert_eq!(
+            decode_file_uri("file:///a%2Fb").as_deref(),
+            Some("/a/b"),
+            "an escaped separator stays inside the path it was given"
+        );
+        assert_eq!(
+            decode_file_uri("file://localhost/tmp").as_deref(),
+            Some("/tmp"),
+            "`localhost` is this machine"
+        );
+        assert_eq!(
+            decode_file_uri("file:///tmp/").as_deref(),
+            Some("/tmp/"),
+            "the resolver cleans it; the decoder does not editorialise"
+        );
+        // The refusals: not a folder here, not a folder now.
+        assert_eq!(decode_file_uri("https://example.com/x"), None);
+        assert_eq!(
+            decode_file_uri("file://server/share"),
+            None,
+            "a remote host"
+        );
+        assert_eq!(decode_file_uri("/tmp"), None, "a path is not a URI");
+        assert_eq!(decode_file_uri("file:///%ff"), None, "not UTF-8");
+        assert_eq!(decode_file_uri("file:///a%zz"), None, "not a hex escape");
+
+        // …and the ordering, which is the point: the escape becomes the `..` the resolver already
+        // handles, so what reaches a listing is a cleaned path and never a directory named `%2e%2e`.
+        let decoded = decode_file_uri("file:///home/zm/%2e%2e/etc").expect("decodes");
+        assert_eq!(decoded, "/home/zm/../etc");
+        assert_eq!(
+            AbsPath::resolve(&decoded, Path::new(CWD), Some(Path::new(HOME)))
+                .expect("a decoded traversal is an ordinary path")
+                .to_string_lossy(),
+            "/home/etc",
+            "resolved exactly as the same path typed would be"
+        );
+        assert_eq!(
+            AbsPath::resolve(
+                &decode_file_uri("file:///..%2f..%2fetc").expect("decodes"),
+                Path::new(CWD),
+                Some(Path::new(HOME))
+            )
+            .expect("clamped")
+            .to_string_lossy(),
+            "/etc",
+            "an escape built out of separators still clamps at the root (Go's Clean)"
+        );
         // Windows-only name hazards, checked where they can be checked from Linux.
         assert!(rejects_windows_reserved("data:stream"));
         assert!(rejects_windows_reserved("CON"));

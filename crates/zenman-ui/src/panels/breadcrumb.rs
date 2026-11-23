@@ -186,13 +186,27 @@ fn measure(ui: &Ui, text: &str, tokens: &Tokens) -> f32 {
 /// navigating, so it survives; the middle is what a path has most of, so it goes.
 fn plan(ui: &Ui, crumbs: &[Crumb], budget: f32, tokens: &Tokens) -> Vec<Slot> {
     let sep = measure(ui, SEPARATOR_LABEL, tokens) + tokens.crumb_separator_gap * 2.0;
+    // The strip is a `left_to_right` layout, and a layout puts its own `item_spacing` between every two
+    // boxes on top of the width of those boxes. The budget is therefore spent in the units the strip
+    // really consumes: a join between two chips costs the separator's box *and* a spacing either side
+    // of it. Pricing a box run instead under-prices a deep trail by one spacing per join, and what that
+    // buys is measurable: the run advances past the end of the pane, `is_rect_visible` refuses the last
+    // slot, and the chip that disappears is always the current one — no node, no paint, nothing to
+    // right-click.
+    let pitch = ui.spacing().item_spacing.x;
+    let join = sep + pitch * 2.0;
     let chips: Vec<f32> = crumbs
         .iter()
         .map(|crumb| chip_width(ui, &crumb.label, tokens))
         .collect();
-    // The width of a run of chips, separators between them included.
+    // The advance of a run of chips, separators and layout spacing included.
     let total = |widths: &[f32]| -> f32 {
-        widths.iter().sum::<f32>() + (widths.len().saturating_sub(1)) as f32 * sep
+        widths.iter().sum::<f32>() + (widths.len().saturating_sub(1)) as f32 * join
+    };
+    // …and the same over the laid-out boxes, whose number includes the separators.
+    let advance = |slots: &[Slot]| -> f32 {
+        slots.iter().map(|slot| slot.width).sum::<f32>()
+            + slots.len().saturating_sub(1) as f32 * pitch
     };
     let push =
         |slots: &mut Vec<Slot>, label: &str, target: Option<FsPath>, width: f32, current: bool| {
@@ -232,7 +246,7 @@ fn plan(ui: &Ui, crumbs: &[Crumb], budget: f32, tokens: &Tokens) -> Vec<Slot> {
     let mut keep = crumbs.len() - 1;
     while keep > 1 {
         let widths: Vec<f32> = chips[crumbs.len() - keep..].to_vec();
-        if total(&widths) + chips[0] + collapse + sep * 2.0 <= budget {
+        if total(&widths) + chips[0] + collapse + join * 2.0 <= budget {
             break;
         }
         keep -= 1;
@@ -268,19 +282,30 @@ fn plan(ui: &Ui, crumbs: &[Crumb], budget: f32, tokens: &Tokens) -> Vec<Slot> {
         );
     }
 
-    // Even `Root / … / current` can be too wide for a pane squeezed to its minimum. Nothing may
-    // reach past the budget, because the address field's button is laid out after it: drop the root
-    // chip first, then squeeze the current one, which is the last thing that can give.
-    let mut used = slots.iter().map(|slot| slot.width).sum::<f32>();
+    // Even `Root / … / current` can be too wide for a pane squeezed to its minimum, and nothing may
+    // reach past the budget: the address field's button is laid out after it.
+    let mut used = advance(&slots);
     if used > budget && slots.len() > 2 {
         // `slots[0]` is the root chip and `slots[1]` the separator that followed it.
         slots.drain(0..2);
-        used = slots.iter().map(|slot| slot.width).sum::<f32>();
+        used = advance(&slots);
+    }
+    // Then the ancestors give way, deepest first: the last chip is the segment the pane is *in*, and
+    // the only handle its folder menu has, so it is the last thing that gives. Go's CSS clipped the
+    // front of the trail and kept its end (`overflow: hidden` on `.breadcrumb`), never the reverse.
+    while used > budget && slots.len() >= 3 {
+        // The ancestor chip and the separator that led to it.
+        slots.drain((slots.len() - 3)..(slots.len() - 1));
+        used = advance(&slots);
     }
     if used > budget {
-        let rest: f32 = slots[..slots.len() - 1].iter().map(|slot| slot.width).sum();
+        // Nothing is left but the current chip: ellipsise it, and never below the width of an
+        // ellipsis, which is what keeps it a chip a pointer can hit.
         let last = slots.len() - 1;
-        slots[last].width = (budget - rest).max(0.0);
+        let rest = advance(&slots[..last]) + pitch;
+        slots[last].width = slots[last]
+            .width
+            .min((budget - rest).max(collapse.min(budget)));
     }
     slots
 }

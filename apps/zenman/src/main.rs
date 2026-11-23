@@ -37,11 +37,12 @@ mod gpu_startup;
 mod i18n;
 mod single_instance;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::Parser;
+use zenman_core::path::{FsPath, VfsKind};
 
 /// The plan step this binary implements; echoed in the window title area (see `app::ZenApp::show`).
 pub const PLAN_STEP: u32 = 7;
@@ -141,6 +142,17 @@ struct Cli {
     /// Directory holding the golden fixtures. Stub: step 2 captures them, step 7 reads them.
     #[arg(long, value_name = "DIR", hide = true)]
     golden_dir: Option<PathBuf>,
+
+    /// Open these folders — the desktop's file-manager contract.
+    ///
+    /// A file manager is launched *at a target*: `inode/directory=…zenman.desktop` makes the panel,
+    /// Thunar's "open in file manager" and `xdg-open <dir>` all run `zenman <uri>`. So the target is a
+    /// positional argument, accepted more than once (each one opens a tab), spelled either as a path
+    /// (`zenman ~/notes`) or as the `file://` URI a desktop passes for `%u` (`zenman file:///tmp`).
+    /// Without this, every one of those launches is a clap error and the desktop's answer is a modal
+    /// "failed to execute default file manager" box.
+    #[arg(value_name = "PATH")]
+    paths: Vec<String>,
 }
 
 impl Cli {
@@ -158,6 +170,43 @@ impl Cli {
     /// `--no-daemon`).
     fn claims_nothing(&self) -> bool {
         self.no_daemon || self.new_instance
+    }
+
+    /// The positional targets, as the folders to list: a `file://` URI decoded, `~` and a relative path
+    /// put through plan §4.2's resolver, and a *file* replaced by the folder that holds it (that is what
+    /// "show me this file" means to a file manager, short of selecting it).
+    ///
+    /// A target that names nothing openable is reported on stderr and skipped, never fatal: two folders
+    /// were asked for and one of them moved, the other still opens.
+    fn targets(&self, home: Option<&Path>) -> Vec<FsPath> {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+        let mut out = Vec::with_capacity(self.paths.len());
+        for arg in &self.paths {
+            // A URI is decoded, a path is not: a directory name may legitimately contain a `%`, so the
+            // scheme is what decides — and a scheme that is not `file:` is refused rather than turned
+            // into the folder `./https:/example.com/x`, which is what resolving it against the cwd did.
+            let decoded = match uri_scheme(arg).as_deref() {
+                None => Some(arg.to_owned()),
+                Some("file") => zenman_core::path::decode_file_uri(arg),
+                Some(other) => {
+                    eprintln!("zenman: {other}: is not a folder on this machine: {arg}");
+                    None
+                }
+            };
+            let Some(raw) = decoded else {
+                continue;
+            };
+            let Ok(path) = FsPath::resolve(&raw, &cwd, home) else {
+                eprintln!("zenman: cannot open {arg}");
+                continue;
+            };
+            // A file's parent, when there is one: `/` has none, and `/` is never a plain file anyway.
+            out.push(match (is_plain_file(&path), path.parent()) {
+                (true, Some(parent)) => parent,
+                _ => path,
+            });
+        }
+        out
     }
 
     fn path_overrides(&self) -> app_dirs::Overrides {
@@ -197,6 +246,39 @@ impl Cli {
             )
         })
     }
+}
+
+/// The scheme of a URI argument, lower-cased, or `None` for something that is a path.
+///
+/// The test is [RFC 3986]'s `scheme ":" //", with one exception this program cannot make without being
+/// wrong twice: a single letter followed by a colon is a Windows drive (`C:\Users\zm\notes`), and a file
+/// manager on that platform is handed those all day. So a one-letter "scheme" is a path.
+///
+/// [RFC 3986]: https://www.rfc-editor.org/rfc/rfc3986#section-3.1
+fn uri_scheme(raw: &str) -> Option<String> {
+    let (head, _) = raw.split_once(':')?;
+    if head.len() < 2 {
+        return None;
+    }
+    let letters = head.to_ascii_lowercase();
+    let scheme = letters.as_bytes();
+    let named = !scheme.is_empty()
+        && scheme[0].is_ascii_alphabetic()
+        && scheme
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'));
+    named.then_some(letters)
+}
+
+/// Is `path` a file on a real filesystem, as opposed to a directory, a store member or something that
+/// cannot be asked? Only the first makes "open the folder that holds it" the right reading of the
+/// command line; an archive path is a folder to *enter*, and a missing path is left to the listing to
+/// report in its own tab.
+fn is_plain_file(path: &FsPath) -> bool {
+    matches!(path.store, VfsKind::Fs)
+        && path
+            .host_abs()
+            .is_some_and(|abs| std::fs::metadata(abs.as_path()).is_ok_and(|m| !m.is_dir()))
 }
 
 /// A boot failure with the exit code that describes it.
@@ -296,13 +378,27 @@ fn run_with_context(cli: &Cli, paths: &app_dirs::AppPaths) -> Result<u8, BootErr
     }
 
     // 2. one instance per data directory. The undo log and the SQLite index are shared files, so a
-    // second window is a corruption bug rather than a convenience: focus the first and exit 0.
-    // `_instance` is held for the whole run and releases the socket on the way out.
+    // second window is a corruption bug rather than a convenience: hand the request to the first and
+    // exit 0. `_instance` is handed to the shell, which holds it for the whole run and releases the
+    // socket on the way out — and which drains it every frame, because the desktop's answer to
+    // "open this folder" on a running file manager has to arrive somewhere.
     let app_id = cli.app_id();
-    let _instance = match single_instance::claim_or_focus(&app_id, paths, cli.claims_nothing()) {
+    let targets = cli.targets(paths.home().as_deref());
+    let wire: Vec<String> = targets.iter().map(FsPath::to_string).collect();
+    let _instance = match single_instance::claim_or_focus(
+        &app_id,
+        paths,
+        cli.claims_nothing(),
+        &wire,
+    ) {
         Ok(single_instance::Claim::AlreadyRunning { socket }) => {
+            let what = match wire.len() {
+                0 => "to focus".to_string(),
+                1 => format!("to open {}", wire[0]),
+                n => format!("to open {n} folders"),
+            };
             println!(
-                "zenman: another instance owns this data directory ({}); asked it to focus and exiting",
+                "zenman: another instance owns this data directory ({}); asked it {what} and exiting",
                 socket.display()
             );
             return Ok(EXIT_OK);
@@ -322,11 +418,8 @@ fn run_with_context(cli: &Cli, paths: &app_dirs::AppPaths) -> Result<u8, BootErr
             ));
         }
     };
-    // Drain whatever arrived between binding and here — the window does not exist yet, so the most this
-    // can do is report it. The per-frame drain is step 7's, when `ZenApp` owns the viewport handle
-    // (plan §5.9: "a second invocation focuses the first").
-    if _instance.take_focus_requests() > 0 {
-        println!("zenman: a second invocation asked this one to focus during startup");
+    for folder in &targets {
+        println!("zenman: opening {folder}");
     }
 
     let mut ladder = gpu_startup::select_ladder(cli.safe_gpu, cli.gl, cli.disable_gpu);
@@ -469,6 +562,8 @@ fn run_with_context(cli: &Cli, paths: &app_dirs::AppPaths) -> Result<u8, BootErr
                 smoke,
                 session,
                 &startup_notes,
+                targets,
+                _instance,
             )))
         }),
     ) {
@@ -500,3 +595,84 @@ fn run_with_context(cli: &Cli, paths: &app_dirs::AppPaths) -> Result<u8, BootErr
 /// Label for the adapter-count line, kept as a constant so the machine-readable boot report is
 /// greppable from `tests/gpu_fallback.rs`.
 const LAST_ADAPTER_COUNT_NOTE: &str = "gpu: adapters visible to this profile: ";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cli(args: &[&str]) -> Cli {
+        // `expect`, and that is the test: before the positional target existed every one of these
+        // command lines was a clap error, and the desktop answered it with a modal dialog.
+        Cli::try_parse_from(args).unwrap_or_else(|e| panic!("{args:?}: {e}"))
+    }
+
+    /// The desktop's file-manager contract, at the front door.
+    #[test]
+    fn a_launched_target_is_accepted_and_resolved() {
+        let home = Path::new("/home/zm");
+        assert!(
+            cli(&["zenman"]).targets(None).is_empty(),
+            "no target is the ordinary start"
+        );
+        assert_eq!(
+            cli(&["zenman", "/tmp"]).targets(None)[0].to_string(),
+            "/tmp",
+            "a path from a terminal"
+        );
+        assert_eq!(
+            cli(&["zenman", "file:///tmp/My%20Docs"]).targets(None)[0].to_string(),
+            "/tmp/My Docs",
+            "a `%u` URI from a .desktop file"
+        );
+        assert_eq!(
+            cli(&["zenman", "~/notes"]).targets(Some(home))[0].to_string(),
+            "/home/zm/notes",
+            "the home the boot resolved, not the process's"
+        );
+        let two: Vec<String> = cli(&["zenman", "/tmp", "/var"])
+            .targets(None)
+            .iter()
+            .map(FsPath::to_string)
+            .collect();
+        assert_eq!(two, ["/tmp", "/var"], "two targets open in order");
+    }
+
+    /// A target that is not a folder does not stop the launch: a file is shown as its folder, and
+    /// anything the desktop invented is reported on stderr and skipped, because the other tab was asked
+    /// for too and still deserves to open.
+    #[test]
+    fn a_file_target_opens_the_folder_that_holds_it_and_a_foreign_one_is_dropped() {
+        let dir = std::env::temp_dir().join(format!("zenman-cli-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp fixture directory");
+        let file = dir.join("notes.txt");
+        std::fs::write(&file, b"x").expect("temp fixture file");
+        let lossy = file.to_string_lossy().into_owned();
+        assert_eq!(
+            cli(&["zenman", &lossy]).targets(None)[0].to_string(),
+            dir.to_string_lossy(),
+            "`zenman notes.txt` means show me the folder holding it"
+        );
+        // The same folder spelled as the URI a .desktop file sends, and a nested folder whose name
+        // needs an escape: the decoder is what puts the space back.
+        std::fs::create_dir_all(dir.join("My Docs")).expect("a fixture folder needing an escape");
+        let uri = format!("file://{}/My%20Docs", dir.to_string_lossy());
+        assert_eq!(
+            cli(&["zenman", &uri]).targets(None)[0].to_string(),
+            format!("{}/My Docs", dir.to_string_lossy()),
+            "the escape is decoded before the path is resolved"
+        );
+        assert_eq!(
+            cli(&["zenman", "https://example.com/x", "/tmp"])
+                .targets(None)
+                .len(),
+            1,
+            "a web address is not a folder, and the real target still opens"
+        );
+        // Named, explicit removals: `remove_dir_all` is banned workspace-wide (product deletion goes
+        // through `ops::delete`, trash-first and logged), and a three-entry fixture tree does not need a
+        // recursive walk to be tidied.
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_dir(dir.join("My Docs"));
+        let _ = std::fs::remove_dir(&dir);
+    }
+}

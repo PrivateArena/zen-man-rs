@@ -714,12 +714,6 @@ fn copied(harness: &Harness<'static, ZenApp>) -> Option<String> {
         })
 }
 
-/// The centre of a breadcrumb chip. The chips are buttons in the accessibility tree (`path_chips`
-/// gives each one a `WidgetInfo`), so a crumb is clickable by name exactly the way a row is.
-fn crumb(harness: &mut Harness<'static, ZenApp>, label: &str) -> Pos2 {
-    harness.get_by_label(label).rect().center()
-}
-
 // ------------------------------------------------------------------- the menu's screen position
 
 /// The box the open menu actually painted: the union of the a11y nodes of the rows it drew. A
@@ -783,8 +777,28 @@ fn the_context_menu_opens_under_the_pointer_wherever_the_pointer_was() {
 
 // ---------------------------------------------------------------------- the breadcrumb folder menu
 
+/// The centre of a breadcrumb chip, picked by the strip it lives in. A crumb's text is shared with tab
+/// titles and with row names, so the row is what identifies it — and the row is where `Root` is, the
+/// segment every path in these fixtures has in the trail.
+fn crumb(harness: &mut Harness<'static, ZenApp>, label: &str) -> Pos2 {
+    let row = ["Root", "…"]
+        .iter()
+        .find_map(|anchor| harness.query_all_by_label(anchor).map(|n| n.rect()).next())
+        .expect("a collapsed trail keeps its root chip or its marker")
+        .center()
+        .y;
+    harness
+        .query_all_by_label(label)
+        .map(|n| n.rect())
+        .find(|r| (r.center().y - row).abs() < 1.0)
+        .unwrap_or_else(|| panic!("{label:?} is not a chip on the trail's row ({row})"))
+        .center()
+}
+
 /// `common::nested_tree` lists `<tag>/nested`; opening `nested/beta/inner` puts `beta` in the trail as
 /// a chip that is neither the store root nor the current segment, and leaves `b2.txt` the only row.
+/// Twelve segments is what cargo's scratch directory makes of it — deep enough that the trail cannot
+/// fit, which is the case the collapse has to get right.
 fn inner_harness(tag: &str) -> (Harness<'static, ZenApp>, PathBuf, PathBuf) {
     let nested = common::nested_tree(tag);
     let beta = nested.join("beta");
@@ -827,6 +841,35 @@ fn right_clicking_a_breadcrumb_chip_opens_the_folder_menu() {
         shown(&harness, PaneSlot::Left).sel.len(),
         1,
         "a crumb is not a row: Go's `stopPropagation` (`navigation.js:213`) left the selection alone"
+    );
+}
+
+/// The other half of the collapse rule: the trail folds its **front**, never its end. The current
+/// segment is where the user is standing and the only handle its folder menu has, so a chip that was
+/// squeezed to zero width left a deep path naming every directory but the one being listed — with
+/// nothing under the pointer to right-click.
+#[test]
+fn the_current_crumb_survives_a_trail_too_deep_for_the_pane() {
+    let (mut harness, _, inner) = inner_harness("menus-crumb-current");
+    let at = crumb(&mut harness, "inner");
+    click_at(&mut harness, at, PointerButton::Secondary);
+    let open = harness
+        .state()
+        .menu
+        .clone()
+        .expect("the current crumb opened no menu");
+    assert_eq!(open.target, MenuTarget::Folder, "a crumb is a folder");
+    assert_eq!(
+        open.folder
+            .and_then(|f| f.host_abs())
+            .map(|p| p.to_string_lossy()),
+        Some(inner.display().to_string()),
+        "and it is the directory the pane is listing"
+    );
+    assert_eq!(
+        labels(&harness),
+        ["Open in new tab", "Copy path", "Copy name"],
+        "the folder menu, on the segment that is on screen"
     );
 }
 

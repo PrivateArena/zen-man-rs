@@ -47,6 +47,12 @@ fn fixture_base() -> PathBuf {
 /// A session in `<scratch>/zenman-ui-fixtures/zenman-ui-test-<tag>`; two tags never collide.
 #[must_use]
 pub fn session(tag: &str) -> Session {
+    session_with_launcher(tag).0
+}
+
+/// …and the launcher recorder it is wrapped in, for the tests that want to assert what the shell
+/// asked the desktop to open.
+pub fn session_with_launcher(tag: &str) -> (Session, std::sync::Arc<NoDesktopEnv>) {
     let dir = fixture_base().join(format!("zenman-ui-test-{tag}"));
     std::fs::create_dir_all(&dir).expect("the fixture directory is creatable");
     let paths = SessionPaths::new(
@@ -56,14 +62,162 @@ pub fn session(tag: &str) -> Session {
         dir.join("probe"),
     )
     .with_db_open(1, std::time::Duration::from_millis(1));
+    let env = std::sync::Arc::new(NoDesktopEnv::new());
     let (session, _notes) = Session::open(
         paths,
         ZenConfig::default(),
-        zenman_core::platform::default_env(),
+        std::sync::Arc::clone(&env) as std::sync::Arc<dyn zenman_core::platform::Env>,
         ZenConfig::default().limits(),
     )
     .expect("a session opens over a fresh directory");
-    session
+    (session, env)
+}
+
+/// The `Env` every UI harness runs on: the host platform for every question, **except** the desktop
+/// launcher, which is recorded instead of run.
+///
+/// The rule is that a test may not launch the desktop. `Env::open_with` hands a path to `xdg-open`,
+/// which on a developer's machine opens an editor window — and when the path is a *directory* it asks
+/// the session manager for the default **file manager**, which on a machine where zen-man-rs is
+/// installed means this project's test suite spawning this project's own binary (and the desktop
+/// reporting the result in a modal dialog). None of it is observable from a headless `egui_kittest`
+/// frame, so recording the hand-over is both the hermetic answer and the stronger assertion: the test
+/// can name the path the launcher was asked about.
+///
+/// Every other method forwards to [`zenman_core::platform::default_env`], because the disk meter, the
+/// mount table, the trash predicate and the writable probe are exactly what the shell renders and must
+/// see for real.
+pub struct NoDesktopEnv {
+    inner: std::sync::Arc<dyn zenman_core::platform::Env>,
+    opened: std::sync::Mutex<Vec<String>>,
+}
+
+impl NoDesktopEnv {
+    /// Wrap the host's environment.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            inner: zenman_core::platform::default_env(),
+            opened: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// The paths handed to the launcher, in order.
+    #[must_use]
+    pub fn opened(&self) -> Vec<String> {
+        self.opened.lock().expect("not poisoned").clone()
+    }
+}
+
+impl Default for NoDesktopEnv {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl zenman_core::platform::Env for NoDesktopEnv {
+    fn os(&self) -> zenman_core::platform::Os {
+        self.inner.os()
+    }
+
+    fn caps(&self) -> zenman_core::platform::PlatformCaps {
+        self.inner.caps()
+    }
+
+    fn open_with(
+        &self,
+        path: &zenman_core::path::AbsPath,
+    ) -> zenman_core::platform::PlatformFuture<'_, Result<(), zenman_core::error::CoreError>> {
+        self.opened
+            .lock()
+            .expect("not poisoned")
+            .push(path.to_string_lossy());
+        // `Ok`: that is what the host answered before (`xdg-open` spawns and returns), so the shell's
+        // success lane is the one under test, and the refusal lane keeps its own tests in
+        // `zenman-core`'s `contract_ops`.
+        zenman_core::platform::ready(Ok(()))
+    }
+
+    fn copy_paths(
+        &self,
+        items: &[zenman_core::platform::CopyItem],
+    ) -> zenman_core::platform::PlatformFuture<
+        '_,
+        Result<zenman_core::platform::CopyReport, zenman_core::error::CoreError>,
+    > {
+        self.inner.copy_paths(items)
+    }
+
+    fn paste_link(
+        &self,
+        items: &[zenman_core::platform::LinkItem],
+    ) -> zenman_core::platform::PlatformFuture<'_, Result<(), zenman_core::error::CoreError>> {
+        self.inner.paste_link(items)
+    }
+
+    fn supports_symlink(&self) -> Result<bool, zenman_core::error::CoreError> {
+        self.inner.supports_symlink()
+    }
+
+    fn chmod(
+        &self,
+        targets: &[zenman_core::path::AbsPath],
+        mode: zenman_core::mode::ModeBits,
+    ) -> zenman_core::platform::PlatformFuture<'_, Result<(), zenman_core::error::CoreError>> {
+        self.inner.chmod(targets, mode)
+    }
+
+    fn can_trash(&self, path: &zenman_core::path::AbsPath) -> bool {
+        self.inner.can_trash(path)
+    }
+
+    fn trash(
+        &self,
+        path: &zenman_core::path::AbsPath,
+    ) -> Result<bool, zenman_core::error::CoreError> {
+        self.inner.trash(path)
+    }
+
+    fn create_shortcut(
+        &self,
+        shortcut: &zenman_core::platform::Shortcut,
+    ) -> Result<(), zenman_core::error::CoreError> {
+        self.inner.create_shortcut(shortcut)
+    }
+
+    fn disk_space(
+        &self,
+        path: &zenman_core::path::AbsPath,
+    ) -> Result<zenman_core::platform::DiskSpace, zenman_core::error::CoreError> {
+        self.inner.disk_space(path)
+    }
+
+    fn mount_entries(
+        &self,
+    ) -> Result<zenman_core::platform::MountTable, zenman_core::error::CoreError> {
+        self.inner.mount_entries()
+    }
+
+    fn exec_program(
+        &self,
+        req: zenman_core::platform::ExecRequest,
+    ) -> zenman_core::platform::PlatformFuture<
+        '_,
+        Result<zenman_core::platform::ExecOutput, zenman_core::error::CoreError>,
+    > {
+        self.inner.exec_program(req)
+    }
+
+    fn has_program(&self, name: &str) -> Result<bool, zenman_core::error::CoreError> {
+        self.inner.has_program(name)
+    }
+
+    fn is_writable(
+        &self,
+        path: &zenman_core::path::AbsPath,
+    ) -> Result<bool, zenman_core::error::CoreError> {
+        self.inner.is_writable(path)
+    }
 }
 
 // --------------------------------------------------------------------------- the deterministic tree

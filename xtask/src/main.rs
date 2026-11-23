@@ -1057,7 +1057,9 @@ mod tests {
             .parent()
             .expect("xtask is a workspace member");
         let names = harness_snapshot_names(root).expect("the harness names its baselines");
-        assert_eq!(names.len(), 15, "one artefact per scene: {names:?}");
+        // Sixteen scenes, sixteen artefacts: adding one is a deliberate act, and this count is the
+        // friction that makes it one.
+        assert_eq!(names.len(), 16, "one artefact per scene: {names:?}");
         assert!(!names.iter().any(|n| n == "01-main-list.png"), "{names:?}");
         assert!(names.iter().any(|n| n == "02-file-list.png"), "{names:?}");
     }

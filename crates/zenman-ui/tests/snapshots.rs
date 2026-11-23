@@ -121,6 +121,9 @@ enum MenuAt {
     Row,
     /// The empty band below the rows.
     Background,
+    /// A left-drawer row — Go's `folder-contextmenu` on a `.sidebar-item` (`sidebar.js:32-37`), which
+    /// opens the same `showFolderContextMenu` a breadcrumb chip does, over the drawer.
+    Place,
 }
 
 /// Every baseline against the `docs/parity/` Go reference it is reviewed against, and the one line a
@@ -148,6 +151,7 @@ const REFERENCE_MAP: &[(&str, &str, &str)] = &[
     ("13-batch-rename.png", "14-batch-rename.png", "the batch-rename preview table (D12)"),
     ("14-quick-find.png", "15-quick-find.png", "quick-find over a finished walk (D6)"),
     ("15-address-bar.png", "", "the address field open over its own path — ours alone: Go's bar was a native `<input>`, and no reference screenshot shows it open"),
+    ("16-folder-menu.png", "", "the folder menu a sidebar row opens — ours alone: the Go reference's is the same popup as its breadcrumb's, and no reference screenshot shows either"),
 ];
 
 /// The `REFERENCE_MAP` row of one baseline: its Go reference (empty when it has none) and the note.
@@ -186,7 +190,11 @@ impl Scene {
             Self::Menu {
                 at: MenuAt::Row, ..
             } => "11-context-menu-file.png",
-            Self::Menu { .. } => "12-context-menu-background.png",
+            Self::Menu {
+                at: MenuAt::Background,
+                ..
+            } => "12-context-menu-background.png",
+            Self::Menu { .. } => "16-folder-menu.png",
             Self::BatchRename { .. } => "13-batch-rename.png",
             Self::QuickFind { .. } => "14-quick-find.png",
             Self::Address { .. } => "15-address-bar.png",
@@ -854,6 +862,28 @@ fn drive_menu(harness: &mut Harness<'static, ZenApp>, at: MenuAt) {
                 egui::PointerButton::Secondary,
             );
         }
+        MenuAt::Place => {
+            // The drawer first, then the row: `Home` is the one place every host has, so the artefact
+            // shows the same header wherever it is rendered.
+            dispatch(harness, Command::ToggleLeftDrawer);
+            settle(harness);
+            harness.get_by_label("Home").click_secondary();
+            harness.run();
+            // The frame that gets painted is the menu itself — asserted, because a baseline of a popup
+            // that silently failed to open would still be a plausible-looking picture.
+            let labels: Vec<_> = harness
+                .state()
+                .menu_specs()
+                .iter()
+                .flatten()
+                .map(|spec| spec.label.clone())
+                .collect();
+            assert_eq!(
+                labels,
+                ["Open in new tab", "Copy path", "Copy name"],
+                "the sidebar row opened Go's folder menu"
+            );
+        }
     }
     settle(harness);
     let open = harness
@@ -869,6 +899,11 @@ fn drive_menu(harness: &mut Harness<'static, ZenApp>, at: MenuAt) {
         MenuAt::Background => assert!(
             matches!(open.target, MenuTarget::Background),
             "the empty band must draw the background menu"
+        ),
+        MenuAt::Place => assert_eq!(
+            open.target,
+            MenuTarget::Folder,
+            "a sidebar row draws the folder menu"
         ),
     }
     assert!(
@@ -1343,6 +1378,16 @@ fn context_menu_background_snapshot_renders_or_skips_with_a_reason() {
     };
     let Some(image) = render(&scene) else { return };
     assert_covers(&image, 0.1, "a background context menu");
+}
+
+#[test]
+fn folder_menu_snapshot_renders_or_skips_with_a_reason() {
+    let scene = Scene::Menu {
+        tag: "snap-menu-place",
+        at: MenuAt::Place,
+    };
+    let Some(image) = render(&scene) else { return };
+    assert_covers(&image, 0.1, "the folder menu over the drawer");
 }
 
 #[test]

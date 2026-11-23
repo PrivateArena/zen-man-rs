@@ -11,6 +11,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use egui_kittest::Harness;
+use egui_kittest::kittest::Queryable;
 
 use zenman_core::ops::delete::DeleteReq;
 use zenman_core::ops::mkdir::MkdirReq;
@@ -291,4 +292,243 @@ fn the_history_panel_uses_gos_vocabulary_and_a_real_permanent_record() {
         action_log::row_icon("rename"),
         "and they differ by type"
     );
+}
+// --------------------------------------------------------------------------- the folder menu
+//
+// Go hangs one `contextmenu` handler on every `.sidebar-item` — places (`sidebar.js:32-37`), bookmarks
+// (`:90-95`), mounts (`:129-134`) — and all three call `showFolderContextMenu`, whose item set is
+// `Open in New Tab` ─ `Copy Path` `Copy Name` (`context-menu.js:146-160`). A right-click on a row is
+// therefore about **the row's folder**, never about the pane's selection or its directory.
+
+/// The whole shell, with the left drawer open.
+fn drawer_harness(app: ZenApp) -> Harness<'static, ZenApp> {
+    let mut harness = Harness::builder()
+        // The workspace `ComboBox` of step 14b surfaces no accessible name in this fork; every other
+        // widget keeps the check, as `tests/menus.rs` explains.
+        .with_accessibility_check(false)
+        .with_size(egui::vec2(1200.0, 800.0))
+        .with_max_steps(64)
+        .with_context_setup(|ctx| {
+            egui_extras::install_image_loaders(ctx);
+            zenman_ui::theme::fonts::install(ctx);
+            zenman_ui::theme::apply(ctx, zenman_core::store::config::ThemeMode::Dark);
+        })
+        .build_ui_state(
+            |ui, app| {
+                app.logic(ui.ctx());
+                app.ui(ui);
+            },
+            app,
+        );
+    harness.run();
+    harness
+}
+
+/// The centre of a drawer row's a11y node, by label.
+///
+/// The label alone is not a key: a bookmark called `listing` shares its text with the tab title and the
+/// breadcrumb chip of the same directory. The drawer's own band is what distinguishes it — everything
+/// left of `Tokens::left_drawer_width` is the drawer, and a row of it is the only thing a click there can
+/// reach.
+fn row_at(harness: &mut Harness<'static, ZenApp>, label: &str) -> egui::Pos2 {
+    let width = Tokens::dark().left_drawer_width;
+    let rects: Vec<_> = harness
+        .query_all_by_label(label)
+        .map(|node| node.rect())
+        .filter(|rect| rect.max.x <= width)
+        .collect();
+    assert_eq!(
+        rects.len(),
+        1,
+        "exactly one row of the drawer (x <= {width}) is called {label:?}"
+    );
+    rects[0].center()
+}
+
+fn is_open(harness: &Harness<'static, ZenApp>) -> bool {
+    harness.state().menu.is_some()
+}
+
+/// Choose an open menu's row: press and release in **separate** frames, because one frame only records
+/// the press — and the press is also what closes a menu whose item is chosen, so a single-frame
+/// `Queryable::click` never reaches the row.
+fn click_row(harness: &mut Harness<'static, ZenApp>, label: &str) {
+    let at = harness.get_by_label(label).rect().center();
+    for pressed in [true, false] {
+        harness.input_mut().events.push(egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        });
+        harness.run();
+    }
+}
+
+fn right_click(harness: &mut Harness<'static, ZenApp>, at: egui::Pos2) {
+    for pressed in [true, false] {
+        harness.input_mut().events.push(egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        });
+    }
+    harness.run();
+    harness.run();
+}
+
+/// The labels of the open menu, in order — the same read `tests/menus.rs` uses, so an item that is
+/// only ever painted and never routed cannot pass for one.
+fn labels(harness: &Harness<'static, ZenApp>) -> Vec<String> {
+    harness
+        .state()
+        .menu_specs()
+        .iter()
+        .flatten()
+        .map(|spec| spec.label.clone())
+        .collect()
+}
+
+/// Every left-drawer row answers a right-click with the folder menu, for **its own** path — and a
+/// right-click is not a navigation, so the pane behind it is untouched.
+#[test]
+fn right_clicking_a_drawer_row_opens_the_folder_menu_for_that_row() {
+    let tag = "side-folder-menu";
+    let dir = common::listing_tree(tag);
+    let mut app = app(tag, &dir);
+    let places = app.session.places();
+    let home = places
+        .user
+        .iter()
+        .find(|p| p.kind == PlaceKind::Home && p.exists)
+        .expect("Home is a real place here");
+    let disk = places.disks.first().expect("there is a root filesystem");
+    app.session
+        .add_favourite(&dir.display().to_string())
+        .unwrap_or_else(|e| panic!("add: {}", e.user_message()));
+    let favourites = app.session.places().favourites;
+    let wanted: Vec<(&str, String, String)> = vec![
+        ("place", home.label.clone(), home.path.clone()),
+        (
+            "bookmark",
+            favourites[0].label.clone(),
+            favourites[0].path.clone(),
+        ),
+        ("drive", disk.label.clone(), disk.mount_point.clone()),
+    ];
+
+    app.model.left_drawer.open = true;
+    let listing = shown_path(&app, PaneSlot::Left).expect("the tab has a directory");
+    let mut harness = drawer_harness(app);
+    for (kind, label, path) in wanted {
+        let at = row_at(&mut harness, &label);
+        right_click(&mut harness, at);
+        let open =
+            harness.state().menu.clone().unwrap_or_else(|| {
+                panic!("right-clicking the {kind} row {label:?} opened no menu")
+            });
+        assert_eq!(
+            open.target,
+            zenman_ui::menus::MenuTarget::Folder,
+            "a {kind} row opens the folder menu"
+        );
+        assert_eq!(
+            open.folder
+                .and_then(|folder| folder.host_abs().map(|p| p.as_path().display().to_string())),
+            Some(path.clone()),
+            "and it is about {path:?}, the row's own path"
+        );
+        assert_eq!(
+            shown_path(harness.state(), PaneSlot::Left),
+            Some(listing.clone()),
+            "a right-click never navigates ({label:?})"
+        );
+        // Escape is the shell's own way out of a menu (`app.js:276`).
+        harness.input_mut().events.push(egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        });
+        harness.run();
+        assert!(
+            harness.state().menu.is_none(),
+            "the menu of the row just tested is closed before the next one"
+        );
+    }
+}
+
+/// The menu a drawer row raises is the reference's, item for item and in its order, painted and not
+/// merely routed. What the items *do* when chosen is the folder menu's own behaviour — asserted
+/// end-to-end for the row's path by [`the_drawer_menu_opens_the_row_in_a_new_tab`] below, and its copy
+/// half by `tests/menus.rs::the_folder_menu_copies_the_chip_and_not_the_selection`, which drives the
+/// identical menu opened from a breadcrumb chip.
+#[test]
+fn the_drawer_menu_offers_the_folder_items_in_gos_order() {
+    let tag = "side-folder-items";
+    let dir = common::listing_tree(tag);
+    let mut app = app(tag, &dir);
+    let disk = app
+        .session
+        .places()
+        .disks
+        .first()
+        .cloned()
+        .expect("a root filesystem");
+    app.model.left_drawer.open = true;
+    let mut harness = drawer_harness(app);
+
+    let at = row_at(&mut harness, &disk.label);
+    right_click(&mut harness, at);
+    assert_eq!(
+        labels(&harness),
+        vec![
+            "Open in new tab".to_string(),
+            "Copy path".to_string(),
+            "Copy name".to_string(),
+        ],
+        "Go's `Open in New Tab` ─ `Copy Path` `Copy Name`, and nothing else"
+    );
+    for label in ["Open in new tab", "Copy path", "Copy name"] {
+        assert_eq!(
+            harness.query_all_by_label(label).count(),
+            1,
+            "{label} is drawn, not only routed"
+        );
+    }
+}
+
+/// `Open in new tab` on a row is Go's `open-path-in-new-tab` → `createTab(paneId, targetPath)`: a new
+/// tab, listing **the row's** folder — the mouse all the way through, from the row's right-click to the
+/// shell's folder dispatch.
+#[test]
+fn the_drawer_menu_opens_the_row_in_a_new_tab() {
+    let tag = "side-folder-tab";
+    let dir = common::listing_tree(tag);
+    let mut app = app(tag, &dir);
+    let disk = app
+        .session
+        .places()
+        .disks
+        .first()
+        .cloned()
+        .expect("a root filesystem");
+    app.model.left_drawer.open = true;
+    let mut harness = drawer_harness(app);
+    let before = harness.state().model.panes[&PaneSlot::Left].tabs.len();
+
+    let at = row_at(&mut harness, &disk.label);
+    right_click(&mut harness, at);
+    click_row(&mut harness, "Open in new tab");
+
+    let pane = &harness.state().model.panes[&PaneSlot::Left];
+    assert_eq!(pane.tabs.len(), before + 1, "one tab was added");
+    assert_eq!(
+        pane.active_tab().map(|tab| tab.path.to_string()),
+        Some(disk.mount_point.clone()),
+        "and it lists the folder of the row, not the pane's own directory"
+    );
+    assert!(!is_open(&harness), "a chosen item closes the menu");
 }
