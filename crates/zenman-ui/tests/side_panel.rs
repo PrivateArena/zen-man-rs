@@ -10,6 +10,8 @@ mod common;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use egui_kittest::Harness;
+
 use zenman_core::ops::delete::DeleteReq;
 use zenman_core::ops::mkdir::MkdirReq;
 use zenman_core::path::{AbsPath, FsPath};
@@ -189,24 +191,37 @@ fn an_unreachable_place_is_a_typed_state_not_a_dead_row() {
 
 #[test]
 fn a_drawer_row_is_ellipsised_to_the_panel_width_it_actually_has() {
+    // The cut is pixel-measured now, so it needs a real font: an immediate-mode harness (no
+    // renderer, no window), with the three cases collected during the frame and asserted after it.
     let tokens = Tokens::dark();
     let long = "/run/media/jang/VERY-LONG-VOLUME-NAME-that-will-not-fit-a-250px-panel";
-    let width = tokens.left_drawer_width - tokens.row_pad_x * 2.0;
-    let short = side_panel::ellipsize_to_width(long, width, &tokens);
-    assert!(short.chars().count() < long.chars().count(), "{short}");
-    assert!(short.ends_with('…'), "and it is marked as cut: {short}");
+    let width = tokens.left_drawer_width - (tokens.drawer_pad_x + tokens.drawer_row_pad_x) * 2.0;
+    let rows = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+    let sink = rows.clone();
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(tokens.left_drawer_width, 200.0))
+        .with_context_setup(|ctx| {
+            zenman_ui::theme::fonts::install(ctx);
+        })
+        .build_ui(move |ui| {
+            let mut sink = sink.borrow_mut();
+            if !sink.is_empty() {
+                return;
+            }
+            for (text, width) in [(long, width), (long, 1.0), ("Home", width)] {
+                sink.push(side_panel::ellipsize_to_width(ui, text, width, &tokens));
+            }
+        });
+    harness.run();
+    let rows = rows.borrow();
+    let (cut, tiny, whole) = (&rows[0], &rows[1], &rows[2]);
+    assert!(cut.chars().count() < long.chars().count(), "{cut}");
+    assert!(cut.ends_with('…'), "and it is marked as cut: {cut}");
     assert!(
-        side_panel::ellipsize_to_width(long, 1.0, &tokens)
-            .chars()
-            .count()
-            <= 2,
-        "a 1-point column still produces a row, not an overflow"
+        tiny.chars().count() <= 2,
+        "a 1-point column still produces a row, not an overflow: {tiny}"
     );
-    assert_eq!(
-        side_panel::ellipsize_to_width("Home", width, &tokens),
-        "Home",
-        "a short label is untouched"
-    );
+    assert_eq!(whole, "Home", "a short label is untouched");
 }
 
 #[test]

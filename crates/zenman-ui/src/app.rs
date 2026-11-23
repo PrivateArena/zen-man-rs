@@ -43,6 +43,7 @@ use crate::menus::{self, MenuAction, MenuContext, MenuSpec, MenuTarget};
 use crate::panels::{
     self,
     file_pane::{PaneCommand, RowOrder},
+    header::HeaderCommand,
 };
 use crate::persist::Persisted;
 use crate::state::{AppModel, Tab, TabId, panes_for, quad_slots};
@@ -789,10 +790,11 @@ impl ZenApp {
         self.open_requested_menu();
         let header_height = tokens.header_height;
         let mut toggle = DrawerToggle::default();
+        let mut header_out: Vec<HeaderCommand> = Vec::new();
         Panel::top("zenman-header")
             .exact_size(header_height)
             .show(ui, |ui| {
-                self.header(ui, &mut toggle);
+                self.header(ui, &mut toggle, &mut header_out);
             });
         if self.model.log_panel {
             Panel::right("zenman-log")
@@ -826,7 +828,7 @@ impl ZenApp {
         CentralPanel::default().show(ui, |ui| {
             crate::dock_content::show(self, ui);
         });
-        self.apply_toggles(&toggle);
+        self.apply_toggles(&toggle, header_out);
         self.notices.show(ui.ctx(), &self.tokens);
         // **Last**, on the foreground layer: in this egui fork the last-allocated overlapping rect
         // wins hover and click (plan §9.2 step 8), so the menu is drawn after every panel, the dock
@@ -861,15 +863,13 @@ impl ZenApp {
 
     /// The 48 px header (plan §2.2: an `egui::TopBottomPanel`, *not* a dock panel — `Side` has no
     /// `Top`).
-    fn header(&mut self, ui: &mut Ui, toggle: &mut DrawerToggle) {
+    fn header(&mut self, ui: &mut Ui, toggle: &mut DrawerToggle, out: &mut Vec<HeaderCommand>) {
         use crate::panels::header;
         let tokens = self.tokens;
         ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new("Zen-Man")
-                    .color(tokens.text_active)
-                    .strong(),
-            );
+            // The product name is the window title's job (`apps/zenman`'s `APP_TITLE`) and the left
+            // drawer's header (Go's `.sidebar-header h2`, `index.html:21`); Go's own global header
+            // starts at `Workspace:` and so does this one.
             // The workspace group (plan §5.8 `panels/header.rs`, step-8c review gap 1):
             // `Workspace: <select>` · `New` · `Delete` · `✓ Saved` · the disk meter. It emits
             // commands like a pane does; the shell answers them, and the answer may open a dialog,
@@ -879,8 +879,7 @@ impl ZenApp {
                 .and_then(|root| self.session.env().disk_space(&root).ok())
                 .map(|space| (space.free, space.total));
             self.workspaces.refresh(self.session.workspaces());
-            let commands = self.workspaces.show(ui, &tokens, disk, Instant::now());
-            self.header_commands(commands);
+            out.extend(self.workspaces.show(ui, &tokens, disk, Instant::now()));
             if let Some(line) = self.boot_lines.first() {
                 ui.label(
                     egui::RichText::new(line)
@@ -894,26 +893,51 @@ impl ZenApp {
                 // (plan D7), never a second table.
                 let quad = self.model.quad();
                 let split = self.model.layout == LayoutMode::Split && !quad;
-                let single = self.model.layout == LayoutMode::Single && !quad;
                 let quad_hint = self.keys.hint_text(Command::QuadLayout);
                 let split_hint = self.keys.hint_text(Command::SplitLayout);
-                if header::chord_button(ui, &tokens, format!("4-Pane ({quad_hint})"), quad) {
+                if header::chord_button(
+                    ui,
+                    &tokens,
+                    format!("4-Pane ({quad_hint})"),
+                    quad,
+                    &format!("Toggle Quad Split View ({quad_hint})"),
+                ) {
                     toggle.quad = true;
                 }
-                if header::chord_button(ui, &tokens, format!("2-Pane ({split_hint})"), split) {
+                if header::chord_button(
+                    ui,
+                    &tokens,
+                    format!("2-Pane ({split_hint})"),
+                    split,
+                    &format!("Toggle Split Dual View ({split_hint})"),
+                ) {
                     toggle.split = true;
                 }
-                if header::chord_button(ui, &tokens, "History".to_string(), self.model.log_panel) {
+                // Go's one and only action-history control (`#action-log-toggle`,
+                // `index.html:66-69`) — the port had a second one beside it.
+                if header::chord_button(
+                    ui,
+                    &tokens,
+                    "History".to_string(),
+                    self.model.log_panel,
+                    &format!(
+                        "Action History ({})",
+                        self.keys.hint_text(Command::ActionLog)
+                    ),
+                ) {
                     toggle.log = true;
                 }
                 ui.separator();
-                if layout_button(ui, &tokens, "list", "single pane", single).clicked() {
-                    toggle.single = true;
-                }
-                if icon_button(ui, &tokens, "info", "action log", self.model.log_panel).clicked() {
-                    toggle.log = true;
-                }
-                if icon_button(ui, &tokens, "disk", "disks", self.model.right_drawer.open).clicked()
+                // Go's right drawer is the Custom Actions manager (`index.html:425-487`), so this is
+                // the *actions* button and not a disk one — the drawer's own header says so.
+                if icon_button(
+                    ui,
+                    &tokens,
+                    "terminal",
+                    "custom actions",
+                    self.model.right_drawer.open,
+                )
+                .clicked()
                 {
                     toggle.right = true;
                 }
@@ -1018,16 +1042,15 @@ impl ZenApp {
         )
     }
 
-    /// Apply pending header toggles (kept out of `header` so the closure borrows stay apart).
-    fn apply_toggles(&mut self, toggle: &DrawerToggle) {
-        if toggle.single {
-            self.set_layout(panes_for(LayoutMode::Single));
-        }
+    /// Apply pending header toggles (kept out of `header` so the closure borrows stay apart). The two
+    /// layout buttons *are* the `F3`/`F4` chords: they run the same command, so both toggle themselves
+    /// off to the single pane exactly as Go's `setSplitView(!state.isSplit)` does (`keyboard.js:194`).
+    fn apply_toggles(&mut self, toggle: &DrawerToggle, commands: Vec<HeaderCommand>) {
         if toggle.split {
-            self.set_layout(panes_for(LayoutMode::Split));
+            self.toggle_split_layout();
         }
         if toggle.quad {
-            self.set_layout(quad_slots());
+            self.toggle_quad_layout();
         }
         if toggle.left {
             self.model.left_drawer.open = !self.model.left_drawer.open;
@@ -1038,6 +1061,47 @@ impl ZenApp {
         if toggle.log {
             self.toggle_log_panel();
         }
+        self.header_commands(commands);
+    }
+
+    /// Go's `setSplitView(!state.isSplit)`: the two-pane grid, or the single pane when it is already
+    /// showing. The `F3` chord and the header's `2-Pane` button are the same two lines of code.
+    fn toggle_split_layout(&mut self) {
+        let to = if self.model.panes.len() > 1 {
+            panes_for(LayoutMode::Single)
+        } else {
+            panes_for(LayoutMode::Split)
+        };
+        self.set_layout(to);
+    }
+
+    /// Go's `setQuadView(!state.isQuad)` (`keyboard.js:195`), same rule as [`Self::toggle_split_layout`].
+    fn toggle_quad_layout(&mut self) {
+        let to = if self.model.quad() {
+            panes_for(LayoutMode::Single)
+        } else {
+            quad_slots()
+        };
+        self.set_layout(to);
+    }
+
+    /// Open the active pane's address field, holding the path it stands for (the same rule the
+    /// strip's own click follows, `panels::breadcrumb::open`) — a bare `editing = true` is what left
+    /// the strip empty.
+    pub fn open_address_bar(&mut self, slot: PaneSlot) {
+        let path = self
+            .model
+            .panes
+            .get(&slot)
+            .and_then(|pane| pane.active_tab())
+            .map(|tab| tab.path.to_string());
+        let Some(pane) = self.model.panes.get_mut(&slot) else {
+            return;
+        };
+        if let Some(path) = path {
+            pane.address_buffer = path;
+        }
+        pane.address_editing = true;
     }
 
     // ---------------------------------------------------------------------------- menus (step 10b)
@@ -1244,23 +1308,10 @@ impl ZenApp {
             Command::SingleLayout => self.set_layout(panes_for(LayoutMode::Single)),
             // Go's F3/F4 *toggle* (`setSplitView(!state.isSplit)`, `setQuadView(!state.isQuad)`,
             // `keyboard.js:194-195`), so the single pane is the chords' off-state — which is why
-            // `SingleLayout` needs no chord of its own.
-            Command::SplitLayout => {
-                let to = if self.model.panes.len() > 1 {
-                    panes_for(LayoutMode::Single)
-                } else {
-                    panes_for(LayoutMode::Split)
-                };
-                self.set_layout(to);
-            }
-            Command::QuadLayout => {
-                let to = if self.model.quad() {
-                    panes_for(LayoutMode::Single)
-                } else {
-                    quad_slots()
-                };
-                self.set_layout(to);
-            }
+            // `SingleLayout` needs no chord of its own, and why the header's two buttons run these
+            // very methods rather than a second copy of the rule.
+            Command::SplitLayout => self.toggle_split_layout(),
+            Command::QuadLayout => self.toggle_quad_layout(),
             Command::Refresh => self.refresh(slot),
             Command::ToggleView => self.run_command(slot, PaneCommand::ToggleGrid),
             Command::NewTab => self.run_command(slot, PaneCommand::NewTab),
@@ -1272,11 +1323,7 @@ impl ZenApp {
             Command::SelectAll => self.run_command(slot, PaneCommand::SelectAll),
             Command::SelectNone => self.escape(slot),
             Command::InvertSelection => self.invert_selection(slot),
-            Command::FocusSearch => {
-                if let Some(pane) = self.model.panes.get_mut(&slot) {
-                    pane.address_editing = true;
-                }
-            }
+            Command::FocusSearch => self.open_address_bar(slot),
             Command::MoveUp
             | Command::MoveDown
             | Command::MoveTop
@@ -2100,6 +2147,7 @@ impl ZenApp {
         {
             if let Some(pane) = self.model.panes.get_mut(&slot) {
                 pane.address_editing = false;
+                pane.address_buffer.clear();
             }
             return;
         }
@@ -2419,7 +2467,6 @@ pub fn tab_title(path: &FsPath) -> String {
 /// Which header buttons were pressed this frame.
 #[derive(Clone, Copy, Default)]
 struct DrawerToggle {
-    single: bool,
     split: bool,
     quad: bool,
     left: bool,
@@ -2488,17 +2535,6 @@ fn icon_button(
         crate::icons::paint(ui, rect, icon, rect.height(), visuals.icon);
     }
     response.on_hover_text(tooltip)
-}
-
-/// A layout-mode button: [`icon_button`] with selection wired to the current grid.
-fn layout_button(
-    ui: &mut Ui,
-    tokens: &Tokens,
-    icon: &str,
-    tooltip: &str,
-    selected: bool,
-) -> egui::Response {
-    icon_button(ui, tokens, icon, tooltip, selected)
 }
 
 #[cfg(test)]

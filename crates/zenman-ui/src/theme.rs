@@ -175,6 +175,40 @@ pub struct Tokens {
     pub drawer_section_gap: f32,
     /// Icon size a drawer row draws (bookmarks, places).
     pub drawer_icon_size: f32,
+    // ---- drawer rows (`frontend/css/sidebar.css`, step 15b geometry) ---------------------------
+    /// `.sidebar-nav { padding: 15px 10px }` (`:43-46`) — a drawer's own horizontal inset.
+    pub drawer_pad_x: f32,
+    /// `.sidebar-header { padding: 20px }` (`:30`) — the title row's horizontal inset, deeper than
+    /// the nav's because the title is not a row.
+    pub drawer_head_pad_x: f32,
+    /// Height of that title row (`20px` padding around a 1.2rem line, plus its 1 px border).
+    pub drawer_header_height: f32,
+    /// `.sidebar-header h2 { font-size: 1.2rem }` (`:35-39`), on our 13 px base.
+    pub drawer_title_size: f32,
+    /// `.sidebar-section-title { padding: 15px 20px 5px 20px }` (`:79-81`) — the section title's
+    /// inset, which sits between the nav's and a row's text column.
+    pub drawer_section_pad_x: f32,
+    /// The same rule's `padding-top: 15px` (`:80`) — the air above a section title, which is what
+    /// separates one section from the rows of the section before it.
+    pub drawer_section_top: f32,
+    /// `.sidebar-item { padding: 10px 12px }` (`:55-60`) — a row's inner horizontal padding.
+    pub drawer_row_pad_x: f32,
+    /// `.sidebar-item { border-radius: 6px }` (`:58`) — the hover background's radius.
+    pub drawer_row_corner: u8,
+    /// `.sidebar-nav { gap: 5px }` (`:46`) — the vertical gap between two rows of a section.
+    pub drawer_row_gap: f32,
+    /// `.sidebar-item .icon { width: 18px }` (`:72-76`): the glyph is *centred* in this box, which
+    /// is what `text-align: center` does to Go's emoji, and [`Self::row_icon_gap`] is its margin.
+    pub drawer_icon_box: f32,
+    /// Width of the capacity meter a mounted-drive row paints in place of its long text — the
+    /// 250 px panel cannot hold `home · 369.8 GiB free of 915.8 GiB` on Go's single line, so the
+    /// numbers move to the row's tooltip and the fraction is what is painted.
+    pub drawer_meter_width: f32,
+    /// Height of that bar (the header meter's own bar is [`Self::drawer_meter_height`]'s 3× — a
+    /// sidebar row is chrome, not the subject of the frame).
+    pub drawer_meter_height: f32,
+    /// Gap between a row's label and its right-hand column (meter, capacity, role).
+    pub drawer_trailing_gap: f32,
     /// How much narrower a header icon button is than the 48 px header it lives in.
     pub header_button_inset: f32,
     // ---- step 14b (header vocabulary, the action log, the two new dialogs) ----------------------
@@ -337,6 +371,19 @@ impl Tokens {
             empty_pane_space: 24.0,
             drawer_section_gap: 4.0,
             drawer_icon_size: 16.0,
+            drawer_pad_x: 10.0,
+            drawer_head_pad_x: 20.0,
+            drawer_header_height: 60.0,
+            drawer_title_size: 16.0,
+            drawer_section_pad_x: 20.0,
+            drawer_section_top: 15.0,
+            drawer_row_pad_x: 12.0,
+            drawer_row_corner: 6,
+            drawer_row_gap: 5.0,
+            drawer_icon_box: 18.0,
+            drawer_meter_width: 56.0,
+            drawer_meter_height: 5.0,
+            drawer_trailing_gap: 8.0,
             header_button_inset: 16.0,
             header_gap: 8.0,
             workspace_select_width: 150.0,
@@ -632,6 +679,14 @@ mod tests {
         assert_eq!(t.status_height, 30.0);
         assert_eq!(t.left_drawer_width, 250.0);
         assert_eq!(t.right_drawer_width, 300.0);
+        // `sidebar.css:43-76`: the row's text column is the nav padding, its own padding, the 18 px
+        // icon box and the icon's 10 px margin — 50 px from the panel's edge, and the row is one
+        // line tall (`padding: 10px 12px` around a 0.95rem line = `row_height`).
+        assert_eq!(
+            t.drawer_pad_x + t.drawer_row_pad_x + t.drawer_icon_box + t.row_icon_gap,
+            50.0
+        );
+        assert_eq!(t.drawer_row_corner, 6);
     }
 
     #[test]

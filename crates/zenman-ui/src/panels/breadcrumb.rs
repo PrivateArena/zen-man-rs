@@ -66,10 +66,10 @@ pub fn show(ui: &mut Ui, m: &mut BreadcrumbModel<'_>, tokens: &Tokens, out: &mut
                         // Go's address bar: clicking the free space to the right of the path opens
                         // the editor.
                         if response.clicked() {
-                            *m.editing = true;
+                            open(m);
                         }
                         if edit_button(ui, tokens).clicked() {
-                            *m.editing = true;
+                            open(m);
                         }
                     }
                 },
@@ -438,8 +438,16 @@ fn edit_button(ui: &mut Ui, tokens: &Tokens) -> egui::Response {
     response
 }
 
+/// Open the address field. It opens **holding the path it stands for** — Go's bar was a span of
+/// text that became an `<input value="…">`, so the field is never the empty black strip it used to
+/// look like, and every entry point (the free space, the pencil button, `Ctrl+F`) says the same.
+fn open(m: &mut BreadcrumbModel<'_>) {
+    *m.buffer = m.path.to_string();
+    *m.editing = true;
+}
+
 /// The address field: Enter resolves, `Esc` cancels (plan §4.2's guard is what makes the resolve
-/// safe).
+/// safe), and so does clicking anything else — the strip is showing a path again, not a modal input.
 fn edit_field(
     ui: &mut Ui,
     m: &mut BreadcrumbModel<'_>,
@@ -448,23 +456,40 @@ fn edit_field(
 ) {
     let field = egui::TextEdit::singleline(m.buffer)
         .font(egui::TextStyle::Monospace)
-        .desired_width(ui.available_width() - tokens.row_icon_size * 2.0);
+        .hint_text("type a path, Enter to list it")
+        .desired_width((ui.available_width() - tokens.crumb_chip_padding).max(0.0));
     let response = ui.add(field).on_hover_text("Type a path, Enter to list it");
+    // The strip *is* the field while it is open: the caret goes in on the frame it opens, with the
+    // path selected so the first keystroke replaces it (Go's `input.select()`).
+    if !response.has_focus() && !response.lost_focus() {
+        response.request_focus();
+        if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), response.id) {
+            state
+                .cursor
+                .set_char_range(Some(egui::text::CCursorRange::select_all_str(m.buffer)));
+            egui::TextEdit::store_state(ui.ctx(), response.id, state);
+        }
+    }
     let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
     let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
-    if (enter && response.has_focus()) || escape {
-        if enter {
-            // Plan §4.2: the address bar is the one entry point for a user-typed path, and
-            // `FsPath::resolve` is the guard — a `..` in it is rejected here, never listed.
-            let raw = m.buffer.clone();
-            match resolve_address(&raw, m.path) {
-                Ok(path) => out.push(PaneCommand::Navigate(path)),
-                Err(e) => out.push(PaneCommand::BadAddress(e.user_message())),
-            }
+    if enter && response.has_focus() {
+        // Plan §4.2: the address bar is the one entry point for a user-typed path, and
+        // `FsPath::resolve` is the guard — a `..` in it is rejected here, never listed.
+        let raw = m.buffer.clone();
+        match resolve_address(&raw, m.path) {
+            Ok(path) => out.push(PaneCommand::Navigate(path)),
+            Err(e) => out.push(PaneCommand::BadAddress(e.user_message())),
         }
-        m.buffer.clear();
-        *m.editing = false;
+        close(m);
+    } else if escape || response.lost_focus() {
+        close(m);
     }
+}
+
+/// Put the strip back to chips, forgetting what was typed.
+fn close(m: &mut BreadcrumbModel<'_>) {
+    m.buffer.clear();
+    *m.editing = false;
 }
 
 /// Resolve a typed address against the tab's own path (relative input means "under here",

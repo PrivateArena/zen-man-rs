@@ -103,6 +103,8 @@ enum Scene {
     QuickFind { tag: &'static str },
     /// The Search Manager, on a terminal index (`running: false`) or mid-rebuild (`true`).
     Index { tag: &'static str, running: bool },
+    /// The address field, open on the path it stands for.
+    Address { tag: &'static str },
 }
 
 /// Which drawer [`Scene::Drawer`] opens.
@@ -145,6 +147,7 @@ const REFERENCE_MAP: &[(&str, &str, &str)] = &[
     ("12-context-menu-background.png", "10-context-menu-background.png", "the background context menu, Go's three rows (D11)"),
     ("13-batch-rename.png", "14-batch-rename.png", "the batch-rename preview table (D12)"),
     ("14-quick-find.png", "15-quick-find.png", "quick-find over a finished walk (D6)"),
+    ("15-address-bar.png", "", "the address field open over its own path — ours alone: Go's bar was a native `<input>`, and no reference screenshot shows it open"),
 ];
 
 /// The `REFERENCE_MAP` row of one baseline: its Go reference (empty when it has none) and the note.
@@ -186,6 +189,7 @@ impl Scene {
             Self::Menu { .. } => "12-context-menu-background.png",
             Self::BatchRename { .. } => "13-batch-rename.png",
             Self::QuickFind { .. } => "14-quick-find.png",
+            Self::Address { .. } => "15-address-bar.png",
         }
     }
 
@@ -201,6 +205,7 @@ impl Scene {
             | Self::Menu { tag, .. }
             | Self::BatchRename { tag }
             | Self::QuickFind { tag }
+            | Self::Address { tag }
             | Self::Index { tag, .. } => tag,
         }
     }
@@ -275,6 +280,7 @@ impl Scene {
             }
             Self::BatchRename { tag }
             | Self::QuickFind { tag }
+            | Self::Address { tag }
             | Self::Drawer { tag, .. }
             | Self::ActionLog { tag }
             | Self::Index { tag, .. } => {
@@ -447,6 +453,7 @@ fn render(scene: &Scene) -> Option<RgbaImage> {
         Scene::Menu { at, .. } => drive_menu(&mut harness, *at),
         Scene::BatchRename { tag } => drive_batch_rename(&mut harness, tag),
         Scene::QuickFind { .. } => drive_quick_find(&mut harness),
+        Scene::Address { .. } => drive_address(&mut harness),
         Scene::Index { running, .. } => drive_index(&mut harness, *running),
     }
 
@@ -710,7 +717,9 @@ fn drive_drawer(harness: &mut Harness<'static, ZenApp>, side: Side) {
         harness,
         match side {
             Side::Left => &["PLACES", "BOOKMARKS", "MOUNTED DRIVES"],
-            Side::Right => &["CUSTOM ACTIONS"],
+            // Go's right drawer is headed by its `.sidebar-header h2` (`index.html:427`), not by a
+            // section title — the title *is* the panel's name.
+            Side::Right => &["Custom Actions"],
         },
     );
     if side == Side::Left {
@@ -979,6 +988,27 @@ fn drive_quick_find(harness: &mut Harness<'static, ZenApp>) {
         "the quick-find list realises rows below the pane's own viewport (D6)"
     );
     assert_labels(harness, &["listing"]);
+}
+
+/// `15-address-bar`: the same entry point the chord uses, and the frame a user sees when the strip
+/// turns into a field.
+fn drive_address(harness: &mut Harness<'static, ZenApp>) {
+    settle(harness);
+    dispatch(harness, Command::FocusSearch);
+    park(harness);
+    let pane = &harness.state().model.panes[&PaneSlot::Left];
+    assert!(pane.address_editing, "the field is open");
+    // The defect this baseline exists for: an open field with nothing in it is a black strip, and
+    // the only way out was <kbd>Esc</kbd>.
+    let path = pane
+        .active_tab()
+        .map(|tab| tab.path.to_string())
+        .unwrap_or_default();
+    assert!(
+        !path.is_empty() && pane.address_buffer == path,
+        "the field holds the path it stands for, not nothing: {:?} vs {path:?}",
+        pane.address_buffer
+    );
 }
 
 /// Stamp the status block's clock-derived fields, run the frames, stamp again, and assert — the
@@ -1256,7 +1286,16 @@ fn right_drawer_snapshot_renders_or_skips_with_a_reason() {
         side: Side::Right,
     };
     let Some(image) = render(&scene) else { return };
-    assert_covers(&image, 0.2, "a listing with the disks drawer open");
+    assert_covers(&image, 0.2, "a listing with the custom-actions drawer open");
+}
+
+#[test]
+fn address_bar_snapshot_renders_or_skips_with_a_reason() {
+    let scene = Scene::Address {
+        tag: "snap-address",
+    };
+    let Some(image) = render(&scene) else { return };
+    assert_covers(&image, 0.2, "a listing with its address field open");
 }
 
 #[test]

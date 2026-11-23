@@ -252,18 +252,44 @@ fn chip(ui: &mut Ui, tokens: &Tokens, text: &str, colour: Color32) {
         });
 }
 
-/// A header button whose label carries its chord (`2-Pane (F3)`, the reference's own wording).
-pub fn chord_button(ui: &mut Ui, tokens: &Tokens, label: String, active: bool) -> bool {
-    let colour = if active {
-        tokens.accent
+/// A header button whose label carries its chord (`2-Pane (F3)`, the reference's own wording), and
+/// Go's `.btn-global`/`.btn-global.active` visuals: `bg-main` + `border-color` at rest, the accent
+/// fill with the `text-active` label once it is the mode on screen (`workspace.css:36-58`).
+///
+/// The accent fill is what makes a *toggle* read as a toggle: with `2-Pane` and `4-Pane` now the
+/// only layout controls, the highlighted one is the grid you are looking at, and clicking it again
+/// is what Go's `setSplitView(!state.isSplit)` means.
+pub fn chord_button(
+    ui: &mut Ui,
+    tokens: &Tokens,
+    label: String,
+    active: bool,
+    tooltip: &str,
+) -> bool {
+    let (fill, stroke, text) = if active {
+        (
+            tokens.accent,
+            Stroke::new(1.0, tokens.accent),
+            tokens.text_active,
+        )
     } else {
-        tokens.text_main
+        (
+            tokens.bg_main,
+            Stroke::new(1.0, tokens.border),
+            tokens.text_main,
+        )
     };
-    ui.button(
-        RichText::new(label)
-            .color(colour)
-            .size(tokens.font_size - 1.0),
+    ui.add(
+        egui::Button::new(
+            RichText::new(label)
+                .color(text)
+                .size(tokens.font_size - 1.0),
+        )
+        .fill(fill)
+        .stroke(stroke)
+        .corner_radius(CornerRadius::same(tokens.crumb_corner_radius)),
     )
+    .on_hover_text(tooltip)
     .clicked()
 }
 

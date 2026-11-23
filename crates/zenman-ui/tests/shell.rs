@@ -49,7 +49,7 @@ fn shell_harness(app: ZenApp) -> Harness<'static, ZenApp> {
 fn the_header_status_bar_and_pane_placeholder_are_in_the_tree() {
     let mut harness = harness();
     harness.run();
-    harness.get_by_label("Zen-Man");
+    harness.get_by_label("Workspace:");
     harness.get_by_label("test boot line");
     // Step 7's placeholder status line is gone: the bar is the real one (`panels/status_bar.rs`),
     // so the assertions are its own words — the selection cell and the pane cell.
@@ -65,14 +65,14 @@ fn header_controls_reach_the_widget_tree_and_the_layout_button_reaches_the_state
     let mut harness = harness();
     harness.run();
     // 14b: the split/quad buttons became the reference's chord-labelled ones (`2-Pane (F3)`,
-    // `4-Pane (F4)`), so the test names them by what the header really prints.
+    // `4-Pane (F4)`), so the test names them by what the header really prints. There is no
+    // single-pane button: Go's two layout buttons *are* the F3/F4 chords and toggle themselves off.
     for name in [
-        "single pane",
         "2-Pane (F3)",
         "4-Pane (F4)",
+        "History",
         "places",
-        "disks",
-        "action log",
+        "custom actions",
     ] {
         harness.get_by_label(name);
     }
@@ -86,11 +86,25 @@ fn header_controls_reach_the_widget_tree_and_the_layout_button_reaches_the_state
         "and the dock layout must stay valid"
     );
     assert_eq!(app.model.panes.len(), 4);
-    // Back to single — the plan's F3 regression path, driven through the real button.
-    harness.get_by_label("single pane").click();
+    // The same button again is the off-state — plan F3's regression path, driven through the real
+    // control that now owns it.
+    harness.get_by_label("4-Pane (F4)").click();
     harness.run();
-    assert!(harness.state().model.layout_mode_is_consistent());
+    assert!(
+        !harness.state().model.quad() && harness.state().model.layout_mode_is_consistent(),
+        "and 4-Pane toggles itself back off"
+    );
     assert_eq!(harness.state().model.panes.len(), 1);
+    harness.get_by_label("2-Pane (F3)").click();
+    harness.run();
+    assert_eq!(harness.state().model.panes.len(), 2);
+    harness.get_by_label("2-Pane (F3)").click();
+    harness.run();
+    assert_eq!(
+        harness.state().model.panes.len(),
+        1,
+        "and 2-Pane toggles too"
+    );
 }
 
 #[test]
@@ -104,14 +118,18 @@ fn drawers_toggle_from_their_header_buttons() {
     // Step 15b: the drawers hold their real content — Go's section titles (uppercase, per
     // `.sidebar-section-title`) and the history panel's Go title.
     harness.get_by_label("PLACES");
-    harness.get_by_label("disks").click();
+    harness.get_by_label("custom actions").click();
     harness.run();
     assert!(harness.state().model.right_drawer.open);
-    harness.get_by_label("CUSTOM ACTIONS");
-    harness.get_by_label("action log").click();
+    // Go's right drawer is headed by its own `.sidebar-header h2`, not by a section title.
+    harness.get_by_label("Custom Actions");
+    harness.get_by_label("History").click();
     harness.run();
     assert!(harness.state().model.log_panel);
     harness.get_by_label("Action History");
+    // The left drawer's header is Go's `Zen-Man` (`index.html:21`) — the product name belongs to the
+    // drawer and the window title, not to the global header.
+    harness.get_by_label("Zen-Man");
 }
 
 #[test]

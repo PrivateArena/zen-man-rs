@@ -21,7 +21,7 @@
 //! gate failure and not a silent gap.
 //!
 //! No GPU, no network, no pixel decode: this module reads file headers ([`crate::png`]) and text, and
-//! it is O(files) — 13 references, 14 baselines.
+//! it is O(files) — 13 references, 15 baselines.
 
 use std::error::Error;
 use std::path::{Path, PathBuf};
@@ -535,7 +535,10 @@ mod tests {
         let report = scan(&root, &baselines(&root)).expect("the tree scans");
         assert!(report.problems.is_empty(), "{:?}", report.problems);
         assert_eq!(report.matched, 13, "one baseline per frozen reference");
-        assert_eq!(report.port_only, 1, "the empty-shell frame is ours alone");
+        assert_eq!(
+            report.port_only, 2,
+            "the empty-shell frame and the open address field are ours alone"
+        );
         assert_eq!(report.orphans, 0);
         assert_eq!(report.unmatched, 0);
         assert_eq!(report.missing, 0);
