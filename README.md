@@ -51,6 +51,56 @@ toolchain block, not a code failure — see plan §9.2 step-16a). The `#[cfg(not
 MSRV: `rust-version = "1.95"` is **declared, not build-verified on the dev box** — the pinned
 channel is absent there (`rust-toolchain.toml` explains why the channel pin is `stable` instead).
 
+## Your tabs come back, and portable mode
+
+**Session restore.** Every tab strip, the selected tab, the grid (one-, two- or four-pane), the divider
+positions, and each tab's group colour and view mode are autosaved to `workspaces.default` in
+`config.json` — the same key the Go app used, so a `config.json` written by `zen-man` restarts this port
+with the tabs `zen-man` left open. The write is debounced 1.5 s (Go's own interval) and flushed again on
+a clean exit, so closing the window immediately after opening a tab does not lose it; an idle window
+writes nothing. Launch with **no argument** and that session is your window. Launch `zenman <folder>`
+and the folder you named is: the session is not merged into that window, and the run then autosaves the
+window it opened, which is what the next no-argument launch brings back.
+
+```none
+boot note: session: none saved yet                                  ← first run on this tree
+boot note: session: restored 6 tab(s) in 2 pane(s)                 ← the next one
+boot note: session: restored 5 tab(s) in 2 pane(s), 1 tab(s) with an unreadable path
+```
+
+A stored tab whose path this build cannot read (a relative or `~`-prefixed string — the shape Go wrote
+when it saved an archive's internal path) is skipped and counted in that line, never opened at whatever
+directory the process happened to start in. A tab whose directory is simply gone is **kept**: it lists
+an error, which is where you left it and what Go did.
+
+**A named window.** `zenman --session <FILE>` opens the session in `FILE`, which is one entry of
+`config.json`'s `workspaces` object — copy `workspaces.default` out of the settings file to make one.
+The file is read, never written, and it outranks both of the above; the autosave still writes
+`workspaces.default` where it always did.
+
+**Portable mode.** Create an empty marker beside the executable:
+
+```sh
+touch target/release/portable.dat
+```
+
+Everything **this app** writes then lives in `target/release/data/` — `config.json` (bookmarks, actions,
+the session), `config.toml` (window/dock settings), `ui.ron`, `action.log`, `zen-man.db`, `gpu/`,
+`run/`, `cache/` — and nothing of it under `~/.config` or `~/.local/share`. (`--migrate-config` still
+reads the Go app's `~/.config/zen-man/config.json`, because reading that file is its whole job, and
+`zenman.portable` is accepted as a synonym for the marker.)
+
+| in order of precedence | trigger | effect |
+|---|---|---|
+| override | `--data-dir`/`--config`, `ZENMAN_DATA_DIR`/`ZENMAN_CONFIG_DIR` | the paths you named; outranks the marker |
+| portable | `portable.dat` beside the binary | `<exe>/data`, including the cache (beside the `.app` on macOS) |
+| platform | default | `io.storytold.zenman` app dirs, `XDG_*` honoured (Go's hard-coded `~/.config` was a real bug) |
+
+A marker whose `data/` folder cannot be written (a read-only USB stick) is a warning on stderr and a
+fallback to the platform layout, never a refusal to start. The boot report prints which layout won —
+`layout: portable (everything beside the binary)` — next to the three paths in use, on stdout and in the
+window.
+
 ## Feature status (plan §7, all 16 steps executed)
 
 | Step | Deliverable | Acceptance evidence |

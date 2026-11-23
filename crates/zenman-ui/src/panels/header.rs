@@ -20,14 +20,17 @@
 //! note, the disk meter text) are dropped first, and the interactive ones are never dropped. A test
 //! asserts every interactive header control's rect lies inside the viewport at 800 and 1600 px.
 
+use std::path::Path;
 use std::time::Instant;
 
 use egui::{Color32, CornerRadius, Frame, Margin, RichText, ScrollArea, Stroke, Ui, vec2};
 
+use zenman_core::error::CoreError;
+use zenman_core::path::{FsPath, ResolveKind};
 use zenman_core::services::workspaces::{
     Autosave, Pending, RESERVED, WorkspaceMeta, normalise_name,
 };
-use zenman_core::store::config::Workspace;
+use zenman_core::store::config::{LayoutMode, PaneSlot, ViewMode, Workspace};
 
 use crate::app::ZenApp;
 use crate::theme::Tokens;
@@ -100,9 +103,19 @@ impl WorkspaceBar {
         self.autosave.mark_saved(now);
     }
 
+    /// Light the chip for a write that was not the autosave's (see [`Autosave::show_chip`]).
+    pub fn show_chip(&mut self, now: Instant) {
+        self.autosave.show_chip(now);
+    }
+
     /// Forget the outstanding write (a restore took the pane set away from it).
     pub fn discard(&mut self) {
         self.autosave.discard();
+    }
+
+    /// The outstanding write, debounce ignored (see [`ZenApp::flush_session`]).
+    pub fn take_pending(&mut self) -> Option<Pending> {
+        self.autosave.take_pending()
     }
 
     /// Whether the `Saved` chip shows (2 s after each write, Go's `_showSaveIndicator`).
@@ -306,10 +319,10 @@ impl ZenApp {
                 .iter()
                 .map(|tab| zenman_core::store::config::TabSession {
                     id: format!("tab-{}", tab.id.0),
-                    path: tab
-                        .path
-                        .host_abs()
-                        .map_or_else(String::new, |host| host.to_string_lossy()),
+                    // The **store** string, not the host path: `Display`/`FsPath::resolve` round-trip
+                    // an archive member (`/a/b.zip/inner`), while `host_abs()` answers `None` for one
+                    // and would have written an empty path — a tab that reloads as nothing.
+                    path: tab.path.to_string(),
                     name: tab.title.clone(),
                     group: tab.group,
                     view: tab.view,
@@ -353,7 +366,6 @@ impl ZenApp {
             ),
         }
     }
-
     /// Answer what the workspace group asked for.
     pub fn header_commands(&mut self, commands: Vec<HeaderCommand>) {
         for command in commands {
@@ -365,6 +377,71 @@ impl ZenApp {
         }
     }
 
+    /// Write whatever the autosave is still holding, **ignoring the debounce** (window close, and the
+    /// smoke run's self-close).
+    ///
+    /// Go had no such path: its only save was the 1.5 s `setTimeout` and nothing ran on exit, so a
+    /// quit inside the window lost the tab opened, closed or navigated in the last second and a half.
+    /// Tolerable for a divider position, not for the session the app now reloads at boot — which is
+    /// why this is a separate call from [`tick_workspaces`](Self::tick_workspaces) rather than a
+    /// shorter debounce. The write itself is atomic (`ZenConfig::save`, tmp+rename), so a flush that
+    /// is interrupted leaves the *previous* session readable.
+    ///
+    /// # Errors
+    /// The config write's own failure, in words: the only caller is a shutdown path, which prints.
+    pub fn flush_session(&mut self, now: Instant) -> Result<(), String> {
+        let Some(pending) = self.workspaces.take_pending() else {
+            return Ok(());
+        };
+        match self.session.workspace_save(&pending.name, &pending.session) {
+            Ok(()) => {
+                self.workspaces.mark_saved(now);
+                self.workspaces.refresh(self.session.workspaces());
+                Ok(())
+            }
+            Err(e) => Err(format!("workspace {}: {}", pending.name, e.user_message())),
+        }
+    }
+
+    /// Boot restore: the session the last run autosaved (Go's `restoreLastWorkspace`, `app.js:61` +
+    /// `workspace.js:179-215`, which is why a restarted zen-man came back with its tabs).
+    ///
+    /// Only the autosave target is restored, because that is what "the tabs I had" means: waking up
+    /// in some named workspace the user selected once and moved on from is a surprise window. The
+    /// report says what came back — or what could not — and nothing here is silent.
+    #[must_use]
+    pub fn restore_last_session(&mut self) -> SessionRestore {
+        match self.session.workspace_restore(RESERVED) {
+            Err(CoreError::NotFound { .. }) => SessionRestore::Missing,
+            Err(e) => SessionRestore::Failed(e.user_message().to_string()),
+            Ok(workspace) => {
+                let applied = self.apply_workspace(&workspace);
+                self.workspaces.selected = workspace_label(RESERVED);
+                self.note_lost_tabs(&applied);
+                SessionRestore::Restored(applied)
+            }
+        }
+    }
+
+    /// Say what a restore could not bring back. Every path that applies a stored session — the boot
+    /// autosave, `--session`, and the header's dropdown — goes through this, so a lost tab is never a
+    /// line only one of them prints.
+    pub fn note_lost_tabs(&mut self, applied: &Applied) {
+        if applied.lost() == 0 {
+            return;
+        }
+        self.notices.post(
+            toast::Level::Warning,
+            format!(
+                "session: {} tab(s) restored, {} lost: {} unreadable path(s), {} in an unopenable pane",
+                applied.tabs,
+                applied.lost(),
+                applied.skipped,
+                applied.dropped
+            ),
+        );
+    }
+
     /// `Session::workspace_restore`, applied: layout, then one tab per stored tab, then a listing.
     pub fn restore_workspace(&mut self, name: &str) {
         match self.session.workspace_restore(name) {
@@ -372,9 +449,18 @@ impl ZenApp {
                 // A pending write of the *old* workspace must not land under the new name.
                 self.workspaces.discard();
                 self.workspaces.selected = workspace_label(name);
-                self.apply_workspace(&workspace);
+                let applied = self.apply_workspace(&workspace);
                 self.notices
                     .post(toast::Level::Success, format!("workspace {name}: restored"));
+                if applied.skipped > 0 {
+                    self.notices.post(
+                        toast::Level::Warning,
+                        format!(
+                            "workspace {name}: {} stored tab(s) had a path this build cannot read",
+                            applied.skipped
+                        ),
+                    );
+                }
             }
             Err(e) => self.notices.post(
                 toast::Level::Error,
@@ -383,44 +469,160 @@ impl ZenApp {
         }
     }
 
-    /// Replace the grid with a stored workspace (Go's `restoreWorkspace`: tabs, then the active pane).
-    pub fn apply_workspace(&mut self, workspace: &Workspace) {
-        let layout = workspace.layout;
-        self.model.layout = layout;
-        crate::dock::set_layout(&mut self.model, &mut self.dock, panes_for(layout));
-        for slot in self.model.grid_slots() {
-            let Some(pane_session) = workspace.panes.get(&slot) else {
+    /// Replace the grid with a stored workspace (Go's `restoreSession`: tabs, then the active pane).
+    ///
+    /// Three questions the stored file answers that a bare `layout` cannot, and which the first
+    /// step-14b cut of this function did not ask:
+    ///
+    /// * **which panes** — a quad session names `LeftBottom`/`RightBottom`, and `LayoutMode` has no
+    ///   quad spelling ([`crate::state::AppModel::quad`] derives it from the pane map), so the slot
+    ///   set comes from the map's keys — and only from them: `store::legacy` records an *empty*
+    ///   `right` pane for every Go `split:false` session, so widening on a named-but-empty pane would
+    ///   turn every migrated single-pane session into a split one, permanently (see [`session_slots`]);
+    /// * **how the panes were divided** — [`Workspace::dock`] carries the divider positions the user
+    ///   dragged, and is reconciled against those slots rather than trusted;
+    /// * **what each tab looked like** — [`TabSession`] has always stored `group` and `view`; a tab
+    ///   that comes back in a different view mode is a different tab.
+    ///
+    /// A stored path that is not absolute is **skipped and counted** rather than opened: Go resolved
+    /// a relative session entry against the *server's* cwd (`api/dir.go:39-44`), which this app has
+    /// no honest equivalent for. A path that is absolute but gone is **kept** — the tab lists an error,
+    /// which is what Go did and what the user expects to see ("where was that folder?"), and it is
+    /// the reason [`TabSession::path`] is a raw string instead of a validated path type.
+    #[must_use]
+    pub fn apply_workspace(&mut self, workspace: &Workspace) -> Applied {
+        let (slots, dropped) = session_slots(workspace);
+        // The dock may be left alone only when it already has exactly this pane set — and that is two
+        // questions, not one. The model's panes and the dock's own leaves can disagree at this point:
+        // `Persisted::restore` installs the settings store's tree without reshaping the model, so a
+        // four-leaf tree from a quad run can be sitting over the two panes the mode spells. Rebuilding
+        // is then the repair; leaving it would paint panels with no pane behind them.
+        //
+        // When they do agree, rebuilding is the loss: at boot the tree in place is the one
+        // `Persisted::restore` put there a moment ago from the shell settings, divider drags included,
+        // and `set_layout` would stamp half-and-half ratios over it — which the next autosave writes
+        // back, so the user could never get them again.
+        let want: std::collections::BTreeSet<PaneSlot> = slots.iter().copied().collect();
+        let grid: std::collections::BTreeSet<PaneSlot> = self.model.panes.keys().copied().collect();
+        let shaped = grid == want && crate::dock::panels(&self.dock) == slots;
+        // The mode follows the grid, which is [`crate::dock::set_layout`]'s own rule — taking it from
+        // the file instead would leave `layout_mode_is_consistent` false on the branch below.
+        self.model.layout = if slots.len() >= 2 {
+            LayoutMode::Split
+        } else {
+            LayoutMode::Single
+        };
+        if !shaped {
+            crate::dock::set_layout(&mut self.model, &mut self.dock, slots.clone());
+        }
+        let mut applied = Applied {
+            panes: slots.len(),
+            dropped,
+            ..Default::default()
+        };
+        for slot in &slots {
+            let Some(pane_session) = workspace.panes.get(slot) else {
                 continue;
             };
-            let tabs: Vec<crate::state::Tab> = pane_session
-                .tabs
-                .iter()
-                .filter_map(|tab| {
-                    let abs = zenman_core::path::AbsPath::from_path(&tab.path).ok()?;
-                    let path = zenman_core::path::FsPath::from_abs(abs.clone());
-                    let id = self.model.next_tab_id();
-                    Some(crate::state::Tab::new(
-                        id,
-                        path.clone(),
-                        if tab.name.is_empty() {
-                            tab_title(&path)
-                        } else {
-                            tab.name.clone()
-                        },
-                    ))
-                })
-                .collect();
-            let count = tabs.len().max(1);
-            if let Some(pane) = self.model.panes.get_mut(&slot) {
-                pane.tabs = tabs;
-                pane.active = pane_session.active.min(count.saturating_sub(1));
-                pane.mru.clear();
+            let mut tabs: Vec<crate::state::Tab> = Vec::with_capacity(pane_session.tabs.len());
+            for stored in &pane_session.tabs {
+                let Some(path) = stored_path(&stored.path) else {
+                    applied.skipped += 1;
+                    continue;
+                };
+                let id = self.model.next_tab_id();
+                let title = if stored.name.is_empty() {
+                    tab_title(&path)
+                } else {
+                    stored.name.clone()
+                };
+                let mut tab = crate::state::Tab::new(id, path, title);
+                tab.group = stored.group;
+                // `view` is the *persisted* answer and `flat` the live one (plan §5.8's `state.rs`
+                // row): a stored `Flat` cannot say which of the three flat modes it was, so it comes
+                // back as Go's own default through `FlatMode::from_view`.
+                tab.flat = crate::state::FlatMode::from_view(stored.view);
+                tab.view = if tab.flat.is_flat() {
+                    ViewMode::Flat
+                } else {
+                    stored.view
+                };
+                tabs.push(tab);
             }
-            for ix in 0..count {
-                self.list_at(slot, ix, false, false);
+            applied.tabs += tabs.len();
+            let shown = pane_session.active.min(tabs.len().saturating_sub(1));
+            let order: Vec<crate::state::TabId> = tabs.iter().map(|tab| tab.id).collect();
+            if let Some(pane) = self.model.panes.get_mut(slot) {
+                pane.tabs = tabs;
+                pane.active = shown;
+                pane.mru.clear();
+                // The MRU ring (`Alt+Z`, step 10) is part of the pane's state: an empty one makes that
+                // chord do nothing on a pane that plainly has tabs in it. Touched in strip order, the
+                // shown tab last so it lands at the front.
+                for id in &order {
+                    pane.touch_mru(*id);
+                }
+                if let Some(id) = order.get(shown) {
+                    pane.touch_mru(*id);
+                }
+            }
+            // Only the tab that is on screen is read here, and it is the only synchronous read this
+            // path makes. The rest of the strip is queued for the next frame's `reload_stale`: Go did
+            // the same (`createTab(…, isLazy)`, `workspace.js:32-35`), and `list_at` opens an archive
+            // store inline — which, from inside the `run_native` creator, would put every container
+            // of the session between the launch and the first frame.
+            if order.get(shown).is_some() {
+                self.list_at(*slot, shown, false, false);
+            }
+            for id in order
+                .iter()
+                .filter(|id| Some(**id) != order.get(shown).copied())
+            {
+                self.model.queue_reload(*id);
             }
         }
-        self.model.active_pane = workspace.active;
+        applied.dock = self.apply_session_dock(workspace, &slots);
+        self.model.active_pane = if slots.contains(&workspace.active) {
+            workspace.active
+        } else {
+            slots.first().copied().unwrap_or(PaneSlot::Left)
+        };
+        applied
+    }
+
+    /// Install the workspace's own dock tree, reconciled against the panes the session registers
+    /// (plan **F17**: a saved layout is validated before it reaches the first paint, and a refusal
+    /// is reported). `false` when the session carried no tree or the tree was refused.
+    ///
+    /// The predicate is the session's own slot set, not "is this a file pane": with the wider answer
+    /// `reconcile` demoted nothing, and a four-leaf tree from a stale file would paint three panels
+    /// that have no pane behind them (`dock_content` correctly declines to draw those) while the model
+    /// believed the session's one or two panes.
+    fn apply_session_dock(&mut self, workspace: &Workspace, slots: &[PaneSlot]) -> bool {
+        let Some(value) = workspace.dock.as_ref() else {
+            return false;
+        };
+        let registered = |panel: &crate::dock::DockId| slots.contains(&crate::dock::slot_of(panel));
+        let default = crate::dock::Dock::new(crate::dock::layout_for_slots(slots));
+        match crate::dock::apply(&mut self.dock, value, &registered, &default) {
+            crate::dock::ApplyReport::Applied => true,
+            crate::dock::ApplyReport::NewerVersion { found } => {
+                self.notices.post(
+                    toast::Level::Warning,
+                    format!(
+                        "saved layout is from a newer zenman (dock v{found}); using the default"
+                    ),
+                );
+                false
+            }
+            crate::dock::ApplyReport::Invalid => {
+                self.notices.post(
+                    toast::Level::Warning,
+                    "saved layout was unreadable; using the default",
+                );
+                false
+            }
+        }
     }
 
     /// `Session::workspace_save` under a name the user typed (`New`).
@@ -429,7 +631,10 @@ impl ZenApp {
         match self.session.workspace_save(name, &session) {
             Ok(()) => {
                 let now = Instant::now();
-                self.workspaces.mark_saved(now);
+                // The chip, not the autosave's memory: this wrote under a name the autosave does not
+                // own, so it must not confirm the outstanding `default` write (that one lands or fails
+                // on its own report).
+                self.workspaces.show_chip(now);
                 self.workspaces.entry = None;
                 self.workspaces.error = None;
                 self.workspaces.selected = workspace_label(name);
@@ -509,6 +714,136 @@ fn workspace_label(name: &str) -> String {
     }
 }
 
+/// The pane set a stored session names, in grid order, **and** the number of stored tabs that set
+/// cannot hold.
+///
+/// The persisted `LayoutMode` spells one or two panes; the quad grid is evidenced by its two bottom
+/// panes ([`crate::state::AppModel::quad`] derives the same fact from the live pane map). Those three
+/// sets are also the only grids [`crate::dock::layout_for_slots`] can build a tree for — a file naming
+/// a single bottom pane would otherwise have been reported as a three-pane restore while the dock
+/// quietly drew one leaf, which is the Go-F3 "silently dropped pane state" this function's doc forbids.
+/// Such a file therefore restores as the grid its `layout` names, and the tabs with nowhere to go are
+/// counted for the report.
+fn session_slots(workspace: &Workspace) -> (Vec<PaneSlot>, usize) {
+    let named: Vec<PaneSlot> = quad_slots()
+        .into_iter()
+        .filter(|slot| workspace.panes.contains_key(slot))
+        .collect();
+    // The quad grid is the one shape `LayoutMode` cannot spell, so four named panes *are* the
+    // evidence for it. Three is not: it is a file this build has no tree for, and the mode's own
+    // answer is the honest grid — with the leftover tabs counted in the report.
+    if named.len() == 4 {
+        return (quad_slots(), 0);
+    }
+    let slots = panes_for(workspace.layout);
+    let dropped = workspace
+        .panes
+        .iter()
+        .filter(|(slot, _)| !slots.contains(slot))
+        .map(|(_, pane)| pane.tabs.len())
+        .sum();
+    (slots, dropped)
+}
+
+/// Read a stored tab path back: an absolute host path or an archive VFS path (both round-trip
+/// through [`FsPath`]), `None` for anything else — empty, relative, or `~`-prefixed. The rejection is
+/// deliberate: resolving those needs a "current directory", and the only one this process has is the
+/// one the user launched it from, which is Go's bug rather than a behaviour to keep.
+fn stored_path(raw: &str) -> Option<FsPath> {
+    match zenman_core::path::resolve_kind(raw) {
+        ResolveKind::AbsoluteUnix | ResolveKind::AbsoluteWindows => {
+            FsPath::resolve(raw, Path::new("/"), None).ok()
+        }
+        ResolveKind::Empty | ResolveKind::Relative | ResolveKind::Tilde => None,
+    }
+}
+
+/// What [`ZenApp::apply_workspace`] did — a value, so the caller can *say* it (plan **F17**: a
+/// swallowed report is how a dropped pane state stayed invisible for a release).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Applied {
+    /// Tabs that came back.
+    pub tabs: usize,
+    /// Panes in the grid after the restore.
+    pub panes: usize,
+    /// Stored tabs whose path this build cannot read (see [`stored_path`]).
+    pub skipped: usize,
+    /// Stored tabs that lived in a pane set this build cannot open (see [`session_slots`]).
+    pub dropped: usize,
+    /// `true` when the session's own dock tree was installed rather than the default topology.
+    pub dock: bool,
+}
+
+impl Applied {
+    /// Stored tabs that did not come back, for either reason.
+    #[must_use]
+    pub fn lost(&self) -> usize {
+        self.skipped + self.dropped
+    }
+
+    /// "restored 6 tab(s) in 2 pane(s), 1 tab(s) with an unreadable path" — the same sentence in the
+    /// autosave report and in the `--session` one, which is why it lives here.
+    #[must_use]
+    pub fn report(&self) -> String {
+        let mut line = format!("restored {} tab(s) in {} pane(s)", self.tabs, self.panes);
+        if self.skipped > 0 {
+            line.push_str(&format!(
+                ", {} tab(s) with an unreadable path",
+                self.skipped
+            ));
+        }
+        if self.dropped > 0 {
+            line.push_str(&format!(
+                ", {} tab(s) in a pane this build cannot open",
+                self.dropped
+            ));
+        }
+        if !self.dock {
+            line.push_str(", default layout");
+        }
+        line
+    }
+}
+
+/// What [`ZenApp::restore_last_session`] did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SessionRestore {
+    /// Nothing was ever saved: a first run (or a fresh data directory).
+    Missing,
+    /// A session was stored and applied; [`Applied`] says what came of it, which may be *no* tabs —
+    /// a session saved from an empty grid, or one whose tabs all named paths this build cannot read.
+    /// Ask [`SessionRestore::restored`] before deciding whether to open a start tab.
+    Restored(Applied),
+    /// The store could not be read at all (a settings file this build cannot parse, an unreadable
+    /// directory). The boot path still starts — a lost session is a notice, not an exit code.
+    Failed(String),
+}
+
+impl SessionRestore {
+    /// `true` when the caller must not open its own start tab: the session brought tabs back.
+    #[must_use]
+    pub fn restored(&self) -> bool {
+        matches!(self, Self::Restored(applied) if applied.tabs > 0)
+    }
+
+    /// The one-line report: stdout (`apps/zenman`'s boot note), the window's boot lines, and the
+    /// smoke test that reads stdout back.
+    /// The line for the window's boot report and the log.
+    #[must_use]
+    pub fn boot_line(&self) -> String {
+        match self {
+            Self::Missing => "session: none saved yet".to_string(),
+            Self::Restored(applied) if applied.tabs == 0 => format!(
+                "session: nothing to restore ({} pane(s), {} tab(s) lost)",
+                applied.panes,
+                applied.lost()
+            ),
+            Self::Restored(applied) => format!("session: {}", applied.report()),
+            Self::Failed(why) => format!("session: could not be restored ({why})"),
+        }
+    }
+}
+
 use crate::app::tab_title;
 use crate::dialogs::{Choice, Confirm, ConfirmButton, Dialog, DialogKind};
-use crate::state::panes_for;
+use crate::state::{panes_for, quad_slots};

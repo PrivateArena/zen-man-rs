@@ -349,6 +349,53 @@ Column conventions: `name` is lowercased, `name_orig` keeps the original, `ext` 
 
 `tests/golden/search-config.json` has **10** fields including `index_state{last_indexed_unix,total_files,is_dirty}`, but the `config` embedded in `/api/index/status` is a **5-field subset** — so `ZenConfig.indexer` cannot round-trip through `/api/index/status`; read the file, not the status payload.
 
+### Session save and restore
+
+The session is **not a file of its own**: it is `workspaces.default` from the table above — the key the
+Go app autosaved to (`api/places.go:26`, `frontend/js/workspace.js:103-133`) and the key the shell
+writes through `WorkspaceService::save`, so an existing `config.json` restarts the Rust port with the
+tabs the Go app left behind.
+
+| event | behaviour | difference from Go |
+|---|---|---|
+| tab / pane / layout change | `workspaces::Autosave` notes the state; 1.5 s of quiet writes `config.json` atomically (tmp+rename) | same debounce, no timer thread (core may not depend on `craft-settings`) |
+| clean exit | `eframe::App::save` → `ZenApp::flush_session` + `Persisted::flush`, **debounce ignored** | Go had no shutdown path at all, so a quit inside the window lost the last tab opened |
+| boot, no path argument | `workspaces.default` is applied: pane set, tab strips, selected tab, per-tab group/view; the session's own divider tree when it has one, and otherwise the shell settings' tree stands **while the pane set is unchanged** (a Go-migrated session has no tree, and a different grid shape rebuilds it) | Go restored `left/right` tabs + `split` only; a quad session was beyond its config |
+| boot, with a path argument | the argument wins and no session is applied | n/a — Go accepted no paths |
+
+A stored tab is `TabSession{id, path, name, group, view}`, where `path` is the **store string** —
+`FsPath::Display`, which round-trips an archive member (`/a/b.zip/inner`) through `FsPath::resolve`;
+the host path alone would silently delete every archive tab at the next restart. On restore, a path
+that is not absolute is **skipped and reported** (Go resolved one against its own server cwd,
+`api/dir.go:39-44`, which this port has no honest equivalent for); a path that is absolute but gone
+keeps its tab and lists an error, which is what Go did. Only the selected tab is read during the
+restore; the rest of the strip is queued for the next frame — Go's own `isLazy` rule
+(`workspace.js:32-35`) — which is also what keeps an archive on an unresponsive mount from delaying
+the window.
+
+`--session <FILE>` reads a **session file**: one entry of the `workspaces` object, so copying
+`workspaces.default` out of a `config.json` makes one (`WorkspaceService::read_session`). It is read,
+never written, and it outranks the autosave and the path arguments; the autosave keeps writing
+`workspaces.default`.
+
+One, two and four panes are the dock trees `dock::layout_for_slots` can build. A session naming any
+other set restores as the grid its `layout` names and **counts** the tabs that had nowhere to go, in
+the report line and in a notice, rather than painting a leaf that has no pane behind it.
+
+### Where the files live
+
+| layout | trigger | paths |
+|---|---|---|
+| override | `--data-dir`/`--config`, `ZENMAN_DATA_DIR`/`ZENMAN_CONFIG_DIR` | as given; `--data-dir` takes the cache with it, `--config` alone does not |
+| **portable** | `portable.dat` (or `zenman.portable`) beside the executable, contents ignored | `<exe>/data` for settings **and** data, `<exe>/data/cache` for scratch — none of this app's files under `$HOME`. On macOS the marker is read beside the `.app` and the tree goes there too: writing inside a signed bundle breaks the signature (the rule craft-libs uses, `crates/settings/src/paths.rs:141-158`) |
+| platform | otherwise | `directories::ProjectDirs` for `io.storytold.zenman`; `XDG_*` honoured (Go hard-coded `~/.config`, plan §5.1) |
+
+An explicit override outranks the marker, and a marker whose folder is unwritable is a warning on
+stderr plus a fallback to the platform layout — never a refusal to start (`app_dirs::Layout`, reported
+by the window's `layout:` boot line). Portable mode moves this app's own files; the read-only Go legacy
+preview (`config_boot::legacy_preview_note`) still looks at `~/.config/zen-man/config.json`, because
+reading that file is the whole of its job.
+
 ## Deviation ledger
 
 Plan §2.3's fourteen behaviours, each against its golden:

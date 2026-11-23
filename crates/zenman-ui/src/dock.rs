@@ -221,6 +221,25 @@ pub fn set_layout(model: &mut crate::state::AppModel, dock: &mut Dock, slots: Ve
     // stays, and `layout_mode_is_consistent` still holds because `set_grid` ran regardless.
 }
 
+/// The pane slots a dock tree actually holds, in grid order.
+///
+/// [`set_layout`] edits the model and the tree together, so they agree by construction — but a tree
+/// read back from a file (`persist`, or a workspace's own `dock` value) can name panels the model does
+/// not have, and that mismatch is only visible by asking the tree. A four-leaf tree from a quad run over
+/// a two-pane grid is the case that matters: the extra panels draw nothing
+/// ([`crate::dock_content`]), so the run looks broken and then saves itself that way.
+pub fn panels(dock: &Dock) -> Vec<PaneSlot> {
+    let mut slots = dock
+        .layout
+        .panels()
+        .into_iter()
+        .map(slot_of)
+        .collect::<Vec<_>>();
+    slots.sort();
+    slots.dedup();
+    slots
+}
+
 /// `true` when a persist is allowed to write *now* (plan §5.7 `persist_pending`): not while the
 /// pointer is down on dock chrome, since the divider position of an in-flight drag is not final.
 ///

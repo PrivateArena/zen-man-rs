@@ -71,7 +71,9 @@ struct Cli {
     #[arg(long, value_name = "DIR")]
     config: Option<PathBuf>,
 
-    /// Restore this session file on boot.
+    /// Open this session file on boot (read-only; it is one entry of `config.json`'s `workspaces`
+    /// object, so copy `workspaces.default` out to make one). Outranks the autosaved session and any
+    /// path arguments; the autosave keeps writing `workspaces.default`.
     #[arg(long, value_name = "FILE")]
     session: Option<PathBuf>,
 
@@ -318,6 +320,11 @@ fn main() -> ExitCode {
             return ExitCode::from(EXIT_CONFIG);
         }
     };
+    // A portable marker whose folder could not be used is the one resolution outcome the user has to
+    // be told about out loud: the files are not where the marker said they would be.
+    if let Some(warning) = &paths.warning {
+        eprintln!("zenman: warning: {warning}");
+    }
 
     crash_guard::install_hook(&paths.data.join("crashes"));
 

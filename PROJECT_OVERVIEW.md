@@ -65,8 +65,8 @@ zen-man-rs/
 |---|---|---|---|
 | Cargo.toml | Workspace root: members, rev-pinned `[patch.crates-io]` egui/winit table, workspace lints (`forbid(unsafe_code)`), profiles | ~135 | `[workspace.dependencies]`, `[workspace.lints]`, `[profile.*]` |
 | apps/zenman/src/main.rs | CLI parse, path overrides, single-instance hand-off, GPU bless/read, engine boot, eframe launch, exit codes | ~678 | `struct Cli` (clap), `Cli::targets(home) -> Vec<FsPath>`, `run_with_context(&Cli, &AppPaths) -> Result<u8, BootError>`, `uri_scheme(raw) -> Option<String>` |
-| apps/zenman/src/app.rs | `eframe::App` adapter: owns `ZenApp`, polls the instance socket, wraps frame logic in the panic guard | ~231 | `pub struct ShellApp`, `ShellApp::new(paths, boot, smoke_after, session, notes, targets, instance) -> Self`, `logic/ui(&mut self, ctx, frame)` |
-| apps/zenman/src/app_dirs.rs | XDG/app dir resolution with CLI+env overrides, plus the Go legacy config location | ~292 | `AppPaths::resolve(&Overrides) -> Result<Self, AppPathsError>`, `gpu_dir()`, `run_dir()`, `zenman_go_legacy_config()` |
+| apps/zenman/src/app.rs | `eframe::App` adapter: owns `ZenApp`, restores the saved session when no folder was named, polls the instance socket, flushes both stores on `save`, wraps frame logic in the panic guard | ~280 | `pub struct ShellApp`, `ShellApp::new(paths, boot, smoke_after, session, notes, targets, instance) -> Self`, `logic/ui(&mut self, ctx, frame)`, `save` → `flush_state()` |
+| apps/zenman/src/app_dirs.rs | XDG/app dir resolution with CLI+env overrides, **portable mode** (`portable.dat`/`zenman.portable` beside the binary → `<exe>/data`), plus the Go legacy config location | ~690 | `AppPaths::resolve(&Overrides) -> Result<Self, AppPathsError>`, `AppPaths::resolve_in(&Overrides, exe_dir)`, `enum Layout::{Override, Portable, Platform}`, `PORTABLE_MARKERS`, `PORTABLE_DATA_DIR`, `exe_dir()`, `gpu_dir()`, `run_dir()`, `zenman_go_legacy_config()` |
 | apps/zenman/src/config_boot.rs | Boot the config: load, repair-or-preserve corrupt file, legacy migration, startup notes | ~483 | `boot(&AppPaths) -> Result<BootContext, BootError>`, `migrate_from(&LegacySource, apply) -> Result<String, BootError>`, `report_lines() -> Vec<String>` |
 | apps/zenman/src/gpu_startup.rs | GPU backend ladder (hardware -> legacy GL -> software), blessed-profile file, `egui_wgpu` setup hook | ~514 | `fallback_ladder() -> Vec<GpuProfile>`, `select_ladder(safe_gpu, gl_only, disable_gpu)`, `WgpuSetup::apply(&mut egui_wgpu::WgpuSetup)` |
 | apps/zenman/src/single_instance.rs | Unix socket/PID claim-or-focus so a second launch forwards its targets to the first window | ~718 | `enum Claim`, `SingleInstanceGuard`, `take_requests() -> Vec<Request>`, `socket_path()` |
@@ -74,6 +74,7 @@ zen-man-rs/
 | apps/zenman/src/i18n.rs | Reader for the build-script-generated catalog; English passthrough when feature off | ~73 | `embedded_locales() -> Vec<&'static str>`, `embedded_locale_count() -> usize`, `translations_available()` |
 | apps/zenman/build.rs | Compiles `i18n/*.json` into a Rust source catalog (`CRAFT_I18N_DIR`) | ~311 | `collect(dir) -> Result<Vec<LocaleCatalog>, String>`, `parse_json_catalog(path)`, `render(rows) -> String` |
 | apps/zenman/tests/gpu_fallback.rs | Drives the compiled binary (`CARGO_BIN_EXE_zenman`) through `--safe-gpu --smoke` | ~205 | no exports |
+| apps/zenman/tests/session_boot.rs | Drives the same binary twice over one settings tree: the session that was saved is the session that reloads, and a folder argument is not reported as a restore | ~415 | no exports |
 | crates/zenman-ui/src/lib.rs | UI crate module surface; re-exports `craft_ui` so the binary needs no direct egui-widget dep | ~68 | `pub mod app..widgets`, `pub use craft_ui` |
 | crates/zenman-ui/src/app.rs | `ZenApp`: the whole shell state machine — tabs per pane, command dispatch, dialogs, workspaces, events | ~2745 | `struct ZenApp`, `ZenApp::new(session, boot_lines)` / `with_persist(..., persist)`, `run_command(slot, PaneCommand)`, `open_tab(slot, FsPath) -> TabId`, `list_at(slot, ix, append, all)`, `drop_paste(&DragPayload, slot, dest, mode)` |
 | crates/zenman-ui/src/state.rs | UI-side model: tabs, selection, per-pane view/flat mode, paging state, clipboard of rows | ~1005 | `struct TabId`, `Selection`, `enum FlatMode` (`to_core() -> core FlatMode`), `struct Tab` |
@@ -88,7 +89,7 @@ zen-man-rs/
 | crates/zenman-ui/src/panels/file_pane.rs | The file list: visual row model (headers/rows), selection, keyboard nav, inline commands | ~1206 | `enum PaneCommand` (~40 variants), `struct RowOrder` (`build(&Tab)`), `enum VisualRow`, `show(...)` |
 | crates/zenman-ui/src/panels/side_panel.rs | Left/right drawers: places, favourites, disks, terminal/log sections, drawer commands | ~789 | `show_left(app, ui)`, `show_right(app, ui)`, `enum SidePanelCommand`, `struct RowSpec` |
 | crates/zenman-ui/src/panels/breadcrumb.rs | Width-aware crumb planning for host and archive paths | ~573 | `show(ui, &mut BreadcrumbModel, &Tokens, &mut Vec<PaneCommand>)`, `trail(&FsPath) -> Vec<Crumb>` |
-| crates/zenman-ui/src/panels/header.rs | Workspace bar: rename/save chip, autosave pending state, disk space readout | ~514 | `struct WorkspaceBar`, `WorkspaceBar::show(ui, &Tokens, disk, now) -> Vec<HeaderCommand>`, `enum HeaderCommand`, `take_due(now)` |
+| crates/zenman-ui/src/panels/header.rs | Workspace bar: rename/save chip, autosave pending state, disk space readout — and the shell's whole session vocabulary (save, restore, boot reload, exit flush) | ~850 | `struct WorkspaceBar`, `WorkspaceBar::show(ui, &Tokens, disk, now) -> Vec<HeaderCommand>`, `enum HeaderCommand`, `take_due(now)`, `ZenApp::workspace_session/apply_workspace(&Workspace) -> Applied/restore_workspace/save_workspace_as`, `restore_last_session() -> SessionRestore`, `flush_session()` |
 | crates/zenman-ui/src/panels/tab_bar.rs | Tab strip with colour-group runs, close/middle-click, drag reorder | ~286 | `show(ui, id, &mut TabBarModel, &Tokens, &mut Vec<TabCommand>)`, `enum TabCommand`, `runs(&[Tab]) -> Vec<GroupRun>` |
 | crates/zenman-ui/src/panels/status_bar.rs | Selection/size/offset summary line | ~164 | `show(ui, &StatusModel, &Tokens)`, `enum StatusInfo`, `selection_tooltip(&StatusModel)` |
 | crates/zenman-ui/src/panels/action_log.rs | Undo-log drawer with query throttle and expandable records | ~449 | `struct LogPanel`, `LogPanel::apply(LogCommand) -> Option<LogId>`, `tick(app)`, `show(app, ui)`, `enum LogCommand` |
@@ -139,13 +140,15 @@ zen-man-rs/
 
 ```
 launch : argv/URI -> Cli::targets -> single_instance claim|forward -> Session::open -> eframe
+         (no targets) -> workspaces.default -> apply_workspace: panes, dock, tabs, active, group, view
 frame  : eframe::App::logic -> crash_guard::guard( ZenApp::run_command -> Session::* )
                         <- Session::poll_at(now) : Vec<EngineEvent>  (jobs, DirChanged, notices)
 jobs   : Session::spawn_job -> worker thread -> Progress/CancelToken -> JobEvent -> EngineEvent
 undo   : ops::* -> history::codec::encode -> action.log (ZMLG)   ;  revert(record) -> ops::*
 browse : Session::page_dir -> DirService(FsSource)  |  archive/vfs ManifestCache for archive stores
 search : SearchManager -> Session::search_live (budget+throttle) | Session::index_search (FTS5)
-persist: craft-settings (dock/tabs) + store::config (ZenConfig) + rusqlite (index)
+persist: craft-settings (dock/tabs) + store::config (ZenConfig: workspaces.default = the session)
+         + rusqlite (index); autosave 1.5 s, flushed by eframe::App::save on a clean exit
 ```
 
 ## Key Architectural Patterns
@@ -169,7 +172,9 @@ persist: craft-settings (dock/tabs) + store::config (ZenConfig) + rusqlite (inde
 | Change pane/dock layout or restart persistence | `crates/zenman-ui/src/dock.rs`, `dock_content.rs`, `crates/zenman-ui/src/persist.rs`, `crates/zenman-core/src/store/config.rs` (`LayoutMode`, `PaneSlot`) |
 | Change colours, fonts or the Go palette parity | `crates/zenman-ui/src/theme.rs` (`Tokens`), `crates/zenman-ui/tests/snapshots.rs`, `docs/parity/` |
 | Add an icon or fix icon mapping | `crates/zenman-ui/src/icons.rs` (`icon_for`), `assets/icons/`, `xtask/src/assets.rs`, `ATTRIBUTION.md` |
-| Change CLI flags, startup, GPU fallback or single-instance hand-off | `apps/zenman/src/main.rs`, `apps/zenman/src/gpu_startup.rs`, `single_instance.rs`, `config_boot.rs`, `apps/zenman/tests/gpu_fallback.rs` |
+| Change CLI flags, startup, GPU fallback or single-instance hand-off | `apps/zenman/src/main.rs`, `apps/zenman/src/gpu_startup.rs`, `single_instance.rs`, `config_boot.rs`, `app_dirs.rs` (portable layout), `apps/zenman/tests/gpu_fallback.rs`, `apps/zenman/tests/session_boot.rs` |
+| Change what the session saves or restores | `crates/zenman-ui/src/panels/header.rs` (`workspace_session`, `apply_workspace`, `restore_last_session`, `flush_session`), `crates/zenman-core/src/services/workspaces.rs` (`Autosave`, `RESERVED`), `crates/zenman-core/src/store/config.rs` (`Workspace`/`TabSession`), `crates/zenman-ui/tests/workspaces.rs`, `docs/contracts.md` → "Session save and restore" |
+| Change where the app's files live | `apps/zenman/src/app_dirs.rs` (`Layout`, `PORTABLE_MARKERS`, `resolve_in`), `docs/contracts.md` → "Where the files live", `apps/zenman/src/config_boot.rs` |
 | Add or change a CI gate | `xtask/src/main.rs` (`run` dispatch + `ci`), the relevant gate module (`source_guards.rs`, `parity.rs`, `contracts.rs`), `.cargo/config.toml` alias |
 | Regenerate fixtures, goldens or snapshots | `scripts/make-fixtures.py`, `xtask/src/fixture_tree.rs`, `xtask/src/contracts.rs`, `crates/zenman-ui/tests/snapshots.rs`, `docs/fixtures.md` |
 | Add an engine feature and surface it | `crates/zenman-core/src/session.rs` (facade method), `crates/zenman-ui/src/app.rs` (command), see `PROJECT_OVERVIEW.crates-zenman-core.md` |

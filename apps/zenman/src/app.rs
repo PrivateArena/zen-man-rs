@@ -18,6 +18,16 @@ use zenman_core::path::{AbsPath, FsPath};
 
 use crate::app_dirs::AppPaths;
 
+/// The directory a fresh shell starts on: the user's home, or the store root when the host has
+/// none (see [`ShellApp::new`] for why that is not an unwrap).
+fn start_folder(paths: &AppPaths) -> FsPath {
+    paths
+        .home()
+        .and_then(|home| AbsPath::from_path(home).ok())
+        .map(FsPath::from_abs)
+        .unwrap_or(FsPath::ROOT)
+}
+
 /// How often an idle shell wakes itself to read the instance socket (see
 /// [`ShellApp::poll_instance`]). Slow enough that the wake-up is not a load, quick enough that a
 /// desktop "Open Folder" on an already-running manager is not experienced as lost.
@@ -57,11 +67,26 @@ impl ShellApp {
         // The window echo of the resolved paths: the smoke test proves `AppPaths::resolve` ran with
         // the CLI overrides applied, and a human sees the same lines the boot log printed.
         let mut lines = vec![boot];
-        lines.push(format!("config: {}", paths.config.display()));
-        lines.push(format!("data:   {}", paths.data.display()));
-        lines.push(format!("cache:  {}", paths.cache.display()));
-        if let Some(session_path) = &paths.session {
-            lines.push(format!("session: {}", session_path.display()));
+        for (label, dir) in [
+            ("config", &paths.config),
+            ("data", &paths.data),
+            ("cache", &paths.cache),
+        ] {
+            lines.push(format!("{label}:   {}", dir.display()));
+        }
+        // Which layout won, next to the paths it produced: the portable marker makes the settings
+        // location a question the user can otherwise only answer by reading source.
+        lines.push(format!("layout: {}", paths.layout.describe()));
+        if let Some(warning) = &paths.warning {
+            lines.push(format!("warning: {warning}"));
+        }
+        // No separate echo of the `--session` path: the restore report printed below names the file it
+        // applied (or refused), and two stdout lines about one file is one more than the reader needs.
+        // The paths and the layout go to stdout too: they are the answer to "which file did it use?",
+        // which is the question a portable build, a `--data-dir`, and a migrated Go directory all make
+        // a human ask. `apps/zenman/tests` reads them back.
+        for line in &lines[1..] {
+            println!("boot note: {line}");
         }
         // The settings folder the boot resolved (`--config` included); `craft-settings` owns the
         // atomic debounced write, so the UI crate still never names a file (rule 7).
@@ -89,22 +114,58 @@ impl ShellApp {
         // Plan §7 step 8: the binary opens a **real tab**. With a target the desktop launched it at
         // (`zenman file:///tmp`, `zenman ~`) that target **is** the start tab — a folder manager opened
         // at a folder shows that folder, not the home directory beside it — and each further target
-        // opens as another tab, in order. With no target the start is the user's home: the Go app opened
-        // on the server's cwd, which is the kind of accident a desktop port does not repeat. When the
-        // host has no home at all (a container with an unset `HOME`, the same case `AppPaths::resolve`
-        // refuses for the config directory) the store root is the honest fallback, and it is listed
-        // through the engine like any other path.
+        // opens as another tab, in order. With no target the start is the **last session**: the Go app
+        // restored its `default` workspace on every boot (`app.js:56-62`), and that behaviour is the
+        // whole reason a restarted file manager is still holding your tabs. With no saved session (a
+        // first run, a fresh `--data-dir`) the start is the user's home; the Go app opened on the
+        // server's cwd, which is the kind of accident a desktop port does not repeat. When the host has
+        // no home at all (a container with an unset `HOME`, the same case `AppPaths::resolve` refuses
+        // for the config directory) the store root is the honest fallback, and it is listed through the
+        // engine like any other path.
         let slot = shell.model.active_pane;
-        let start = targets.first().cloned().unwrap_or_else(|| {
-            paths
-                .home()
-                .and_then(|home| AbsPath::from_path(home).ok())
-                .map(FsPath::from_abs)
-                .unwrap_or(FsPath::ROOT)
-        });
-        shell.open_tab(slot, start);
-        for folder in targets.into_iter().skip(1) {
-            shell.open_tab(slot, folder);
+        // Three starts, in order of who asked. `--session <FILE>` names a session file, which is the
+        // most specific request and wins; a folder on the command line is next (the desktop's "open
+        // this", which must show that folder and nothing else); with neither, the session the last run
+        // autosaved — the Go app's `restoreLastWorkspace` (`app.js:56-62`), and the reason a restarted
+        // file manager still holds your tabs. Only the last of the three can fall through to the home
+        // directory, and that only when there is no session to restore.
+        if let Some(file) = &paths.session {
+            let line = match zenman_core::services::workspaces::WorkspaceService::read_session(file)
+            {
+                Ok(workspace) => {
+                    let applied = shell.apply_workspace(&workspace);
+                    // The same notice the autosave path gives: a tab that came back as nothing has to
+                    // say so, whichever way the session was asked for.
+                    shell.note_lost_tabs(&applied);
+                    format!("session file {}: {}", file.display(), applied.report())
+                }
+                Err(e) => format!(
+                    "session file {}: not restored ({})",
+                    file.display(),
+                    e.user_message()
+                ),
+            };
+            println!("boot note: {line}");
+            shell.boot_lines.push(line);
+            if shell.model.panes.values().all(|pane| pane.tabs.is_empty()) {
+                shell.open_tab(slot, start_folder(paths));
+            }
+        } else if targets.is_empty() {
+            let restored = shell.restore_last_session();
+            let line = restored.boot_line();
+            // On stdout as well as in the window: it is the line that answers "did it find my tabs, and
+            // what did it do about the ones it could not read?", and `apps/zenman/tests` drives the
+            // real binary to check exactly that.
+            println!("boot note: {line}");
+            shell.boot_lines.push(line);
+            if !restored.restored() {
+                shell.open_tab(slot, start_folder(paths));
+            }
+        } else if let Some(first) = targets.first() {
+            shell.open_tab(slot, first.clone());
+            for folder in targets.iter().skip(1) {
+                shell.open_tab(slot, folder.clone());
+            }
         }
         Self {
             shell,
@@ -113,6 +174,22 @@ impl ShellApp {
             close_sent: false,
             frame_panicked: false,
             instance,
+        }
+    }
+
+    /// Write what either store is still holding, debounce ignored: the `craft-settings` shell slice
+    /// (dock, drawers, theme) and the session in `config.json`.
+    ///
+    /// Both stores debounce (1.5 s), and the session is what the next boot reloads, so a quit inside
+    /// the window used to lose the last tab opened or navigated — Go lost it the same way and had no
+    /// shutdown hook at all. Cheap when nothing is pending: each flush no-ops on a clean store.
+    fn flush_state(&mut self) {
+        let now = Instant::now();
+        if let Err(e) = self.shell.persist.flush() {
+            eprintln!("zenman: could not write the settings: {e}");
+        }
+        if let Err(e) = self.shell.flush_session(now) {
+            eprintln!("zenman: could not write the session: {e}");
         }
     }
 
@@ -204,12 +281,10 @@ impl eframe::App for ShellApp {
         if self.started.elapsed() >= after {
             if !self.close_sent {
                 self.close_sent = true;
-                // Flush the settings before the window goes away (plan §5.7 `persist`: a kill
+                // Flush both stores before the window goes away (plan §5.7 `persist`: a kill
                 // during a write leaves the previous file valid; a clean exit must not lose the
                 // last second of edits either).
-                if let Err(e) = self.shell.persist.flush() {
-                    eprintln!("zenman: could not write the settings: {e}");
-                }
+                self.flush_state();
                 ctx.send_viewport_cmd(ViewportCommand::Close);
             }
             return;
@@ -227,5 +302,13 @@ impl eframe::App for ShellApp {
             // reported by the hook (`data_dir/crashes/`).
             log::error!("frame paint recovered: {report}");
         }
+    }
+
+    /// eframe's persistence hook: called on its own interval and once on the way out (the pinned
+    /// fork calls it at `egui/crates/eframe/src/native/epi_integration.rs:499`), which is the only
+    /// in-process place a clean exit can be observed — `Drop` does not run when the event loop simply
+    /// returns, and `on_exit` is behind the GL feature.
+    fn save(&mut self, _storage: &mut dyn eframe::Storage) {
+        self.flush_state();
     }
 }

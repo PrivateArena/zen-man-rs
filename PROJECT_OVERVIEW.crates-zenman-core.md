@@ -63,7 +63,7 @@ crates/zenman-core/
 | src/services/action_log.rs | View/query model over the undo log | ~295 | `struct LogQuery`, `LogRow`, `LogPage`, `label(&ActionRecord) -> String` |
 | src/services/archive.rs | Archive properties for the Properties dialog | ~189 | `ArchiveService`, `struct ArchiveProps` |
 | src/services/places.rs | Left-panel places: user dirs, bookmarks, visible mounts | ~382 | `Places`, `user_places(home)`, `favourite_places(&[Bookmark])`, `struct Disk`, `visible_mount(mount_point)` |
-| src/services/workspaces.rs | Named workspace (session) store + autosave scheduling | ~473 | `WorkspaceService`, `WorkspaceMeta`, `struct Autosave`, `blank_session(layout, path) -> Workspace` |
+| src/services/workspaces.rs | Named workspace (session) store, the `--session` session file, and the autosave scheduler | ~645 | `WorkspaceService::{new, reload, list, restore, save, delete, rename, read_session}`, `WorkspaceMeta`, `RESERVED`, `struct Autosave` (`note`/`due`/`take_due`/`take_pending`/`discard`/`mark_saved`/`show_saved`), `Pending`, `normalise_name`, `blank_session(layout, path) -> Workspace` |
 | src/services/name_match.rs | Hand-written matcher used by Quick Find / filters: glob, word, and a mini regex VM | ~1337 | `compile_name_match(query, mode) -> Result<NameMatcher, CoreError>`, `tokenize(query)`, `enum NameMode` |
 | src/services/sort.rs | Single sort spec shared by panes and the index | ~267 | `trait SortRow`, `sort_by<T: SortRow>(rows, spec)`, `sort_entries(&mut [FileEntry], spec)` |
 | src/ops/mod.rs | Shared op vocabulary: conflict policy, progress sink, shared error cell | ~197 | `enum ConflictPolicy/ConflictDecision`, `unique_target(&AbsPath)`, `trait ProgressSink`, `shared(CoreError) -> SharedError` |

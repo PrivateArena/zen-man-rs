@@ -154,6 +154,34 @@ impl WorkspaceService {
         ZenConfig::load(&self.path)
     }
 
+    /// Read a **session file**: one stored workspace, kept in its own file rather than in the
+    /// `workspaces` map (`zenman --session <FILE>`). The bytes are exactly one entry of
+    /// `config.json`'s `workspaces` object, so copying `workspaces.default` out of the settings file
+    /// makes a session file, and the round trip needs no second format (`docs/contracts.md` →
+    /// "Session save and restore").
+    ///
+    /// # Errors
+    /// [`CoreError::NotFound`] for a file that is not there, [`CoreError::Config`] for bytes that are
+    /// not a workspace: a session file the user handed us is input, and the honest answer is the
+    /// reason, not a silent fallback to the autosave.
+    pub fn read_session(path: &Path) -> Result<Workspace, CoreError> {
+        let text = std::fs::read_to_string(path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                CoreError::NotFound {
+                    path: path.display().to_string(),
+                    source_path: None,
+                }
+            } else {
+                CoreError::Config {
+                    msg: format!("could not read {}: {e}", path.display()),
+                }
+            }
+        })?;
+        serde_json::from_str(&text).map_err(|e| CoreError::Config {
+            msg: format!("{} is not a session: {e}", path.display()),
+        })
+    }
+
     /// The dropdown's rows, in stored order (`BTreeMap` ⇒ alphabetical, so the list is stable without
     /// the UI sorting it). Reserved names are included and flagged; Go filtered them out here, which is
     /// why a workspace saved as `Default` was unrestorable by name — the port flags instead.
@@ -274,6 +302,13 @@ fn lookup_key(config: &ZenConfig, name: &str) -> Option<String> {
 pub struct Autosave {
     debounce: Duration,
     pending: Option<PendingState>,
+    /// The pair the last successful write put on disk. `note` compares against it: after a write the
+    /// pending slot is empty again, and without this memory the *next* frame's `note` (an idle shell
+    /// notes the same state every frame) looked like a fresh change and re-armed the clock — which
+    /// rewrote `config.json` every 1.5 s forever, with a `Saved` chip that never went out.
+    written: Option<Pending>,
+    /// Handed out by a `take_*` and not yet confirmed as written.
+    in_flight: Option<Pending>,
     last_saved: Option<Instant>,
 }
 
@@ -305,6 +340,8 @@ impl Autosave {
         Self {
             debounce,
             pending: None,
+            in_flight: None,
+            written: None,
             last_saved: None,
         }
     }
@@ -315,12 +352,16 @@ impl Autosave {
         self.debounce
     }
 
-    /// Record the desired state. A no-op when nothing changed since the last note.
+    /// Record the desired state. A no-op when nothing changed since the last note **or since the
+    /// last write** (see [`Autosave::written`]).
     pub fn note(&mut self, name: &str, session: &Workspace, now: Instant) {
         let target = Pending {
             name: name.to_string(),
             session: session.clone(),
         };
+        if self.pending.is_none() && self.written.as_ref() == Some(&target) {
+            return;
+        }
         match &mut self.pending {
             Some(state) if state.target == target => {}
             Some(state) => {
@@ -352,17 +393,50 @@ impl Autosave {
         if !self.due(now) {
             return None;
         }
-        self.pending.take().map(|state| state.target)
+        self.claim()
+    }
+
+    /// Take the outstanding write **without** waiting for the debounce — the clean-exit path.
+    ///
+    /// Go had none: its only save was the 1.5 s `setTimeout`, so a quit inside the window lost the
+    /// last tab open (`workspace.js:99-132`, and no `beforeunload` handler anywhere). A session that
+    /// reloads the tabs it had is worth the one call that makes "what you saw is what is on disk"
+    /// true at exit as well as after a settle.
+    pub fn take_pending(&mut self) -> Option<Pending> {
+        self.claim()
+    }
+
+    /// Hand the pending write out and remember it as [`Autosave::in_flight`] until [`Autosave::mark_saved`]
+    /// confirms it. An unconfirmed take leaves [`Autosave::written`] as it was, so a write that failed
+    /// is noted again on the next frame and retried.
+    fn claim(&mut self) -> Option<Pending> {
+        let taken = self.pending.take().map(|state| state.target);
+        self.in_flight = taken.clone();
+        taken
     }
 
     /// Discard the outstanding write (the user switched workspaces; saving the old one under the new
-    /// name would be data loss).
+    /// name would be data loss). What is already on disk is *not* forgotten — it is still on disk.
     pub fn discard(&mut self) {
         self.pending = None;
+        self.in_flight = None;
     }
 
-    /// Record that a write landed at `now` — starts the [`SAVED_INDICATOR_TTL`] clock.
+    /// Light the [`SAVED_INDICATOR_TTL`] chip without claiming anything was written.
+    ///
+    /// For a write the autosave did not make — a `New` workspace stored under a name the autosave does
+    /// not own. Confirming *that* as the written state would silence the retry of an autosave whose own
+    /// write had failed.
+    pub fn show_chip(&mut self, now: Instant) {
+        self.last_saved = Some(now);
+    }
+
+    /// Record that a write landed at `now` — starts the [`SAVED_INDICATOR_TTL`] clock, and is what
+    /// makes the state on screen *known* to be the state on disk.
     pub fn mark_saved(&mut self, now: Instant) {
+        if let Some(wrote) = self.in_flight.take() {
+            self.written = Some(wrote);
+        }
         self.last_saved = Some(now);
     }
 
@@ -462,6 +536,102 @@ mod tests {
         save.note("default", &workspace("/b"), base);
         assert!(!save.due(base + AUTOSAVE_DEBOUNCE - Duration::from_millis(1)));
         assert!(save.due(base + AUTOSAVE_DEBOUNCE));
+    }
+
+    #[test]
+    fn take_pending_wins_the_debounce_race_at_exit() {
+        let base = Instant::now();
+        let mut save = Autosave::new(AUTOSAVE_DEBOUNCE);
+        save.note("default", &workspace("/a"), base);
+        assert!(!save.due(base), "the write is not due yet");
+        assert_eq!(
+            save.take_pending()
+                .map(|p| p.session.panes[&PaneSlot::Left].tabs[0].path.clone()),
+            Some("/a".to_string()),
+            "a clean exit must still get the write"
+        );
+        assert!(
+            !save.is_dirty(),
+            "taking it clears it: no second write after the debounce"
+        );
+        assert!(save.take_pending().is_none(), "and nothing to take twice");
+    }
+
+    #[test]
+    fn a_write_lands_once_then_the_idle_frame_is_quiet() {
+        let base = Instant::now();
+        let mut save = Autosave::new(AUTOSAVE_DEBOUNCE);
+        save.note("default", &workspace("/a"), base);
+        let wrote = save.take_due(base + AUTOSAVE_DEBOUNCE).expect("due");
+        assert!(
+            save.take_due(base + AUTOSAVE_DEBOUNCE * 2).is_none(),
+            "never twice for one change"
+        );
+        save.mark_saved(base + AUTOSAVE_DEBOUNCE);
+        assert_eq!(
+            wrote.session.layout,
+            crate::store::config::LayoutMode::Split
+        );
+        // Every later frame of an untouched shell notes the same state, and none of them is a change:
+        // this is the loop that used to rewrite `config.json` forever and keep the chip lit.
+        for tick in 1..20 {
+            save.note("default", &workspace("/a"), base + AUTOSAVE_DEBOUNCE * tick);
+            assert!(
+                save.take_due(base + AUTOSAVE_DEBOUNCE * (tick + 1))
+                    .is_none(),
+                "an idle shell re-armed the autosave after its own write"
+            );
+        }
+        // A real change arms it again; a take that was never confirmed did not mark anything saved.
+        save.note("default", &workspace("/b"), base);
+        assert!(
+            save.due(base + AUTOSAVE_DEBOUNCE),
+            "a changed state still writes"
+        );
+    }
+
+    #[test]
+    fn a_session_file_is_one_workspaces_entry_and_reads_back() {
+        // The documented way to make a session file: take `workspaces.default` out of `config.json`.
+        // So the round trip that matters is `save` → `restore` → write those bytes out → `read_session`.
+        static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "zenman-session-file-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let service = WorkspaceService::new(dir.join("config.json"));
+        let config = service
+            .save(&ZenConfig::default(), RESERVED, &workspace("/a"))
+            .expect("saved");
+        let stored = WorkspaceService::restore(&config, RESERVED).expect("stored");
+
+        let file = dir.join("session.json");
+        std::fs::write(
+            &file,
+            serde_json::to_string_pretty(&stored).expect("a workspace serialises"),
+        )
+        .expect("session file");
+        assert_eq!(
+            WorkspaceService::read_session(&file).expect("reads back"),
+            stored
+        );
+        assert!(
+            matches!(
+                WorkspaceService::read_session(&dir.join("absent.json")),
+                Err(CoreError::NotFound { .. })
+            ),
+            "a missing session file is a typed absence, not an empty window"
+        );
+        std::fs::write(&file, b"{").expect("broken file");
+        assert!(
+            matches!(
+                WorkspaceService::read_session(&file),
+                Err(CoreError::Config { .. })
+            ),
+            "a file that is not JSON says so"
+        );
     }
 
     #[test]

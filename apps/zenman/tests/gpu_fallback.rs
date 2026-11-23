@@ -111,7 +111,16 @@ fn an_available_profile_is_accepted_and_the_smoke_run_exits_zero() {
 
     let data = scratch("profile0");
     let run = zenman(
-        &["--data-dir", &data.display().to_string(), "--smoke", "1"],
+        &[
+            "--data-dir",
+            &data.display().to_string(),
+            // `--config` too, not just `--data-dir`: the settings tree is where the session lives, and
+            // a smoke run that wrote it would overwrite the developer's own saved tabs.
+            "--config",
+            &data.join("config").display().to_string(),
+            "--smoke",
+            "1",
+        ],
         &[],
     );
     let text = run.combined();
@@ -181,10 +190,21 @@ fn all_profiles_rejected_exits_with_code_three() {
     };
     let data = scratch("exhausted");
     let run = zenman(
-        &["--data-dir", &data.display().to_string(), "--smoke", "1"],
+        &[
+            "--data-dir",
+            &data.display().to_string(),
+            "--config",
+            &data.join("config").display().to_string(),
+            "--smoke",
+            "1",
+        ],
         &[
             ("ZENMAN_GPU_BACKEND", forced),
             ("ZENMAN_DATA_DIR", &data.display().to_string()),
+            (
+                "ZENMAN_CONFIG_DIR",
+                &data.join("config").display().to_string(),
+            ),
         ],
     );
     let text = run.combined();

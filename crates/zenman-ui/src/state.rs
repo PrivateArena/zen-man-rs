@@ -761,6 +761,15 @@ impl AppModel {
         std::mem::take(&mut self.stale).into_iter().collect()
     }
 
+    /// Queue one tab for that same next-pass reload, without an event to ask for it.
+    ///
+    /// This is the deferred half of a session restore: the tab that is not on screen does not need to
+    /// be read before the window exists, and reading it there would put an archive open, a dead mount,
+    /// or a slow directory in front of the first frame.
+    pub fn queue_reload(&mut self, id: TabId) {
+        self.stale.insert(id);
+    }
+
     /// Allocate the next tab id.
     pub fn next_tab_id(&mut self) -> TabId {
         let id = TabId(self.next_tab);
