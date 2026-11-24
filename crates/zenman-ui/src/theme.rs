@@ -347,7 +347,10 @@ pub struct Tokens {
 }
 
 /// Luminance above which a chip's ink flips from the shell's text colour to its background colour.
-const CHIP_INK_SWITCH: f32 = 0.62;
+const CHIP_INK_SWITCH: f32 = 0.55;
+/// How much of a folded chip's colour is kept: enough hue to tell the groups apart, enough dimming that
+/// a fold reads as a fold.
+const CHIP_FOLDED_LIFT: f32 = 0.62;
 
 impl Tokens {
     /// The dark token set — the reference's only theme (§10 decision 7: match the current dark
@@ -555,25 +558,31 @@ impl Tokens {
         }
     }
 
-    /// The chip's body: the group's own colour, solid when the run is open.
+    /// The chip's body: the group's own colour, solid when the run is open and washed out when it is
+    /// folded, so nine folded chips do not shout over the one run the user is working in.
     ///
     /// Kept in the palette (like every colour here) because the strip may not name a colour itself.
     #[must_use]
     pub fn group_chip_fill(self, group: GroupColor, collapsed: bool) -> Color32 {
         let paint = self.group_color(group);
         if collapsed {
-            // Folded: the same hue, washed out, so nine folded chips do not shout over the one open run.
-            paint.gamma_multiply(0.45)
+            paint.gamma_multiply(CHIP_FOLDED_LIFT)
         } else {
             paint
         }
     }
 
-    /// Ink for a chip filled with `group`'s colour: whichever of the shell's two text colours has the
-    /// contrast, by relative luminance.
+    /// Ink for the chip of `group`, painted by [`Tokens::group_chip_fill`] in the same state: whichever of
+    /// the shell's two text colours has the contrast against *that* fill, by relative luminance.
+    ///
+    /// The fold matters. A folded chip's fill is washed out, so an ink chosen against the solid colour
+    /// would be a dark grey on a darkened yellow — readable unfolded, unreadable folded — and the fold is
+    /// exactly when the label is the chip's only content.
     #[must_use]
-    pub fn group_chip_ink(self, group: GroupColor) -> Color32 {
-        let [r, g, b, _] = self.group_color(group).to_normalized_gamma_f32();
+    pub fn group_chip_ink(self, group: GroupColor, collapsed: bool) -> Color32 {
+        let [r, g, b, _] = self
+            .group_chip_fill(group, collapsed)
+            .to_normalized_gamma_f32();
         if 0.299 * r + 0.587 * g + 0.114 * b > CHIP_INK_SWITCH {
             self.bg_main
         } else {

@@ -1016,7 +1016,7 @@ fn right_clicking_a_tab_opens_the_tab_menu_and_switches_to_nothing() {
         MenuTarget::Tab {
             id: first,
             group: None,
-            multi: false,
+            count: 1,
         },
         "the menu must name the tab under the cursor"
     );
@@ -1177,8 +1177,8 @@ fn the_tab_menus_group_block_groups_what_it_is_clicked_over() {
         "a colour row is always offered: that is how a group starts"
     );
     assert!(
-        !enabled("New Tab Group"),
-        "one tab is not a multi-selection, so the row that groups the selection is greyed: {menu:?}"
+        enabled("New Tab Group"),
+        "one right-clicked tab is already a group waiting to happen: {menu:?}"
     );
     assert!(
         !enabled("Remove Group"),
@@ -1244,7 +1244,7 @@ fn a_tab_menu_does_not_outlive_its_tab() {
         Some(MenuTarget::Tab {
             id: last,
             group: None,
-            multi: false,
+            count: 1,
         }),
         "fixture: the menu was opened over the last tab"
     );

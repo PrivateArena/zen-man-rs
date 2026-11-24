@@ -1323,8 +1323,12 @@ impl ZenApp {
             MenuSubject::Tab { id } => {
                 let pane = self.model.panes.get(&slot);
                 let group = pane.and_then(|pane| pane.group_of(id));
-                let multi = pane.is_some_and(|pane| pane.tab_sel.len() > 1);
-                (MenuTarget::Tab { id, group, multi }, None)
+                // The count the rows speak about: the selection the right-click just folded, which is
+                // one when the click landed outside it (`Pane::right_click_selection`).
+                let count = pane
+                    .filter(|pane| pane.tab_sel.contains(&id))
+                    .map_or(1, |pane| pane.tab_sel.len().max(1));
+                (MenuTarget::Tab { id, group, count }, None)
             }
             MenuSubject::Group { id } => {
                 let collapsed = self
@@ -1434,9 +1438,9 @@ impl ZenApp {
                 MenuTarget::TabGroup { .. } => true,
                 _ => false,
             },
-            multi_tab: match target {
-                MenuTarget::Tab { multi, .. } => multi,
-                _ => false,
+            tab_count: match target {
+                MenuTarget::Tab { count, .. } => count,
+                _ => 0,
             },
             target,
         }

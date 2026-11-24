@@ -629,7 +629,7 @@ fn paint_chip(
     let Some(group) = m.group(gid) else { return };
     let (fill, ink, label, collapsed) = (
         tokens.group_chip_fill(group.color, group.collapsed),
-        tokens.group_chip_ink(group.color),
+        tokens.group_chip_ink(group.color, group.collapsed),
         group.label().to_string(),
         group.collapsed,
     );

@@ -1,8 +1,11 @@
 # Tab groups (Firefox-style) — design
 
-Status: agreed design, implementing. Surveys: `PROJECT_OVERVIEW.md`, commit `358aa3d` (tab menu + the
-greyed group placeholder rows this feature replaces). Reviewed twice against an external design review;
-two of its suggestions were rejected with evidence in §9.
+Status: **shipped**. Landed as six commits after `358aa3d`, each with its own tests; §10 is the order
+they went in. Surveys: `PROJECT_OVERVIEW.md`, commit `358aa3d` (the tab menu whose greyed group block this
+replaces). Reviewed twice against an external design review; two of its suggestions were rejected with
+evidence in §9. The two places where the shipped code is more precise than this document say so inline:
+`MenuContext::tab_count` (§6) counts instead of being a bool, and `DropTarget::End` (§8) is the one
+off-item landing that means something.
 
 ## 1. Feature
 
@@ -155,12 +158,15 @@ the keymap table): `menus::MenuAction::Group(GroupCommand)` with
 tabs and which group a verb applies to is resolved in `ZenApp::run_group_command(slot, target, verb)` from
 the open menu's `MenuTarget` and `Pane::tab_sel` — menu specs stay data-only.
 
-Right-click rule: `PaneCommand::TabContextId` folds the selection first (a tab already in `tab_sel` keeps
-it, any other resets the selection to itself), **then** records the `context_request`, so `menu_context`
-never reads a stale selection.
+Right-click rule: `PaneCommand::TabContext` folds the selection through `Pane::right_click_selection`
+(a tab already in `tab_sel` keeps the set, any other collapses it to itself) **before** recording the
+`context_request`, so `menu_context` never reads a stale selection and a row enabled for three tabs cannot
+fire on one.
 
-`MenuTarget::Tab { ix }` gains `group: Option<GroupId>, multi: bool`; `MenuContext` gains bools `in_group`,
-`multi_tab` → `bits()`/`with_bits` become `[bool; 9]` with the predicate table generated, not typed. New
+`MenuTarget::Tab { ix }` gains `group: Option<GroupId>, count: usize`; `MenuContext` gains `in_group` and
+`tab_count`, and they are **not** in `bits()` — that array is the listing's seven plan booleans, which the
+exhaustive 128-row table walks, and multiplying it by four would prove nothing about a listing menu. The
+tab menu's own two facts get their own cases. New
 `MenuTarget::TabGroup { id }` → `group_menu()`: Rename / Collapse-Expand / Select all in group / colour
 rows / Ungroup / Close tabs in group (danger). The tab menu's six `MenuAction::Placeholder` rows become
 real: `New Tab Group` (≥ 2 selected), `Add to group ▸` the nine colours, `Remove from group`.
@@ -205,6 +211,10 @@ on a chip → append to that group; outside any group's territory → `Pane::lea
 breaks a run re-compacts it (invariant 1) instead of silently releasing membership — leaving a group is
 only ever an explicit drop outside one.
 
+`DropTarget::End` — the strip's own floor past the last item — is the one landing outside an item that
+means something: it is how the end of the strip is reached, and it releases the tab from its group.
+Anywhere else off-item cancels.
+
 Cross-pane tab drag is out of scope.
 
 ## 9. Rejected review advice, with evidence
@@ -223,6 +233,10 @@ Cross-pane tab drag is out of scope.
 Model and persistence cannot land apart (moving `Tab.group` to an id breaks the accent bar, the session
 writer and the reader at once), and id-based commands are the riskiest refactor, so they go first, alone,
 with no visible change.
+
+Every step below is in; `cargo xtask ci` is green with all of them, and §1's seven behaviours are driven
+end to end by `crates/zenman-ui/tests/tab_groups.rs` (chip paint, fold, fold-shows-the-active-tab, hover
+flyout, rename prompt, ungroup/close, drag in and out, selection grouping, restart).
 
 | # | Step | Verify |
 |---|---|---|

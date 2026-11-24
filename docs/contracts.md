@@ -360,10 +360,10 @@ tabs the Go app left behind.
 |---|---|---|
 | tab / pane / layout change | `workspaces::Autosave` notes the state; 1.5 s of quiet writes `config.json` atomically (tmp+rename) | same debounce, no timer thread (core may not depend on `craft-settings`) |
 | clean exit | `eframe::App::save` → `ZenApp::flush_session` + `Persisted::flush`, **debounce ignored** | Go had no shutdown path at all, so a quit inside the window lost the last tab opened |
-| boot, no path argument | `workspaces.default` is applied: pane set, tab strips, selected tab, per-tab group/view; the session's own divider tree when it has one, and otherwise the shell settings' tree stands **while the pane set is unchanged** (a Go-migrated session has no tree, and a different grid shape rebuilds it) | Go restored `left/right` tabs + `split` only; a quad session was beyond its config |
+| boot, no path argument | `workspaces.default` is applied: pane set, tab strips, selected tab, per-tab group/view, and each pane's tab groups with their labels and folds; the session's own divider tree when it has one, and otherwise the shell settings' tree stands **while the pane set is unchanged** (a Go-migrated session has no tree, and a different grid shape rebuilds it) | Go restored `left/right` tabs + `split` only; a quad session was beyond its config, and it had no group beyond a letter |
 | boot, with a path argument | the argument wins and no session is applied | n/a — Go accepted no paths |
 
-A stored tab is `TabSession{id, path, name, group, view}`, where `path` is the **store string** —
+A stored tab is `TabSession{id, path, name, group, groupId, view}`, where `path` is the **store string** —
 `FsPath::Display`, which round-trips an archive member (`/a/b.zip/inner`) through `FsPath::resolve`;
 the host path alone would silently delete every archive tab at the next restart. On restore, a path
 that is not absolute is **skipped and reported** (Go resolved one against its own server cwd,
@@ -372,6 +372,30 @@ keeps its tab and lists an error, which is what Go did. Only the selected tab is
 restore; the rest of the strip is queued for the next frame — Go's own `isLazy` rule
 (`workspace.js:32-35`) — which is also what keeps an archive on an unresponsive mount from delaying
 the window.
+
+#### Tab groups (`groups`, `groupId`)
+
+A pane's tab groups ride the same object: `PaneSession.groups` is a list of
+`TabGroupSession{id, name, group, collapsed}` (`docs/tab-groups-design.md`), and `TabSession.groupId`
+names the row its tab belongs to.
+
+| key | who wrote it | what it means | what Go does with it |
+|---|---|---|---|
+| `group` | Go (`a`…`e`), and the port writes it on | the group's **colour**, which is what the port paints and Go paints | reads and writes it; `F`…`I` (the port's four extra palette slots) are not its letters, so it reads those as no group |
+| `groupId` | the port only | the group's **identity** — `g<n>`, opaque like `id` | ignored on read, **dropped on write**: a Go re-save loses the labels and folds, and `group` is what survives so the grouping itself comes back |
+| `groups[]` | the port only | one row per group: label (`""` = name it after the colour), colour, fold | same: dropped |
+
+A group id is stored as the number the shell minted (`g41`), and a restore **keeps** an id it can parse
+and moves its allocator past it. That is not tidiness: `Autosave` compares the session by value, so a
+restore that renamed its own groups would be dirty the moment it started and would rewrite the file.
+
+Restore repairs rather than refuses, because the file may have been written by something else:
+clashing ids keep the first row; a tab naming a missing row falls back to its `group` letter rather than
+losing membership; a letter-only session (any Go one) becomes **one unnamed, expanded group per
+contiguous run of that letter**, since Go had no group object to name; a row with no members is dropped;
+a row with no colour takes the first colour no other row of that pane holds, and past nine of them colours
+repeat — colour is an attribute, identity is `groupId`.
+
 
 `--session <FILE>` reads a **session file**: one entry of the `workspaces` object, so copying
 `workspaces.default` out of a `config.json` makes one (`WorkspaceService::read_session`). It is read,

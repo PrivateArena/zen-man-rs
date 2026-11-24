@@ -127,8 +127,9 @@ pub enum MenuTarget {
         id: TabId,
         /// The group that tab belongs to, `None` when it belongs to none.
         group: Option<GroupId>,
-        /// More than one tab of the strip is selected.
-        multi: bool,
+        /// How many tabs the menu is speaking about: the multi-selection when the right-click landed
+        /// inside it, one when it did not (`Pane::right_click_selection` made it so).
+        count: usize,
     },
     /// A tab group's own menu, from its chip: every row acts on the whole run (`docs/tab-groups-design.md`
     /// §5), so this target has no tab and no selection.
@@ -163,8 +164,9 @@ pub struct MenuContext {
     /// The tab the menu was opened over belongs to a group. Tab menus only — a row of the listing has
     /// nothing to do with it, and `menu_context` answers `false` for every non-tab target.
     pub in_group: bool,
-    /// More than one tab of the strip is selected, which is what `New Tab Group` waits for.
-    pub multi_tab: bool,
+    /// How many tabs a tab menu's rows would act on — the selection the right-click left behind, never
+    /// a stale one, because the right-click folded it first.
+    pub tab_count: usize,
     /// What the click landed on.
     pub target: MenuTarget,
 }
@@ -172,7 +174,7 @@ pub struct MenuContext {
 impl MenuContext {
     /// The plan's seven listing booleans, as the cross-product test walks them.
     ///
-    /// [`MenuContext::in_group`] and [`MenuContext::multi_tab`] are **not** in it: they belong to the tab
+    /// [`MenuContext::in_group`] and [`MenuContext::tab_count`] are **not** in it: they belong to the tab
     /// menu, which reads nothing else, and widening this array would multiply every listing menu's
     /// exhaustive walk by four to prove nothing about it. The tab menu's two facts get their own table in
     /// [`crate::app::ZenApp::menu_context`]'s tests instead.
@@ -422,7 +424,7 @@ pub fn menu_for(
 ) -> Vec<Vec<MenuSpec>> {
     match ctx.target {
         MenuTarget::Folder => folder_menu(actions, sel),
-        MenuTarget::Tab { .. } => tab_menu(),
+        MenuTarget::Tab { .. } => tab_menu(ctx.tab_count.max(1)),
         MenuTarget::TabGroup { collapsed, .. } => group_menu(collapsed),
         MenuTarget::Background | MenuTarget::Row { .. } => file_menu(ctx, sel, actions),
     }
@@ -453,10 +455,11 @@ pub fn folder_menu(actions: &[CustomAction], sel: &ActionContext) -> Vec<Vec<Men
 ///
 /// Go's own shape, and the row order it prints: `Close tab`, `Duplicate tab` (`tabs.js:365-367`), the two
 /// copy rows, then the tab-group block (`tabs.js:353-359,378-381`) — which used to be six greyed rows
-/// and is now the feature: one row to start a group from the selection, one to take it back out, and the
-/// palette's nine colours, Go's `Red Group`… wording kept because that is what the reference prints.
+/// and is now the feature: one row to start a group from the selection (and from one right-clicked tab:
+/// that is how a group begins), one to take it back out, and the palette's nine colours, Go's
+/// `Red Group`… wording kept because that is what the reference prints.
 #[must_use]
-pub fn tab_menu() -> Vec<Vec<MenuSpec>> {
+pub fn tab_menu(count: usize) -> Vec<Vec<MenuSpec>> {
     let mut colours: Vec<MenuSpec> = GroupColor::ALL
         .iter()
         .map(|color| {
@@ -473,10 +476,16 @@ pub fn tab_menu() -> Vec<Vec<MenuSpec>> {
         0,
         spec(
             MenuAction::Group(GroupVerb::New),
-            "New Tab Group".to_string(),
+            // A single tab is a group too (that is how you start one), but a row that grouped three
+            // tabs and one that grouped one are different offers, so the row says which it is.
+            if count > 1 {
+                format!("New Tab Group with {count} Tabs")
+            } else {
+                "New Tab Group".to_string()
+            },
             Some("plus"),
             false,
-            multi_tab,
+            always,
         ),
     );
     shrink(vec![
@@ -560,14 +569,10 @@ pub fn group_menu(collapsed: bool) -> Vec<Vec<MenuSpec>> {
     shrink(out)
 }
 
-/// The tab menu's two facts, and nothing else (see [`MenuContext::bits`] for why they are apart from the
+/// The tab menu's facts, and nothing else (see [`MenuContext::bits`] for why they are apart from the
 /// listing's seven).
 fn in_group(ctx: &MenuContext) -> bool {
     ctx.in_group
-}
-
-fn multi_tab(ctx: &MenuContext) -> bool {
-    ctx.multi_tab
 }
 
 /// A search-result menu (Go's `showSearchResultContextMenu`, `context-menu.js:159-177`).
@@ -1448,7 +1453,7 @@ mod tests {
         // which is live now, and still prints no hint because a group verb has no chord (design §6), so
         // `format!` leaves the trailing space on those rows.
         assert_eq!(
-            labels(&tab_menu()),
+            labels(&tab_menu(1)),
             [
                 "Close tab Ctrl+W",
                 "Duplicate tab ",

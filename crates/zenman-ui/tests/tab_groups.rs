@@ -848,15 +848,15 @@ fn a_right_click_outside_the_selection_acts_on_one_tab_only() {
     assert!(is_open(&harness), "fixture: the menu is open");
     let open = harness.state().menu.clone().expect("fixture: a menu");
     let ctx = harness.state().menu_context(PaneSlot::Left, open.target);
-    assert!(
-        !ctx.multi_tab,
+    assert_eq!(
+        ctx.tab_count, 1,
         "the menu read a two-tab selection off a right-click on a tab outside it: {ctx:?}"
     );
     let menu = rows(&harness);
     assert!(
         menu.iter()
-            .any(|(label, on, _)| label == "New Tab Group" && !*on),
-        "`New Tab Group` is lit over a single right-clicked tab: {menu:?}"
+            .any(|(label, on, _)| label == "New Tab Group" && *on),
+        "`New Tab Group` is greyed over a single right-clicked tab, which is a group of one: {menu:?}"
     );
 
     // The colour rows are about that one tab, and that is all they change.
@@ -908,18 +908,18 @@ fn the_selection_is_what_new_tab_group_groups() {
     assert!(is_open(&harness), "the tab right-click opened nothing");
     let open = harness.state().menu.clone().expect("fixture: a menu");
     let ctx = harness.state().menu_context(PaneSlot::Left, open.target);
-    assert!(
-        ctx.multi_tab,
+    assert_eq!(
+        ctx.tab_count, 2,
         "the tab menu read a one-tab selection off a two-tab one: {ctx:?}"
     );
     let menu = rows(&harness);
     assert!(
         menu.iter()
-            .any(|(label, on, _)| label == "New Tab Group" && *on),
-        "`New Tab Group` is greyed over a two-tab selection: {menu:?}"
+            .any(|(label, on, _)| label == "New Tab Group with 2 Tabs" && *on),
+        "the row that groups the selection does not say how many tabs it is about: {menu:?}"
     );
 
-    let row = menu_row_point(&harness, "New Tab Group");
+    let row = menu_row_point(&harness, "New Tab Group with 2 Tabs");
     click_at(
         &mut harness,
         row,
