@@ -1,5 +1,5 @@
 //! Step 14b: the workspace vocabulary (plan §7 row 14, §9.2 step-8c review gap 1) and the `Saved`
-//! chip behind it.
+//! report behind it — which lives in the status bar, not in the tab row (`panels::status_bar`).
 //!
 //! Go's header was `Workspace: <select>` · `New` · `Delete` · `Saved` · disk meter. It is now one
 //! button and its popup (`panels::header`), plus the navigation ribbon's window verbs. This file
@@ -381,7 +381,7 @@ fn the_saved_chip_appears_and_then_expires() {
         !clock.show_saved(now + SAVED_INDICATOR_TTL),
         "the chip outlived Go's 2 s"
     );
-    // …and the same rule through the real header, painted. The debounce is pushed out past the
+    // …and the same rule through the real shell, painted. The debounce is pushed out past the
     // test's TTL sleep: an autosave landing during the sleep would legitimately re-light the chip,
     // and the point here is the *expiry* of one that has already landed.
     app.workspaces.autosave = Autosave::new(Duration::from_secs(60));
@@ -399,6 +399,51 @@ fn the_saved_chip_appears_and_then_expires() {
         drawn(&harness, "Saved"),
         0,
         "the chip is still up after the TTL"
+    );
+}
+
+/// The tab row is the scarce real estate in the shell, so the write report moved to the bottom band:
+/// one pill, drawn once, inside the status bar's 30 px, and clear of the workspace button it used to
+/// sit next to.
+#[test]
+fn the_saved_pill_shares_the_status_bar_and_not_the_tab_row() {
+    let dir = tree("ws-bar", &["a.txt"]);
+    let mut app = pane_app("ws-bar", &dir);
+    app.workspaces.autosave = Autosave::new(Duration::from_secs(60));
+    app.workspaces.mark_saved(Instant::now());
+    let size = egui::vec2(1600.0, 800.0);
+    let harness = build(app, size);
+    let pills: Vec<egui::Rect> = harness
+        .query_all_by_label("Saved")
+        .map(|node| node.rect())
+        .collect();
+    assert_eq!(
+        pills.len(),
+        1,
+        "the write report is drawn once and in one place"
+    );
+    let tokens = zenman_ui::theme::Tokens::dark();
+    let band = size.y - tokens.status_height;
+    assert!(
+        pills[0].min.y >= band - 1.0,
+        "the pill sat at y {} — above the status band, which starts at {band}",
+        pills[0].min.y
+    );
+    assert!(
+        pills[0].max.x <= size.x,
+        "the pill hangs off the bar's right edge ({:?})",
+        pills[0]
+    );
+    let button = harness
+        .query_all_by_label("workspace")
+        .map(|node| node.rect())
+        .next()
+        .expect("the workspace button is still on the tab row");
+    assert!(
+        button.max.x <= pills[0].min.x,
+        "the tab row is back to button-then-tabs: {:?} vs {:?}",
+        button,
+        pills[0]
     );
 }
 

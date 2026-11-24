@@ -3,15 +3,25 @@
 //! Go's said `N items selected` plus a hover tooltip of the first ten names in *insertion* order
 //! (`file-list.js:569`, `Array.from(set).slice(0, 10)`); here the clamp is in **display order**,
 //! which is the plan's one-line fix, and the plural is a real test rather than a hope.
+//!
+//! The bar also carries the shell's one write report — the `Saved` pill (Go's `_showSaveIndicator`),
+//! which used to sit next to the workspace button in the tab row. A tab is the row's scarcest
+//! pixel: the user reads the tab names twice a second and the write report once, so it belongs
+//! on the line that already reports the state of the frame, not on the one that carries the tabs.
 
-use egui::Ui;
+use egui::{Align, Layout, Ui};
 
 use crate::jobs_ui::JobSlot;
+use crate::panels::header;
 use crate::state::Selection;
 use crate::theme::Tokens;
 
 /// How many selected names the tooltip lists before it says "and N more" (`file-list.js:578`).
 pub const DISPLAY_CAP: usize = 10;
+
+/// The write report's one word (Go's `#save-indicator` text): the pill's room is counted from it, so
+/// the width and the drawing must name the same string.
+pub const SAVED_LABEL: &str = "Saved";
 
 /// Percent per unit fraction: the job line reports a whole-number percentage of an
 /// `f32` progress fraction, and the geometry guard wants that number named.
@@ -60,6 +70,9 @@ pub struct StatusModel<'a> {
     /// The shell's boot note (GPU profile, session report) — the one line the deleted header used
     /// to print. It shares the bar with the counts rather than costing a row of its own.
     pub note: Option<String>,
+    /// The autosave's `Saved` report (see [`SAVED_LABEL`]): `true` for the 2 s after a write lands
+    /// (`SAVED_INDICATOR_TTL`), answered by [`header::WorkspaceBar::chip_shows`].
+    pub saved: bool,
 }
 
 /// Draw the bar.
@@ -153,13 +166,17 @@ pub fn show(ui: &mut Ui, m: &StatusModel<'_>, tokens: &Tokens) {
             let _ = response.on_hover_text(note.clone());
         }
     }
+    // The pill's slot is counted whether or not the pill is up: an autosave lands on every
+    // navigation, and a report that appeared and vanished would shove the pane/job label sideways
+    // twice a second — the same reason the tab row used to reserve the room for it.
+    let gap = ui.spacing().item_spacing.x;
+    let pill_width = header::chip_room(ui, tokens, SAVED_LABEL) - gap;
+    let cell_right = bar.max.x - tokens.cell_padding;
+    let label_width = (cell_right - pill_width - gap - note_max).max(0.0);
     ui.put(
         egui::Rect::from_min_size(
             egui::pos2(note_max, bar.center().y - tokens.font_size),
-            egui::vec2(
-                bar.width() * 0.26 - tokens.cell_padding,
-                tokens.font_size * 2.0,
-            ),
+            egui::vec2(label_width, tokens.font_size * 2.0),
         ),
         egui::Label::new(
             egui::RichText::new(right)
@@ -168,6 +185,21 @@ pub fn show(ui: &mut Ui, m: &StatusModel<'_>, tokens: &Tokens) {
         )
         .truncate(),
     );
+    // The `Saved` pill, in the corner: the last thing in the bar, and the only thing in it that is
+    // drawn as a frame rather than as text.
+    if m.saved && cell_right - pill_width - gap > note_max {
+        crate::widgets::in_rect(
+            ui,
+            egui::Rect::from_min_max(
+                egui::pos2(cell_right - pill_width, bar.min.y),
+                egui::pos2(cell_right, bar.max.y),
+            ),
+            Layout::left_to_right(Align::Center),
+            |ui| {
+                header::chip(ui, tokens, SAVED_LABEL, tokens.success);
+            },
+        );
+    }
     ui.advance_cursor_after_rect(bar);
 }
 

@@ -10,7 +10,9 @@
 //! # Who owns what
 //!
 //! [`WorkspaceBar`] owns the autosave state machine (`workspaces::Autosave`, step 14a) and the
-//! `Saved` chip clock; the shell owns the engine. The bar never calls `Session` — it emits
+//! `Saved` clock — the *clock*, not the pill: the tab row is the scarce real estate in the shell, so
+//! what it reports is drawn by [`crate::panels::status_bar`] and this row reserves only the width of
+//! the workspace name. The shell owns the engine. The bar never calls `Session` — it emits
 //! [`HeaderCommand`]s, exactly like a pane emits [`crate::panels::file_pane::PaneCommand`], and the
 //! `impl ZenApp` block at the bottom of this file is the only place that answers them.
 //!
@@ -133,7 +135,8 @@ impl WorkspaceBar {
         self.autosave.take_pending()
     }
 
-    /// Whether the `Saved` chip shows (2 s after each write, Go's `_showSaveIndicator`).
+    /// Whether the `Saved` pill shows (2 s after each write, Go's `_showSaveIndicator`). The shell
+    /// hands the answer to the status bar, which is where the pill is drawn.
     #[must_use]
     pub fn chip_shows(&self, now: Instant) -> bool {
         self.autosave.show_saved(now)
@@ -157,17 +160,17 @@ impl WorkspaceBar {
             .collect()
     }
 
-    /// Draw the button, its `Saved` chip and (while it is open) its popup; report what was asked.
+    /// Draw the button and (while it is open) its popup; report what was asked.
     ///
     /// One control where Go had four (`select` + `New` + `Delete` + the autosave text): the button
     /// names the session on screen, the popup lists every stored one, and the two verbs of the
-    /// selected workspace ride the popup's right edge, which is where a browser puts them.
+    /// selected workspace ride the popup's right edge, which is where a browser puts them. The
+    /// autosave text is no longer here at all — see [`crate::panels::status_bar::StatusModel::saved`].
     pub fn show(
         &mut self,
         ui: &mut Ui,
         tokens: &Tokens,
         disk: Option<(u64, u64)>,
-        now: Instant,
         room: f32,
     ) -> Vec<HeaderCommand> {
         let mut out = Vec::new();
@@ -177,18 +180,7 @@ impl WorkspaceBar {
         let current = self.selected.clone();
         let target = self.selected_name();
         let mut asked: Option<HeaderCommand> = None;
-        // The pill is the one part of the control that may be skipped: it reports a write that
-        // happened two seconds ago, and a narrow row would rather show *which* workspace this is.
-        let pill = self.chip_shows(now) && room >= toggle_width(ui, tokens, &self.selected);
-        let response = toggle(
-            ui,
-            tokens,
-            &self.selected,
-            room - if pill { chip_room(ui, tokens) } else { 0.0 },
-        );
-        if pill {
-            chip(ui, tokens, "Saved", tokens.success);
-        }
+        let response = toggle(ui, tokens, &self.selected, room);
         egui::Popup::menu(&response)
             .width(tokens.workspace_select_width)
             .show(|ui| {
@@ -294,18 +286,19 @@ fn label_width(ui: &Ui, tokens: &Tokens, label: &str) -> f32 {
         .x
 }
 
-/// The room the whole control wants in the row: the button, the `Saved` pill, and the row's inset.
+/// The room the whole control wants in the row: the button and the row's inset.
 ///
-/// The pill's room is **always** reserved. An autosave fires on every navigation, so a width that
-/// followed the chip would shove the whole tab strip sideways twice a second.
+/// No pill is counted here since the `Saved` report moved to the status bar, which is what gives the
+/// tab strip back its `Saved`-pill width.
 #[must_use]
 pub fn button_width(ui: &Ui, tokens: &Tokens, label: &str) -> f32 {
-    toggle_width(ui, tokens, label) + chip_room(ui, tokens) + tokens.chrome_pad_x
+    toggle_width(ui, tokens, label) + tokens.chrome_pad_x
 }
 
 /// What [`chip`] needs, including the gap the row's own layout puts in front of it.
-fn chip_room(ui: &Ui, tokens: &Tokens) -> f32 {
-    chip_width(ui, tokens, "Saved") + ui.spacing().item_spacing.x
+#[must_use]
+pub(crate) fn chip_room(ui: &Ui, tokens: &Tokens, text: &str) -> f32 {
+    chip_width(ui, tokens, text) + ui.spacing().item_spacing.x
 }
 
 /// The button's name, painted rather than allocated: an interaction rect laid over the button's own
@@ -334,7 +327,7 @@ fn paint_clipped(ui: &Ui, rect: Rect, text: &str, tokens: &Tokens) {
     );
 }
 
-/// How wide the `Saved` pill is: its text and the frame's own two margins.
+/// How wide a pill is: its text and the frame's own two margins.
 fn chip_width(ui: &Ui, tokens: &Tokens, text: &str) -> f32 {
     let font = egui::FontId::proportional(tokens.font_size - 1.0);
     ui.painter()
@@ -410,11 +403,12 @@ fn toggle(ui: &mut Ui, tokens: &Tokens, label: &str, room: f32) -> egui::Respons
     response
 }
 
-/// A small status chip: `Saved` in the success colour, the only pill-shaped thing the chrome owns.
+/// A small status pill: the only pill-shaped thing the chrome owns, drawn into a caller's cell —
+/// today the status bar's, for the `Saved` report.
 ///
 /// The text is a real `Label` (a painted string would be invisible to the accessibility tree, and
 /// to every test), and the pill is its `Frame` — the frame itself allocates nothing interactive.
-fn chip(ui: &mut Ui, tokens: &Tokens, text: &str, colour: Color32) {
+pub(crate) fn chip(ui: &mut Ui, tokens: &Tokens, text: &str, colour: Color32) {
     Frame::new()
         .stroke(Stroke::new(1.0, colour))
         .corner_radius(CornerRadius::same(tokens.corner_radius / 2))

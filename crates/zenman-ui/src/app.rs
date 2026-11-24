@@ -952,6 +952,9 @@ impl ZenApp {
             jobs: &self.jobs.foreground,
             panes: self.model.panes.len(),
             note: self.boot_lines.first().cloned(),
+            // The tab row reports the workspace *name*; the write that follows a navigation is told
+            // here, on the frame clock the autosave itself runs on.
+            saved: self.workspaces.chip_shows(self.last_frame),
         };
         panels::status_bar::show(ui, &model, &tokens);
     }

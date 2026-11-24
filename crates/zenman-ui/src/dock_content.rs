@@ -9,8 +9,6 @@
 use craft_ui::docking::{DockArea, DockContent, DockOutput, DockStyle, Permissions};
 use egui::{Align, Color32, Layout, Rect, Stroke, Ui, Window, pos2, vec2};
 
-use std::time::Instant;
-
 use zenman_core::session::Session;
 use zenman_core::store::config::PaneSlot;
 
@@ -56,8 +54,6 @@ pub struct PaneDock<'a> {
     pub keys: &'a KeyMap,
     /// Free/total bytes of the data volume, for the workspace popup.
     pub disk: Option<(u64, u64)>,
-    /// The frame's clock, for the `Saved` chip.
-    pub now: Instant,
     /// What the chrome asked the shell to do, drained by [`show`].
     pub header: Vec<HeaderCommand>,
 }
@@ -305,9 +301,7 @@ impl PaneDock<'_> {
             button_rect,
             Layout::left_to_right(Align::Center),
             |ui| {
-                asked = self
-                    .workspaces
-                    .show(ui, &tokens, self.disk, self.now, button);
+                asked = self.workspaces.show(ui, &tokens, self.disk, button);
             },
         );
         self.header.extend(asked);
@@ -412,7 +406,6 @@ pub fn show(app: &mut ZenApp, ui: &mut Ui) {
             workspaces: &mut app.workspaces,
             keys: &app.keys,
             disk,
-            now: Instant::now(),
             header: Vec::new(),
         };
         let output: DockOutput<DockId> = DockArea::new(dock::dock_area_id()).show_content(
@@ -560,7 +553,6 @@ mod tests {
             workspaces: &mut crate::panels::header::WorkspaceBar::default(),
             keys: &crate::keymap::KeyMap::default(),
             disk: None,
-            now: std::time::Instant::now(),
             header: Vec::new(),
         };
         assert_eq!(
