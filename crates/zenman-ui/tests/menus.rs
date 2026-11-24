@@ -1067,14 +1067,15 @@ fn the_tab_menu_duplicates_the_tab_it_was_opened_over() {
     let (mut harness, listing, _) = two_tab_harness("menus-tab-dup");
     // The right-clicked tab's own view and colour: the copy carries both, the listing carries none.
     let app = harness.state_mut();
-    let tabs = &mut app
-        .model
-        .panes
-        .get_mut(&PaneSlot::Left)
-        .expect("fixture")
-        .tabs;
-    tabs[0].group = Some(GroupColor::A);
-    tabs[0].view = ViewMode::Grid;
+    // A group is a *record* the pane owns, not a field of the tab: mint the id, then let the pane's
+    // algebra create it (a bare `tab.group = …` would name a group that does not exist — invariant 2).
+    let gid = app.model.next_group_id();
+    {
+        let pane = app.model.pane_mut(PaneSlot::Left);
+        let first = pane.tabs[0].id;
+        pane.create_group(gid, &[first], GroupColor::A);
+        pane.tabs[0].view = ViewMode::Grid;
+    }
     let at = tab_point(&harness, PaneSlot::Left, 0);
     click_at(&mut harness, at, PointerButton::Secondary);
     let row = menu_row_point(&harness, "Duplicate tab");
@@ -1091,7 +1092,17 @@ fn the_tab_menu_duplicates_the_tab_it_was_opened_over() {
     );
     assert_ne!(tabs[1].id, tabs[0].id, "a tab id is not reused");
     assert_eq!(
+        tabs[1].group, tabs[0].group,
+        "the copy lands in its original's group — the id, not a copy of the colour"
+    );
+    assert_eq!(
         tabs[1].group,
+        Some(gid),
+        "and the group it lands in is the one this test made"
+    );
+    let grouped = &harness.state().model.panes[&PaneSlot::Left];
+    assert_eq!(
+        grouped.tab_color(tabs[1].group),
         Some(GroupColor::A),
         "the group colour travels with the copy"
     );

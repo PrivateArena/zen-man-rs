@@ -564,15 +564,22 @@ fn the_tabs_that_were_open_are_the_tabs_that_come_back() {
     // The middle tab: neither the first nor the last, so a restore that recomputed the selection
     // instead of reading it back cannot pass by accident.
     app.model.pane_mut(PaneSlot::Left).active = 1;
-    // A grouped, grid-view tab: the two per-tab fields `TabSession` has always stored and the first
-    // restore path dropped on the floor.
+    // A **named, folded, green** group of one tab, next to two plain ones: the group record is the
+    // state a restart has to bring back (design §4's feature 7), and the two ungrouped tabs are what
+    // proves the restore did not group everything that shares a colour. The grid view is the other
+    // per-tab field the first restore path dropped on the floor.
+    let group = app.model.next_group_id();
     {
-        let tab = app
-            .model
-            .tab_at_mut((PaneSlot::Left, 0))
-            .expect("the tab just opened");
-        tab.group = Some(GroupColor::C);
-        tab.view = ViewMode::Grid;
+        let pane = app.model.pane_mut(PaneSlot::Left);
+        let member = pane.tabs[0].id;
+        assert!(
+            pane.create_group(group, &[member], GroupColor::C).is_some()
+                && pane.rename_group(group, "in progress")
+                && pane.set_collapsed(group, true),
+            "the fixture group does not exist"
+        );
+        pane.tabs[0].view = ViewMode::Grid;
+        pane.debug_assert_invariants();
     }
     shutdown(&mut app);
 
@@ -600,8 +607,54 @@ fn the_tabs_that_were_open_are_the_tabs_that_come_back() {
         "the grid that was saved is the grid that came back"
     );
     let tab = &back.model.panes[&PaneSlot::Left].tabs[0];
-    assert_eq!(tab.group, Some(GroupColor::C), "the group was lost");
     assert_eq!(tab.view, ViewMode::Grid, "the view mode was lost");
+    // (a) the group itself, as a record: colour, name and fold all survived the file.
+    let back_pane = &back.model.panes[&PaneSlot::Left];
+    let restored = tab
+        .group
+        .expect("the grouped tab came back with no group at all");
+    let restored_group = back_pane
+        .group(restored)
+        .expect("the tab names a group the pane does not have (invariant 2)");
+    assert_eq!(
+        restored_group.color,
+        GroupColor::C,
+        "the group came back in another colour"
+    );
+    assert_eq!(
+        restored_group.name, "in progress",
+        "the group's own name was lost — a renamed group that returns unnamed is a lost rename"
+    );
+    assert!(
+        restored_group.collapsed,
+        "the folded group came back unfolded, so the strip grew tabs the user had hidden"
+    );
+    assert_eq!(
+        back_pane.tab_color(tab.group),
+        Some(GroupColor::C),
+        "the member's accent is not its group's colour"
+    );
+    // (b) the member tab points at that group and nothing else does. Tab ids are re-minted by the
+    // restore (`TabId` is a runtime identity; only the *group* id is adopted), so membership is checked
+    // against the tab that came back in the grouped tab's place.
+    assert_eq!(
+        tab.group,
+        Some(restored),
+        "the tab's own pointer does not name the group the pane holds"
+    );
+    assert_eq!(
+        back_pane.member_ids(restored),
+        vec![back_pane.tabs[0].id],
+        "the group's membership is not the tab that was saved in it"
+    );
+    // (c) the two tabs that were never grouped are still ungrouped.
+    assert_eq!(
+        back_pane.tabs[1].group, None,
+        "the tab beside the group was pulled into it by the restart"
+    );
+    assert_eq!(back_pane.tabs[2].group, None, "and so was the third one");
+    // (d) and the restore left the pane in a legal state, not merely a plausible-looking one.
+    back_pane.debug_assert_invariants();
     assert_eq!(
         back.model.panes[&PaneSlot::Left].active,
         1,
@@ -617,6 +670,278 @@ fn the_tabs_that_were_open_are_the_tabs_that_come_back() {
         "{}",
         report.boot_line()
     );
+}
+
+// ------------------------------------------------------- a Go config that only has the letter
+//
+// Go never stored a group *record*: the `group` letter was the whole story, and it put the same letter
+// on tabs that were not next to each other. Such a file has no `groups` rows and no `groupId` on any
+// tab, so the restore has to invent the groups (design §4 step 3) and then write them back as the real
+// thing — otherwise the same repair would run again on every start, and the two runs the file
+// describes (`B, none, B`) would keep being whatever the restore felt like.
+
+#[test]
+fn a_letter_only_go_session_comes_back_as_two_groups_and_leaves_as_one_of_rows() {
+    let dirs = ["ws-legacy-a", "ws-legacy-b", "ws-legacy-c"].map(|tag| tree(tag, &["a.txt"]));
+    let app = fresh_shell("ws-legacy");
+    let tab = |id: &str, path: &Path, group: Option<GroupColor>| TabSession {
+        id: id.into(),
+        path: path.to_string_lossy().into_owned(),
+        name: id.into(),
+        group,
+        group_id: None, // a Go file has no idea this key exists
+        view: ViewMode::List,
+    };
+    let session = Workspace {
+        panes: BTreeMap::from([(
+            PaneSlot::Left,
+            PaneSession {
+                // Go's own spelling of two groups that share a colour — in Go a colour *was* a group,
+                // which is exactly why identity had to move off it (design §2).
+                tabs: vec![
+                    tab("t1", &dirs[0], Some(GroupColor::B)),
+                    tab("t2", &dirs[1], None),
+                    tab("t3", &dirs[2], Some(GroupColor::B)),
+                ],
+                active: 0,
+                groups: Vec::new(), // the rows this file cannot have
+            },
+        )]),
+        active: PaneSlot::Left,
+        layout: LayoutMode::Single,
+        dock: None,
+    };
+    app.session
+        .workspace_save(RESERVED, &session)
+        .expect("stored as a migrated session would be");
+
+    let mut back = reopened_shell("ws-legacy");
+    let SessionRestore::Restored(applied) = back.restore_last_session() else {
+        panic!("a stored session was not applied");
+    };
+    assert_eq!(
+        applied.tabs, 3,
+        "every tab of the letter-only strip has to come back: {applied:?}"
+    );
+    let pane = &back.model.panes[&PaneSlot::Left];
+    // One group per **contiguous run**, not per letter and not one group of three.
+    assert_eq!(
+        pane.groups.len(),
+        2,
+        "two runs of one letter are two groups: {:?}",
+        pane.groups
+    );
+    for group in &pane.groups {
+        assert!(
+            group.is_unnamed(),
+            "a synthesised group has no name to invent, so it must stay unnamed: {group:?}"
+        );
+        assert_eq!(
+            group.label(),
+            GroupColor::B.name(),
+            "an unnamed group labels with its colour's word, which is what its chip shows"
+        );
+        assert!(
+            !group.collapsed,
+            "a file that never mentioned a fold must not come back folded: {group:?}"
+        );
+        assert_eq!(
+            group.color,
+            GroupColor::B,
+            "the run keeps the letter's colour it was written with"
+        );
+    }
+    assert_eq!(
+        pane.members(pane.groups[0].id),
+        vec![0],
+        "the first run is the first tab alone"
+    );
+    assert_eq!(
+        pane.members(pane.groups[1].id),
+        vec![2],
+        "and the second run is the third tab alone — the middle one is not a member of either"
+    );
+    assert_eq!(
+        pane.tabs[1].group, None,
+        "the tab written with no letter came back grouped"
+    );
+    pane.debug_assert_invariants();
+
+    // And the letter-only file leaves as a real one: rows, and a pointer on each member.
+    let written = back.workspace_session();
+    let written = &written.panes[&PaneSlot::Left];
+    assert!(
+        !written.groups.is_empty(),
+        "the synthesised groups were not written back as rows, so the repair runs again next start"
+    );
+    assert_eq!(
+        written.groups.len(),
+        2,
+        "the two runs were flattened into one row: {:?}",
+        written.groups
+    );
+    assert_eq!(
+        written
+            .tabs
+            .iter()
+            .filter(|tab| tab.group_id.is_some())
+            .count(),
+        2,
+        "the two tabs that came back in a group must each name a row, and the tab that came back \
+         ungrouped must still name nothing: {:?}",
+        written.tabs
+    );
+    assert_ne!(
+        written.tabs[0].group_id, written.tabs[2].group_id,
+        "the two runs point at the same row, so on disk they are one group again: {:?}",
+        written.groups
+    );
+    for tab in &written.tabs {
+        let named = tab.group_id.as_deref();
+        assert!(
+            named.is_none()
+                || written
+                    .groups
+                    .iter()
+                    .any(|row| Some(row.id.as_str()) == named),
+            "a tab names a row the file does not hold: {:?}",
+            written.tabs
+        );
+    }
+    // Go's own key keeps the letter, so a Go re-read still sees the accents it wrote (design §4).
+    assert_eq!(
+        written.tabs.iter().map(|tab| tab.group).collect::<Vec<_>>(),
+        vec![Some(GroupColor::B), None, Some(GroupColor::B)],
+        "the letter half of the membership was dropped on the way out"
+    );
+}
+
+#[test]
+fn a_restored_group_keeps_the_ids_it_was_saved_with() {
+    // `Autosave` compares the whole `Workspace` by value, so a restore that re-minted its group ids
+    // would come back `!=` the bytes it had just read and dirty the config on every single start — and
+    // a group whose id moved would strand the `groupId` of any tab whose row was written elsewhere.
+    let dirs = ["ws-keep-a", "ws-keep-b", "ws-keep-c"].map(|tag| tree(tag, &["a.txt"]));
+    // What the shell would write right now: the row ids and every tab's pointer.
+    let written = |app: &ZenApp| -> (Vec<String>, Vec<Option<String>>) {
+        let session = app.workspace_session();
+        let pane = &session.panes[&PaneSlot::Left];
+        (
+            pane.groups.iter().map(|group| group.id.clone()).collect(),
+            pane.tabs.iter().map(|tab| tab.group_id.clone()).collect(),
+        )
+    };
+    // …and what it holds in memory: id, name, member count.
+    let groups = |app: &ZenApp| -> Vec<(String, String, usize)> {
+        let pane = &app.model.panes[&PaneSlot::Left];
+        pane.groups
+            .iter()
+            .map(|group| {
+                let members = pane
+                    .tabs
+                    .iter()
+                    .filter(|tab| tab.group == Some(group.id))
+                    .count();
+                (group.id.to_store(), group.name.clone(), members)
+            })
+            .collect()
+    };
+
+    let mut app = fresh_shell("ws-keep");
+    app.set_layout(panes_for(LayoutMode::Single));
+    for dir in &dirs {
+        app.open_tab(
+            PaneSlot::Left,
+            FsPath::from_abs(AbsPath::from_path(dir).expect("absolute")),
+        );
+    }
+    // A group that is made and then released **before** the save, so the one row the file holds is not
+    // the first id this shell ever minted: a restore that re-minted instead of adopting would write a
+    // different string for the same group, and the comparisons below would catch it.
+    let released = app.model.next_group_id();
+    let group = app.model.next_group_id();
+    {
+        let pane = app.model.pane_mut(PaneSlot::Left);
+        let ids = pane.tabs.iter().map(|tab| tab.id).collect::<Vec<_>>();
+        assert!(
+            pane.create_group(released, &ids[..1], GroupColor::A)
+                .is_some()
+                && pane.create_group(group, &ids[1..], GroupColor::D).is_some()
+                && pane.rename_group(group, "work"),
+            "the fixture groups were not made"
+        );
+        pane.ungroup(released);
+        assert_eq!(
+            pane.groups.len(),
+            1,
+            "releasing the first group must leave exactly the row this test is about"
+        );
+        pane.debug_assert_invariants();
+    }
+    let minted = group.to_store();
+    assert_ne!(
+        minted,
+        released.to_store(),
+        "fixture: the row that survives is not the first id this shell minted, which is what lets the \
+         comparisons below see a re-mint"
+    );
+    let first = written(&app);
+    assert_eq!(
+        first.0,
+        vec![minted.clone()],
+        "the group the shell made writes the id it was minted with"
+    );
+    shutdown(&mut app);
+
+    let want = vec![(minted.clone(), "work".to_string(), 2)];
+    let mut back = reopened_shell("ws-keep");
+    assert!(
+        back.restore_last_session().restored(),
+        "fixture: the session must load"
+    );
+    let second = written(&back);
+    assert_eq!(
+        second, first,
+        "the first restore re-minted the ids it had just read, so every start dirties the file: \
+         {second:?} vs {first:?}"
+    );
+    assert_eq!(
+        groups(&back),
+        want,
+        "the id survived but the group it names did not"
+    );
+    back.model.panes[&PaneSlot::Left].debug_assert_invariants();
+    assert_eq!(
+        back.model.panes[&PaneSlot::Left].tabs[1].group,
+        Some(group),
+        "the restore minted a fresh identity instead of keeping the one the file named"
+    );
+    // Adopting is also what keeps the allocator honest: a group made after a restore must not be the
+    // one that was just read back.
+    assert_ne!(
+        back.model.next_group_id(),
+        group,
+        "the restore left the id allocator below the ids it loaded, so the next `New Tab Group` would \
+         collide with a group already on the strip"
+    );
+    shutdown(&mut back);
+
+    let mut again = reopened_shell("ws-keep");
+    assert!(
+        again.restore_last_session().restored(),
+        "fixture: the second restart must load"
+    );
+    let third = written(&again);
+    assert_eq!(
+        third, first,
+        "the second restore moved the ids: {third:?} vs {first:?}"
+    );
+    assert_eq!(
+        groups(&again),
+        want,
+        "two restarts renamed the group out from under its own id"
+    );
+    again.model.panes[&PaneSlot::Left].debug_assert_invariants();
 }
 
 #[test]
@@ -723,6 +1048,7 @@ fn a_stored_path_that_is_not_absolute_is_skipped_and_said() {
                         name: "relative".into(),
                         group: None,
                         view: ViewMode::List,
+                        group_id: None,
                     },
                     TabSession {
                         id: "t2".into(),
@@ -730,9 +1056,11 @@ fn a_stored_path_that_is_not_absolute_is_skipped_and_said() {
                         name: "empty".into(),
                         group: None,
                         view: ViewMode::List,
+                        group_id: None,
                     },
                 ],
                 active: 0,
+                groups: Vec::new(),
             },
         )]),
         active: PaneSlot::Left,
@@ -893,8 +1221,10 @@ fn a_migrated_single_pane_session_still_opens_as_single() {
                         name: "home".into(),
                         group: None,
                         view: ViewMode::List,
+                        group_id: None,
                     }],
                     active: 0,
+                    groups: Vec::new(),
                 },
             ),
             (
@@ -902,6 +1232,7 @@ fn a_migrated_single_pane_session_still_opens_as_single() {
                 PaneSession {
                     tabs: Vec::new(),
                     active: 0,
+                    groups: Vec::new(),
                 },
             ),
         ]),
@@ -1003,6 +1334,7 @@ fn a_three_pane_session_restores_the_grid_the_dock_can_hold_and_says_so() {
             name: name.into(),
             group: None,
             view: ViewMode::List,
+            group_id: None,
         }]
     };
     let session = Workspace {
@@ -1012,6 +1344,7 @@ fn a_three_pane_session_restores_the_grid_the_dock_can_hold_and_says_so() {
                 PaneSession {
                     tabs: tabs("l"),
                     active: 0,
+                    groups: Vec::new(),
                 },
             ),
             (
@@ -1019,6 +1352,7 @@ fn a_three_pane_session_restores_the_grid_the_dock_can_hold_and_says_so() {
                 PaneSession {
                     tabs: tabs("r"),
                     active: 0,
+                    groups: Vec::new(),
                 },
             ),
             (
@@ -1026,6 +1360,7 @@ fn a_three_pane_session_restores_the_grid_the_dock_can_hold_and_says_so() {
                 PaneSession {
                     tabs: tabs("b"),
                     active: 0,
+                    groups: Vec::new(),
                 },
             ),
         ]),
@@ -1076,6 +1411,7 @@ fn a_selection_that_no_longer_exists_is_clamped_not_wrapped() {
                         name: "one".into(),
                         group: None,
                         view: ViewMode::List,
+                        group_id: None,
                     },
                     TabSession {
                         id: "t2".into(),
@@ -1083,9 +1419,11 @@ fn a_selection_that_no_longer_exists_is_clamped_not_wrapped() {
                         name: "two".into(),
                         group: None,
                         view: ViewMode::List,
+                        group_id: None,
                     },
                 ],
                 active: 99,
+                groups: Vec::new(),
             },
         )]),
         active: PaneSlot::Left,

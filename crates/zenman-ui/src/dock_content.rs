@@ -312,6 +312,7 @@ impl PaneDock<'_> {
                     tabs: &pane.tabs,
                     active: pane.active,
                     overflow_open: pane.tabs_overflow_open,
+                    groups: &pane.groups,
                 };
                 let mut out = Vec::new();
                 let strip = Rect::from_min_max(

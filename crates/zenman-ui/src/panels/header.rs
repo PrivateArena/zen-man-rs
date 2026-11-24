@@ -22,6 +22,7 @@
 //! to satisfy it by itself: the button ellipsises its label to the room it has, and the list, the
 //! disk line and the two verbs live in a popup that is only laid out while it is open.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Instant;
 
@@ -32,9 +33,12 @@ use egui::{
 use zenman_core::error::CoreError;
 use zenman_core::path::{FsPath, ResolveKind};
 use zenman_core::services::workspaces::{Autosave, Pending, RESERVED, WorkspaceMeta};
-use zenman_core::store::config::{LayoutMode, PaneSlot, ViewMode, Workspace};
+use zenman_core::store::config::{
+    GroupColor, LayoutMode, PaneSlot, TabGroupSession, ViewMode, Workspace,
+};
 
 use crate::app::ZenApp;
+use crate::state::{GroupId, TabGroup};
 use crate::theme::Tokens;
 use crate::widgets::{disk_meter, toast};
 
@@ -445,8 +449,22 @@ impl ZenApp {
                     // and would have written an empty path — a tab that reloads as nothing.
                     path: tab.path.to_string(),
                     name: tab.title.clone(),
-                    group: tab.group,
+                    // Both halves of the membership: `group_id` is this app's group, `group` is Go's
+                    // letter for the same thing, written from the group's colour so a Go re-read still
+                    // sees the accent it wrote (design §4).
+                    group: pane.tab_color(tab.group),
+                    group_id: tab.group.map(|id| id.to_store()),
                     view: tab.view,
+                })
+                .collect::<Vec<_>>();
+            let groups = pane
+                .groups
+                .iter()
+                .map(|group| zenman_core::store::config::TabGroupSession {
+                    id: group.id.to_store(),
+                    name: group.name.clone(),
+                    group: Some(group.color),
+                    collapsed: group.collapsed,
                 })
                 .collect::<Vec<_>>();
             panes.insert(
@@ -454,6 +472,7 @@ impl ZenApp {
                 zenman_core::store::config::PaneSession {
                     tabs,
                     active: pane.active,
+                    groups,
                 },
             );
         }
@@ -657,10 +676,17 @@ impl ZenApp {
             let Some(pane_session) = workspace.panes.get(slot) else {
                 continue;
             };
+            // Design §4 step 1: the **rows** first, keyed by their stored id string, so a tab can be
+            // resolved against them and so a clash keeps the first row rather than the last.
+            let (mut groups, ids) = stored_groups(&mut self.model, &pane_session.groups);
             let mut tabs: Vec<crate::state::Tab> = Vec::with_capacity(pane_session.tabs.len());
+            // The letters of the tabs that came out memberless — design §4 step 2's fallback list, in
+            // strip order and `None` wherever a `group_id` resolved.
+            let mut orphan_letters: Vec<Option<GroupColor>> = Vec::new();
             for stored in &pane_session.tabs {
                 let Some(path) = stored_path(&stored.path) else {
                     applied.skipped += 1;
+                    orphan_letters.push(None);
                     continue;
                 };
                 let id = self.model.next_tab_id();
@@ -670,7 +696,16 @@ impl ZenApp {
                     stored.name.clone()
                 };
                 let mut tab = crate::state::Tab::new(id, path, title);
-                tab.group = stored.group;
+                // Step 2: `groupId` wins. A tab naming a row that is **gone** falls through to the
+                // letter rather than losing its membership, because `group` still says what colour it
+                // was in — that is the whole reason both keys are written.
+                let member = stored
+                    .group_id
+                    .as_deref()
+                    .and_then(|raw| ids.get(raw))
+                    .copied();
+                tab.group = member;
+                orphan_letters.push(if member.is_none() { stored.group } else { None });
                 // `view` is the *persisted* answer and `flat` the live one (plan §5.8's `state.rs`
                 // row): a stored `Flat` cannot say which of the three flat modes it was, so it comes
                 // back as Go's own default through `FlatMode::from_view`.
@@ -682,12 +717,23 @@ impl ZenApp {
                 };
                 tabs.push(tab);
             }
+            // Step 3: a session written before tab groups (or by Go, which only ever had the letter)
+            // becomes one unnamed, expanded group per contiguous run of one letter. After the rows, so
+            // that a repair can never steal a colour a real row holds.
+            for (start, end, color) in legacy_runs(&orphan_letters) {
+                let id = self.model.next_group_id();
+                for tab in &mut tabs[start..end] {
+                    tab.group = Some(id);
+                }
+                groups.push(TabGroup::new(id, color));
+            }
             applied.tabs += tabs.len();
             let shown = pane_session.active.min(tabs.len().saturating_sub(1));
             let order: Vec<crate::state::TabId> = tabs.iter().map(|tab| tab.id).collect();
+            let wanted = order.get(shown).copied();
             if let Some(pane) = self.model.panes.get_mut(slot) {
                 pane.tabs = tabs;
-                pane.active = shown;
+                pane.groups = groups;
                 pane.mru.clear();
                 // The MRU ring (`Alt+Z`, step 10) is part of the pane's state: an empty one makes that
                 // chord do nothing on a pane that plainly has tabs in it. Touched in strip order, the
@@ -695,10 +741,25 @@ impl ZenApp {
                 for id in &order {
                     pane.touch_mru(*id);
                 }
-                if let Some(id) = order.get(shown) {
-                    pane.touch_mru(*id);
+                if let Some(id) = wanted {
+                    pane.touch_mru(id);
                 }
+                // Step 4: contiguity, then the empty rows, then the shown tab **by id** — compacting
+                // moves tabs, so the index the file stored no longer names it.
+                pane.compact();
+                pane.prune_groups();
+                pane.active = wanted
+                    .and_then(|id| pane.tabs.iter().position(|tab| tab.id == id))
+                    .unwrap_or(0);
+                pane.tab_sel = wanted.into_iter().collect();
+                pane.tab_sel_anchor = wanted;
+                pane.debug_assert_invariants();
             }
+            let shown = self
+                .model
+                .panes
+                .get(slot)
+                .map_or(0, |pane| pane.tabs.len().min(pane.active));
             // Only the tab that is on screen is read here, and it is the only synchronous read this
             // path makes. The rest of the strip is queued for the next frame's `reload_stale`: Go did
             // the same (`createTab(…, isLazy)`, `workspace.js:32-35`), and `list_at` opens an archive
@@ -931,6 +992,70 @@ fn session_slots(workspace: &Workspace) -> (Vec<PaneSlot>, usize) {
         .map(|(_, pane)| pane.tabs.len())
         .sum();
     (slots, dropped)
+}
+
+/// The rows of one stored pane, as runtime groups plus the `String → GroupId` map its tabs resolve
+/// against (design §4 steps 1 and 3).
+///
+/// Ids come back from the file through [`AppModel::adopt_group_id`] rather than being re-minted, because
+/// a restore that renamed its own groups would no longer equal what it read, and `Autosave` compares the
+/// session by value: every start would dirty the session file.
+fn stored_groups(
+    model: &mut crate::state::AppModel,
+    rows: &[TabGroupSession],
+) -> (Vec<TabGroup>, BTreeMap<String, GroupId>) {
+    let mut ids: BTreeMap<String, GroupId> = BTreeMap::new();
+    let mut groups: Vec<TabGroup> = Vec::with_capacity(rows.len());
+    let mut taken: Vec<GroupColor> = Vec::new();
+    let mut colourless: Vec<usize> = Vec::new();
+    for row in rows {
+        if ids.contains_key(row.id.as_str()) {
+            // Two rows, one id: the first is the group, the second is a duplicate of it in somebody
+            // else's file. Keeping both would give one id two labels.
+            continue;
+        }
+        let id = model.adopt_group_id(&row.id);
+        ids.insert(row.id.clone(), id);
+        let Some(color) = row.group else {
+            colourless.push(groups.len());
+            groups.push(TabGroup::new(id, GroupColor::A));
+            continue;
+        };
+        taken.push(color);
+        let mut group = TabGroup::new(id, color);
+        group.name = row.name.clone();
+        group.collapsed = row.collapsed;
+        groups.push(group);
+    }
+    for ix in colourless {
+        // A row that named no colour (hand-edited, or a foreign writer) takes the first colour no other
+        // row of this pane holds; past nine of them colours repeat, because a colour is only an accent.
+        let color = GroupColor::ALL
+            .iter()
+            .find(|color| !taken.contains(color))
+            .copied()
+            .unwrap_or(GroupColor::A);
+        taken.push(color);
+        groups[ix].color = color;
+    }
+    (groups, ids)
+}
+
+/// The contiguous runs of a bare group letter — design §4 step 3, the shape Go's sessions are in: Go had
+/// no group *object*, so every run of one letter becomes one unnamed, expanded group.
+///
+/// `None` entries are tabs that already resolved to a stored row, and they break a run: the letter says
+/// "same group as the tab next to me" only where the file had no row to say otherwise.
+fn legacy_runs(letters: &[Option<GroupColor>]) -> Vec<(usize, usize, GroupColor)> {
+    let mut runs: Vec<(usize, usize, GroupColor)> = Vec::new();
+    for (ix, color) in letters.iter().copied().enumerate() {
+        let Some(color) = color else { continue };
+        match runs.last_mut() {
+            Some((_, end, have)) if *have == color && *end == ix => *end = ix + 1,
+            _ => runs.push((ix, ix + 1, color)),
+        }
+    }
+    runs
 }
 
 /// Read a stored tab path back: an absolute host path or an archive VFS path (both round-trip

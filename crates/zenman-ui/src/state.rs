@@ -338,8 +338,10 @@ pub struct Tab {
     pub total: usize,
     /// Next-page cursor, `None` when everything is loaded.
     pub has_more: bool,
-    /// The tab's group colour, if any.
-    pub group: Option<GroupColor>,
+    /// The tab group this tab belongs to, if any. The **identity**, never the colour: what a group is
+    /// called, what it is painted and whether it is folded all live in [`Pane::groups`], so re-colouring
+    /// a group is one field write and not a re-key of every member (design §2).
+    pub group: Option<GroupId>,
     /// A `load-more` page is in flight.
     pub loading_more: bool,
     /// The page size this tab asked for (the banner quotes it; the shell sets it from
@@ -438,8 +440,14 @@ pub struct Pane {
     pub active: usize,
     /// Most-recently-used tab ring, cap 5 (`Alt+Z` in step 10).
     pub mru: std::collections::VecDeque<TabId>,
-    /// Collapsed groups in this pane's listing.
-    pub collapsed_groups: Vec<GroupColor>,
+    /// This pane's tab groups, in creation order. An entry exists **iff** at least one tab names it
+    /// ([`Pane::prune_groups`]) — see the invariants at the head of the group algebra.
+    pub groups: Vec<TabGroup>,
+    /// The tabs the strip has multi-selected (right-click acts on all of them, and so does
+    /// <kbd>New Tab Group</kbd>). Ids, because a reorder must not move the selection onto another tab.
+    pub tab_sel: BTreeSet<TabId>,
+    /// The anchor a <kbd>Shift</kbd>-click ranges from.
+    pub tab_sel_anchor: Option<TabId>,
     /// Refreshes in flight. **Not a bool**: two refreshes in one pane must not clear each other's
     /// spinner nor hang one (plan §4.3).
     pub loading: BTreeSet<Origin>,
@@ -627,6 +635,495 @@ impl Pane {
     }
 }
 
+// ------------------------------------------------------------------  tab groups (design §2)
+//
+// The algebra below is the only way a group changes. Everything the user can do — the strip's chip,
+// the tab menu, a drag, a restart — ends up here, which is what keeps the four invariants true:
+//
+// 1. a group's members are **contiguous** in `Pane::tabs` (`Pane::compact`);
+// 2. `Pane::groups` holds an entry **iff** at least one tab names it (`Pane::prune_groups`, and pruning
+//    happens **before** compacting — compacting with a dangling id is the panic site);
+// 3. `Pane::tab_sel` only holds ids of tabs this pane has;
+// 4. a collapsed group still shows its **active** tab, so `Pane::active` is never a hidden index and
+//    activation never has to edit `collapsed`.
+
+/// One tab group of one pane.
+///
+/// A runtime identity, minted per shell by [`AppModel::next_group_id`] exactly like [`TabId`], and
+/// persisted only as an opaque string ([`GroupId::to_store`]) because the strip, the menus, the hover
+/// popup and a rename prompt all need to name a group without holding a borrow of the pane.
+///
+/// Colour is **not** identity: [`TabGroup`] carries both, and [`Pane::set_group_color`] can move a group
+/// to another colour without any member having to change.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GroupId(pub u64);
+
+impl GroupId {
+    /// The store spelling of this id — `g7`. Written into [`TabSession::group_id`]
+    /// (`zenman_core::store::config`) and read back by [`GroupId::from_store`], which is what lets a
+    /// restored session keep the ids it was saved with instead of dirtying itself (design §4).
+    #[must_use]
+    pub fn to_store(self) -> String {
+        format!("g{}", self.0)
+    }
+
+    /// The id a stored string names, when this app wrote it. Anything else (`None`) is a hand-edited
+    /// or foreign id and gets a fresh one.
+    #[must_use]
+    pub fn from_store(raw: &str) -> Option<Self> {
+        let tail = raw.strip_prefix('g')?;
+        if tail.is_empty() || !tail.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        tail.parse::<u64>().ok().map(Self)
+    }
+}
+
+/// One tab group: a label, a colour and a fold (`docs/tab-groups-design.md` §2).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TabGroup {
+    /// Identity, minted per app by [`AppModel::next_group_id`].
+    pub id: GroupId,
+    /// The chip's text; **empty means "name it after the colour"**, which is why the label is derived
+    /// ([`TabGroup::label`]) instead of defaulted — an unnamed group that gets re-coloured has to follow.
+    pub name: String,
+    /// The palette entry the chip and its members' accent bars paint with.
+    pub color: GroupColor,
+    /// Folded to the chip alone.
+    pub collapsed: bool,
+}
+
+impl TabGroup {
+    /// A group of `id` in `color`, unnamed and expanded.
+    #[must_use]
+    pub fn new(id: GroupId, color: GroupColor) -> Self {
+        Self {
+            id,
+            name: String::new(),
+            color,
+            collapsed: false,
+        }
+    }
+
+    /// What the chip says: the user's name, or the colour's own word while it has none.
+    #[must_use]
+    pub fn label(&self) -> &str {
+        if self.name.is_empty() {
+            self.color.name()
+        } else {
+            &self.name
+        }
+    }
+
+    /// `true` when this group is the unnamed default, whose label is its colour.
+    #[must_use]
+    pub fn is_unnamed(&self) -> bool {
+        self.name.is_empty()
+    }
+}
+
+/// How a strip click changes the multi-selection (`SelKind` of the tab strip).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TabSelKind {
+    /// Plain click: this tab alone.
+    Replace,
+    /// <kbd>Ctrl</kbd>/`Cmd`-click: in or out of the set.
+    Toggle,
+    /// <kbd>Shift</kbd>-click: the run from the anchor to here (hidden tabs included — the strip's order
+    /// is the tab order, and a collapsed group the user cannot see is still the block they meant).
+    Range,
+}
+
+impl Pane {
+    /// The group `id`, if this pane still has it.
+    #[must_use]
+    pub fn group(&self, id: GroupId) -> Option<&TabGroup> {
+        self.groups.iter().find(|group| group.id == id)
+    }
+
+    /// The colour a tab's accent bar paints with — `None` for an ungrouped tab, and for a tab whose
+    /// group is gone (which [`Pane::debug_assert_invariants`] calls a bug, not a state).
+    #[must_use]
+    pub fn tab_color(&self, group: Option<GroupId>) -> Option<GroupColor> {
+        group.and_then(|id| self.group(id)).map(|group| group.color)
+    }
+
+    /// The group of the tab `id`, if the pane has it.
+    #[must_use]
+    pub fn group_of(&self, id: TabId) -> Option<GroupId> {
+        self.tabs
+            .iter()
+            .find(|tab| tab.id == id)
+            .and_then(|tab| tab.group)
+    }
+
+    /// The indices of a group's tabs, in strip order.
+    #[must_use]
+    pub fn members(&self, id: GroupId) -> Vec<usize> {
+        self.tabs
+            .iter()
+            .enumerate()
+            .filter(|(_, tab)| tab.group == Some(id))
+            .map(|(ix, _)| ix)
+            .collect()
+    }
+
+    /// The ids of a group's tabs, in strip order.
+    #[must_use]
+    pub fn member_ids(&self, id: GroupId) -> Vec<TabId> {
+        self.members(id)
+            .iter()
+            .filter_map(|&ix| self.tabs.get(ix))
+            .map(|tab| tab.id)
+            .collect()
+    }
+
+    /// The group of the shown tab, which is the question a chip answers for one click.
+    #[must_use]
+    pub fn active_group(&self) -> Option<GroupId> {
+        self.active_tab().and_then(|tab| tab.group)
+    }
+
+    /// Every tab of the pane, in strip order — the multi-selection resolved.
+    #[must_use]
+    pub fn selected_tabs(&self) -> Vec<TabId> {
+        self.tabs
+            .iter()
+            .filter(|tab| self.tab_sel.contains(&tab.id))
+            .map(|tab| tab.id)
+            .collect()
+    }
+
+    /// The first colour no group of this pane holds (`GroupColor::ALL` order), or — when all nine are
+    /// taken, which needs nine groups and is legal — the first colour overall.
+    #[must_use]
+    pub fn free_color(&self) -> GroupColor {
+        *GroupColor::ALL
+            .iter()
+            .find(|color| !self.groups.iter().any(|group| group.color == **color))
+            .unwrap_or(&GroupColor::A)
+    }
+
+    /// Make `tabs` one group of `color`, unnamed, and return its id. Nothing comes back for a selection
+    /// of fewer than one live tab, which is the menu's "enabled" rule written down once.
+    pub fn create_group(
+        &mut self,
+        id: GroupId,
+        tabs: &[TabId],
+        color: GroupColor,
+    ) -> Option<GroupId> {
+        let hit: Vec<TabId> = self.resolve(tabs);
+        if hit.is_empty() {
+            return None;
+        }
+        for tab in &mut self.tabs {
+            if hit.contains(&tab.id) {
+                tab.group = Some(id);
+            }
+        }
+        self.groups.push(TabGroup::new(id, color));
+        self.prune_groups();
+        self.compact();
+        Some(id)
+    }
+
+    /// Add `tabs` to an existing group (a drop on a chip, `Add to group` in the tab menu).
+    pub fn join_group(&mut self, id: GroupId, tabs: &[TabId]) -> bool {
+        if self.group(id).is_none() {
+            return false;
+        }
+        let hit = self.resolve(tabs);
+        if hit.is_empty() {
+            return false;
+        }
+        for tab in &mut self.tabs {
+            if hit.contains(&tab.id) {
+                tab.group = Some(id);
+            }
+        }
+        self.prune_groups();
+        self.compact();
+        true
+    }
+
+    /// Take `tabs` out of whatever group they are in, and drop the group when the last one leaves.
+    pub fn leave_group(&mut self, tabs: &[TabId]) -> usize {
+        let hit = self.resolve(tabs);
+        let mut left = 0;
+        for tab in &mut self.tabs {
+            if hit.contains(&tab.id) && tab.group.take().is_some() {
+                left += 1;
+            }
+        }
+        self.prune_groups();
+        self.compact();
+        left
+    }
+
+    /// Release every member and forget the group — the tabs stay open (design §1: *ungroup*).
+    pub fn ungroup(&mut self, id: GroupId) -> usize {
+        let members = self.member_ids(id);
+        let left = self.leave_group(&members);
+        self.groups.retain(|group| group.id != id);
+        left
+    }
+
+    /// Rename a group. An empty name is the *unnamed* state, not a name of zero width.
+    pub fn rename_group(&mut self, id: GroupId, name: &str) -> bool {
+        let Some(group) = self.groups.iter_mut().find(|group| group.id == id) else {
+            return false;
+        };
+        group.name = name.trim().to_string();
+        true
+    }
+
+    /// Fold or unfold a group. Never called on the shown tab's group by the *keyboard* paths, which is
+    /// invariant 4's other half: the strip keeps that tab visible either way, so this cannot hide it.
+    pub fn set_collapsed(&mut self, id: GroupId, collapsed: bool) -> bool {
+        let Some(group) = self.groups.iter_mut().find(|group| group.id == id) else {
+            return false;
+        };
+        group.collapsed = collapsed;
+        true
+    }
+
+    /// Toggle it ([`TabCommand::ToggleGroup`](crate::panels::tab_bar::TabCommand::ToggleGroup)).
+    pub fn toggle_collapsed(&mut self, id: GroupId) -> bool {
+        let Some(want) = self.group(id).map(|group| !group.collapsed) else {
+            return false;
+        };
+        self.set_collapsed(id, want)
+    }
+
+    /// Re-colour a group, and if `color` is already held, **merge** the two: the members of `id` join
+    /// the group that owns the colour, which comes out expanded — folding tabs the user was looking at is
+    /// a surprise, not a merge (design §2). Returns the group that survived.
+    pub fn set_group_color(&mut self, id: GroupId, color: GroupColor) -> Option<GroupId> {
+        let target = self
+            .groups
+            .iter()
+            .find(|group| group.color == color && group.id != id)
+            .map(|group| group.id);
+        let Some(survivor) = target else {
+            let group = self.groups.iter_mut().find(|group| group.id == id)?;
+            group.color = color;
+            return Some(id);
+        };
+        for tab in &mut self.tabs {
+            if tab.group == Some(id) {
+                tab.group = Some(survivor);
+            }
+        }
+        self.groups.retain(|group| group.id != id);
+        self.set_collapsed(survivor, false);
+        self.prune_groups();
+        self.compact();
+        Some(survivor)
+    }
+
+    /// Append a group row. Only the restore path needs this: a runtime group is born in
+    /// [`Pane::create_group`].
+    pub fn add_group(&mut self, group: TabGroup) {
+        if !self.groups.iter().any(|have| have.id == group.id) {
+            self.groups.push(group);
+        }
+    }
+
+    /// The single path that removes tabs: it keeps `active`, the MRU ring, the multi-selection and the
+    /// group table in step, which is why nothing outside this `impl` may `tabs.remove` (invariant 2/3).
+    /// Returns the ids it actually closed, in strip order.
+    pub fn close_tabs(&mut self, ids: &[TabId]) -> Vec<TabId> {
+        let hit = self.resolve(ids);
+        if hit.is_empty() {
+            return hit;
+        }
+        self.tabs.retain(|tab| !hit.contains(&tab.id));
+        for id in &hit {
+            self.mru.retain(|existing| existing != id);
+            self.tab_sel.remove(id);
+        }
+        if self
+            .tab_sel_anchor
+            .is_some_and(|anchor| hit.contains(&anchor))
+        {
+            self.tab_sel_anchor = self.tab_sel.iter().next().copied();
+        }
+        // Clamp only. Which tab takes the focus after a close is the MRU ring's question, and the caller
+        // answers it (`ZenApp::close_shown_tab`); this just never leaves `active` off the end.
+        self.active = self.active.min(self.tabs.len().saturating_sub(1));
+        self.prune_groups();
+        hit
+    }
+
+    /// The shown tab's id, or `None` in an empty pane.
+    #[must_use]
+    pub fn active_id(&self) -> Option<TabId> {
+        self.active_tab().map(|tab| tab.id)
+    }
+
+    /// Show `id` (the id-based half of `SelectTab`): clamps, records the range anchor and the MRU ring.
+    /// Never touches a group's `collapsed` — invariant 4 keeps the shown tab visible instead.
+    pub fn activate(&mut self, id: TabId) -> bool {
+        let Some(ix) = self.tabs.iter().position(|tab| tab.id == id) else {
+            return false;
+        };
+        self.active = ix;
+        self.tab_sel = BTreeSet::from([id]);
+        self.tab_sel_anchor = Some(id);
+        self.touch_mru(id);
+        true
+    }
+
+    /// The strip's click handling: one tab, toggled, or the run from the anchor (see [`TabSelKind`]).
+    /// The shown tab always follows the click — a strip click selects *and* shows, as in a browser; the
+    /// rest of the set rides along for the verbs that need it.
+    pub fn select_tab(&mut self, id: TabId, kind: TabSelKind) -> bool {
+        let Some(ix) = self.tabs.iter().position(|tab| tab.id == id) else {
+            return false;
+        };
+        match kind {
+            TabSelKind::Replace => {
+                self.tab_sel = BTreeSet::from([id]);
+                self.tab_sel_anchor = Some(id);
+            }
+            TabSelKind::Toggle => {
+                if !self.tab_sel.insert(id) {
+                    self.tab_sel.remove(&id);
+                }
+                self.tab_sel_anchor = Some(id);
+            }
+            TabSelKind::Range => {
+                let anchor = self.tab_sel_anchor.unwrap_or(id);
+                let from = self
+                    .tabs
+                    .iter()
+                    .position(|tab| tab.id == anchor)
+                    .unwrap_or(ix);
+                let (lo, hi) = (from.min(ix), from.max(ix));
+                self.tab_sel = self
+                    .tabs
+                    .iter()
+                    .skip(lo)
+                    .take(hi - lo + 1)
+                    .map(|tab| tab.id)
+                    .collect();
+            }
+        }
+        self.tab_sel
+            .retain(|live| self.tabs.iter().any(|tab| tab.id == *live));
+        true
+    }
+
+    /// Drop the rows no tab names any more (invariant 2). Idempotent, and called by every mutation that
+    /// can empty a group.
+    pub fn prune_groups(&mut self) {
+        self.groups
+            .retain(|group| self.tabs.iter().any(|tab| tab.group == Some(group.id)));
+    }
+
+    /// Restore contiguity (invariant 1): walking the strip, the first member of a group brings all of
+    /// them with it. Tab order inside the group is kept, which is what makes it safe to run after a
+    /// merge, a create or a restore of a Go session that never kept its letters contiguous.
+    ///
+    /// Runs on identity, not colour — two groups may share a colour once nine of them exist, and the
+    /// compacting must not merge them.
+    pub fn compact(&mut self) {
+        if !self.tabs.iter().any(|tab| tab.group.is_some()) {
+            return;
+        }
+        let shown = self.active_id();
+        let len = self.tabs.len();
+        let mut taken: Vec<bool> = vec![false; len];
+        let mut order: Vec<usize> = Vec::with_capacity(len);
+        for ix in 0..len {
+            if taken[ix] {
+                continue;
+            }
+            taken[ix] = true;
+            order.push(ix);
+            let Some(group) = self.tabs[ix].group else {
+                continue;
+            };
+            for other in 0..len {
+                if !taken[other] && self.tabs[other].group == Some(group) {
+                    taken[other] = true;
+                    order.push(other);
+                }
+            }
+        }
+        if order.iter().copied().eq(0..len) {
+            return;
+        }
+        let mut slots: Vec<Option<Tab>> = self.tabs.drain(..).map(Some).collect();
+        self.tabs = order
+            .iter()
+            .filter_map(|ix| slots.get_mut(*ix).and_then(Option::take))
+            .collect();
+        if let Some(id) = shown {
+            self.active = self
+                .tabs
+                .iter()
+                .position(|tab| tab.id == id)
+                .unwrap_or(self.active.min(self.tabs.len().saturating_sub(1)));
+        }
+    }
+
+    /// The invariants of this module, as a runtime check (design §2). Called at the end of
+    /// `ZenApp::run_command` and of the workspace restore, so a UI path that breaks one is caught in
+    /// the suite that exercised it rather than in the field.
+    pub fn debug_assert_invariants(&self) {
+        for group in &self.groups {
+            let members = self.members(group.id);
+            debug_assert!(
+                !members.is_empty(),
+                "group {:?} ({}) has no members (invariant 2)",
+                group.id,
+                group.label()
+            );
+            let contiguous = members.windows(2).all(|pair| pair[1] == pair[0] + 1);
+            debug_assert!(
+                contiguous,
+                "group {:?} ({}) is not one run: {members:?} (invariant 1)",
+                group.id,
+                group.label()
+            );
+        }
+        for tab in &self.tabs {
+            if let Some(id) = tab.group {
+                debug_assert!(
+                    self.group(id).is_some(),
+                    "tab {:?} names the dead group {id:?} (invariant 2)",
+                    tab.id
+                );
+            }
+        }
+        for id in &self.tab_sel {
+            debug_assert!(
+                self.tabs.iter().any(|tab| tab.id == *id),
+                "tab_sel holds the dead tab {id:?} (invariant 3)"
+            );
+        }
+        debug_assert!(
+            self.active < self.tabs.len() || self.tabs.is_empty(),
+            "active {} points off a strip of {} (invariant 4)",
+            self.active,
+            self.tabs.len()
+        );
+    }
+
+    /// Keep only the ids of tabs this pane actually has, in strip order — the resolution every
+    /// id-carrying command runs first, so a tab closed between the click and the apply is ignored
+    /// instead of shifting a later index (design §6).
+    #[must_use]
+    fn resolve(&self, ids: &[TabId]) -> Vec<TabId> {
+        self.tabs
+            .iter()
+            .filter(|tab| ids.contains(&tab.id))
+            .map(|tab| tab.id)
+            .collect()
+    }
+}
+
 /// The page size a fresh tab asks the engine for, until the shell applies `Limits`
 /// (`Limits::dir_page_default` is the same 200 Go used; the value is passed in by the caller).
 pub const DEFAULT_PAGE_SIZE: usize = 200;
@@ -668,6 +1165,8 @@ pub struct AppModel {
     pub stale: BTreeSet<TabId>,
     /// Tab-id allocator (see [`AppModel::next_tab_id`]).
     next_tab: u64,
+    /// Tab-group-id allocator (see [`AppModel::next_group_id`]).
+    next_group: u64,
 }
 
 impl Default for AppModel {
@@ -681,6 +1180,7 @@ impl Default for AppModel {
             log_panel: false,
             stale: BTreeSet::new(),
             next_tab: 1,
+            next_group: 1,
         }
     }
 }
@@ -829,6 +1329,31 @@ impl AppModel {
         let id = TabId(self.next_tab);
         self.next_tab += 1;
         id
+    }
+
+    /// A fresh tab-group identity. `restore` re-uses the ids a session was saved with, so this also has
+    /// to be **bumped past** them (`ZenApp::apply_workspace`) or the next `New Tab Group` would mint an
+    /// id that is already on the strip.
+    #[must_use]
+    pub fn next_group_id(&mut self) -> GroupId {
+        let id = GroupId(self.next_group);
+        self.next_group += 1;
+        id
+    }
+
+    /// Adopt a group id read back from a session: same number, and the allocator moves past it.
+    ///
+    /// Restoring must not re-mint, because a restore that changed its own ids would come out `!=` the
+    /// bytes it read, and [`Autosave`](zenman_core::services::workspaces::Autosave) compares the session
+    /// by value — every start would dirty the session file.
+    pub fn adopt_group_id(&mut self, raw: &str) -> GroupId {
+        match GroupId::from_store(raw) {
+            Some(id) => {
+                self.next_group = self.next_group.max(id.0 + 1);
+                id
+            }
+            None => self.next_group_id(),
+        }
     }
 
     /// The pane slots the current grid shows.

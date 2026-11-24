@@ -476,6 +476,9 @@ fn pane_from(tabs: Vec<LegacyTabState>, active: &str) -> PaneSession {
             name: t.name,
             // `group: ""` is "no group" — proven by `tests/golden/legacy-config-real.json`.
             group: GroupColor::parse_go(&t.group),
+            // No Go counterpart: Go had the letter and nothing else, so the groups the port mints from
+            // those letters on restore are named by their colour and expanded.
+            group_id: None,
             view: crate::store::config::ViewMode::default(),
         })
         .collect();
@@ -486,6 +489,7 @@ fn pane_from(tabs: Vec<LegacyTabState>, active: &str) -> PaneSession {
     PaneSession {
         tabs,
         active: index,
+        groups: Vec::new(),
     }
 }
 

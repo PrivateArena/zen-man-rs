@@ -75,6 +75,14 @@ pub struct Tokens {
     pub group_yellow: Color32,
     /// Group E (`#8b5cf6`).
     pub group_purple: Color32,
+    /// Group `F` (orange; the port's own letter, no Go value to be faithful to).
+    pub group_orange: Color32,
+    /// Group `G` (cyan).
+    pub group_cyan: Color32,
+    /// Group `H` (pink).
+    pub group_pink: Color32,
+    /// Group `I` (teal).
+    pub group_teal: Color32,
     // ---- geometry (§2.3 px table) ---------------------------------------------------------------
     /// File row height: 40.
     pub row_height: f32,
@@ -344,6 +352,10 @@ impl Tokens {
             group_green: Color32::from_rgb(0x10, 0xb9, 0x81),
             group_yellow: Color32::from_rgb(0xfb, 0xbf, 0x24),
             group_purple: Color32::from_rgb(0x8b, 0x5c, 0xf6),
+            group_orange: Color32::from_rgb(0xf9, 0x73, 0x16),
+            group_cyan: Color32::from_rgb(0x06, 0xb6, 0xd4),
+            group_pink: Color32::from_rgb(0xec, 0x48, 0x99),
+            group_teal: Color32::from_rgb(0x14, 0xb8, 0xa6),
             row_height: 40.0,
             tab_bar_height: 34.0,
             toolbar_height: 38.0,
@@ -477,6 +489,10 @@ impl Tokens {
             group_green: Color32::from_rgb(0x0d, 0x94, 0x67),
             group_yellow: Color32::from_rgb(0xd6, 0x9c, 0x12),
             group_purple: Color32::from_rgb(0x6f, 0x44, 0xd3),
+            group_orange: Color32::from_rgb(0xc2, 0x60, 0x0b),
+            group_cyan: Color32::from_rgb(0x0e, 0x74, 0x90),
+            group_pink: Color32::from_rgb(0xbe, 0x18, 0x5d),
+            group_teal: Color32::from_rgb(0x0f, 0x76, 0x6e),
             ..Self::dark()
         }
     }
@@ -492,6 +508,10 @@ impl Tokens {
             GroupColor::C => self.group_green,
             GroupColor::D => self.group_yellow,
             GroupColor::E => self.group_purple,
+            GroupColor::F => self.group_orange,
+            GroupColor::G => self.group_cyan,
+            GroupColor::H => self.group_pink,
+            GroupColor::I => self.group_teal,
         }
     }
 
@@ -703,8 +723,17 @@ mod tests {
         assert_eq!(t.drawer_row_corner, 6);
     }
 
+    /// `Color32` is not `Ord`, so the palette's distinctness is a pairwise walk.
+    fn distinct_group_colours(t: &Tokens) -> bool {
+        let paint: Vec<Color32> = GroupColor::ALL.iter().map(|c| t.group_color(*c)).collect();
+        paint
+            .iter()
+            .enumerate()
+            .all(|(ix, colour)| paint[ix + 1..].iter().all(|other| other != colour))
+    }
+
     #[test]
-    fn group_colours_are_the_five_hex_values() {
+    fn group_colours_are_the_nine_palette_values() {
         let t = Tokens::dark();
         assert_eq!(
             t.group_color(GroupColor::A),
@@ -725,6 +754,34 @@ mod tests {
         assert_eq!(
             t.group_color(GroupColor::E),
             Color32::from_rgb(0x8b, 0x5c, 0xf6)
+        );
+        // The four letters the port added: no Go value exists, so the palette *is* the contract.
+        assert_eq!(
+            t.group_color(GroupColor::F),
+            Color32::from_rgb(0xf9, 0x73, 0x16)
+        );
+        assert_eq!(
+            t.group_color(GroupColor::G),
+            Color32::from_rgb(0x06, 0xb6, 0xd4)
+        );
+        assert_eq!(
+            t.group_color(GroupColor::H),
+            Color32::from_rgb(0xec, 0x48, 0x99)
+        );
+        assert_eq!(
+            t.group_color(GroupColor::I),
+            Color32::from_rgb(0x14, 0xb8, 0xa6)
+        );
+        assert!(distinct_group_colours(&t), "nine distinct colours");
+        let light = Tokens::light();
+        assert_ne!(
+            light.group_color(GroupColor::A),
+            t.group_color(GroupColor::A),
+            "and a light-mode ramp of its own"
+        );
+        assert!(
+            distinct_group_colours(&light),
+            "nine distinct light colours"
         );
     }
 

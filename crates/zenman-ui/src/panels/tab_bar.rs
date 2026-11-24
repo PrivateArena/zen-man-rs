@@ -6,12 +6,17 @@
 //! pane). The plan's Done-when — "40 tabs: `fit` puts the overflow list and the `+` button in the
 //! strip at all widths, `+` stays inside the pane bounds" — is [`tests::forty_tabs_never_lose_the_new_tab_button`].
 
+//!
+//! Group *runs* used to be computed here (`runs`/`GroupRun`); they were never called, never tested,
+//! and keyed on the per-tab colour, which is no longer identity. `items()` of the tab-group step is what
+//! walks the strip, and it is tested.
+
 use craft_ui::tabs::TabFit;
 use egui::{Id, Rect, Ui};
 
 use zenman_core::store::config::GroupColor;
 
-use crate::state::Tab;
+use crate::state::{Tab, TabGroup};
 use crate::theme::Tokens;
 
 /// What the strip asked for.
@@ -31,19 +36,6 @@ pub enum TabCommand {
     ToggleOverflow,
 }
 
-/// A run of consecutive tabs sharing one group colour (plan row's `GroupRun`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct GroupRun {
-    /// The group.
-    pub color: GroupColor,
-    /// First tab index in the run.
-    pub start: usize,
-    /// One past the last.
-    pub end: usize,
-    /// Whether the run is collapsed (step 10's group toggle).
-    pub collapsed: bool,
-}
-
 /// The strip's input (plan row's `TabBarModel`).
 pub struct TabBarModel<'a> {
     /// The pane's tabs, left to right.
@@ -52,33 +44,19 @@ pub struct TabBarModel<'a> {
     pub active: usize,
     /// The overflow list is open.
     pub overflow_open: bool,
+    /// The pane's tab groups, which is where a tab's colour comes from now that `Tab::group` names a
+    /// group rather than a colour (design §2).
+    pub groups: &'a [TabGroup],
 }
 
 impl TabBarModel<'_> {
-    /// The group runs, in strip order (the same grouping Go painted as a coloured left edge).
+    /// The colour a tab's accent bar takes: its group's, or none.
     #[must_use]
-    pub fn group_runs(&self) -> Vec<GroupRun> {
-        runs(self.tabs)
+    pub fn tab_color(&self, tab: &Tab) -> Option<GroupColor> {
+        tab.group
+            .and_then(|id| self.groups.iter().find(|group| group.id == id))
+            .map(|group| group.color)
     }
-}
-
-/// The group runs of a tab list.
-#[must_use]
-pub fn runs(tabs: &[Tab]) -> Vec<GroupRun> {
-    let mut out: Vec<GroupRun> = Vec::new();
-    for (ix, tab) in tabs.iter().enumerate() {
-        let Some(color) = tab.group else { continue };
-        match out.last_mut() {
-            Some(run) if run.color == color && run.end == ix => run.end = ix + 1,
-            _ => out.push(GroupRun {
-                color,
-                start: ix,
-                end: ix + 1,
-                collapsed: false,
-            }),
-        }
-    }
-    out
 }
 
 /// Draw the strip into the rect its row's owner reserved for it.
@@ -159,7 +137,7 @@ pub fn show(
             tokens.hairline(),
             egui::StrokeKind::Inside,
         );
-        if let Some(color) = tab.group {
+        if let Some(color) = m.tab_color(tab) {
             ui.painter().rect_filled(
                 Rect::from_min_size(
                     tab_rect.min,

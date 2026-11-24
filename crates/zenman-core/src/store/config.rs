@@ -213,22 +213,50 @@ pub enum ViewMode {
 /// A named tab group. Go stored the group letter *and* a hex colour; the port keeps the letter and
 /// derives the colour, because a user re-picking a colour for a group in the Go app left the two
 /// stores able to disagree (the migration table calls `color` a **real data loss to record**).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+///
+/// The letter is the on-disk spelling (`#[serde(rename_all = "UPPERCASE")]` is Go's `group` key, so it
+/// is **not** cosmetic and must not be renamed to a colour word), and it is only ever an accent for
+/// the port: group *identity* is [`TabSession::group_id`] / [`TabGroupSession::id`]. `A..E` are Go's
+/// alphabet; `F..I` are the port's, added for the tab-group palette (`docs/tab-groups-design.md` §3) and
+/// unknown to Go, which reads them as no group.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum GroupColor {
-    /// Group `A`.
+    /// Group `A` — red, the one colour with a captured Go hex.
+    #[default]
     A,
-    /// Group `B`.
+    /// Group `B` — blue.
     B,
-    /// Group `C`.
+    /// Group `C` — green.
     C,
-    /// Group `D`.
+    /// Group `D` — yellow.
     D,
-    /// Group `E`.
+    /// Group `E` — purple.
     E,
+    /// Group `F` — orange (no Go counterpart).
+    F,
+    /// Group `G` — cyan (no Go counterpart).
+    G,
+    /// Group `H` — pink (no Go counterpart).
+    H,
+    /// Group `I` — teal (no Go counterpart).
+    I,
 }
 
 impl GroupColor {
+    /// Every colour a tab group can be painted with, in menu order.
+    pub const ALL: [Self; 9] = [
+        Self::A,
+        Self::B,
+        Self::C,
+        Self::D,
+        Self::E,
+        Self::F,
+        Self::G,
+        Self::H,
+        Self::I,
+    ];
+
     /// The colour this group paints with.
     ///
     /// Only [`GroupColor::A`] has a captured value: `docs/contracts.md` and `tests/golden/config.json`
@@ -239,24 +267,79 @@ impl GroupColor {
     pub const fn color(self) -> Option<&'static str> {
         match self {
             Self::A => Some("#ff4a4a"),
-            Self::B | Self::C | Self::D | Self::E => None,
+            Self::B | Self::C | Self::D | Self::E | Self::F | Self::G | Self::H | Self::I => None,
         }
     }
 
-    /// Parse a Go `group` value: `""` (or whitespace) is *no group* — `legacy-config-real.json` proves
-    /// the Go app wrote `""`, not an absent key.
+    /// The colour's own word, for a menu row that offers it (`"Red"`).
     #[must_use]
-    pub fn parse_go(raw: &str) -> Option<Self> {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::A => "Red",
+            Self::B => "Blue",
+            Self::C => "Green",
+            Self::D => "Yellow",
+            Self::E => "Purple",
+            Self::F => "Orange",
+            Self::G => "Cyan",
+            Self::H => "Pink",
+            Self::I => "Teal",
+        }
+    }
+
+    /// The colour's menu row label (`"Red group"`) — the spelling Go's tab menu used for its own group
+    /// rows, kept so the port's menu reads like the reference.
+    #[must_use]
+    pub fn label(self) -> String {
+        format!("{} group", self.name())
+    }
+
+    /// Read one group letter, in either case. `None` for empty text and for anything that is not a
+    /// letter of the alphabet — which is what makes an unknown letter a *no colour* rather than a
+    /// broken config file (see [`deserialize_group_color`]).
+    #[must_use]
+    pub fn parse_letter(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_uppercase().as_str() {
-            "" => None,
             "A" => Some(Self::A),
             "B" => Some(Self::B),
             "C" => Some(Self::C),
             "D" => Some(Self::D),
             "E" => Some(Self::E),
+            "F" => Some(Self::F),
+            "G" => Some(Self::G),
+            "H" => Some(Self::H),
+            "I" => Some(Self::I),
             _ => None,
         }
     }
+
+    /// Parse a Go `group` value: `""` (or whitespace) is *no group* — `legacy-config-real.json` proves
+    /// the Go app wrote `""`, not an absent key. Only Go's own alphabet `a..e` parses: `F..I` are the
+    /// port's letters, so a Go file that somehow carries one is not data this app has to honour.
+    #[must_use]
+    pub fn parse_go(raw: &str) -> Option<Self> {
+        let colour = Self::parse_letter(raw)?;
+        if matches!(colour, Self::A | Self::B | Self::C | Self::D | Self::E) {
+            Some(colour)
+        } else {
+            None
+        }
+    }
+}
+
+/// Read an optional group colour without ever failing the file.
+///
+/// `#[serde(rename_all = "UPPERCASE")]` alone would make a lowercase `"a"` — which is exactly what the
+/// Go app wrote (`store::legacy::LegacyTabState::group`) — a `Deserialize` **error**, and an error here
+/// is not a lost colour: it takes the whole `TabSession`, and with it the whole workspace, down with
+/// it. So a value that is not a port letter is `None`, silently, the way an unknown key already is.
+pub fn deserialize_group_color<'de, D>(deserializer: D) -> Result<Option<GroupColor>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?
+        .as_deref()
+        .and_then(GroupColor::parse_letter))
 }
 
 /// One open tab of a session.
@@ -271,10 +354,40 @@ pub struct TabSession {
     pub path: String,
     /// Tab title.
     pub name: String,
-    /// Colour group, if any.
+    /// The colour of this tab's group, if any. Kept because it is Go's spelling of group membership
+    /// (`docs/contracts.md` §2.3) and because a session whose `groups` rows were lost still restores
+    /// its accents — and, via [`TabGroupSession`]'s absence, its groups.
+    #[serde(default, deserialize_with = "deserialize_group_color")]
     pub group: Option<GroupColor>,
+    /// Which group this tab belongs to, as the opaque [`TabGroupSession::id`] of the row. `None` is
+    /// "no group", and also "every config written before tab groups" — which is why [`Self::group`]
+    /// stays authoritative for anything that has no row to look a letter up in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<String>,
     /// View mode. No Go counterpart (migration table), so it always defaults to `List`.
     pub view: ViewMode,
+}
+
+/// One tab group of one pane (`docs/tab-groups-design.md` §4).
+///
+/// Per pane rather than per workspace because `TabSession.group` is per pane too: the same letter in
+/// two panes is two groups there, and a group whose tabs are all closed has no reason to live on.
+///
+/// `name` is empty for an **unnamed** group, whose chip shows [`GroupColor::name`]; storing the colour's
+/// word would leave an unnamed group called "Red group" forever after the user re-coloured it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct TabGroupSession {
+    /// The group's id, matched against [`TabSession::group_id`]. Opaque and per pane, like a tab id.
+    pub id: String,
+    /// The label on the chip; empty means "name it after the colour".
+    pub name: String,
+    /// The chip's colour. `None` (or a letter Go wrote in lowercase) is repaired to the first free
+    /// colour on restore rather than dropped.
+    #[serde(default, deserialize_with = "deserialize_group_color")]
+    pub group: Option<GroupColor>,
+    /// Whether the run is folded to just the chip.
+    pub collapsed: bool,
 }
 
 /// A pane's tab strip.
@@ -286,6 +399,10 @@ pub struct PaneSession {
     /// Index of the selected tab; `usize::MAX` means "none" (Go's `left_active: ""`), which the UI
     /// clamps rather than trusting.
     pub active: usize,
+    /// This pane's tab groups. Not `skip_serializing_if`-free by accident: an empty list is written
+    /// nowhere, so a session with no groups serialises byte-for-byte as it did before tab groups.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<TabGroupSession>,
 }
 
 /// A named workspace: the whole window state of one task.
@@ -860,6 +977,7 @@ mod tests {
             path: "/tmp".into(),
             name: "tmp".into(),
             group: Some(GroupColor::A),
+            group_id: None,
             view: ViewMode::List,
         });
         tabs.active = 0;
@@ -1042,5 +1160,97 @@ mod tests {
         assert_eq!(GroupColor::parse_go(""), None);
         assert_eq!(GroupColor::parse_go("a"), Some(GroupColor::A));
         assert_eq!(GroupColor::parse_go("z"), None);
+    }
+
+    #[test]
+    fn the_alphabet_went_past_go_and_the_disk_still_holds_letters() {
+        assert_eq!(GroupColor::ALL.len(), 9, "red..teal");
+        assert_eq!(
+            GroupColor::ALL.last().copied(),
+            Some(GroupColor::I),
+            "the menu walks ALL, so its order is the palette order"
+        );
+        assert_eq!(GroupColor::F.name(), "Orange");
+        assert_eq!(GroupColor::F.label(), "Orange group");
+        // A..E are Go's; F..I are the port's, and Go must not be able to produce them.
+        assert_eq!(GroupColor::parse_go("f"), None, "no such group in Go");
+        assert_eq!(GroupColor::parse_letter("i"), Some(GroupColor::I));
+        // The on-disk spelling stays the letter, not the colour word — Go's `group` key reads it.
+        let json = serde_json::to_value(GroupColor::F).expect("a letter");
+        assert_eq!(json, serde_json::json!("F"));
+        assert_eq!(
+            GroupColor::color(GroupColor::F),
+            None,
+            "the port's letters have no captured Go hex to lie with"
+        );
+    }
+
+    #[test]
+    fn a_foreign_group_letter_costs_the_colour_and_not_the_session() {
+        // The bug this guards: `rename_all = "UPPERCASE"` alone makes Go's lowercase `"a"` a
+        // Deserialize *error*, and an error here would drop the whole workspace at load.
+        let raw = r#"{"workspaces":{"default":{"panes":{"left":{"tabs":[
+             {"id":"t1","path":"/tmp","name":"tmp","group":"a"},
+             {"id":"t2","path":"/var","name":"var","group":"Z"},
+             {"id":"t3","path":"/opt","name":"opt","group":null}]}}}}}"#;
+        let cfg: ZenConfig = serde_json::from_str(raw).expect("the file still reads");
+        let tabs = &cfg.workspaces["default"].panes[&PaneSlot::Left].tabs;
+        assert_eq!(tabs.len(), 3, "no tab was lost to a bad letter");
+        assert_eq!(tabs[0].group, Some(GroupColor::A), "Go's lowercase letter");
+        assert_eq!(tabs[1].group, None, "an unknown letter is no colour");
+        assert_eq!(tabs[2].group, None, "and so is an explicit null");
+        assert_eq!(tabs[1].group_id, None, "and nothing was invented for it");
+    }
+
+    #[test]
+    fn a_group_round_trips_and_no_group_costs_no_bytes() {
+        let mut pane = PaneSession::default();
+        pane.tabs.push(TabSession {
+            id: "t1".into(),
+            path: "/tmp".into(),
+            name: "tmp".into(),
+            group: Some(GroupColor::F),
+            group_id: Some("g1".into()),
+            view: ViewMode::List,
+        });
+        pane.active = 0;
+        pane.groups.push(TabGroupSession {
+            id: "g1".into(),
+            name: String::new(),
+            group: Some(GroupColor::F),
+            collapsed: true,
+        });
+        let value = serde_json::to_value(&pane).expect("a pane writes");
+        assert_eq!(value["groups"][0]["collapsed"], serde_json::json!(true));
+        assert_eq!(value["groups"][0]["group"], serde_json::json!("F"));
+        assert_eq!(
+            value["tabs"][0]["groupId"],
+            serde_json::json!("g1"),
+            "camelCase"
+        );
+        let back: PaneSession = serde_json::from_value(value).expect("and reads");
+        assert_eq!(back, pane, "byte-for-byte through the file format");
+
+        // An empty pane list and an ungrouped tab write **nothing extra**, so a session that never had
+        // a group serialises exactly as it did before the feature existed.
+        let bare = PaneSession {
+            tabs: vec![TabSession {
+                id: "t1".into(),
+                path: "/tmp".into(),
+                name: "tmp".into(),
+                group: None,
+                group_id: None,
+                view: ViewMode::List,
+            }],
+            active: 0,
+            groups: Vec::new(),
+        };
+        let value = serde_json::to_value(&bare).expect("a pane writes");
+        assert!(value.get("groups").is_none(), "no groups key: {value:#?}");
+        assert!(value["tabs"][0].get("groupId").is_none(), "no groupId key");
+        // And the inverse: a file written before tab groups still reads.
+        let old: PaneSession =
+            serde_json::from_str(r#"{"tabs":[],"active":18446744073709551615}"#).expect("old file");
+        assert!(old.groups.is_empty());
     }
 }

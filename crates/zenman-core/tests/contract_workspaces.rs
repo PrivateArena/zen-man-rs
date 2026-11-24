@@ -99,6 +99,7 @@ fn tab(id: &str, path: &str) -> TabSession {
         path: path.to_string(),
         name: "Fixtures".to_string(),
         group: None,
+        group_id: None,
         view: zenman_core::store::config::ViewMode::List,
     }
 }
@@ -110,6 +111,7 @@ fn workspace(path: &str) -> Workspace {
             PaneSession {
                 tabs: vec![tab("t1", path)],
                 active: 0,
+                groups: Vec::new(),
             },
         )]),
         active: PaneSlot::Left,
