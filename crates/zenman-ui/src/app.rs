@@ -547,9 +547,14 @@ impl ZenApp {
                 });
             }
             PaneCommand::TabContext { id, at } => {
-                // Recorded, and nothing else: the tab menu acts on the tab under the cursor, so the
-                // right-click must not switch to it — Go's `showTabContextMenu` (`tabs.js:351-386`)
-                // never called `switchTab`, and neither does this.
+                // The selection is folded **before** the request is recorded, because the menu is adopted
+                // next frame and its rows are enabled off the selection: without the fold, a
+                // `New Tab Group` greyed (or lit) for a stale set of tabs would fire on that set
+                // (`Pane::right_click_selection`). What the right-click does *not* do is switch tabs:
+                // Go's `showTabContextMenu` (`tabs.js:351-386`) never called `switchTab`.
+                if let Some(pane) = self.model.panes.get_mut(&slot) {
+                    pane.right_click_selection(id);
+                }
                 self.context_request = Some(MenuRequest {
                     slot,
                     subject: MenuSubject::Tab { id },
@@ -683,6 +688,13 @@ impl ZenApp {
                     }
                 }
             }
+        }
+        // Whatever the command did, the tab strip's invariants (`docs/tab-groups-design.md` §2) are the
+        // pane's business, and this is the one point every command passes through: a verb that folds a
+        // run it just emptied, or closes a tab out from under the selection, fails here in the suite that
+        // exercised it instead of painting something impossible later.
+        if let Some(pane) = self.model.panes.get(&slot) {
+            pane.debug_assert_invariants();
         }
     }
 

@@ -851,6 +851,25 @@ impl Pane {
         self.active_tab().and_then(|tab| tab.group)
     }
 
+    /// The selection a right-click leaves behind (design §6): **inside** the multi-selection it changes
+    /// nothing — that is the whole point of selecting three tabs and right-clicking one of them — and
+    /// **outside** it collapses the set onto the clicked tab, because a menu about that tab must not act
+    /// on three tabs the pointer never touched.
+    ///
+    /// It says nothing about which tab is *shown*: Go's `showTabContextMenu` never called `switchTab`, and
+    /// a right-click that navigated would be a surprise. The two calls are separate for that reason.
+    pub fn right_click_selection(&mut self, id: TabId) -> bool {
+        if !self.tabs.iter().any(|tab| tab.id == id) {
+            return false;
+        }
+        if self.tab_sel.contains(&id) {
+            return true;
+        }
+        self.tab_sel = BTreeSet::from([id]);
+        self.tab_sel_anchor = Some(id);
+        true
+    }
+
     /// Every tab of the pane, in strip order — the multi-selection resolved.
     #[must_use]
     pub fn selected_tabs(&self) -> Vec<TabId> {
@@ -1987,6 +2006,33 @@ mod groups {
             "an id this pane does not have is refused, not clamped"
         );
         assert!(!pane.select_tab(TabId(99), TabSelKind::Replace));
+    }
+
+    #[test]
+    fn a_right_click_folds_the_selection_onto_what_it_hit() {
+        // The rule the tab menu's enablement is read off (`docs/tab-groups-design.md` §6): inside the
+        // selection a right-click is a question about the whole set, outside it a question about one tab.
+        let (mut pane, ids) = strip(&["a", "b", "c", "d"]);
+        pane.select_tab(ids[1], TabSelKind::Replace);
+        pane.select_tab(ids[2], TabSelKind::Toggle);
+        assert_eq!(pane.selected_tabs(), vec![ids[1], ids[2]]);
+        assert!(pane.right_click_selection(ids[1]), "inside the set");
+        assert_eq!(
+            pane.selected_tabs(),
+            vec![ids[1], ids[2]],
+            "so the set the menu will act on survives"
+        );
+        assert!(pane.right_click_selection(ids[3]), "outside the set");
+        assert_eq!(
+            pane.selected_tabs(),
+            vec![ids[3]],
+            "and a tab the pointer never touched leaves it"
+        );
+        assert!(
+            !pane.right_click_selection(TabId(99)),
+            "a tab that is gone is not a target"
+        );
+        assert_eq!(pane.selected_tabs(), vec![ids[3]], "and changes nothing");
     }
 
     #[test]
