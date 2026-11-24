@@ -169,7 +169,13 @@ exhaustive 128-row table walks, and multiplying it by four would prove nothing a
 tab menu's own two facts get their own cases. New
 `MenuTarget::TabGroup { id }` → `group_menu()`: Rename / Collapse-Expand / Select all in group / colour
 rows / Ungroup / Close tabs in group (danger). The tab menu's six `MenuAction::Placeholder` rows become
-real: `New Tab Group` (≥ 2 selected), `Add to group ▸` the nine colours, `Remove from group`.
+real. Their wording is the reference's wherever it has a string for the row (`Red Group`, `Remove Group` —
+`frontend/js/tabs.js:354,381`). Two deliberate differences from it: the reference has **no** create row at
+all (a colour row both creates and moves), and our requirement names one, so `New Tab Group` is ours —
+enabled for **one** right-clicked tab as much as for a selection, because one tab is how a group begins, and
+naming its tab count over a selection (`New Tab Group with 3 Tabs`) so the row cannot promise three and do
+one. And the reference paints a colour dot on each of its five rows with inline CSS; ours cannot without
+nine new atlas entries, so the rows carry their colour's name as the label.
 `MenuAction::Placeholder` and `fn never` die; `tests/menus.rs`'s placeholder test becomes an enablement
 test.
 
@@ -197,7 +203,14 @@ pub struct TabGroupHover { slot: PaneSlot, id: GroupId, chip: Rect, since: f64, 
 - clicking an entry = `Select { id, Replace }` and **no** expand: the flyout is how you work inside a
   collapsed group, and invariant 4 keeps that tab painted.
 
-Drawn as an `egui::Area` (`Order::Foreground`) + `Frame::popup`, keyed by `GroupId`.
+Drawn as an `egui::Popup::menu` anchored to the chip rect, keyed by `(GroupId, chip)`.
+
+It is **not** the same-frame close the first plan assumed, and cannot be: a `Popup` takes its anchor rect on
+the frame it opens, and the strip only reports a hovered chip after that frame is laid out — so the flyout
+lives one extra frame after the pointer leaves (`TabGroupHover::bridge`), and closes on the frame after
+that. The bridge is also what lets the pointer travel the gap between chip and list without the list
+disappearing under it. The `popup` rect is read back off the response the popup builds, which is why the
+keep-alive test is `chip ∪ popup` and not the chip alone.
 
 ## 8. Drag and drop (feature 5)
 
@@ -211,9 +224,10 @@ on a chip → append to that group; outside any group's territory → `Pane::lea
 breaks a run re-compacts it (invariant 1) instead of silently releasing membership — leaving a group is
 only ever an explicit drop outside one.
 
-`DropTarget::End` — the strip's own floor past the last item — is the one landing outside an item that
-means something: it is how the end of the strip is reached, and it releases the tab from its group.
-Anywhere else off-item cancels.
+`DropTarget::End` — the strip's own floor past the last item — is the one landing outside an item that means
+something: it is how the end of the strip is reached, and it releases the tab from its group. Anywhere else
+off-item cancels, and a cancelled drag leaves the strip exactly as it was (asserted:
+`drop_on_the_floor_moves_the_tab_and_releases_it`, `a_cancelled_drag_moves_nothing`).
 
 Cross-pane tab drag is out of scope.
 
