@@ -193,7 +193,12 @@ pub fn show(
                     })
                     .size(tokens.font_size),
             )
-            .truncate(),
+            .truncate()
+            // Chrome text, never content text. A *selectable* label takes `Sense::click_and_drag()`,
+            // it is allocated after the tab's own rect (so it is the front-most hit), and it paints
+            // the selection highlight over the title — which is what left only the tab's four edges
+            // clickable: the title swallowed the click the tab was waiting for.
+            .selectable(false),
         );
         let close_response = ui
             .interact(close, id.with(("tab-close", ix)), egui::Sense::click())

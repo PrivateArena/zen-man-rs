@@ -1022,3 +1022,38 @@ fn a_second_tab_lists_independently_and_the_strip_names_it() {
         "two tabs, two listings, one strip"
     );
 }
+
+/// The centre of a tab's title is where a user aims, and it is the one place the tab *used* not to
+/// answer: a selectable title label takes `Sense::click_and_drag()` and is allocated on top of the
+/// tab's own rect, so it swallowed the click (and painted a selection highlight) — only the four
+/// edges of the tab still worked.
+#[test]
+fn clicking_the_middle_of_a_tab_title_shows_that_tab() {
+    let mut harness = pane_harness("tab-centre");
+    // A second tab over a *different* directory, so the two titles are distinguishable and the shown
+    // one is the new one: the click has to travel backwards, onto the first tab's title.
+    let docs = common::listing_tree("tab-centre").join("docs");
+    harness
+        .state_mut()
+        .open_tab(PaneSlot::Left, fixture_path(&docs));
+    settle(&mut harness);
+    assert_eq!(
+        harness.state().model.panes[&PaneSlot::Left].active,
+        1,
+        "the new tab is the shown one to begin with"
+    );
+    // The top-most node the word names is the tab's title: the address strip paints a crumb for the
+    // same directory a row below the strip, so nothing else shares the label up there.
+    let title = harness
+        .query_all_by_label("listing")
+        .map(|node| node.rect())
+        .min_by(|a, b| a.min.y.total_cmp(&b.min.y))
+        .expect("the first tab's title is painted on the strip");
+    click_at(&mut harness, title.center());
+    settle(&mut harness);
+    assert_eq!(
+        harness.state().model.panes[&PaneSlot::Left].active,
+        0,
+        "a click on the title's centre showed the tab behind it"
+    );
+}

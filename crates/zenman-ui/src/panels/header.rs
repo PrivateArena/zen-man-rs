@@ -26,7 +26,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use egui::{
-    Color32, CornerRadius, Frame, Margin, Rect, RichText, ScrollArea, Stroke, Ui, pos2, vec2,
+    Color32, CornerRadius, Frame, Label, Margin, Rect, RichText, ScrollArea, Stroke, Ui, pos2, vec2,
 };
 
 use zenman_core::error::CoreError;
@@ -414,10 +414,15 @@ pub(crate) fn chip(ui: &mut Ui, tokens: &Tokens, text: &str, colour: Color32) {
         .corner_radius(CornerRadius::same(tokens.corner_radius / 2))
         .inner_margin(Margin::same(tokens.chip_pad as i8))
         .show(ui, |ui| {
-            ui.label(
-                RichText::new(text)
-                    .color(colour)
-                    .size(tokens.font_size - 1.0),
+            ui.add(
+                Label::new(
+                    RichText::new(text)
+                        .color(colour)
+                        .size(tokens.font_size - 1.0),
+                )
+                // Chrome text: a selectable pill would highlight when clicked and take the click off
+                // whatever the pill is reporting on (`tab_bar`'s title says the rest).
+                .selectable(false),
             );
         });
 }

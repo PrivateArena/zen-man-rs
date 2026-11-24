@@ -129,7 +129,10 @@ pub fn show(ui: &mut Ui, m: &StatusModel<'_>, tokens: &Tokens) {
                 .color(tokens.text_muted)
                 .size(tokens.font_size - 1.0),
         )
-        .truncate(),
+        .truncate()
+        // Every label in this bar is chrome: reporting on the frame, not holding text to copy. A
+        // selectable one would swallow the click and paint a highlight over the count instead.
+        .selectable(false),
     );
     let label_end = note_min;
     if count > 0 {
@@ -161,7 +164,8 @@ pub fn show(ui: &mut Ui, m: &StatusModel<'_>, tokens: &Tokens) {
                         .color(tokens.text_muted)
                         .size(tokens.font_size - 2.0),
                 )
-                .truncate(),
+                .truncate()
+                .selectable(false),
             );
             let _ = response.on_hover_text(note.clone());
         }
@@ -183,7 +187,8 @@ pub fn show(ui: &mut Ui, m: &StatusModel<'_>, tokens: &Tokens) {
                 .color(tokens.text_muted)
                 .size(tokens.font_size - 1.0),
         )
-        .truncate(),
+        .truncate()
+        .selectable(false),
     );
     // The `Saved` pill, in the corner: the last thing in the bar, and the only thing in it that is
     // drawn as a frame rather than as text.
