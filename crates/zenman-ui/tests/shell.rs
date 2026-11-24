@@ -25,11 +25,13 @@ fn harness() -> Harness<'static, ZenApp> {
 
 /// The one harness shape every test uses: window-sized, SVG loaders installed (the icon registry
 /// needs them exactly as `apps/zenman` installs them), dark theme applied.
+///
+/// The accessibility check is **on**: every control the chrome draws — the workspace button, the
+/// address buttons, each icon in the navigation ribbon — publishes a name, because an icon with no
+/// name is unreachable by keyboard, test or screen reader alike.
 fn shell_harness(app: ZenApp) -> Harness<'static, ZenApp> {
     Harness::builder()
-        // The header's workspace `ComboBox` (step 14b) surfaces `current_text_value` but no accessible
-        // name in this fork — the same omission the fork's own `TextEdit` has, so the same opt-out.
-        .with_accessibility_check(false)
+        .with_accessibility_check(true)
         .with_size(egui::vec2(1440.0, 900.0))
         .with_context_setup(|ctx| {
             egui_extras::install_image_loaders(ctx);
@@ -45,11 +47,32 @@ fn shell_harness(app: ZenApp) -> Harness<'static, ZenApp> {
         )
 }
 
+/// Click the first control of one name. Every pane carries its own navigation ribbon, so a window
+/// verb exists once per pane in a grid — `get_by_label`'s "exactly one" is the wrong demand here.
+fn click_chrome(harness: &mut Harness<'static, ZenApp>, label: &str) {
+    let at = harness
+        .query_all_by_label(label)
+        .map(|node| node.rect().center())
+        .next()
+        .unwrap_or_else(|| panic!("{label:?} is not in the widget tree"));
+    for pressed in [true, false] {
+        harness.input_mut().events.push(egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        });
+    }
+    harness.run();
+}
+
 #[test]
-fn the_header_status_bar_and_pane_placeholder_are_in_the_tree() {
+fn the_chrome_status_bar_and_pane_placeholder_are_in_the_tree() {
     let mut harness = harness();
     harness.run();
-    harness.get_by_label("Workspace:");
+    // One button where Go had `Workspace:` + `New` + `Delete` (`panels/header.rs`).
+    harness.get_by_label("workspace");
+    // The boot line lost its header cell and gained the status bar's middle.
     harness.get_by_label("test boot line");
     // Step 7's placeholder status line is gone: the bar is the real one (`panels/status_bar.rs`),
     // so the assertions are its own words — the selection cell and the pane cell.
@@ -61,24 +84,33 @@ fn the_header_status_bar_and_pane_placeholder_are_in_the_tree() {
 }
 
 #[test]
-fn header_controls_reach_the_widget_tree_and_the_layout_button_reaches_the_state() {
+fn chrome_controls_reach_the_widget_tree_and_the_layout_button_reaches_the_state() {
     let mut harness = harness();
     harness.run();
-    // 14b: the split/quad buttons became the reference's chord-labelled ones (`2-Pane (F3)`,
-    // `4-Pane (F4)`), so the test names them by what the header really prints. There is no
-    // single-pane button: Go's two layout buttons *are* the F3/F4 chords and toggle themselves off.
-    for name in [
-        "2-Pane (F3)",
-        "4-Pane (F4)",
-        "History",
-        "places",
-        "custom actions",
-    ] {
+    // The navigation bar's global group: every one of them an icon with an accessible name, the
+    // chord living in the tooltip rather than the label (`nav_bar.rs`). There is no single-pane
+    // button: Go's two layout buttons *are* the F3/F4 chords and toggle themselves off.
+    for name in ["history", "places", "custom actions", "2-pane", "4-pane"] {
         harness.get_by_label(name);
     }
-    // Clicking the quad button must change the *state*, not just the picture.
-    harness.get_by_label("4-Pane (F4)").click();
+    // Plan **D7**: one chord table, two front ends. The button no longer prints its key, so the
+    // tooltip is what has to agree with the keymap — and it is read out of `KeyMap::hint`.
+    let hint = harness
+        .state()
+        .keys
+        .hint_text(zenman_ui::keymap::Command::QuadLayout);
+    assert_eq!(hint, "F4", "the test must know the real chord");
+    harness.get_by_label("4-pane").hover();
     harness.run();
+    assert!(
+        harness
+            .query_all_by_label_contains(&format!("4-pane ({hint})"))
+            .count()
+            > 0,
+        "the ribbon's tooltip did not carry `KeyMap::hint`'s chord ({hint})"
+    );
+    // Clicking the quad button must change the *state*, not just the picture.
+    click_chrome(&mut harness, "4-pane");
     let app = harness.state();
     assert!(app.model.quad(), "the grid must follow the button");
     assert!(
@@ -88,48 +120,109 @@ fn header_controls_reach_the_widget_tree_and_the_layout_button_reaches_the_state
     assert_eq!(app.model.panes.len(), 4);
     // The same button again is the off-state — plan F3's regression path, driven through the real
     // control that now owns it.
-    harness.get_by_label("4-Pane (F4)").click();
-    harness.run();
+    click_chrome(&mut harness, "4-pane");
     assert!(
         !harness.state().model.quad() && harness.state().model.layout_mode_is_consistent(),
-        "and 4-Pane toggles itself back off"
+        "and 4-pane toggles itself back off"
     );
     assert_eq!(harness.state().model.panes.len(), 1);
-    harness.get_by_label("2-Pane (F3)").click();
-    harness.run();
+    click_chrome(&mut harness, "2-pane");
     assert_eq!(harness.state().model.panes.len(), 2);
-    harness.get_by_label("2-Pane (F3)").click();
-    harness.run();
+    click_chrome(&mut harness, "2-pane");
     assert_eq!(
         harness.state().model.panes.len(),
         1,
-        "and 2-Pane toggles too"
+        "and 2-pane toggles too"
     );
 }
 
 #[test]
-fn drawers_toggle_from_their_header_buttons() {
+fn drawers_toggle_from_their_ribbon_buttons() {
     let mut harness = harness();
     harness.run();
     assert!(!harness.state().model.left_drawer.open);
-    harness.get_by_label("places").click();
-    harness.run();
+    click_chrome(&mut harness, "places");
     assert!(harness.state().model.left_drawer.open);
     // Step 15b: the drawers hold their real content — Go's section titles (uppercase, per
     // `.sidebar-section-title`) and the history panel's Go title.
     harness.get_by_label("PLACES");
-    harness.get_by_label("custom actions").click();
-    harness.run();
+    click_chrome(&mut harness, "custom actions");
     assert!(harness.state().model.right_drawer.open);
     // Go's right drawer is headed by its own `.sidebar-header h2`, not by a section title.
     harness.get_by_label("Custom Actions");
-    harness.get_by_label("History").click();
-    harness.run();
+    click_chrome(&mut harness, "history");
     assert!(harness.state().model.log_panel);
     harness.get_by_label("Action History");
     // The left drawer's header is Go's `Zen-Man` (`index.html:21`) — the product name belongs to the
     // drawer and the window title, not to the global header.
     harness.get_by_label("Zen-Man");
+}
+
+#[test]
+fn a_narrow_pane_folds_its_ribbon_before_it_starves_the_address_bar() {
+    // The ribbon is capped by the address strip's floor, not by a button count: a pane too narrow
+    // for the whole ribbon puts it behind one overflow button instead of eating the trail.
+    let session = common::session("fold");
+    let mut app = ZenApp::new(session, Vec::new());
+    app.set_layout(quad_slots());
+    // With tabs, because the point of the fold is that the chrome gives room back to the panes: a
+    // workspace control that grew with its name used to push the whole strip out of a narrow leaf.
+    for (ix, slot) in quad_slots().into_iter().enumerate() {
+        let id = app.model.next_tab_id();
+        app.model
+            .pane_mut(slot)
+            .tabs
+            .push(Tab::new(id, FsPath::ROOT, format!("leaf {ix}")));
+    }
+    let mut harness = Harness::builder()
+        .with_accessibility_check(true)
+        .with_size(egui::vec2(900.0, 480.0))
+        .with_context_setup(|ctx| {
+            egui_extras::install_image_loaders(ctx);
+            zenman_ui::theme::fonts::install(ctx);
+            zenman_ui::theme::apply(ctx, zenman_core::store::config::ThemeMode::Dark);
+        })
+        .build_ui_state(
+            |ui, app| {
+                app.logic(ui.ctx());
+                app.ui(ui);
+            },
+            app,
+        );
+    harness.run();
+    // Four panes in a 900x480 window: every one of them below the fold.
+    assert_eq!(
+        harness.query_all_by_label("More controls").count(),
+        4,
+        "each pane's ribbon folded into its own overflow button"
+    );
+    assert_eq!(
+        harness.query_all_by_label("4-pane").count(),
+        0,
+        "and not one of them kept a global button inline"
+    );
+    // The window's verbs are still one click away — that is the difference between folded and gone.
+    click_chrome(&mut harness, "More controls");
+    assert!(
+        harness
+            .query_all_by_label_contains("Action history")
+            .count()
+            > 0,
+        "the overflow menu did not open its rows"
+    );
+    // And the tabs survived: one close button per pane, every one of them inside the window.
+    for node in harness.query_all_by_label("Close tab") {
+        assert!(
+            node.rect().max.x <= 900.0 && node.rect().min.x >= 0.0,
+            "a tab of the strip was pushed out of the window: {:?}",
+            node.rect()
+        );
+    }
+    assert_eq!(
+        harness.query_all_by_label("Close tab").count(),
+        4,
+        "the workspace control ate a pane's whole tab strip"
+    );
 }
 
 #[test]

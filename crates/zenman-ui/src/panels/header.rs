@@ -1,10 +1,11 @@
-//! The header's workspace vocabulary (plan §5.8 `panels/header.rs`, §9.2 step-8c review gap 1).
+//! The workspace vocabulary of the pane chrome (plan §5.8 `panels/header.rs`, §9.2 step-8c review
+//! gap 1, restyled for the browser-like shell).
 //!
-//! The reference header is
-//! `Workspace: <select>` · `New` · `Delete` · `Saved` · disk meter · `History` · `2-Pane (F3)` ·
-//! `4-Pane (F4)`. Step 8 drew the right-hand half; this file owns the left-hand half and the two
-//! layout buttons' *chords*, which come from [`KeyMap::hint`] so a re-bound key cannot leave a stale
-//! label behind (plan **D7** — one table, two front ends).
+//! Go's header was `Workspace: <select>` · `New` · `Delete` · `Saved` · disk meter. That is now one
+//! control: a button naming the session on screen, whose popup lists every stored workspace and
+//! carries the two verbs of the selected one on its right edge (`Edit`, `Delete`) above the *New
+//! workspace* row. Nothing here prints a chord any more — the navigation bar owns the buttons, and
+//! [`crate::keymap::KeyMap::hint`] stays the one table for what a key is bound to (plan **D7**).
 //!
 //! # Who owns what
 //!
@@ -15,40 +16,60 @@
 //!
 //! # Fitting at 800 px
 //!
-//! The plan's criterion is "every control reachable at 800 px". `fit_toolbar` does not exist in the
-//! pinned `craft_ui`, so the fit is done here: the *optional, non-interactive* members (the boot
-//! note, the disk meter text) are dropped first, and the interactive ones are never dropped. A test
-//! asserts every interactive header control's rect lies inside the viewport at 800 and 1600 px.
+//! The plan's criterion is "every control reachable at 800 px", and one control is now narrow enough
+//! to satisfy it by itself: the button ellipsises its label to the room it has, and the list, the
+//! disk line and the two verbs live in a popup that is only laid out while it is open.
 
 use std::path::Path;
 use std::time::Instant;
 
-use egui::{Color32, CornerRadius, Frame, Margin, RichText, ScrollArea, Stroke, Ui, vec2};
+use egui::{
+    Color32, CornerRadius, Frame, Margin, Rect, RichText, ScrollArea, Stroke, Ui, pos2, vec2,
+};
 
 use zenman_core::error::CoreError;
 use zenman_core::path::{FsPath, ResolveKind};
-use zenman_core::services::workspaces::{
-    Autosave, Pending, RESERVED, WorkspaceMeta, normalise_name,
-};
+use zenman_core::services::workspaces::{Autosave, Pending, RESERVED, WorkspaceMeta};
 use zenman_core::store::config::{LayoutMode, PaneSlot, ViewMode, Workspace};
 
 use crate::app::ZenApp;
 use crate::theme::Tokens;
 use crate::widgets::{disk_meter, toast};
 
-/// What the workspace group asks the shell to do.
+/// What the workspace control asks the shell to do.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HeaderCommand {
     /// Select a stored workspace: `Session::workspace_restore`.
     Restore(String),
-    /// Store the running session under a new name: `Session::workspace_save`.
+    /// Ask for a name, then store the running session under it: see [`ZenApp::create_workspace_prompt`].
+    Create,
+    /// Store the running session under a name: `Session::workspace_save`.
     SaveNew(String),
+    /// Ask for a new name for a stored workspace: see [`ZenApp::rename_workspace_prompt`].
+    Rename(String),
+    /// Move a stored workspace: `Session::workspace_rename`.
+    RenameTo {
+        /// The name it has now.
+        from: String,
+        /// The name the user typed.
+        to: String,
+    },
     /// Delete a stored workspace. Destructive, so the shell answers it with a `Confirm`.
     Delete(String),
+    /// Show / hide the action-history slide-in (the navigation bar's `history` button).
+    ToggleLog,
+    /// Show / hide the places drawer.
+    ToggleLeftDrawer,
+    /// Show / hide the custom-actions drawer.
+    ToggleRightDrawer,
+    /// The `F3` chord's button: the two-pane grid, or the single pane.
+    ToggleSplit,
+    /// The `F4` chord's button: the four-pane grid.
+    ToggleQuad,
 }
 
-/// The header's workspace group: the dropdown, `New`/`Delete`, the `Saved` chip, and the autosave
-/// clock behind them.
+/// The pane chrome's workspace control: one button that names the session on screen, a popup that
+/// lists every stored one, and the `Edit`/`Delete` verbs of the Edge workspace menu.
 #[derive(Debug)]
 pub struct WorkspaceBar {
     /// The autosave target — always the reserved name (Go's `autoSaveSession()` wrote `default`).
@@ -57,12 +78,8 @@ pub struct WorkspaceBar {
     pub autosave: Autosave,
     /// The stored workspaces, refreshed from the session whenever the panel is drawn.
     pub names: Vec<WorkspaceMeta>,
-    /// What the selector shows.
+    /// What the button shows.
     pub selected: String,
-    /// `Some` while the inline *New workspace* field is open.
-    pub entry: Option<String>,
-    /// The last validation failure (a name Go would have accepted and then made unselectable).
-    pub error: Option<String>,
     /// The dock tree carried into the next autosave (serialised only when the dock moved).
     pub dock: Option<serde_json::Value>,
 }
@@ -73,9 +90,7 @@ impl Default for WorkspaceBar {
             target: RESERVED.to_string(),
             autosave: Autosave::default(),
             names: Vec::new(),
-            selected: RESERVED.to_string(),
-            entry: None,
-            error: None,
+            selected: workspace_label(RESERVED),
             dock: None,
         }
     }
@@ -124,10 +139,11 @@ impl WorkspaceBar {
         self.autosave.show_saved(now)
     }
 
-    /// The dropdown's rows: every stored name, with the reserved one *flagged*, not hidden (Go
-    /// filtered `default` out and thereby made a session saved as `Default` unrestorable).
+    /// The popup's rows: every stored name, with the reserved one *flagged*, not hidden (Go
+    /// filtered `default` out and thereby made a session saved as `Default` unrestorable), and the
+    /// tab count that makes a row recognisable before it is clicked.
     #[must_use]
-    pub fn labels(&self) -> Vec<(String, String)> {
+    pub fn labels(&self) -> Vec<(String, String, usize)> {
         self.names
             .iter()
             .map(|meta| {
@@ -136,118 +152,265 @@ impl WorkspaceBar {
                 } else {
                     meta.name.clone()
                 };
-                (meta.name.clone(), label)
+                (meta.name.clone(), label, meta.tabs)
             })
             .collect()
     }
 
-    /// Draw the group and report what it asked for.
+    /// Draw the button, its `Saved` chip and (while it is open) its popup; report what was asked.
+    ///
+    /// One control where Go had four (`select` + `New` + `Delete` + the autosave text): the button
+    /// names the session on screen, the popup lists every stored one, and the two verbs of the
+    /// selected workspace ride the popup's right edge, which is where a browser puts them.
     pub fn show(
         &mut self,
         ui: &mut Ui,
         tokens: &Tokens,
         disk: Option<(u64, u64)>,
         now: Instant,
+        room: f32,
     ) -> Vec<HeaderCommand> {
         let mut out = Vec::new();
-        let labels = self.labels();
-        let mut current = self.selected.clone();
-        let mut entry = self.entry.clone();
-        let room = ui.available_width();
-        let mut asked = None;
-        let mut cancel = false;
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing = vec2(tokens.header_gap, 0.0);
-            ui.label(
-                RichText::new("Workspace:")
-                    .color(tokens.text_muted)
-                    .size(tokens.font_size),
-            );
-            // `craft_ui::ComboBox`, not egui's: the framework's own guard says egui's popup cannot
-            // grow while it is open, and the workspace list is exactly the kind that grows.
-            let _combo = craft_ui::ComboBox::from_id_salt("zenman-workspace-select")
-                .width(tokens.workspace_select_width)
-                .selected_text(RichText::new(current.clone()).color(tokens.text_main))
-                .show_ui(ui, |ui| {
-                    ScrollArea::vertical()
-                        .max_height(tokens.log_row_height * tokens.dropdown_visible_rows)
-                        .show(ui, |ui| {
-                            for (name, label) in &labels {
-                                ui.selectable_value(&mut current, name.clone(), label);
-                            }
-                        });
+        let rows = self.labels();
+        // The rows carry the display label (the reserved one flagged, as on the button); the verbs
+        // act on the *stored* name, which is what `Session` looks up.
+        let current = self.selected.clone();
+        let target = self.selected_name();
+        let mut asked: Option<HeaderCommand> = None;
+        // The pill is the one part of the control that may be skipped: it reports a write that
+        // happened two seconds ago, and a narrow row would rather show *which* workspace this is.
+        let pill = self.chip_shows(now) && room >= toggle_width(ui, tokens, &self.selected);
+        let response = toggle(
+            ui,
+            tokens,
+            &self.selected,
+            room - if pill { chip_room(ui, tokens) } else { 0.0 },
+        );
+        if pill {
+            chip(ui, tokens, "Saved", tokens.success);
+        }
+        egui::Popup::menu(&response)
+            .width(tokens.workspace_select_width)
+            .show(|ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("Workspaces")
+                            .strong()
+                            .color(tokens.text_main)
+                            .size(tokens.font_size),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if crate::panels::nav_bar::icon_button(
+                            ui,
+                            tokens,
+                            "trash",
+                            "Delete workspace",
+                        )
+                        .clicked()
+                        {
+                            asked.get_or_insert(HeaderCommand::Delete(target.clone()));
+                        }
+                        if crate::panels::nav_bar::icon_button(
+                            ui,
+                            tokens,
+                            "edit",
+                            "Rename workspace",
+                        )
+                        .clicked()
+                        {
+                            asked.get_or_insert(HeaderCommand::Rename(target));
+                        }
+                    });
                 });
-            if ui
-                .button(RichText::new("New").color(tokens.text_main))
-                .clicked()
-            {
-                entry = Some(String::new());
-            }
-            if ui
-                .button(RichText::new("Delete").color(tokens.danger))
-                .clicked()
-            {
-                asked = Some(HeaderCommand::Delete(current.clone()));
-            }
-            if self.chip_shows(now) {
-                chip(ui, tokens, "Saved", tokens.success);
-            }
-            if let Some((free, total)) = disk
-                && room > tokens.workspace_select_width * tokens.header_disk_fit_ratio
-            {
-                ui.label(
-                    RichText::new(format!(
-                        "{} free of {}",
-                        disk_meter::format_size(free),
-                        disk_meter::format_size(total)
-                    ))
-                    .color(tokens.text_muted)
-                    .size(tokens.font_size - 1.0),
-                );
-            }
-            if let Some(text) = &mut entry {
-                let field = ui.add_sized(
-                    vec2(tokens.form_field_width, tokens.menu_item_height),
-                    egui::TextEdit::singleline(text).hint_text("new workspace name"),
-                );
-                let commit = ui.button("Save").clicked()
-                    || field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if ui.button("Cancel").clicked() {
-                    cancel = true;
+                ui.separator();
+                ScrollArea::vertical()
+                    .max_height(tokens.log_row_height * tokens.dropdown_visible_rows)
+                    .show(ui, |ui| {
+                        for (name, label, tabs) in &rows {
+                            ui.horizontal(|ui| {
+                                let shown = ui.selectable_label(*label == current, label.clone());
+                                let clicked = shown.clicked();
+                                // The count is what tells two workspaces apart before clicking
+                                // either — Go's `select` had nothing but the name to go on.
+                                ui.label(
+                                    RichText::new(format!("{tabs} tab(s)"))
+                                        .color(tokens.text_muted)
+                                        .size(tokens.font_size - 2.0),
+                                );
+                                if clicked && *label != current {
+                                    asked.get_or_insert(HeaderCommand::Restore(name.clone()));
+                                }
+                            });
+                        }
+                    });
+                ui.separator();
+                if ui
+                    .button(RichText::new("New workspace").color(tokens.text_main))
+                    .clicked()
+                {
+                    asked.get_or_insert(HeaderCommand::Create);
                 }
-                if commit {
-                    asked = normalise_name(text)
-                        .map(|name| Some(HeaderCommand::SaveNew(name)))
-                        .unwrap_or_else(|e| {
-                            self.error = Some(e.user_message());
-                            None
-                        });
-                    if asked.is_some() {
-                        entry = None;
-                    }
+                if let Some((free, total)) = disk {
+                    ui.label(
+                        RichText::new(format!(
+                            "{} free of {}",
+                            disk_meter::format_size(free),
+                            disk_meter::format_size(total)
+                        ))
+                        .color(tokens.text_muted)
+                        .size(tokens.font_size - 2.0),
+                    );
                 }
-            }
-        });
-        if cancel {
-            entry = None;
-        }
-        if let Some(text) = entry {
-            self.entry = Some(text);
-        } else {
-            self.entry = None;
-        }
-        if current != self.selected {
-            self.selected.clone_from(&current);
-            out.push(HeaderCommand::Restore(current));
-        }
+            });
         if let Some(command) = asked {
             out.push(command);
         }
         out
     }
+
+    /// The stored name behind [`Self::selected`] — the same string the button prints, minus the
+    /// reserved row's `(autosave)` flag.
+    #[must_use]
+    pub fn selected_name(&self) -> String {
+        self.names
+            .iter()
+            .find(|meta| workspace_label(&meta.name) == self.selected)
+            .map_or_else(|| self.selected.clone(), |meta| meta.name.clone())
+    }
 }
 
-/// A small status chip: `Saved` in the success colour, the only pill-shaped thing the header owns.
+/// The width of the collapsed control itself: two icon boxes, the name, and a gap on either side of
+/// the name — the same arithmetic [`toggle`] lays out with, which is what lets the name print in full
+/// rather than ellipsising against a reservation that was counted differently.
+fn toggle_width(ui: &Ui, tokens: &Tokens, label: &str) -> f32 {
+    tokens.nav_button * 2.0 + tokens.nav_gap * 2.0 + label_width(ui, tokens, label)
+}
+
+/// The name's own width at the size the button paints it.
+fn label_width(ui: &Ui, tokens: &Tokens, label: &str) -> f32 {
+    ui.painter()
+        .layout_no_wrap(label.to_owned(), tokens.font(), tokens.text_main)
+        .size()
+        .x
+}
+
+/// The room the whole control wants in the row: the button, the `Saved` pill, and the row's inset.
+///
+/// The pill's room is **always** reserved. An autosave fires on every navigation, so a width that
+/// followed the chip would shove the whole tab strip sideways twice a second.
+#[must_use]
+pub fn button_width(ui: &Ui, tokens: &Tokens, label: &str) -> f32 {
+    toggle_width(ui, tokens, label) + chip_room(ui, tokens) + tokens.chrome_pad_x
+}
+
+/// What [`chip`] needs, including the gap the row's own layout puts in front of it.
+fn chip_room(ui: &Ui, tokens: &Tokens) -> f32 {
+    chip_width(ui, tokens, "Saved") + ui.spacing().item_spacing.x
+}
+
+/// The button's name, painted rather than allocated: an interaction rect laid over the button's own
+/// *after* it takes the click (rule 10, plan §9.2 step 8 — the last-allocated overlapping rect wins),
+/// which is why the address bar's chips are painted the same way (`breadcrumb::paint_chip_label`).
+fn paint_clipped(ui: &Ui, rect: Rect, text: &str, tokens: &Tokens) {
+    // The slot is exactly the name's width at the size it is painted, so the common case — a wide
+    // pane, a short name — prints the whole thing and the ellipsis is only for a clamped button.
+    let width = rect.width().max(0.0);
+    if width <= 0.0 || text.is_empty() {
+        return;
+    }
+    let mut job =
+        egui::text::LayoutJob::simple(text.to_owned(), tokens.font(), tokens.text_main, width);
+    job.wrap = egui::text::TextWrapping {
+        max_width: width,
+        max_rows: 1,
+        break_anywhere: true,
+        overflow_character: Some('…'),
+    };
+    let galley = ui.painter().layout_job(job);
+    ui.painter().galley(
+        pos2(rect.min.x, rect.center().y - galley.size().y / 2.0),
+        galley,
+        tokens.text_main,
+    );
+}
+
+/// How wide the `Saved` pill is: its text and the frame's own two margins.
+fn chip_width(ui: &Ui, tokens: &Tokens, text: &str) -> f32 {
+    let font = egui::FontId::proportional(tokens.font_size - 1.0);
+    ui.painter()
+        .layout_no_wrap(text.to_owned(), font, tokens.text_main)
+        .size()
+        .x
+        + tokens.chip_pad * 2.0
+}
+
+/// The collapsed workspace button: the stack glyph, the name of the session on screen, and the
+/// chevron that says there is a list behind it.
+///
+/// It takes the width its name wants, or the `room` the row can spare — whichever is smaller, never
+/// less than the two icon boxes — and the name ellipsises inside that ([`paint_clipped`]). The tabs
+/// are the subject of the row; the button is a guest in it.
+fn toggle(ui: &mut Ui, tokens: &Tokens, label: &str, room: f32) -> egui::Response {
+    let want = toggle_width(ui, tokens, label);
+    let width = want
+        .min(room)
+        .min(ui.available_width())
+        .max(tokens.nav_button * 2.0);
+    let height = tokens.nav_button;
+    let (rect, response) = ui.allocate_exact_size(vec2(width, height), egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let radius = egui::CornerRadius::same(tokens.crumb_corner_radius);
+        let fill = if response.is_pointer_button_down_on() {
+            tokens.bg_hover
+        } else if response.hovered() {
+            tokens.bg_card
+        } else {
+            tokens.transparent
+        };
+        ui.painter().rect_filled(rect, radius, fill);
+        if response.hovered() {
+            ui.painter()
+                .rect_stroke(rect, radius, tokens.hairline(), egui::StrokeKind::Inside);
+        }
+        let box_y = rect.center().y - tokens.nav_button / 2.0;
+        let icon = Rect::from_min_size(
+            pos2(rect.min.x, box_y),
+            vec2(tokens.nav_button, tokens.nav_button),
+        );
+        crate::icons::paint(
+            ui,
+            icon,
+            "workspace",
+            tokens.row_icon_size,
+            tokens.text_muted,
+        );
+        let chevron = Rect::from_min_size(
+            pos2(rect.max.x - tokens.nav_button, box_y),
+            vec2(tokens.nav_button, tokens.nav_button),
+        );
+        crate::icons::paint(
+            ui,
+            chevron,
+            "chevron-down",
+            tokens.row_icon_size,
+            tokens.text_muted,
+        );
+        let text = Rect::from_min_max(
+            pos2(icon.max.x + tokens.nav_gap, rect.min.y),
+            pos2((chevron.min.x - tokens.nav_gap).max(icon.max.x), rect.max.y),
+        );
+        paint_clipped(ui, text, label, tokens);
+    }
+    let response = response.on_hover_text("Workspaces: switch, rename or delete a saved session");
+    response.widget_info(|| {
+        let mut info = egui::WidgetInfo::new(egui::Role::Button);
+        info.label = Some("workspace".into());
+        info
+    });
+    response
+}
+
+/// A small status chip: `Saved` in the success colour, the only pill-shaped thing the chrome owns.
 ///
 /// The text is a real `Label` (a painted string would be invisible to the accessibility tree, and
 /// to every test), and the pill is its `Frame` — the frame itself allocates nothing interactive.
@@ -263,47 +426,6 @@ fn chip(ui: &mut Ui, tokens: &Tokens, text: &str, colour: Color32) {
                     .size(tokens.font_size - 1.0),
             );
         });
-}
-
-/// A header button whose label carries its chord (`2-Pane (F3)`, the reference's own wording), and
-/// Go's `.btn-global`/`.btn-global.active` visuals: `bg-main` + `border-color` at rest, the accent
-/// fill with the `text-active` label once it is the mode on screen (`workspace.css:36-58`).
-///
-/// The accent fill is what makes a *toggle* read as a toggle: with `2-Pane` and `4-Pane` now the
-/// only layout controls, the highlighted one is the grid you are looking at, and clicking it again
-/// is what Go's `setSplitView(!state.isSplit)` means.
-pub fn chord_button(
-    ui: &mut Ui,
-    tokens: &Tokens,
-    label: String,
-    active: bool,
-    tooltip: &str,
-) -> bool {
-    let (fill, stroke, text) = if active {
-        (
-            tokens.accent,
-            Stroke::new(1.0, tokens.accent),
-            tokens.text_active,
-        )
-    } else {
-        (
-            tokens.bg_main,
-            Stroke::new(1.0, tokens.border),
-            tokens.text_main,
-        )
-    };
-    ui.add(
-        egui::Button::new(
-            RichText::new(label)
-                .color(text)
-                .size(tokens.font_size - 1.0),
-        )
-        .fill(fill)
-        .stroke(stroke)
-        .corner_radius(CornerRadius::same(tokens.crumb_corner_radius)),
-    )
-    .on_hover_text(tooltip)
-    .clicked()
 }
 
 // ------------------------------------------------------------------ the shell's answers
@@ -366,13 +488,25 @@ impl ZenApp {
             ),
         }
     }
-    /// Answer what the workspace group asked for.
+    /// Answer what the workspace control and the navigation ribbon asked for.
     pub fn header_commands(&mut self, commands: Vec<HeaderCommand>) {
         for command in commands {
             match command {
                 HeaderCommand::Restore(name) => self.restore_workspace(&name),
+                HeaderCommand::Create => self.create_workspace_prompt(),
                 HeaderCommand::SaveNew(name) => self.save_workspace_as(&name),
+                HeaderCommand::Rename(name) => self.rename_workspace_prompt(&name),
+                HeaderCommand::RenameTo { from, to } => self.rename_workspace(&from, &to),
                 HeaderCommand::Delete(name) => self.confirm_delete_workspace(&name),
+                HeaderCommand::ToggleLog => self.toggle_log_panel(),
+                HeaderCommand::ToggleLeftDrawer => {
+                    self.model.left_drawer.open = !self.model.left_drawer.open;
+                }
+                HeaderCommand::ToggleRightDrawer => {
+                    self.model.right_drawer.open = !self.model.right_drawer.open;
+                }
+                HeaderCommand::ToggleSplit => self.toggle_split_layout(),
+                HeaderCommand::ToggleQuad => self.toggle_quad_layout(),
             }
         }
     }
@@ -424,7 +558,7 @@ impl ZenApp {
     }
 
     /// Say what a restore could not bring back. Every path that applies a stored session — the boot
-    /// autosave, `--session`, and the header's dropdown — goes through this, so a lost tab is never a
+    /// autosave, `--session`, and the popup's rows — goes through this, so a lost tab is never a
     /// line only one of them prints.
     pub fn note_lost_tabs(&mut self, applied: &Applied) {
         if applied.lost() == 0 {
@@ -635,8 +769,6 @@ impl ZenApp {
                 // own, so it must not confirm the outstanding `default` write (that one lands or fails
                 // on its own report).
                 self.workspaces.show_chip(now);
-                self.workspaces.entry = None;
-                self.workspaces.error = None;
                 self.workspaces.selected = workspace_label(name);
                 self.workspaces.refresh(self.session.workspaces());
                 self.notices
@@ -645,6 +777,63 @@ impl ZenApp {
             Err(e) => self.notices.post(
                 toast::Level::Error,
                 format!("workspace {name}: {}", e.user_message()),
+            ),
+        }
+    }
+
+    /// The popup's *New workspace* row: a name first, then the write (the reference asked for the
+    /// name with `window.prompt`, so a modal is the parity answer, not an invention).
+    pub fn create_workspace_prompt(&mut self) {
+        self.open_dialog(Dialog::Prompt(Prompt::new(
+            DialogKind::NewWorkspace,
+            "New workspace",
+            "Name the workspace to save the current session as:",
+            "",
+            "Save",
+            Validation::None,
+        )));
+    }
+
+    /// The popup's `Edit` verb: the same dialog, seeded with the name it has now (Go had no rename
+    /// at all; its Save-As was a save plus a delete, which loses the stored session if the second
+    /// half is interrupted — [`Session::workspace_rename`] moves the entry instead).
+    pub fn rename_workspace_prompt(&mut self, name: &str) {
+        let mut prompt = Prompt::new(
+            DialogKind::RenameWorkspace {
+                name: name.to_string(),
+            },
+            "Rename workspace",
+            format!("New name for the workspace {name:?}:"),
+            name,
+            "Rename",
+            Validation::None,
+        );
+        prompt.select = Some(name.chars().count());
+        self.open_dialog(Dialog::Prompt(prompt));
+    }
+
+    /// `Session::workspace_rename`, with the reporting the delete path already has: the chip, a
+    /// refreshed list, and the selected name following the move.
+    pub fn rename_workspace(&mut self, from: &str, to: &str) {
+        if from == to {
+            return;
+        }
+        match self.session.workspace_rename(from, to) {
+            Ok(()) => {
+                let now = Instant::now();
+                self.workspaces.show_chip(now);
+                if self.workspaces.selected == workspace_label(from) {
+                    self.workspaces.selected = workspace_label(to);
+                }
+                self.workspaces.refresh(self.session.workspaces());
+                self.notices.post(
+                    toast::Level::Success,
+                    format!("workspace {from}: renamed to {to}"),
+                );
+            }
+            Err(e) => self.notices.post(
+                toast::Level::Error,
+                format!("workspace {from}: {}", e.user_message()),
             ),
         }
     }
@@ -845,5 +1034,5 @@ impl SessionRestore {
 }
 
 use crate::app::tab_title;
-use crate::dialogs::{Choice, Confirm, ConfirmButton, Dialog, DialogKind};
+use crate::dialogs::{Choice, Confirm, ConfirmButton, Dialog, DialogKind, Prompt, Validation};
 use crate::state::{panes_for, quad_slots};

@@ -68,6 +68,10 @@ static ICONS: &[(&str, &[u8])] = &[
     ),
     ("font", include_bytes!("../../../assets/icons/font.svg")),
     ("grid", include_bytes!("../../../assets/icons/grid.svg")),
+    (
+        "history",
+        include_bytes!("../../../assets/icons/history.svg"),
+    ),
     ("home", include_bytes!("../../../assets/icons/home.svg")),
     ("image", include_bytes!("../../../assets/icons/image.svg")),
     ("info", include_bytes!("../../../assets/icons/info.svg")),
@@ -83,6 +87,14 @@ static ICONS: &[(&str, &[u8])] = &[
     ),
     ("search", include_bytes!("../../../assets/icons/search.svg")),
     (
+        "select-all",
+        include_bytes!("../../../assets/icons/select-all.svg"),
+    ),
+    (
+        "select-none",
+        include_bytes!("../../../assets/icons/select-none.svg"),
+    ),
+    (
         "settings",
         include_bytes!("../../../assets/icons/settings.svg"),
     ),
@@ -93,6 +105,11 @@ static ICONS: &[(&str, &[u8])] = &[
         include_bytes!("../../../assets/icons/terminal.svg"),
     ),
     ("trash", include_bytes!("../../../assets/icons/trash.svg")),
+    ("tree", include_bytes!("../../../assets/icons/tree.svg")),
+    (
+        "workspace",
+        include_bytes!("../../../assets/icons/workspace.svg"),
+    ),
     ("video", include_bytes!("../../../assets/icons/video.svg")),
 ];
 
@@ -237,6 +254,7 @@ pub const KNOWN_ICONS: &[&str] = &[
     "folder-open",
     "font",
     "grid",
+    "history",
     "home",
     "image",
     "info",
@@ -248,12 +266,16 @@ pub const KNOWN_ICONS: &[&str] = &[
     "quad",
     "refresh",
     "search",
+    "select-all",
+    "select-none",
     "settings",
     "split",
     "star",
     "terminal",
     "trash",
+    "tree",
     "video",
+    "workspace",
 ];
 
 #[cfg(test)]

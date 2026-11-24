@@ -41,9 +41,7 @@ fn write(path: &Path, bytes: &[u8]) {
 
 fn build_harness(app: ZenApp, size: Vec2) -> Harness<'static, ZenApp> {
     let mut harness = Harness::builder()
-        // The header's workspace `ComboBox` (step 14b) surfaces `current_text_value` but no accessible
-        // name in this fork — the same omission the fork's own `TextEdit` has, so the same opt-out.
-        .with_accessibility_check(false)
+        .with_accessibility_check(true)
         .with_size(size)
         .with_max_steps(64)
         .with_context_setup(|ctx| {

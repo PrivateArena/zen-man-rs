@@ -80,6 +80,46 @@ impl FlatMode {
         !matches!(self, Self::Off)
     }
 
+    /// The navigation bar's recursive-listing rows: `(mode, label, tooltip)`, in Go's own words
+    /// (`main.js`'s flat-view dropdown: *mixed*, *mixed_no_folders*, *grouped*) with the mode Go's
+    /// plain listing had and its dropdown could not go back to.
+    #[must_use]
+    pub const fn rows() -> [(Self, &'static str, &'static str); 4] {
+        [
+            (
+                Self::Off,
+                "This folder",
+                "List only the files and folders of this directory",
+            ),
+            (
+                Self::Mixed,
+                "Mixed",
+                "List every entry under this directory, folders among them",
+            ),
+            (
+                Self::MixedNoFolders,
+                "No folders",
+                "List every file under this directory, without the folder rows",
+            ),
+            (
+                Self::Grouped,
+                "Grouped",
+                "The recursive listing, grouped by its own folder",
+            ),
+        ]
+    }
+
+    /// The mode's own word, for a tooltip that has to say what is current.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Off => "this folder",
+            Self::Mixed => "mixed",
+            Self::MixedNoFolders => "no folders",
+            Self::Grouped => "grouped",
+        }
+    }
+
     /// The **engine's** spelling of this mode — the value that goes into
     /// [`ListDir::flat`](zenman_core::services::dirs::ListDir::flat), and into
     /// [`DirCacheKey`](zenman_core::services::dirs::DirCacheKey) with it.

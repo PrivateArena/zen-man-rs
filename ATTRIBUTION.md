@@ -12,7 +12,7 @@ is the gate that house rule 3 (an asset and its attribution land in the same com
 
 ## `assets/icons/` — the zen-man icon set
 
-40 line icons, authored **originally for this project** (2026) by the zen-man-rs contributors, drawn
+45 line icons, authored **originally for this project** (2026) by the zen-man-rs contributors, drawn
 from scratch as simple geometric `viewBox="0 0 24 24"` stroke glyphs (`stroke="currentColor"`,
 `stroke-width="2"`, the conventions `craft_ui::icons::SvgStyle` rewrites at load time). They are not
 derived from any third-party icon set: no path data was copied from Feather/Lucide/Material or any
@@ -46,6 +46,7 @@ required beyond this file.
 | `assets/icons/folder.svg` | MIT OR Apache-2.0 | closed folder | directory rows, pane headers, bookmarks |
 | `assets/icons/font.svg` | MIT OR Apache-2.0 | letter A | font file rows |
 | `assets/icons/grid.svg` | MIT OR Apache-2.0 | four tiles | grid view mode |
+| `assets/icons/history.svg` | MIT OR Apache-2.0 | clock with returning arrow | action-history toggle |
 | `assets/icons/home.svg` | MIT OR Apache-2.0 | house | home breadcrumb |
 | `assets/icons/image.svg` | MIT OR Apache-2.0 | picture | image rows |
 | `assets/icons/info.svg` | MIT OR Apache-2.0 | circled i | about and props dialogs |
@@ -58,12 +59,16 @@ required beyond this file.
 | `assets/icons/quad.svg` | MIT OR Apache-2.0 | four panes | quad-grid layout button |
 | `assets/icons/refresh.svg` | MIT OR Apache-2.0 | circular arrow | refresh verb |
 | `assets/icons/search.svg` | MIT OR Apache-2.0 | magnifier | header search, quick-find |
+| `assets/icons/select-all.svg` | MIT OR Apache-2.0 | box with check | select-everything button |
+| `assets/icons/select-none.svg` | MIT OR Apache-2.0 | box with cross | clear-selection button |
 | `assets/icons/settings.svg` | MIT OR Apache-2.0 | gear | settings and custom-action roles |
 | `assets/icons/split.svg` | MIT OR Apache-2.0 | split pane | two-pane layout button |
 | `assets/icons/star.svg` | MIT OR Apache-2.0 | star | bookmark verb |
 | `assets/icons/terminal.svg` | MIT OR Apache-2.0 | prompt | open-terminal custom action |
 | `assets/icons/trash.svg` | MIT OR Apache-2.0 | waste bin | delete verb |
+| `assets/icons/tree.svg` | MIT OR Apache-2.0 | indented lines | recursive-listing (flat) mode button |
 | `assets/icons/video.svg` | MIT OR Apache-2.0 | camera | video rows |
+| `assets/icons/workspace.svg` | MIT OR Apache-2.0 | stacked layers | workspace switcher button |
 
 ## Fonts
 

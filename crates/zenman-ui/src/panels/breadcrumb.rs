@@ -32,25 +32,29 @@ pub struct BreadcrumbModel<'a> {
 }
 
 /// Draw the strip and collect its commands.
+///
+/// The caller owns the row: [`crate::panels::nav_bar`] reserves this band, paints its background and
+/// leaves the trail everything the ribbon does not take.
 pub fn show(ui: &mut Ui, m: &mut BreadcrumbModel<'_>, tokens: &Tokens, out: &mut Vec<PaneCommand>) {
     let height = tokens.toolbar_height;
     egui::Frame::new()
-        .fill(tokens.bg_card)
+        .fill(tokens.transparent)
         .inner_margin(egui::Margin::symmetric(tokens.cell_padding as i8, 0))
         .show(ui, |ui| {
             ui.allocate_ui_with_layout(
                 vec2(ui.available_width(), height),
                 egui::Layout::left_to_right(egui::Align::Center),
                 |ui| {
-                    let back = icon_button(ui, "←", "Back", m.can_back, tokens);
+                    let back = icon_button(ui, "chevron-left", "Back", m.can_back, tokens);
                     if back.clicked() && m.can_back {
                         out.push(PaneCommand::Back);
                     }
-                    let forward = icon_button(ui, "→", "Forward", m.can_forward, tokens);
+                    let forward =
+                        icon_button(ui, "chevron-right", "Forward", m.can_forward, tokens);
                     if forward.clicked() && m.can_forward {
                         out.push(PaneCommand::Forward);
                     }
-                    let up = icon_button(ui, "↑", "Parent directory", true, tokens);
+                    let up = icon_button(ui, "arrow-up", "Parent directory", true, tokens);
                     if up.clicked() {
                         out.push(PaneCommand::Up);
                     }
@@ -59,7 +63,7 @@ pub fn show(ui: &mut Ui, m: &mut BreadcrumbModel<'_>, tokens: &Tokens, out: &mut
                     } else {
                         // The trailing button is subtracted from the trail's budget *first*, which
                         // is what guarantees the collapse can never push it off screen.
-                        let side = tokens.toolbar_height - tokens.header_button_inset;
+                        let side = tokens.nav_button;
                         let budget =
                             (ui.available_width() - side - tokens.crumb_separator_gap).max(0.0);
                         let response = path_chips(ui, m.path, budget, tokens, out);
@@ -387,7 +391,7 @@ fn path_chips(
     }
     // The free space after the trail, up to the room reserved for the trailing button.
     let rest = ui.available_rect_before_wrap();
-    let side = tokens.toolbar_height - tokens.header_button_inset;
+    let side = tokens.nav_button;
     let edge = egui::Rect::from_min_max(
         rest.min,
         egui::pos2(
@@ -446,7 +450,7 @@ fn paint_chip_label(
 /// The trailing address-field button: the one affordance the trail can never squeeze out of the
 /// strip, because its width is subtracted from the trail's budget before the chips are counted.
 fn edit_button(ui: &mut Ui, tokens: &Tokens) -> egui::Response {
-    let side = tokens.toolbar_height - tokens.header_button_inset;
+    let side = tokens.nav_button;
     let (rect, response) = ui.allocate_exact_size(vec2(side, side), egui::Sense::click());
     if ui.is_rect_visible(rect) {
         if response.hovered() {
@@ -533,15 +537,15 @@ fn resolve_address(raw: &str, cwd: &FsPath) -> Result<FsPath, zenman_core::error
     FsPath::resolve(raw, std::path::Path::new(&cwd), None)
 }
 
-/// A small square history button.
+/// A small square history button: an SVG glyph, greyed when there is nowhere to go.
 fn icon_button(
     ui: &mut Ui,
-    glyph: &str,
+    icon: &str,
     tooltip: &str,
     enabled: bool,
     tokens: &Tokens,
 ) -> egui::Response {
-    let side = tokens.toolbar_height - tokens.header_button_inset;
+    let side = tokens.nav_button;
     let (rect, response) = ui.allocate_exact_size(vec2(side, side), egui::Sense::click());
     if ui.is_rect_visible(rect) {
         if response.hovered() && enabled {
@@ -551,23 +555,25 @@ fn icon_button(
                 tokens.bg_hover,
             );
         }
-        ui.painter().text(
-            rect.center(),
-            egui::Align2::CENTER_CENTER,
-            glyph,
-            tokens.font(),
-            if !enabled {
-                tokens.disabled_text
-            } else if response.hovered() {
-                tokens.text_active
-            } else {
-                tokens.text_main
-            },
-        );
+        let tint = if !enabled {
+            tokens.disabled_text
+        } else if response.hovered() {
+            tokens.text_active
+        } else {
+            tokens.text_main
+        };
+        crate::icons::paint(ui, rect, icon, tokens.row_icon_size, tint);
     }
-    response.on_hover_text(if enabled {
+    let response = response.on_hover_text(if enabled {
         tooltip.to_string()
     } else {
         format!("{tooltip}: nowhere to go")
-    })
+    });
+    let label = tooltip.to_owned();
+    response.widget_info(|| {
+        let mut info = egui::WidgetInfo::new(egui::Role::Button);
+        info.label = Some(label.clone());
+        info
+    });
+    response
 }

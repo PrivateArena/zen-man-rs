@@ -3450,6 +3450,22 @@ impl Session {
         Ok(removed)
     }
 
+    /// Move a stored session to a new name, contents untouched. **Port-only**: `POST /api/workspaces`
+    /// never had a rename action (an unknown `action` is a 405, `docs/contracts.md`), because Go's
+    /// Save-As was a save plus a delete — two writes, with the stored session lost if the second one
+    /// never happened. This is a pass-through to
+    /// [`WorkspaceService::rename`](crate::services::workspaces::WorkspaceService::rename), so the
+    /// name rules stay core's single table, and it is not in the parity contract.
+    ///
+    /// # Errors
+    /// [`CoreError::NotFound`] for an unknown `from`, [`CoreError::AlreadyExists`] for a taken `to`,
+    /// plus the name rules and the config write's own failures.
+    pub fn workspace_rename(&self, from: &str, to: &str) -> Result<(), CoreError> {
+        let next = self.workspace_service().rename(&self.config(), from, to)?;
+        *lock(&self.inner.config) = next;
+        Ok(())
+    }
+
     // ------------------------------------------------------------------------------ custom actions
 
     /// `GET /api/actions` (golden `actions.json`): the actions, in menu order.

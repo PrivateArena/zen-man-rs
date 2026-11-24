@@ -297,8 +297,10 @@ impl Scene {
             }
         }
         let mut builder = Harness::builder()
-            // The header's workspace `ComboBox` (step 14b) surfaces `current_text_value` but no
-            // accessible name in this fork — the same omission the fork's own `TextEdit` has.
+            // The baselines that open a dialog draw the fork's own `TextEdit`/`DragValue`, which
+            // surface `current_text_value` but no accessible name — the same omission, and the reason
+            // one builder serves every scene. The shell's chrome all publishes names now: the
+            // pane-only harnesses in `tests/{shell,workspaces,menus}.rs` run with the check on.
             .with_accessibility_check(false)
             .with_size(SIZE);
         if !matches!(self, Self::Empty | Self::Listing { .. }) {

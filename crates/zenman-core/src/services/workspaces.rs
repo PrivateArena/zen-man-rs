@@ -635,6 +635,58 @@ mod tests {
     }
 
     #[test]
+    fn rename_moves_the_entry_its_contents_and_refuses_a_collision() {
+        // The verb Go never had: its Save-As was a save plus a delete, which loses the stored
+        // session if the second write never happens. A rename is one write, or none.
+        static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "zenman-ws-rename-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let service = WorkspaceService::new(dir.join("config.json"));
+        let config = service
+            .save(&ZenConfig::default(), "alpha", &workspace("/a"))
+            .expect("saved");
+        let config = service
+            .rename(&config, "Alpha", "beta")
+            .expect("a rename matches case-insensitively, like restore");
+        assert!(
+            !config.workspaces.contains_key("alpha"),
+            "the old spelling survived: {:?}",
+            config.workspaces.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            WorkspaceService::restore(&config, "BETA")
+                .expect("moved")
+                .panes
+                .values()
+                .map(|p| p.tabs.len())
+                .sum::<usize>(),
+            1,
+            "the tabs did not travel with the entry"
+        );
+        // Onto a name that is taken: refused, and the store is left exactly as it was.
+        let config = service
+            .save(&config, "gamma", &workspace("/g"))
+            .expect("saved");
+        assert!(matches!(
+            service.rename(&config, "beta", "Gamma"),
+            Err(CoreError::AlreadyExists { .. })
+        ));
+        // Of a workspace that is not there: the same typed absence as a failed restore.
+        assert!(matches!(
+            service.rename(&config, "absent", "delta"),
+            Err(CoreError::NotFound { .. })
+        ));
+        assert!(
+            service.rename(&config, "beta", "a/b").is_err(),
+            "name rules apply"
+        );
+    }
+
+    #[test]
     fn blank_session_is_an_empty_split_grid() {
         let ws = blank_session(crate::store::config::LayoutMode::Single, "/");
         assert_eq!(ws.panes.values().map(|p| p.tabs.len()).sum::<usize>(), 1);

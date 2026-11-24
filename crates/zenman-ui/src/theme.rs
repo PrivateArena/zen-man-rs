@@ -5,7 +5,7 @@
 //! the §2.3 visual-spec table, quoted verbatim from the Go app's `frontend/css/base.css:2-18`
 //! (and re-measured against `docs/parity/*.png` by step 15's human gate, never by pixel diff).
 //!
-//! Geometry is here too: the 40 px row / 38 px tab / 50 px toolbar / 48 px header / 30 px status bar
+//! Geometry is here too: the 40 px row / 34 px tab row / 38 px navigation bar / 30 px status bar
 //! constants are the same table, and every widget that lays itself out reads them from [`Tokens`]
 //! rather than repeating the numbers.
 
@@ -78,14 +78,15 @@ pub struct Tokens {
     // ---- geometry (§2.3 px table) ---------------------------------------------------------------
     /// File row height: 40.
     pub row_height: f32,
-    /// Tab bar height: 38.
+    /// Tab bar height: 34 (the row a pane's tabs and its workspace button live in).
     pub tab_bar_height: f32,
-    /// Pane toolbar height: 50.
+    /// Navigation bar height: 38 (the row the address bar and the tool ribbon live in).
     pub toolbar_height: f32,
-    /// Global header height: 48.
-    pub header_height: f32,
     /// Status bar height: 30.
     pub status_height: f32,
+    /// The least room the status bar's middle cell needs before the boot note is printed in it —
+    /// the point at which a truncation would say less than nothing.
+    pub status_note_min_width: f32,
     /// Left drawer width: 250.
     pub left_drawer_width: f32,
     /// Right drawer width: 300 (off-canvas in Go; an egui `SidePanel` here).
@@ -119,9 +120,10 @@ pub struct Tokens {
     pub search_manager_max_width: f32,
     // ---- shell geometry the widgets ask for (step 7c: the literals `dock_content`/`app` used to
     //      carry; the `xtask ci` geometry guard is what keeps them here) -------------------------
-    /// Smallest rect a dock pane accepts (`PanelLimits::min`): enough for the 38 px strip, a toolbar
-    /// row and a placeholder line, and small enough that the quad grid fits the 900x480 window
-    /// minimum.
+    /// Smallest rect a dock pane accepts (`PanelLimits::min`): enough for the 34 px tab row, the
+    /// 38 px navigation bar, a column header and a placeholder line, and wide enough that the tab
+    /// row can give the strip its floor ([`Self::tab_strip_min_width`]) *and* the workspace control
+    /// its two icon boxes. Small enough that the quad grid still fits the 900x480 window minimum.
     pub pane_min: egui::Vec2,
     /// "No ceiling" for a pane: `PanelLimits::max` has no infinity, so this is the value the dock
     /// treats as unbounded — far larger than any viewport.
@@ -154,6 +156,9 @@ pub struct Tokens {
     pub tab_overflow_width: f32,
     /// Width the strip reserves for its `+` button.
     pub tab_new_button: f32,
+    /// The least a pane's tab strip may be left with: the `+`, the overflow button and one tab at
+    /// [`Self::tab_min_width`]. The workspace control shrinks itself to what the row has beyond this.
+    pub tab_strip_min_width: f32,
     /// The `×` of a tab.
     pub tab_close_size: f32,
     /// Widest single breadcrumb segment.
@@ -162,7 +167,7 @@ pub struct Tokens {
     pub crumb_chip_padding: f32,
     /// Gap on each side of a crumb separator (`toolbar.css:70`, `gap: 4px`).
     pub crumb_separator_gap: f32,
-    /// How far a chip is inset from the top and bottom of its 50 px strip (the chip is the strip's
+    /// How far a chip is inset from the top and bottom of the navigation bar (the chip is the bar's
     /// height minus twice this), so it reads as a chip and not as a block of the address bar.
     pub crumb_chip_inset: f32,
     /// Corner radius of a crumb chip (`toolbar.css:86`, `border-radius: 4px`).
@@ -209,12 +214,21 @@ pub struct Tokens {
     pub drawer_meter_height: f32,
     /// Gap between a row's label and its right-hand column (meter, capacity, role).
     pub drawer_trailing_gap: f32,
-    /// How much narrower a header icon button is than the 48 px header it lives in.
-    pub header_button_inset: f32,
-    // ---- step 14b (header vocabulary, the action log, the two new dialogs) ----------------------
-    /// Gap between two header control groups (the CSS toolbar's `gap: 8px`, `toolbar.css:12`).
-    pub header_gap: f32,
-    /// Width of the workspace selector's collapsed text (`toolbar.css`'s `select` is 150 px).
+    // ---- pane chrome (the tab row and the navigation bar a pane draws above its listing) ---------
+    /// The square of a chrome icon button: 24.
+    pub nav_button: f32,
+    /// Gap between two icon buttons of one chrome ribbon group.
+    pub nav_gap: f32,
+    /// Gap between two groups of a chrome ribbon (nav | tools | globals).
+    pub nav_group_gap: f32,
+    /// The floor of a pane's address strip: the ribbon may have whatever the row has left over.
+    /// This is what keeps a collapsed trail down to its root, its marker and the last two segments
+    /// however narrow the pane gets — a number of buttons is not a budget.
+    pub nav_trail_min_width: f32,
+    /// Horizontal inset of a pane's chrome rows.
+    pub chrome_pad_x: f32,
+    // ---- step 14b (workspace vocabulary, the action log, the two new dialogs) --------------------
+    /// Width of the workspace popup.
     pub workspace_select_width: f32,
     /// Inner padding of the `Saved` chip.
     pub chip_pad: f32,
@@ -230,10 +244,8 @@ pub struct Tokens {
     pub form_field_width: f32,
     /// Gap between two rows of a dialog form.
     pub form_gap: f32,
-    /// How many rows a header dropdown shows before it scrolls (the CSS `select`'s own 6).
+    /// How many rows the workspace popup shows before it scrolls.
     pub dropdown_visible_rows: f32,
-    /// The width, in selector widths, the header needs before it prints the disk meter's text.
-    pub header_disk_fit_ratio: f32,
     // ---- menus (step 10b; `frontend/css/context-menu.css`) --------------------------------------
     /// `min-width: 180px` (`context-menu.css:8`); the frame grows to fit the widest label + chord.
     pub menu_min_width: f32,
@@ -333,10 +345,10 @@ impl Tokens {
             group_yellow: Color32::from_rgb(0xfb, 0xbf, 0x24),
             group_purple: Color32::from_rgb(0x8b, 0x5c, 0xf6),
             row_height: 40.0,
-            tab_bar_height: 38.0,
-            toolbar_height: 50.0,
-            header_height: 48.0,
+            tab_bar_height: 34.0,
+            toolbar_height: 38.0,
             status_height: 30.0,
+            status_note_min_width: 120.0,
             left_drawer_width: 250.0,
             right_drawer_width: 300.0,
             action_log_width: 360.0,
@@ -347,7 +359,7 @@ impl Tokens {
             search_manager_fraction: 0.85,
             dialog_max_width: 1200.0,
             search_manager_max_width: 1100.0,
-            pane_min: egui::vec2(180.0, 120.0),
+            pane_min: egui::vec2(200.0, 150.0),
             pane_unbounded_max: 100_000.0,
             dock_gap: 4.0,
             tab_gap: 4.0,
@@ -361,11 +373,12 @@ impl Tokens {
             tab_min_width: 60.0,
             tab_overflow_width: 22.0,
             tab_new_button: 22.0,
+            tab_strip_min_width: 120.0,
             tab_close_size: 14.0,
             crumb_max_width: 220.0,
             crumb_chip_padding: 6.0,
             crumb_separator_gap: 4.0,
-            crumb_chip_inset: 12.0,
+            crumb_chip_inset: 6.0,
             crumb_corner_radius: 4,
             tab_fixed_chrome: 32.0,
             empty_pane_space: 24.0,
@@ -384,9 +397,12 @@ impl Tokens {
             drawer_meter_width: 56.0,
             drawer_meter_height: 5.0,
             drawer_trailing_gap: 8.0,
-            header_button_inset: 16.0,
-            header_gap: 8.0,
-            workspace_select_width: 150.0,
+            nav_button: 24.0,
+            nav_gap: 2.0,
+            nav_group_gap: 8.0,
+            nav_trail_min_width: 340.0,
+            chrome_pad_x: 6.0,
+            workspace_select_width: 240.0,
             chip_pad: 6.0,
             log_row_height: 54.0,
             log_accent_width: 3.0,
@@ -395,7 +411,6 @@ impl Tokens {
             form_field_width: 260.0,
             form_gap: 6.0,
             dropdown_visible_rows: 6.0,
-            header_disk_fit_ratio: 3.0,
             menu_min_width: 180.0,
             menu_max_width: 420.0,
             dialog_width: 420.0,
@@ -673,9 +688,8 @@ mod tests {
         assert_eq!(t.bg_main, Color32::from_rgb(0x0f, 0x11, 0x17));
         assert_eq!(t.accent, Color32::from_rgb(0x58, 0x65, 0xf2));
         assert_eq!(t.row_height, 40.0);
-        assert_eq!(t.tab_bar_height, 38.0);
-        assert_eq!(t.toolbar_height, 50.0);
-        assert_eq!(t.header_height, 48.0);
+        assert_eq!(t.tab_bar_height, 34.0);
+        assert_eq!(t.toolbar_height, 38.0);
         assert_eq!(t.status_height, 30.0);
         assert_eq!(t.left_drawer_width, 250.0);
         assert_eq!(t.right_drawer_width, 300.0);

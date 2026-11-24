@@ -107,6 +107,13 @@ pub enum DialogKind {
         /// The stored workspace the answer is about.
         name: String,
     },
+    /// `Prompt` → `Session::workspace_save`: the name a *New workspace* is stored under.
+    NewWorkspace,
+    /// `Prompt` → `Session::workspace_rename`: the new name of a stored workspace.
+    RenameWorkspace {
+        /// The name it has now.
+        name: String,
+    },
     /// `Properties` (step 13b) — the subject is the path it printed, and the only answer is "close".
     Properties {
         /// The pane the dialog was opened from.

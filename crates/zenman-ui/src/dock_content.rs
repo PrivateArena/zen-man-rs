@@ -1,20 +1,26 @@
 //! The `DockContent` adapter (plan §5.7 `dock_content.rs` row).
 //!
-//! Step 7's `body` is the **empty pane**: the 38 px tab strip the pane owns (the dock draws none —
-//! stripless groups, §2.2), a toolbar row, and the empty listing placeholder. Step 8 replaces the
-//! placeholder with `panels::file_pane::show` (the virtual list); nothing else about the plumbing
-//! changes, which is the point of the adapter seam.
+//! A pane body is the chrome it owns plus the listing: the **tab row** (the workspace button and the
+//! strip — the dock draws no header of its own for a stripless group, §2.2), the **navigation bar**
+//! (address strip and tool ribbon), then `panels::file_pane::show`. There is no window-wide header:
+//! every control the shell has is either in a pane's chrome or in a drawer, which is what the
+//! browser-shaped shell asked for and what the tab row's workspace button makes possible.
 
 use craft_ui::docking::{DockArea, DockContent, DockOutput, DockStyle, Permissions};
-use egui::{Color32, Rect, Stroke, Ui, Window};
+use egui::{Align, Color32, Layout, Rect, Stroke, Ui, Window, pos2, vec2};
+
+use std::time::Instant;
 
 use zenman_core::session::Session;
 use zenman_core::store::config::PaneSlot;
 
 use crate::app::ZenApp;
 use crate::dock::{self, DockId};
+use crate::keymap::{Command, KeyMap};
 use crate::panels::breadcrumb;
 use crate::panels::file_pane::{self, PaneCommand, PaneModel};
+use crate::panels::header::{self, HeaderCommand, WorkspaceBar};
+use crate::panels::nav_bar::{self, NavBarHints, NavBarModel};
 use crate::panels::tab_bar::{self, TabBarModel, TabCommand};
 use crate::state::Pane;
 use crate::theme::Tokens;
@@ -43,6 +49,17 @@ pub struct PaneDock<'a> {
     pub commands: Vec<(PaneSlot, PaneCommand)>,
     /// The file drag in flight, cloned in so a body can offer its rows as drop targets (step 10c).
     pub drag: Option<crate::drag_drop::DragPayload>,
+    /// The workspace control of the tab row: the session on screen, the stored ones, the autosave
+    /// clock. Borrowed separately from `model` so the pane can drive it (plan §5.8 `header.rs`).
+    pub workspaces: &'a mut WorkspaceBar,
+    /// The keymap, for the chord text the ribbon's tooltips quote (plan **D7**).
+    pub keys: &'a KeyMap,
+    /// Free/total bytes of the data volume, for the workspace popup.
+    pub disk: Option<(u64, u64)>,
+    /// The frame's clock, for the `Saved` chip.
+    pub now: Instant,
+    /// What the chrome asked the shell to do, drained by [`show`].
+    pub header: Vec<HeaderCommand>,
 }
 
 impl<'a> DockContent<DockId> for PaneDock<'a> {
@@ -105,7 +122,7 @@ impl<'a> DockContent<DockId> for PaneDock<'a> {
 }
 
 impl PaneDock<'_> {
-    /// One pane: its tab strip, its address strip, its listing (plan §5.7 `dock_content.rs`: the
+    /// One pane: its tab row, its navigation bar, its listing (plan §5.7 `dock_content.rs`: the
     /// dock draws no header of its own, so all three live here).
     fn pane(&mut self, ui: &mut Ui, slot: PaneSlot) {
         let tokens = self.tokens;
@@ -116,6 +133,9 @@ impl PaneDock<'_> {
             Stroke::new(1.0, tokens.border)
         });
         frame.show(ui, |ui| {
+            // The chrome rows sit flush: a browser's tab row, toolbar and column header are one
+            // continuous surface, and the 4 px between them here is `item_spacing`, not design.
+            ui.spacing_mut().item_spacing.y = 0.0;
             // One egui id space per pane: without this, the identically-ordered widgets of two
             // panes (back/forward/up, row rects) share one `Id`, and the second pane trips
             // `Context::check_for_id_clash` — whose flame glyph this font stack panics on (rule 11).
@@ -125,9 +145,12 @@ impl PaneDock<'_> {
                     .panes
                     .get(&slot)
                     .is_some_and(|pane| !pane.tabs.is_empty());
+                // The chrome is drawn whether or not the pane has tabs: it is where the workspace
+                // button, the drawers and the layout switches live, and a tab-less pane is exactly
+                // the case that needs its `+`.
+                self.tab_row(ui, slot);
+                self.nav_row(ui, slot);
                 if has_tabs {
-                    self.tab_strip(ui, slot);
-                    self.address_strip(ui, slot);
                     self.listing(ui, slot);
                 } else {
                     ui.vertical_centered(|ui| {
@@ -198,54 +221,115 @@ impl PaneDock<'_> {
             .extend(commands.into_iter().map(|cmd| (slot, cmd)));
     }
 
-    /// The address strip (plan §5.8 `breadcrumb.rs`).
-    fn address_strip(&mut self, ui: &mut Ui, slot: PaneSlot) {
+    /// The navigation bar (plan §5.8 `breadcrumb.rs`, `nav_bar.rs`): the address strip and the icon
+    /// ribbon, in the one row the pane owns.
+    fn nav_row(&mut self, ui: &mut Ui, slot: PaneSlot) {
         let tokens = self.tokens;
-        let Some(pane) = self.model.panes.get_mut(&slot) else {
-            return;
+        let quad = self.model.quad();
+        let split = self.model.layout == zenman_core::store::config::LayoutMode::Split && !quad;
+        let log_open = self.model.log_panel;
+        let left_drawer = self.model.left_drawer.open;
+        let right_drawer = self.model.right_drawer.open;
+        let hints = NavBarHints {
+            refresh: self.keys.hint_text(Command::Refresh),
+            history: self.keys.hint_text(Command::ActionLog),
+            split: self.keys.hint_text(Command::SplitLayout),
+            quad: self.keys.hint_text(Command::QuadLayout),
         };
-        let active = pane.active.min(pane.tabs.len().saturating_sub(1));
-        let Pane {
-            tabs,
-            address_editing,
-            address_buffer,
-            ..
-        } = pane;
-        let Some(tab) = tabs.get(active) else {
-            return;
-        };
-        let can_back = tab.can_go_back();
-        let can_forward = tab.can_go_forward();
+        // A pane without a tab has no path, no history and no listing mode — but its navigation bar
+        // is still where the window's verbs live, so the bar is drawn with an empty address half.
+        let mut address = None;
+        let mut flat = crate::state::FlatMode::Off;
+        let mut grid = false;
+        if let Some(pane) = self.model.panes.get_mut(&slot) {
+            let active = pane.active.min(pane.tabs.len().saturating_sub(1));
+            let Pane {
+                tabs,
+                address_editing,
+                address_buffer,
+                ..
+            } = pane;
+            if let Some(tab) = tabs.get(active) {
+                flat = tab.flat;
+                grid = tab.view == zenman_core::store::config::ViewMode::Grid;
+                address = Some(breadcrumb::BreadcrumbModel {
+                    path: &tab.path,
+                    can_back: tab.can_go_back(),
+                    can_forward: tab.can_go_forward(),
+                    editing: address_editing,
+                    buffer: address_buffer,
+                });
+            }
+        }
         let mut out = Vec::new();
-        let mut model = breadcrumb::BreadcrumbModel {
-            path: &tab.path,
-            can_back,
-            can_forward,
-            editing: address_editing,
-            buffer: address_buffer,
+        let mut global = Vec::new();
+        let mut model = NavBarModel {
+            address,
+            flat,
+            grid,
+            quad,
+            split,
+            log_open,
+            left_drawer,
+            right_drawer,
+            hints,
         };
-        breadcrumb::show(ui, &mut model, &tokens, &mut out);
+        nav_bar::show(ui, &mut model, &tokens, &mut out, &mut global);
         self.commands.extend(out.into_iter().map(|cmd| (slot, cmd)));
+        self.header.extend(global);
     }
 
-    /// The coloured 38 px strip the pane owns *while its group is stripless* (plan §5.7: the dock
-    /// reserves no header height for a protected single-panel group, which is what lets this live
-    /// here). Step 8's `panels::tab_bar` is the implementation; this is the call site.
-    fn tab_strip(&mut self, ui: &mut Ui, slot: PaneSlot) {
+    /// The row the pane's tabs and its workspace button share (plan §5.7: the dock reserves no
+    /// header height for a protected single-panel group, which is what lets this live here).
+    fn tab_row(&mut self, ui: &mut Ui, slot: PaneSlot) {
         let tokens = self.tokens;
+        let whole = Rect::from_min_size(
+            ui.cursor().min,
+            vec2(ui.available_width(), tokens.tab_bar_height),
+        );
+        // The strip paints its own background from where its tabs start; the row behind the
+        // workspace button is the same colour, so the pair reads as one bar.
+        if ui.is_rect_visible(whole) {
+            ui.painter().rect_filled(whole, 0.0, tokens.bg_sidebar);
+        }
+        // The button wants the width of its name; the strip needs the width of a tab. The tabs win.
+        let (room, _) = tab_row_split(&tokens, whole.width());
+        let button = header::button_width(ui, &tokens, &self.workspaces.selected).min(room);
+        let button_rect = Rect::from_min_max(
+            pos2(whole.min.x + tokens.chrome_pad_x, whole.min.y),
+            pos2(whole.min.x + tokens.chrome_pad_x + button, whole.max.y),
+        );
+        let mut asked = Vec::new();
+        crate::widgets::in_rect(
+            ui,
+            button_rect,
+            Layout::left_to_right(Align::Center),
+            |ui| {
+                asked = self
+                    .workspaces
+                    .show(ui, &tokens, self.disk, self.now, button);
+            },
+        );
+        self.header.extend(asked);
         let id = file_pane::pane_id(slot).with("strip");
-        let (commands, overflow_open) = {
-            let Some(pane) = self.model.panes.get(&slot) else {
-                return;
-            };
-            let mut model = TabBarModel {
-                tabs: &pane.tabs,
-                active: pane.active,
-                overflow_open: pane.tabs_overflow_open,
-            };
-            let mut out = Vec::new();
-            tab_bar::show(ui, id, &mut model, &tokens, &mut out);
-            (out, model.overflow_open)
+        let (commands, overflow_open) = match self.model.panes.get(&slot) {
+            Some(pane) => {
+                let mut model = TabBarModel {
+                    tabs: &pane.tabs,
+                    active: pane.active,
+                    overflow_open: pane.tabs_overflow_open,
+                };
+                let mut out = Vec::new();
+                let strip = Rect::from_min_max(
+                    pos2(button_rect.max.x + tokens.nav_group_gap, whole.min.y),
+                    whole.max,
+                );
+                tab_bar::show(ui, id, strip, &mut model, &tokens, &mut out);
+                (out, model.overflow_open)
+            }
+            // A slot the model does not have draws no tabs — but the row is still its height, or the
+            // listing below would be painted over the chrome that is there.
+            None => (Vec::new(), false),
         };
         if let Some(pane) = self.model.panes.get_mut(&slot) {
             pane.tabs_overflow_open = overflow_open;
@@ -262,7 +346,22 @@ impl PaneDock<'_> {
                 }
             }
         }
+        // The row is over: the button, the strip and the `+` were all placed inside `whole`.
+        ui.advance_cursor_after_rect(whole);
     }
+}
+
+/// How a tab row of `width` is split between the workspace control and the tab strip: the strip
+/// keeps [`Tokens::tab_strip_min_width`] — one tab, its overflow button and the `+` — and the control
+/// gets the rest, or its name, whichever is smaller. Past that the control ellipsises; the strip is
+/// what the pane is for.
+///
+/// Returns `(room, strip)` — `room` is the control's band, `strip` what the tabs are left with.
+#[must_use]
+pub(crate) fn tab_row_split(tokens: &Tokens, width: f32) -> (f32, f32) {
+    let chrome = tokens.chrome_pad_x * 2.0 + tokens.nav_group_gap;
+    let room = (width - chrome - tokens.tab_strip_min_width).max(tokens.nav_button * 2.0);
+    (room, (width - chrome - room).max(0.0))
 }
 
 fn placeholder_title(slot: PaneSlot) -> String {
@@ -294,7 +393,14 @@ pub fn show(app: &mut ZenApp, ui: &mut Ui) {
     style.font = tokens.font();
     style.floating_background = tokens.bg_card;
 
-    let (out, mut dock_error, focus, intents, commands) = {
+    let (out, mut dock_error, focus, intents, commands, header) = {
+        // One read of the config per frame, not one per pane: the popup's rows and the disk line are
+        // the same data in both, and `Session::workspaces` clones the whole config to answer.
+        app.workspaces.refresh(app.session.workspaces());
+        let disk = zenman_core::path::AbsPath::from_path("/")
+            .ok()
+            .and_then(|root| app.session.env().disk_space(&root).ok())
+            .map(|space| (space.free, space.total));
         let mut content = PaneDock {
             model: &mut app.model,
             session: &app.session,
@@ -303,6 +409,11 @@ pub fn show(app: &mut ZenApp, ui: &mut Ui) {
             jobs: &app.jobs,
             commands: Vec::new(),
             drag: app.drag.clone(),
+            workspaces: &mut app.workspaces,
+            keys: &app.keys,
+            disk,
+            now: Instant::now(),
+            header: Vec::new(),
         };
         let output: DockOutput<DockId> = DockArea::new(dock::dock_area_id()).show_content(
             ui,
@@ -322,6 +433,7 @@ pub fn show(app: &mut ZenApp, ui: &mut Ui) {
             focused.as_ref().map(dock::slot_of),
             std::mem::take(&mut content.intents),
             std::mem::take(&mut content.commands),
+            std::mem::take(&mut content.header),
         )
     };
     if let Some(slot) = focus {
@@ -346,6 +458,10 @@ pub fn show(app: &mut ZenApp, ui: &mut Ui) {
     for (slot, command) in commands {
         app.run_command(slot, command);
     }
+    // The chrome's commands are the same thing at window scope — the workspace verbs and the four
+    // toggles of the ribbon. They run last, after the panes, because a layout switch reshapes the
+    // grid the pane commands just listed into.
+    app.header_commands(header);
 }
 
 /// The floating-window pass the plan row names (`send_keys(ctx, typing_window(ctx)?, events)`):
@@ -396,6 +512,28 @@ mod tests {
     }
 
     #[test]
+    fn a_narrow_row_gives_its_tabs_the_floor_and_its_button_the_rest() {
+        let tokens = Tokens::dark();
+        // The smallest pane the dock accepts, and everything up from it: the strip never falls below
+        // its floor, which is the point at which tabs stop being clickable.
+        for width in [tokens.pane_min.x, 240.0, 400.0, 900.0, 1440.0] {
+            let (room, strip) = tab_row_split(&tokens, width);
+            assert!(
+                strip >= tokens.tab_strip_min_width - tokens.nav_gap,
+                "a row of {width} left the strip {strip} — below its floor"
+            );
+            assert!(
+                room >= tokens.nav_button * 2.0,
+                "a row of {width} left the workspace control {room} — not even its two icon boxes"
+            );
+            assert!(
+                room + strip <= width,
+                "a row of {width} allocated {room} + {strip}"
+            );
+        }
+    }
+
+    #[test]
     fn dock_id_round_trips_through_the_slot_helper() {
         let panel = DockId::FilePane(PaneSlot::RightBottom);
         assert_eq!(dock::slot_of(&panel), PaneSlot::RightBottom);
@@ -419,6 +557,11 @@ mod tests {
             jobs: &jobs,
             commands: Vec::new(),
             drag: None,
+            workspaces: &mut crate::panels::header::WorkspaceBar::default(),
+            keys: &crate::keymap::KeyMap::default(),
+            disk: None,
+            now: std::time::Instant::now(),
+            header: Vec::new(),
         };
         assert_eq!(
             content.logical_label(&DockId::FilePane(PaneSlot::Left)),

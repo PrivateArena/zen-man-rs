@@ -116,7 +116,7 @@ pub struct ZenApp {
     pub theme: ThemeMode,
     /// The design tokens for the current theme.
     pub tokens: Tokens,
-    /// The boot report lines (GPU profile, startup notes) shown in the header tooltip/status area.
+    /// The boot report lines (GPU profile, startup notes): the first one is the status bar's note.
     pub boot_lines: Vec<String>,
     /// The context menu a panel asked for last frame, waiting to be adopted by
     /// [`Self::open_requested_menu`].
@@ -141,7 +141,7 @@ pub struct ZenApp {
     pub archives_touched: bool,
     /// The file drag in flight (step 10c, `drag_drop`): `None` when the pointer is not dragging rows.
     pub drag: Option<crate::drag_drop::DragPayload>,
-    /// The header's workspace group: the dropdown, `New`/`Delete`, the `✓ Saved` chip and the
+    /// The workspace control of a pane's tab row: the popup, its verbs, the `✓ Saved` chip and the
     /// autosave clock (plan §5.8 `panels/header.rs`, step 14b).
     pub workspaces: crate::panels::header::WorkspaceBar,
     /// The action-log panel's state (plan §5.8 `panels/action_log.rs`, step 14b).
@@ -829,18 +829,10 @@ impl ZenApp {
         }
     }
 
-    /// Per-frame drawing: header, drawers, dock, toasts.
+    /// Per-frame drawing: the panes and their chrome, the drawers, the dock, the toasts.
     pub fn ui(&mut self, ui: &mut Ui) {
         let tokens = self.tokens;
         self.open_requested_menu();
-        let header_height = tokens.header_height;
-        let mut toggle = DrawerToggle::default();
-        let mut header_out: Vec<HeaderCommand> = Vec::new();
-        Panel::top("zenman-header")
-            .exact_size(header_height)
-            .show(ui, |ui| {
-                self.header(ui, &mut toggle, &mut header_out);
-            });
         if self.model.log_panel {
             Panel::right("zenman-log")
                 .exact_size(tokens.action_log_width)
@@ -870,10 +862,13 @@ impl ZenApp {
             .show(ui, |ui| {
                 self.status_bar(ui);
             });
-        CentralPanel::default().show(ui, |ui| {
-            crate::dock_content::show(self, ui);
-        });
-        self.apply_toggles(&toggle, header_out);
+        // The dock fills the frame: `CentralPanel::default()`'s own 8 px margin is dead space
+        // around a grid that already strokes its own panes.
+        CentralPanel::default()
+            .frame(egui::Frame::new().fill(tokens.bg_main))
+            .show(ui, |ui| {
+                crate::dock_content::show(self, ui);
+            });
         self.notices.show(ui.ctx(), &self.tokens);
         // **Last**, on the foreground layer: in this egui fork the last-allocated overlapping rect
         // wins hover and click (plan §9.2 step 8), so the menu is drawn after every panel, the dock
@@ -904,101 +899,6 @@ impl ZenApp {
         if ui.ctx().input(|i| i.pointer.any_released()) {
             self.drag = None;
         }
-    }
-
-    /// The 48 px header (plan §2.2: an `egui::TopBottomPanel`, *not* a dock panel — `Side` has no
-    /// `Top`).
-    fn header(&mut self, ui: &mut Ui, toggle: &mut DrawerToggle, out: &mut Vec<HeaderCommand>) {
-        use crate::panels::header;
-        let tokens = self.tokens;
-        ui.horizontal(|ui| {
-            // The product name is the window title's job (`apps/zenman`'s `APP_TITLE`) and the left
-            // drawer's header (Go's `.sidebar-header h2`, `index.html:21`); Go's own global header
-            // starts at `Workspace:` and so does this one.
-            // The workspace group (plan §5.8 `panels/header.rs`, step-8c review gap 1):
-            // `Workspace: <select>` · `New` · `Delete` · `✓ Saved` · the disk meter. It emits
-            // commands like a pane does; the shell answers them, and the answer may open a dialog,
-            // so nothing here is called from inside the draw closure.
-            let disk = AbsPath::from_path("/")
-                .ok()
-                .and_then(|root| self.session.env().disk_space(&root).ok())
-                .map(|space| (space.free, space.total));
-            self.workspaces.refresh(self.session.workspaces());
-            out.extend(self.workspaces.show(ui, &tokens, disk, Instant::now()));
-            if let Some(line) = self.boot_lines.first() {
-                ui.label(
-                    egui::RichText::new(line)
-                        .color(tokens.text_muted)
-                        .size(tokens.font_size - 2.0),
-                );
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // Right-to-left, so these come out in the reference's order: `History` ·
-                // `2-Pane (F3)` · `4-Pane (F4)`. The chord text is `KeyMap::hint`'s own spelling
-                // (plan D7), never a second table.
-                let quad = self.model.quad();
-                let split = self.model.layout == LayoutMode::Split && !quad;
-                let quad_hint = self.keys.hint_text(Command::QuadLayout);
-                let split_hint = self.keys.hint_text(Command::SplitLayout);
-                if header::chord_button(
-                    ui,
-                    &tokens,
-                    format!("4-Pane ({quad_hint})"),
-                    quad,
-                    &format!("Toggle Quad Split View ({quad_hint})"),
-                ) {
-                    toggle.quad = true;
-                }
-                if header::chord_button(
-                    ui,
-                    &tokens,
-                    format!("2-Pane ({split_hint})"),
-                    split,
-                    &format!("Toggle Split Dual View ({split_hint})"),
-                ) {
-                    toggle.split = true;
-                }
-                // Go's one and only action-history control (`#action-log-toggle`,
-                // `index.html:66-69`) — the port had a second one beside it.
-                if header::chord_button(
-                    ui,
-                    &tokens,
-                    "History".to_string(),
-                    self.model.log_panel,
-                    &format!(
-                        "Action History ({})",
-                        self.keys.hint_text(Command::ActionLog)
-                    ),
-                ) {
-                    toggle.log = true;
-                }
-                ui.separator();
-                // Go's right drawer is the Custom Actions manager (`index.html:425-487`), so this is
-                // the *actions* button and not a disk one — the drawer's own header says so.
-                if icon_button(
-                    ui,
-                    &tokens,
-                    "terminal",
-                    "custom actions",
-                    self.model.right_drawer.open,
-                )
-                .clicked()
-                {
-                    toggle.right = true;
-                }
-                if icon_button(
-                    ui,
-                    &tokens,
-                    "folder-open",
-                    "places",
-                    self.model.left_drawer.open,
-                )
-                .clicked()
-                {
-                    toggle.left = true;
-                }
-            });
-        });
     }
 
     /// The 30 px status bar (plan §5.8 `status_bar.rs`), fed by the active pane's tab.
@@ -1051,6 +951,7 @@ impl ZenApp {
             info,
             jobs: &self.jobs.foreground,
             panes: self.model.panes.len(),
+            note: self.boot_lines.first().cloned(),
         };
         panels::status_bar::show(ui, &model, &tokens);
     }
@@ -1087,31 +988,9 @@ impl ZenApp {
         )
     }
 
-    /// Apply pending header toggles (kept out of `header` so the closure borrows stay apart). The two
-    /// layout buttons *are* the `F3`/`F4` chords: they run the same command, so both toggle themselves
-    /// off to the single pane exactly as Go's `setSplitView(!state.isSplit)` does (`keyboard.js:194`).
-    fn apply_toggles(&mut self, toggle: &DrawerToggle, commands: Vec<HeaderCommand>) {
-        if toggle.split {
-            self.toggle_split_layout();
-        }
-        if toggle.quad {
-            self.toggle_quad_layout();
-        }
-        if toggle.left {
-            self.model.left_drawer.open = !self.model.left_drawer.open;
-        }
-        if toggle.right {
-            self.model.right_drawer.open = !self.model.right_drawer.open;
-        }
-        if toggle.log {
-            self.toggle_log_panel();
-        }
-        self.header_commands(commands);
-    }
-
     /// Go's `setSplitView(!state.isSplit)`: the two-pane grid, or the single pane when it is already
-    /// showing. The `F3` chord and the header's `2-Pane` button are the same two lines of code.
-    fn toggle_split_layout(&mut self) {
+    /// showing. The `F3` chord and the ribbon's `2-pane` button are the same two lines of code.
+    pub(crate) fn toggle_split_layout(&mut self) {
         let to = if self.model.panes.len() > 1 {
             panes_for(LayoutMode::Single)
         } else {
@@ -1121,7 +1000,7 @@ impl ZenApp {
     }
 
     /// Go's `setQuadView(!state.isQuad)` (`keyboard.js:195`), same rule as [`Self::toggle_split_layout`].
-    fn toggle_quad_layout(&mut self) {
+    pub(crate) fn toggle_quad_layout(&mut self) {
         let to = if self.model.quad() {
             panes_for(LayoutMode::Single)
         } else {
@@ -1395,7 +1274,7 @@ impl ZenApp {
             Command::SingleLayout => self.set_layout(panes_for(LayoutMode::Single)),
             // Go's F3/F4 *toggle* (`setSplitView(!state.isSplit)`, `setQuadView(!state.isQuad)`,
             // `keyboard.js:194-195`), so the single pane is the chords' off-state — which is why
-            // `SingleLayout` needs no chord of its own, and why the header's two buttons run these
+            // `SingleLayout` needs no chord of its own, and why the ribbon's two buttons run these
             // very methods rather than a second copy of the rule.
             Command::SplitLayout => self.toggle_split_layout(),
             Command::QuadLayout => self.toggle_quad_layout(),
@@ -1957,9 +1836,25 @@ impl ZenApp {
             DialogKind::SearchManager { .. } => {}
             // Batch rename and the action editor ran above; a *cancelled* workspace delete is the
             // only thing that reaches this match from 14b, and it changes nothing.
-            DialogKind::BatchRename { .. }
-            | DialogKind::ActionEditor { .. }
-            | DialogKind::DeleteWorkspace { .. } => {}
+            DialogKind::BatchRename { .. } | DialogKind::ActionEditor { .. } => {}
+            // The workspace popup's two prompts. A cancelled one is a no-op; an empty name never
+            // reaches here (`Validation::None`), and an illegal one is core's to refuse.
+            DialogKind::NewWorkspace => {
+                if choice == Choice::Ok && !text.is_empty() {
+                    self.header_commands(vec![HeaderCommand::SaveNew(text)]);
+                }
+            }
+            DialogKind::RenameWorkspace { name } => {
+                if choice == Choice::Ok && !text.is_empty() {
+                    self.header_commands(vec![HeaderCommand::RenameTo {
+                        from: name,
+                        to: text,
+                    }]);
+                }
+            }
+            // A *cancelled* workspace delete is the only answer that reaches this match; the
+            // affirmative one ran above (`Answer::Button` on `DeleteWorkspace`).
+            DialogKind::DeleteWorkspace { .. } => {}
             DialogKind::NewFolder { slot } => {
                 if self.new_folder_request == Some(slot) {
                     self.new_folder_request = None;
@@ -2602,16 +2497,6 @@ fn folder_text(folder: &FsPath, named: bool) -> String {
     }
 }
 
-/// Which header buttons were pressed this frame.
-#[derive(Clone, Copy, Default)]
-struct DrawerToggle {
-    split: bool,
-    quad: bool,
-    left: bool,
-    right: bool,
-    log: bool,
-}
-
 /// The shell's build-step number, echoed in the status line (`apps/zenman` prints the crate
 /// constants separately).
 pub const SHELL_STEP: u32 = 7;
@@ -2621,58 +2506,6 @@ fn is_registered(panel: &dock::DockId) -> bool {
     // Every slot the grid can have is "registered" — the grid shape lives in the `Layout` itself,
     // and `reconcile` only asks this for panels the *file* named, all of which we accept.
     matches!(panel, dock::DockId::FilePane(_))
-}
-
-/// A small icon button with the token-derived visuals of `craft_ui::buttons::IconButtonStyle`.
-///
-/// Plan §2.2 names `IconButton::show` for this; its `paint_icon` callback receives a `&Ui`,
-/// which cannot host the `egui::Image` widget the SVG registry needs (image loading is a `&mut Ui`
-/// operation) — a fork-API correction recorded in §9.2. The frame painting therefore uses the
-/// same `ButtonVisuals` types through the `Ui` it owns, so the visual language is unchanged and
-/// the icon path is the registry's.
-fn icon_button(
-    ui: &mut Ui,
-    tokens: &Tokens,
-    icon: &str,
-    tooltip: &str,
-    selected: bool,
-) -> egui::Response {
-    let size = egui::vec2(
-        tokens.header_height - tokens.header_button_inset,
-        tokens.header_height - tokens.header_button_inset,
-    );
-    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
-    let visuals = if selected {
-        craft_ui::buttons::ButtonVisuals {
-            fill: tokens.bg_hover,
-            stroke: egui::Stroke::new(1.0, tokens.accent),
-            icon: tokens.text_active,
-        }
-    } else if response.hovered() {
-        craft_ui::buttons::ButtonVisuals {
-            fill: tokens.bg_hover,
-            stroke: egui::Stroke::NONE,
-            icon: tokens.text_main,
-        }
-    } else {
-        craft_ui::buttons::ButtonVisuals {
-            fill: tokens.transparent,
-            stroke: egui::Stroke::NONE,
-            icon: tokens.text_muted,
-        }
-    };
-    if ui.is_rect_visible(rect) {
-        let radius = egui::CornerRadius::same(tokens.corner_radius);
-        if visuals.fill != tokens.transparent {
-            ui.painter().rect_filled(rect, radius, visuals.fill);
-        }
-        if !visuals.stroke.is_empty() {
-            ui.painter()
-                .rect_stroke(rect, radius, visuals.stroke, egui::StrokeKind::Inside);
-        }
-        crate::icons::paint(ui, rect, icon, rect.height(), visuals.icon);
-    }
-    response.on_hover_text(tooltip)
 }
 
 #[cfg(test)]

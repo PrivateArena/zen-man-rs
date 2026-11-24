@@ -68,9 +68,7 @@ fn pane_harness_at(tag: &str, dir: &std::path::Path, size: egui::Vec2) -> Harnes
     let path = fixture_path(dir);
     app.open_tab(PaneSlot::Left, path);
     let mut harness = Harness::builder()
-        // The header's workspace `ComboBox` (step 14b) surfaces `current_text_value` but no accessible
-        // name in this fork — the same omission the fork's own `TextEdit` has, so the same opt-out.
-        .with_accessibility_check(false)
+        .with_accessibility_check(true)
         .with_size(size)
         .with_context_setup(|ctx| {
             egui_extras::install_image_loaders(ctx);
@@ -92,6 +90,14 @@ fn settle(harness: &mut Harness<'static, ZenApp>) {
     for _ in 0..SETTLE {
         harness.run();
     }
+}
+
+/// The recursive-listing control is one dropdown in the navigation bar, so a mode is two clicks:
+/// the button, then its row.
+fn choose_flat(harness: &mut Harness<'static, ZenApp>, mode: &str) {
+    harness.get_by_label("recursive listing").click();
+    settle(harness);
+    harness.get_by_label(mode).click();
 }
 
 /// The pane's shown tab (the harness is a single pane, so there is exactly one candidate).
@@ -429,7 +435,7 @@ fn clicking_mixed_lists_the_recursive_rows() {
         ]
     );
     assert_eq!(shown(&harness).flat, FlatMode::Off);
-    harness.get_by_label("Mixed").click();
+    choose_flat(&mut harness, "Mixed");
     // The flat page is a real worker-thread job (`page_dir` turns a flat miss into `JobKind::List`)
     // and kittest's fake time never advances it — wait on the wall clock until every job is done and
     // the tab's own pending set has drained (see `common::settle_until`).
@@ -494,7 +500,7 @@ fn no_folders_drops_the_folder_rows_and_still_shows_the_nested_files() {
     // Going Mixed → No folders also pins the re-fetch: the mode is part of the engine's cache key, so
     // the second click cannot be served the first mode's page.
     let mut harness = nested_harness("flatomit");
-    harness.get_by_label("Mixed").click();
+    choose_flat(&mut harness, "Mixed");
     common::settle_until(&mut harness, "the mixed walk finishes", |h| {
         h.state().jobs.live_count() == 0 && shown(h).pending.is_empty()
     });
@@ -503,7 +509,7 @@ fn no_folders_drops_the_folder_rows_and_still_shows_the_nested_files() {
         8,
         "mixed keeps the folders"
     );
-    harness.get_by_label("No folders").click();
+    choose_flat(&mut harness, "No folders");
     // The mode is part of the engine's cache key, so this is a *second* real walk, not a re-paint.
     common::settle_until(&mut harness, "the no-folders walk finishes", |h| {
         h.state().jobs.live_count() == 0 && shown(h).pending.is_empty()
@@ -538,12 +544,12 @@ fn grouped_walks_like_mixed_and_collapse_hides_a_group() {
     // is the pane's render over `rel_path`. So Mixed → Grouped must keep the same rows — and change
     // only the visual order.
     let mut harness = nested_harness("flatgrp");
-    harness.get_by_label("Mixed").click();
+    choose_flat(&mut harness, "Mixed");
     common::settle_until(&mut harness, "the mixed walk finishes", |h| {
         h.state().jobs.live_count() == 0 && shown(h).pending.is_empty()
     });
     let mixed = rel_rows(shown(&harness));
-    harness.get_by_label("Grouped").click();
+    choose_flat(&mut harness, "Grouped");
     // Grouped is the *same request* as Mixed (`navigation.js:92-97`), so no second walk: a frame
     // settle is enough here.
     settle(&mut harness);

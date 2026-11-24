@@ -1,8 +1,9 @@
 //! The dock: pane grid, persistence shape, and the layout edits (plan §5.7 `dock.rs` row).
 //!
 //! File panes are the **only** dock panels: `docking::Side` is `Start | End` only (§2.2 verified),
-//! so the 48 px header is an `egui::TopBottomPanel` outside the `DockArea`, and the drawers and the
-//! action log are panels too — the dock owns nothing but the pane grid.
+//! so the drawers and the action log are panels outside the `DockArea`, while a pane's own chrome —
+//! its tab row and its navigation bar — is drawn by [`crate::dock_content`] inside the pane. There is
+//! no window-wide header panel.
 //!
 //! Every pane answers [`Permissions::PROTECTED`], which makes its group render **stripless**
 //! (`is_protected() = !movable && !closable && !accepts_tabs`, `docking/model.rs:529-535`): no dock

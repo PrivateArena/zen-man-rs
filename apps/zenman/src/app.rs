@@ -35,7 +35,8 @@ const INSTANCE_POLL: Duration = Duration::from_millis(250);
 
 /// The window: the real shell plus the binary's own smoke timer.
 pub struct ShellApp {
-    /// The shell (`zenman-ui`'s `ZenApp`): header, dock, drawers, jobs, persistence.
+    /// The shell (`zenman-ui`'s `ZenApp`): dock, drawers, jobs, persistence. Its chrome — the tab
+    /// row and the navigation bar — belongs to the panes (`zenman_ui::dock_content`).
     shell: zenman_ui::app::ZenApp,
     smoke_after: Option<Duration>,
     started: Instant,

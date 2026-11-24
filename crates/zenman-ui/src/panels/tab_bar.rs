@@ -77,16 +77,19 @@ pub fn runs(tabs: &[Tab]) -> Vec<GroupRun> {
     out
 }
 
-/// Draw the strip.
+/// Draw the strip into the rect its row's owner reserved for it.
+///
+/// The caller owns the row because the row is shared: the pane's workspace button is the first
+/// thing in it (plan §5.8 `tab_bar.rs` row, browser-style chrome), so the strip is what is left over.
+#[allow(clippy::too_many_arguments)]
 pub fn show(
     ui: &mut Ui,
     id: Id,
+    strip: Rect,
     m: &mut TabBarModel<'_>,
     tokens: &Tokens,
     out: &mut Vec<TabCommand>,
 ) {
-    let rect = ui.available_rect_before_wrap();
-    let strip = Rect::from_min_size(rect.min, egui::vec2(rect.width(), tokens.tab_bar_height));
     if ui.is_rect_visible(strip) {
         ui.painter().rect_filled(strip, 0.0, tokens.bg_sidebar);
         ui.painter()
@@ -282,5 +285,4 @@ pub fn show(
     if response.clicked() {
         out.push(TabCommand::NewTab);
     }
-    ui.advance_cursor_after_rect(strip);
 }

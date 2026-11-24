@@ -303,9 +303,7 @@ fn the_history_panel_uses_gos_vocabulary_and_a_real_permanent_record() {
 /// The whole shell, with the left drawer open.
 fn drawer_harness(app: ZenApp) -> Harness<'static, ZenApp> {
     let mut harness = Harness::builder()
-        // The workspace `ComboBox` of step 14b surfaces no accessible name in this fork; every other
-        // widget keeps the check, as `tests/menus.rs` explains.
-        .with_accessibility_check(false)
+        .with_accessibility_check(true)
         .with_size(egui::vec2(1200.0, 800.0))
         .with_max_steps(64)
         .with_context_setup(|ctx| {

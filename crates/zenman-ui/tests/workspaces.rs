@@ -1,10 +1,11 @@
-//! Step 14b: the header's workspace vocabulary (plan §7 row 14, §9.2 step-8c review gap 1) and the
-//! `Saved` chip behind it.
+//! Step 14b: the workspace vocabulary (plan §7 row 14, §9.2 step-8c review gap 1) and the `Saved`
+//! chip behind it.
 //!
-//! The reference header is `Workspace: <select>` · `New` · `Delete` · `Saved` · disk meter ·
-//! `History` · `2-Pane (F3)` · `4-Pane (F4)`. This file asserts the words are on screen, that every
-//! *interactive* one is reachable at 800 px (plan §5.8's `header.rs` criterion), and that the
-//! workspace verbs really move state through `Session` — not just the toast.
+//! Go's header was `Workspace: <select>` · `New` · `Delete` · `Saved` · disk meter. It is now one
+//! button and its popup (`panels::header`), plus the navigation ribbon's window verbs. This file
+//! asserts the names are on screen, that every *interactive* one is reachable at 800 px (plan §5.8's
+//! criterion, restated for the chrome that replaced the header), and that the workspace verbs really
+//! move state through `Session` — not just the toast.
 
 mod common;
 
@@ -19,6 +20,8 @@ use zenman_core::path::{AbsPath, FsPath};
 use zenman_core::services::workspaces::{Autosave, SAVED_INDICATOR_TTL};
 use zenman_core::store::config::{LayoutMode, PaneSlot};
 use zenman_ui::app::ZenApp;
+use zenman_ui::dialogs::{Answer, Choice, DialogKind};
+use zenman_ui::panels::header::HeaderCommand;
 use zenman_ui::state::panes_for;
 
 const SETTLE: usize = 6;
@@ -43,7 +46,7 @@ fn build(app: ZenApp, size: Vec2) -> Harness<'static, ZenApp> {
     let mut harness = Harness::builder()
         .with_size(size)
         .with_max_steps(64)
-        .with_accessibility_check(false)
+        .with_accessibility_check(true)
         .with_context_setup(|ctx| {
             egui_extras::install_image_loaders(ctx);
             zenman_ui::theme::fonts::install(ctx);
@@ -78,69 +81,217 @@ fn pane_app(tag: &str, dir: &Path) -> ZenApp {
     app
 }
 
-/// Every header control a user can click, by the text it answers to.
-const INTERACTIVE: [&str; 5] = ["New", "Delete", "History", "2-Pane (F3)", "4-Pane (F4)"];
+/// Every chrome control a user can click without opening a popup, by the name it answers to: the
+/// workspace button of the tab row and the global group of the navigation ribbon.
+const INTERACTIVE: [&str; 6] = [
+    "workspace",
+    "history",
+    "places",
+    "custom actions",
+    "2-pane",
+    "4-pane",
+];
 
-/// How many times the shell drew a header string (the a11y tree is what a click can reach).
+/// Click the first control of one name: every pane carries its own chrome, so a window-level control
+/// exists once per pane in a grid, and `get_by_label`'s "exactly one" is the wrong demand.
+fn click_first(harness: &mut Harness<'static, ZenApp>, label: &str) {
+    let at = harness
+        .query_all_by_label(label)
+        .map(|node| node.rect().center())
+        .next()
+        .unwrap_or_else(|| panic!("{label:?} is not in the widget tree"));
+    for pressed in [true, false] {
+        harness.input_mut().events.push(egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        });
+    }
+    harness.run();
+}
+
+/// How many times the shell drew a chrome string (the a11y tree is what a click can reach).
 fn drawn(harness: &Harness<'static, ZenApp>, label: &str) -> usize {
     harness.query_all_by_label(label).count()
 }
 
 #[test]
-fn the_header_prints_the_reference_vocabulary() {
+fn the_workspace_button_carries_the_reference_vocabulary() {
     let dir = tree("ws-vocab", &["a.txt"]);
     let mut app = pane_app("ws-vocab", &dir);
-    // The dropdown's rows are the stored workspaces, and a fresh config has none: write the
+    // The popup's rows are the stored workspaces, and a fresh config has none: write the
     // autosave target once so the test sees the same list a running shell shows.
     app.save_workspace_as(zenman_core::services::workspaces::RESERVED);
-    let harness = build(app, egui::vec2(1600.0, 800.0));
-    for want in [
-        "Workspace:",
-        "New",
-        "Delete",
-        "History",
-        "2-Pane (F3)",
-        "4-Pane (F4)",
-    ] {
+    let mut harness = build(app, egui::vec2(1600.0, 800.0));
+    // Go's `select` + `New` + `Delete` are one button; its vocabulary moved into the popup, and the
+    // two verbs of the selected workspace to that popup's right edge.
+    assert!(
+        drawn(&harness, "workspace") > 0,
+        "the workspace control is missing from the tab row"
+    );
+    click_first(&mut harness, "workspace");
+    for want in ["New workspace", "Rename workspace", "Delete workspace"] {
         assert!(
             drawn(&harness, want) > 0,
-            "the reference header's {want:?} is missing from the widget tree"
+            "the workspace popup is missing {want:?}: {:?}",
+            harness.query_all_by_label("").count()
         );
     }
-    // The chord in the label is the keymap's own spelling (plan D7), not a second table.
-    let hint = harness
-        .state()
-        .keys
-        .hint_text(zenman_ui::keymap::Command::SplitLayout);
-    assert_eq!(
-        hint, "F3",
-        "the header prints whatever the keymap says, so the test must know the real chord"
-    );
-    assert!(
-        drawn(&harness, &format!("2-Pane ({hint})")) > 0,
-        "`2-Pane` did not carry `KeyMap::hint`'s chord ({hint})"
-    );
     // `Default` is present and flagged, not hidden (Go hid it and so made it unrestorable).
     let names = harness.state().workspaces.names.clone();
     assert!(
         names.iter().any(|meta| meta.reserved),
-        "the reserved autosave workspace is missing from the dropdown: {names:?}"
+        "the reserved autosave workspace is missing from the popup: {names:?}"
+    );
+    assert!(
+        drawn(&harness, "default (autosave)") > 0,
+        "and the popup does not show it with its flag"
     );
 }
 
 #[test]
-fn every_interactive_header_control_is_reachable_at_800_px() {
+fn every_interactive_chrome_control_is_reachable_at_800_px() {
+    // Plan §5.8's criterion, restated for the chrome that replaced the header: nothing a user can
+    // click is dropped when the window is small. The ribbon's globals and the pane tools both stay
+    // inline here — the address strip's floor is what folds them, and 800 px is above it.
     let dir = tree("ws-800", &["a.txt"]);
     let harness = build(pane_app("ws-800", &dir), egui::vec2(800.0, 600.0));
-    for name in INTERACTIVE {
+    for name in INTERACTIVE.iter().chain(&[
+        "view",
+        "refresh",
+        "recursive listing",
+        "select all",
+        "select none",
+    ]) {
+        let mut inside = 0;
+        for node in harness.query_all_by_label(name) {
+            // A control drawn past the window's edge is named but unreachable: egui still records
+            // it, so presence alone would pass. This is the a11y-tree version of a click.
+            if node.rect().max.x <= 800.0 && node.rect().min.x >= 0.0 {
+                inside += 1;
+            }
+        }
         assert!(
-            drawn(&harness, name) > 0,
-            "{name:?} is not in the widget tree at 800 px — the header dropped a control"
+            inside > 0,
+            "{name:?} is not inside the 800 px window — the chrome dropped or pushed out a control"
         );
     }
-    // The selector survives the narrow header, too (the *optional* member it drops first is the
-    // disk meter's text; `WorkspaceBar::show` guards it on `available_width`).
-    assert!(drawn(&harness, "Workspace:") > 0);
+}
+
+#[test]
+fn the_popup_row_that_is_not_shown_restores_the_session_it_names() {
+    // Clicking a workspace row is Go's `select` change: the stored session comes back, and the
+    // control follows it. The reserved one and a named one differ in their tab count, which is what
+    // makes the two rows distinguishable at all.
+    let dir = tree("ws-switch", &["a.txt"]);
+    let mut app = pane_app("ws-switch", &dir);
+    app.save_workspace_as(zenman_core::services::workspaces::RESERVED);
+    app.set_layout(panes_for(LayoutMode::Split));
+    app.save_workspace_as("two-pane");
+    assert_eq!(
+        app.workspaces.selected, "two-pane",
+        "the seed did not stick"
+    );
+    let mut harness = build(app, egui::vec2(1440.0, 900.0));
+    click_first(&mut harness, "workspace");
+    click_first(&mut harness, "default (autosave)");
+    assert_eq!(
+        harness.state().workspaces.selected,
+        format!("{} (autosave)", zenman_core::services::workspaces::RESERVED),
+        "the row click did not move the control"
+    );
+    assert_eq!(
+        harness.state().model.panes.len(),
+        1,
+        "and did not restore the grid the row stands for"
+    );
+    // And the control now shows the row that was clicked, flagged exactly as the popup spelled it.
+    assert!(
+        harness
+            .state()
+            .workspaces
+            .selected_name()
+            .eq_ignore_ascii_case(zenman_core::services::workspaces::RESERVED),
+        "the control moved to something else: {:?}",
+        harness.state().workspaces.selected
+    );
+}
+
+#[test]
+fn the_workspace_verbs_move_the_stored_session_and_say_so() {
+    // The popup's three verbs, driven through the shell's own answers: `New` and `Edit` ask for a
+    // name in a `Prompt`, and the affirmative answer is what writes.
+    let dir = tree("ws-verbs", &["a.txt"]);
+    let mut app = pane_app("ws-verbs", &dir);
+    let stored = |app: &ZenApp| -> Vec<String> {
+        app.session
+            .workspaces()
+            .into_iter()
+            .map(|meta| meta.name)
+            .collect()
+    };
+
+    app.header_commands(vec![HeaderCommand::Create]);
+    assert!(
+        app.dialogs.active().is_some(),
+        "New workspace asked no name"
+    );
+    app.answer(Answer::Text {
+        kind: DialogKind::NewWorkspace,
+        choice: Choice::Ok,
+        text: "alpha".into(),
+    });
+    assert!(stored(&app).contains(&"alpha".into()), "New saved nothing");
+
+    app.header_commands(vec![HeaderCommand::Rename("alpha".into())]);
+    assert!(
+        app.dialogs.active().is_some(),
+        "Edit asked no name for its rename"
+    );
+    app.answer(Answer::Text {
+        kind: DialogKind::RenameWorkspace {
+            name: "alpha".into(),
+        },
+        choice: Choice::Ok,
+        text: "beta".into(),
+    });
+    let names = stored(&app);
+    assert!(
+        names.contains(&"beta".to_string()) && !names.contains(&"alpha".to_string()),
+        "Edit left {names:?}"
+    );
+    // A rename moves the entry, so the tabs come back with it — which is the whole reason this is
+    // `Session::workspace_rename` and not Go's save-then-delete pair.
+    app.set_layout(panes_for(LayoutMode::Split));
+    app.restore_workspace("beta");
+    assert_eq!(
+        app.model.layout,
+        LayoutMode::Single,
+        "the renamed workspace did not carry its grid"
+    );
+    assert_eq!(
+        app.model.panes[&PaneSlot::Left].tabs.len(),
+        1,
+        "and not its tab"
+    );
+
+    // Onto a taken name: refused, reported, and both workspaces still there.
+    app.save_workspace_as("gamma");
+    let before = stored(&app);
+    app.rename_workspace("beta", "gamma");
+    assert_eq!(
+        stored(&app),
+        before,
+        "a rename onto an existing name changed the store"
+    );
+    assert!(
+        app.notices
+            .queued()
+            .iter()
+            .any(|n| n.text.contains("beta") && !n.text.contains("renamed")),
+        "the refusal said nothing about beta"
+    );
 }
 
 #[test]

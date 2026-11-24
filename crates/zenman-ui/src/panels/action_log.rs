@@ -400,7 +400,7 @@ impl ZenApp {
         }
     }
 
-    /// Toggle the drawer from the header's `History` button (Go's `#history-btn`).
+    /// Toggle the drawer from the navigation bar's `history` button (Go's `#history-btn`).
     pub fn toggle_log_panel(&mut self) {
         self.model.log_panel = !self.model.log_panel;
         if self.model.log_panel {

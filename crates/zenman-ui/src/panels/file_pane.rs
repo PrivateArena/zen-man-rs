@@ -342,7 +342,6 @@ pub fn show(
     let mut out = Vec::new();
     let drag = model.drag.clone();
     let _ = panel;
-    toolbar(ui, model, tokens, &mut out);
     header_row(ui, model, tokens, &mut out);
     if let Some(error) = &model.tab.error {
         error_row(ui, tokens, &error.user_message());
@@ -463,70 +462,6 @@ fn push_background_context(
     });
 }
 
-/// The pane toolbar: view, flat mode, refresh, select-all / select-none.
-///
-/// Go kept these in a 50 px toolbar per pane (`main.js`'s `pane-toolbar`) with a flat-view dropdown
-/// and a grid checkbox; the same controls, in the same order, as tokens.
-fn toolbar(ui: &mut Ui, model: &PaneModel<'_>, tokens: &Tokens, out: &mut Vec<PaneCommand>) {
-    let grid = model.tab.view == ViewMode::Grid;
-    let flat = model.tab.flat;
-    // 15c D7: reserve the band, then place the two groups in it. The old form put the select buttons
-    // in a `right_to_left` arm *inside* the horizontal, which continues from the cursor and not from
-    // the pane's right edge — the quad layout's panes therefore clipped them.
-    let whole = Rect::from_min_size(
-        ui.cursor().min,
-        egui::vec2(ui.available_width(), tokens.toolbar_height),
-    );
-    let (left, right) = band(whole);
-    // Vertically centre each group inside the reserved band (the tokens' own heights, no literals).
-    let inset = ((tokens.toolbar_height - tokens.menu_item_height) * 0.5).max(0.0);
-    let shift = egui::Vec2::Y * inset;
-    let left = Rect::from_min_max(left.min + shift, left.max - shift);
-    let right = Rect::from_min_max(right.min + shift, right.max - shift);
-    crate::widgets::in_rect(
-        ui,
-        left,
-        egui::Layout::left_to_right(egui::Align::Center),
-        |ui| {
-            let toggle = if grid { "list" } else { "grid" };
-            let tip = if grid {
-                "Switch to the list view"
-            } else {
-                "Switch to the grid view"
-            };
-            if tool_icon(ui, tokens, toggle, tip).clicked() {
-                out.push(PaneCommand::ToggleGrid);
-            }
-            if tool_icon(ui, tokens, "refresh", "Re-read the directory (F5)").clicked() {
-                out.push(PaneCommand::Refresh);
-            }
-            flat_buttons(ui, flat, out);
-        },
-    );
-    crate::widgets::in_rect(
-        ui,
-        right,
-        egui::Layout::right_to_left(egui::Align::Center),
-        |ui| {
-            if ui
-                .button("Select none")
-                .on_hover_text("Clear the selection")
-                .clicked()
-            {
-                out.push(PaneCommand::SelectNone);
-            }
-            if ui
-                .button("Select all")
-                .on_hover_text("Select every loaded row")
-                .clicked()
-            {
-                out.push(PaneCommand::SelectAll);
-            }
-        },
-    );
-    ui.advance_cursor_after_rect(whole);
-}
-
 /// The two anchored halves of a full-width band, split at its centre (see [`band_at`]).
 #[must_use]
 pub fn band(whole: Rect) -> (Rect, Rect) {
@@ -628,62 +563,6 @@ fn header_row(ui: &mut Ui, model: &PaneModel<'_>, tokens: &Tokens, out: &mut Vec
             .on_hover_text(format!("Sort by {label} (click again to reverse)"));
         if response.clicked() {
             out.push(PaneCommand::Sort(column));
-        }
-    }
-}
-
-/// A toolbar icon button: its own square in the horizontal layout (not the pane's centre — the
-/// icon is allocated, then painted inside that rect, exactly as the header's buttons do).
-fn tool_icon(ui: &mut Ui, tokens: &Tokens, icon: &str, tooltip: &str) -> egui::Response {
-    let side = tokens.row_icon_size;
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::click());
-    if ui.is_rect_visible(rect) {
-        let tint = if response.hovered() {
-            tokens.text_main
-        } else {
-            tokens.text_muted
-        };
-        crate::icons::paint(ui, rect, icon, side, tint);
-    }
-    response.on_hover_text(tooltip)
-}
-
-/// The recursive-listing buttons, in Go's own words (`main.js`'s flat-view dropdown: *mixed*,
-/// *mixed_no_folders*, *grouped*).
-///
-/// **Live since step 9d.** A click sets the tab's mode and the shell re-lists with it —
-/// [`PaneCommand::SetFlat`] → `ZenApp::run_command` → `ListDir { flat }` → `Session::page_dir`, whose
-/// flat miss is a `JobKind::List` job answering as `DirPageReady` (plan §4.1). The mode is part of the
-/// engine's cache key, so a mode switch cannot be served the previous mode's page — except
-/// *Grouped*, which shares *Mixed*'s key on purpose because the walk is the same request Go sent
-/// (`navigation.js:92-97`); see [`FlatMode::to_core`]. The chosen one is drawn as current, which is
-/// Go's toolbar behaviour (`toolbar.css`'s `.active` state on the flat-view control).
-fn flat_buttons(ui: &mut Ui, flat: FlatMode, out: &mut Vec<PaneCommand>) {
-    for (mode, label, tip) in [
-        (
-            FlatMode::Mixed,
-            "Mixed",
-            "List every entry under this directory, folders among them",
-        ),
-        (
-            FlatMode::MixedNoFolders,
-            "No folders",
-            "List every file under this directory, without the folder rows",
-        ),
-        (
-            FlatMode::Grouped,
-            "Grouped",
-            "The recursive listing, grouped by its own folder",
-        ),
-    ] {
-        // `selectable_label` is the "visibly current" part: the chosen mode carries the accent
-        // selection visuals, the others the plain button's — Go's `.active` class, same meaning.
-        if ui
-            .selectable_label(flat == mode, label)
-            .on_hover_text(tip)
-            .clicked()
-        {
-            out.push(PaneCommand::SetFlat(mode));
         }
     }
 }
@@ -922,7 +801,7 @@ fn banner(ui: &mut Ui, model: &PaneModel<'_>, tokens: &Tokens, out: &mut Vec<Pan
             tokens.row_pad_y as i8,
         ))
         .show(ui, |ui| {
-            // 15c D7: the same band discipline as the toolbar — the message keeps the left half, the
+            // 15c D7: the same band discipline the navigation bar uses — the message keeps the left half, the
             // two buttons the right half, so a narrow pane loses characters of the message instead of
             // the only way out of it.
             let whole = ui.available_rect_before_wrap();

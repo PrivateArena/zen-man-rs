@@ -57,6 +57,9 @@ pub struct StatusModel<'a> {
     pub jobs: &'a [JobSlot],
     /// How many panes the grid shows.
     pub panes: usize,
+    /// The shell's boot note (GPU profile, session report) — the one line the deleted header used
+    /// to print. It shares the bar with the counts rather than costing a row of its own.
+    pub note: Option<String>,
 }
 
 /// Draw the bar.
@@ -94,13 +97,19 @@ pub fn show(ui: &mut Ui, m: &StatusModel<'_>, tokens: &Tokens) {
         },
         StatusInfo::Done(text) => format!("{left} · {text}"),
     };
+    // Three regions, counted as fractions of the bar: the selection and listing counts, the boot
+    // note, and the job/pane cell. The note is the long one, so it gets its own third rather than
+    // whatever the two labels happened to leave.
+    let left_width = bar.width() * 0.45;
+    let note_min = bar.min.x + bar.width() * 0.46;
+    let note_max = bar.min.x + bar.width() * 0.74;
     let label = ui.put(
         egui::Rect::from_min_size(
             egui::pos2(
                 bar.min.x + tokens.cell_padding,
                 bar.center().y - tokens.font_size,
             ),
-            egui::vec2(bar.width() * 0.6, tokens.font_size * 2.0),
+            egui::vec2(left_width, tokens.font_size * 2.0),
         ),
         egui::Label::new(
             egui::RichText::new(&text)
@@ -109,6 +118,7 @@ pub fn show(ui: &mut Ui, m: &StatusModel<'_>, tokens: &Tokens) {
         )
         .truncate(),
     );
+    let label_end = note_min;
     if count > 0 {
         let _ = label.on_hover_text(selection_tooltip(m));
     }
@@ -123,14 +133,31 @@ pub fn show(ui: &mut Ui, m: &StatusModel<'_>, tokens: &Tokens) {
             plural(live.len())
         )
     };
+    // The boot note, in the gap between the two cells: it is a fact about the frame, and it is
+    // long, so it gets the middle and the truncation, with the whole sentence on hover.
+    if let Some(note) = &m.note {
+        let gap = egui::Rect::from_min_max(
+            egui::pos2(label_end + tokens.cell_padding, bar.min.y),
+            egui::pos2(note_max, bar.max.y),
+        );
+        if gap.width() > tokens.status_note_min_width {
+            let response = ui.put(
+                gap,
+                egui::Label::new(
+                    egui::RichText::new(note)
+                        .color(tokens.text_muted)
+                        .size(tokens.font_size - 2.0),
+                )
+                .truncate(),
+            );
+            let _ = response.on_hover_text(note.clone());
+        }
+    }
     ui.put(
         egui::Rect::from_min_size(
-            egui::pos2(
-                bar.max.x - bar.width() * 0.35,
-                bar.center().y - tokens.font_size,
-            ),
+            egui::pos2(note_max, bar.center().y - tokens.font_size),
             egui::vec2(
-                bar.width() * 0.35 - tokens.cell_padding,
+                bar.width() * 0.26 - tokens.cell_padding,
                 tokens.font_size * 2.0,
             ),
         ),

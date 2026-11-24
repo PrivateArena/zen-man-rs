@@ -342,7 +342,7 @@ fn snapshot_name_is_recognised(name: &str) -> bool {
 }
 
 /// The `const SIZE: egui::Vec2 = egui::vec2(w, h)` of the snapshot test — the size the token
-/// geometry (48 px header + 38 px strip + 30 px status bar at the reference window size) implies.
+/// geometry (34 px tab row + 38 px navigation bar + 30 px status bar at the reference window size) implies.
 pub(crate) fn harness_size(root: &Path) -> Result<(u32, u32), Box<dyn Error>> {
     let file = root.join("crates/zenman-ui/tests/snapshots.rs");
     let text = std::fs::read_to_string(&file)?;

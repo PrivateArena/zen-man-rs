@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 
 use egui::{Event, Modifiers, PointerButton, Pos2, Vec2};
 use egui_kittest::Harness;
-use egui_kittest::kittest::Queryable;
+use egui_kittest::kittest::{AccessKitNode, Queryable};
 
 use zenman_core::path::{AbsPath, FsPath};
 use zenman_core::store::config::{CustomAction, LayoutMode, PaneSlot};
@@ -63,12 +63,7 @@ fn fixture_path(path: &Path) -> FsPath {
 
 fn build_harness(app: ZenApp, size: Vec2) -> Harness<'static, ZenApp> {
     let mut harness = Harness::builder()
-        // The header's workspace `ComboBox` (step 14b) surfaces `current_text_value` but no accessible
-        // name in this fork — the same omission the fork's own `TextEdit` has (plan §9.2 step 10), so
-        // the same opt-out. Every other widget in the shell keeps the check honest.
-        // The header's workspace `ComboBox` (step 14b) surfaces `current_text_value` but no accessible
-        // name in this fork — the same omission the fork's own `TextEdit` has, so the same opt-out.
-        .with_accessibility_check(false)
+        .with_accessibility_check(true)
         .with_size(size)
         // The menu is opened by a command that ran at the *end* of the previous frame, and jobs plus
         // the coalesced `DirChanged` window stretch the frame loop: 10a found the builder's default too
@@ -716,6 +711,22 @@ fn copied(harness: &Harness<'static, ZenApp>) -> Option<String> {
 
 // ------------------------------------------------------------------- the menu's screen position
 
+/// A point inside the `row`th listing row, `x` points in from the column header's left edge.
+fn row_point(harness: &Harness<'static, ZenApp>, row: usize, x: f32) -> Pos2 {
+    let header = harness
+        .query_all_by(|node: &AccessKitNode<'_>| {
+            node.role() == egui::Role::Button && node.label().is_some_and(|l| l.starts_with("Name"))
+        })
+        .next()
+        .expect("the column header's Name button")
+        .rect();
+    let tokens = harness.state().tokens;
+    Pos2::new(
+        header.min.x + x,
+        header.max.y + tokens.row_height * (row as f32 + 0.5),
+    )
+}
+
 /// The box the open menu actually painted: the union of the a11y nodes of the rows it drew. A
 /// remembered-position `Area` moves this; a clamped one does not, so it is the only honest way to
 /// assert *where* the menu landed.
@@ -739,11 +750,15 @@ fn the_context_menu_opens_under_the_pointer_wherever_the_pointer_was() {
     let mut harness = pane_harness("menus-where", &dir);
     let mut offsets = vec![];
     let mut tops = vec![];
-    for at in [
-        Pos2::new(150.0, 260.0),
-        Pos2::new(480.0, 340.0),
-        Pos2::new(90.0, 300.0),
-    ] {
+    // One row each, at three different heights: the menu must follow the pointer, and the rows are
+    // where a *row* menu can come from. Located through the column header rather than by a literal
+    // y, because the chrome above the listing is the part that moves when the shell is restyled.
+    let points = [
+        row_point(&harness, 0, 150.0),
+        row_point(&harness, 1, 320.0),
+        row_point(&harness, 2, 90.0),
+    ];
+    for at in points {
         click_at(&mut harness, at, PointerButton::Secondary);
         let open = harness
             .state()

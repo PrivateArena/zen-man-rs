@@ -74,9 +74,7 @@ fn abs(path: &Path) -> AbsPath {
 
 fn build_harness(app: ZenApp, size: egui::Vec2) -> Harness<'static, ZenApp> {
     let mut harness = Harness::builder()
-        // The header's workspace `ComboBox` (step 14b) surfaces `current_text_value` but no accessible
-        // name in this fork — the same omission the fork's own `TextEdit` has, so the same opt-out.
-        .with_accessibility_check(false)
+        .with_accessibility_check(true)
         .with_size(size)
         // Jobs and the `DirChanged` coalescing window make a frame loop outlive the
         // builder's 4-step settle budget; the wait helpers, not the step guard, decide
