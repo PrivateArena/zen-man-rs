@@ -53,7 +53,8 @@
 //! * **Custom actions execute in step 14** (`services/actions.rs`). [`file_menu`] takes the list and
 //!   filters it by *role* only (Go's `getActionsForContext`, `custom-actions.js:337-366`); the glob
 //!   `patterns` filter is that step's, and a click on a custom row is reported, never run.
-//! * **Duplicate Tab / tab group colours** ([`tab_menu`]'s missing rows) are step **14**'s workspaces.
+//! * **Tab groups** ([`tab_menu`]'s greyed rows) are step **14**'s workspaces; `Duplicate Tab` is here
+//!   ([`Command::DuplicateTab`]), the six group rows are not.
 //! * **Open Containing Folder** ([`search_menu`]'s missing rows) is step **12**'s search manager.
 
 use egui::text::LayoutJob;
@@ -76,15 +77,19 @@ pub enum MenuAction {
     Command(Command),
     /// A custom action. Reported, never executed, until step 14's `services::actions`.
     Custom(CustomAction),
+    /// A row that names a verb the shell does not have yet. Every such spec is built **disabled**, so
+    /// [`show`] never emits it: the row is there to keep the menu's shape honest (Go's tab-group block)
+    /// while the command behind it is unwritten, and a greyed row fires nothing.
+    Placeholder,
 }
 
 impl MenuAction {
-    /// The [`Command`] half, `None` for a custom action.
+    /// The [`Command`] half, `None` for a custom action and for a placeholder.
     #[must_use]
     pub fn command(&self) -> Option<Command> {
         match self {
             Self::Command(command) => Some(*command),
-            Self::Custom(_) => None,
+            Self::Custom(_) | Self::Placeholder => None,
         }
     }
 }
@@ -107,6 +112,11 @@ pub enum MenuTarget {
     /// [`crate::app::OpenMenu::folder`] names it. Go spelled the same thing as a DOM attribute
     /// (`data-target-path`, `context-menu.js:148-156`).
     Folder,
+    /// The tab strip's menu (Go's `showTabContextMenu`, `tabs.js:351`); `ix` is the strip index the
+    /// right-click landed on. Its rows act on the tab `ix` *names*, which is why
+    /// [`crate::app::ZenApp::menu_context`] — built from the pane's *shown* tab — must never be read by
+    /// one of its predicates, since the right-clicked tab need not be the shown one.
+    Tab { ix: usize },
 }
 
 /// Everything a builder may ask about. Every field is derived by
@@ -238,6 +248,12 @@ fn always(_: &MenuContext) -> bool {
     true
 }
 
+/// Available never — the predicate a placeholder row is built with, so the row is drawn and fires
+/// nothing ([`MenuAction::Placeholder`]).
+fn never(_: &MenuContext) -> bool {
+    false
+}
+
 /// Needs something selected (Go's `selectedPaths.size > 0` guard inside every `trigger*`).
 fn selection(ctx: &MenuContext) -> bool {
     ctx.has_selection
@@ -292,9 +308,10 @@ pub fn file_menu(
 ) -> Vec<Vec<MenuSpec>> {
     let custom = custom_specs(actions, sel);
     let groups = match ctx.target {
-        // [`menu_for`] routes [`MenuTarget::Folder`] to [`folder_menu`]; sharing the background shape
-        // here is only what keeps this match total, not a second answer for a folder click.
-        MenuTarget::Background | MenuTarget::Folder => {
+        // [`menu_for`] routes [`MenuTarget::Folder`] to [`folder_menu`] and [`MenuTarget::Tab`] to
+        // [`tab_menu`]; sharing the background shape here is only what keeps this match total, not a
+        // second answer for a folder or a tab click.
+        MenuTarget::Background | MenuTarget::Folder | MenuTarget::Tab { .. } => {
             let mut groups = vec![vec![
                 item(Command::Paste, paste_here, icon_paste(ctx)),
                 item(Command::PasteLink, paste_link_here, Some("link")),
@@ -375,10 +392,10 @@ pub fn menu_for(
     sel: &ActionContext,
     actions: &[CustomAction],
 ) -> Vec<Vec<MenuSpec>> {
-    if ctx.target == MenuTarget::Folder {
-        folder_menu(actions, sel)
-    } else {
-        file_menu(ctx, sel, actions)
+    match ctx.target {
+        MenuTarget::Folder => folder_menu(actions, sel),
+        MenuTarget::Tab { .. } => tab_menu(),
+        MenuTarget::Background | MenuTarget::Row { .. } => file_menu(ctx, sel, actions),
     }
 }
 
@@ -403,21 +420,50 @@ pub fn folder_menu(actions: &[CustomAction], sel: &ActionContext) -> Vec<Vec<Men
     shrink(groups)
 }
 
-/// The tab-strip menu (Go's `showTabContextMenu`, `tabs.js:351-386`).
+/// The tab-strip menu (Go's `showTabContextMenu`, `tabs.js:351-386`), group by group.
 ///
-/// Go's `Duplicate Tab` (`tabs.js:365-367`) and the five `… Group` rows plus `Remove Group`
-/// (`tabs.js:353-359,378-381`) need `Tab::{group,color}` plumbing that is step 14's workspaces; they
-/// are absent here rather than faked.
+/// Go's own shape, and the row order it prints: `Close tab`, `Duplicate tab` (`tabs.js:365-367`, live
+/// here since this slice), the two copy rows, then the tab-group block, which is the placeholder half
+/// (`group_rows`). `New tab` is *not* a row of Go's tab menu (its strip has its own `+`), so it is
+/// not one here either.
 #[must_use]
 pub fn tab_menu() -> Vec<Vec<MenuSpec>> {
     shrink(vec![
-        vec![item(Command::NewTab, always, Some("plus"))],
         vec![item(Command::CloseTab, always, Some("close"))],
+        vec![item(Command::DuplicateTab, always, Some("plus"))],
         vec![
             item(Command::CopyPath, always, Some("document")),
             item(Command::CopyName, always, Some("file")),
         ],
+        group_rows(),
     ])
+}
+
+/// The five `… Group` rows and `Remove Group` (Go's `tabs.js:353-359,378-381`), inert until tab groups
+/// land. `Tab::group` and its accent bar already exist (`state.rs`, `tab_bar.rs`, `GroupColor` in
+/// `store::config`), so what is missing is the verbs; a greyed row keeps the menu's shape and fires
+/// nothing (the shell's rule for a row it cannot honour — see this module's "Disabled items stay
+/// visible"). The colour swatch Go paints before each name comes with those verbs.
+fn group_rows() -> Vec<MenuSpec> {
+    [
+        "Red Group",
+        "Blue Group",
+        "Green Group",
+        "Yellow Group",
+        "Purple Group",
+        "Remove Group",
+    ]
+    .into_iter()
+    .map(|label| {
+        spec(
+            MenuAction::Placeholder,
+            label.to_owned(),
+            None,
+            false,
+            never,
+        )
+    })
+    .collect()
 }
 
 /// A search-result menu (Go's `showSearchResultContextMenu`, `context-menu.js:159-177`).
@@ -1197,7 +1243,7 @@ mod tests {
             .flatten()
             .filter_map(|spec| match &spec.action {
                 MenuAction::Custom(a) => Some(a.name.as_str()),
-                MenuAction::Command(_) => None,
+                MenuAction::Command(_) | MenuAction::Placeholder => None,
             })
             .collect();
         assert_eq!(names, ["on-files", "everywhere"]);
@@ -1219,7 +1265,7 @@ mod tests {
             .flatten()
             .filter_map(|spec| match &spec.action {
                 MenuAction::Custom(a) => Some(a.name.clone()),
-                MenuAction::Command(_) => None,
+                MenuAction::Command(_) | MenuAction::Placeholder => None,
             })
             .collect();
         assert_eq!(dir_names, ["on-dirs", "everywhere"]);
@@ -1230,7 +1276,7 @@ mod tests {
             .flatten()
             .filter_map(|spec| match &spec.action {
                 MenuAction::Custom(a) => Some(a.name.clone()),
-                MenuAction::Command(_) => None,
+                MenuAction::Command(_) | MenuAction::Placeholder => None,
             })
             .collect();
         assert_eq!(bg_names, ["everywhere", "bg-only"]);
@@ -1294,14 +1340,21 @@ mod tests {
                 "Copy name Ctrl+Alt+C",
             ]
         );
-        // `showTabContextMenu` (`tabs.js:351-386`) minus the step-14 rows.
+        // `showTabContextMenu` (`tabs.js:351-386`): the four live rows, then Go's tab-group block,
+        // which is placeholders and so prints no hint (`format!` leaves the trailing space).
         assert_eq!(
             labels(&tab_menu()),
             [
-                "New tab Ctrl+T",
                 "Close tab Ctrl+W",
+                "Duplicate tab ",
                 "Copy path Alt+Shift+C",
                 "Copy name Ctrl+Alt+C",
+                "Red Group ",
+                "Blue Group ",
+                "Green Group ",
+                "Yellow Group ",
+                "Purple Group ",
+                "Remove Group ",
             ]
         );
         // `showSearchResultContextMenu` (`context-menu.js:159-177`) minus the step-12 rows.

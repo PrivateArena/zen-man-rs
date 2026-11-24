@@ -84,6 +84,8 @@ pub enum MenuSubject {
     Listing(Option<usize>),
     /// A folder that is not a row — a breadcrumb chip (Go's `showFolderContextMenu` + `data-path`).
     Folder(FsPath),
+    /// One tab of the pane: Go's `showTabContextMenu` (`tabs.js:351`), named by its strip index.
+    Tab { ix: usize },
 }
 
 /// A context menu a panel asked for, waiting one frame to be drawn (see
@@ -485,6 +487,16 @@ impl ZenApp {
                 self.context_request = Some(MenuRequest {
                     slot,
                     subject: MenuSubject::Folder(path),
+                    at,
+                });
+            }
+            PaneCommand::TabContext { ix, at } => {
+                // Recorded, and nothing else: the tab menu acts on the tab under the cursor, so the
+                // right-click must not switch to it — Go's `showTabContextMenu` (`tabs.js:351-386`)
+                // never called `switchTab`, and neither does this.
+                self.context_request = Some(MenuRequest {
+                    slot,
+                    subject: MenuSubject::Tab { ix },
                     at,
                 });
             }
@@ -1056,6 +1068,9 @@ impl ZenApp {
                 None => (MenuTarget::Background, None),
             },
             MenuSubject::Folder(path) => (MenuTarget::Folder, Some(path)),
+            // No field is added to `OpenMenu`: `target` already carries `ix` (and is `Copy`), so a
+            // fourth one would be a second spelling of the same number.
+            MenuSubject::Tab { ix } => (MenuTarget::Tab { ix }, None),
         };
         self.menu = Some(OpenMenu {
             slot,
@@ -1163,6 +1178,17 @@ impl ZenApp {
         }) {
             self.menu = None;
         }
+        // …nor its **tab**: a closed or dragged-away tab must not leave a menu whose verbs name
+        // nothing, so a tab menu is dropped the moment the strip no longer has that index.
+        if self.menu.as_ref().is_some_and(|open| {
+            matches!(open.target, MenuTarget::Tab { ix } if self
+                .model
+                .panes
+                .get(&open.slot)
+                .is_none_or(|pane| ix >= pane.tabs.len()))
+        }) {
+            self.menu = None;
+        }
         let Some(open) = self.menu.clone() else {
             return;
         };
@@ -1184,17 +1210,31 @@ impl ZenApp {
         if outcome.close {
             self.menu = None;
         }
+        let tab_ix = match open.target {
+            MenuTarget::Tab { ix } => Some(ix),
+            _ => None,
+        };
         for action in clicked {
             self.menu = None;
-            match (action, open.folder.clone()) {
-                (MenuAction::Command(command), Some(folder)) => {
+            match (action, open.folder.clone(), tab_ix) {
+                (MenuAction::Command(command), Some(folder), _) => {
                     self.dispatch_folder(open.slot, command, &folder, ctx);
                 }
-                (MenuAction::Command(command), None) => self.dispatch(open.slot, command, ctx),
+                // The tab menu's rows name their own tab (Go's `data-tab-id`, `tabs.js:361`), so the
+                // verb runs against the tab under the cursor rather than the shown one.
+                (MenuAction::Command(command), None, Some(ix)) => {
+                    self.dispatch_tab(open.slot, command, ix, ctx);
+                }
+                (MenuAction::Command(command), None, None) => {
+                    self.dispatch(open.slot, command, ctx)
+                }
+                // A placeholder row is built disabled, so `menus::show` never reports it as clicked;
+                // this arm exists because the type allows it, not because the shell can reach it.
+                (MenuAction::Placeholder, _, _) => {}
                 // Go's `custom-action-for-path` (`context-menu.js:710`): a folder menu's rows carry
                 // their own target, filtered *and* executed against the clicked path rather than
                 // against the pane's selection.
-                (MenuAction::Custom(action), folder) => {
+                (MenuAction::Custom(action), folder, _) => {
                     let context = match &folder {
                         Some(folder) => self.folder_action_context(open.slot, folder),
                         None => self.action_context(open.slot),
@@ -1284,6 +1324,7 @@ impl ZenApp {
             Command::Refresh => self.refresh(slot),
             Command::ToggleView => self.run_command(slot, PaneCommand::ToggleGrid),
             Command::NewTab => self.run_command(slot, PaneCommand::NewTab),
+            Command::DuplicateTab => self.duplicate_shown_tab(slot),
             Command::CloseTab => self.close_shown_tab(slot),
             Command::NextTab => self.cycle_tab(slot, 1),
             Command::PrevTab => self.cycle_tab(slot, -1),
@@ -1532,6 +1573,89 @@ impl ZenApp {
                 format!("{}: not a folder command", other.label()),
             ),
         }
+    }
+
+    /// Run one **tab menu** row against the tab it was opened over — the fourth front end on
+    /// [`Self::dispatch`]'s table (plan **D7**). [`Command::CloseTab`] and its neighbours normally
+    /// answer for the pane's *shown* tab; here they name the tab under the cursor, which is the whole
+    /// point of the menu. Every other command is a row [`crate::menus::tab_menu`] does not draw, and is
+    /// refused here rather than run against the shown tab by accident.
+    fn dispatch_tab(&mut self, slot: PaneSlot, command: Command, ix: usize, ctx: &egui::Context) {
+        let Some(tab) = self
+            .model
+            .panes
+            .get(&slot)
+            .and_then(|pane| pane.tabs.get(ix))
+        else {
+            self.notices.post(
+                toast::Level::Warning,
+                format!("{}: that tab is gone", command.label()),
+            );
+            return;
+        };
+        // Read what the verbs need first: the match below needs `&mut self`, and a menu can
+        // have been drawn against a tab that closed before the click landed.
+        let path = tab.path.clone();
+        match command {
+            Command::CloseTab => self.run_command(slot, PaneCommand::CloseTab(ix)),
+            Command::DuplicateTab => self.duplicate_tab(slot, ix),
+            Command::CopyPath | Command::CopyName => {
+                let named = command == Command::CopyName;
+                self.copy_lines(&[folder_text(&path, named)], ctx);
+            }
+            other => self.notices.post(
+                toast::Level::Warning,
+                format!("{}: not a tab command", other.label()),
+            ),
+        }
+    }
+
+    /// Go's `duplicateTab` (`tabs.js:365-367`): the copy opens **beside** its original — a browser's
+    /// rule, and the reason the tab colour runs [`crate::panels::tab_bar::runs`] stays legible.
+    fn duplicate_tab(&mut self, slot: PaneSlot, ix: usize) {
+        let id = self.model.next_tab_id();
+        // Read the tab first: the insert below needs the pane mutably, and the menu can have been
+        // drawn against a tab that closed before the click landed.
+        let copy = self
+            .model
+            .panes
+            .get(&slot)
+            .and_then(|pane| pane.tabs.get(ix))
+            .map(|tab| tab.duplicate(id));
+        let Some(copy) = copy else {
+            self.notices.post(
+                toast::Level::Warning,
+                format!("{}: that tab is gone", Command::DuplicateTab.label()),
+            );
+            return;
+        };
+        let Some(pane) = self.model.panes.get_mut(&slot) else {
+            return;
+        };
+        // `ix + 1`, clamped: a pane whose last tab was duplicated has its copy last, and a pane that
+        // lost tabs in between cannot be indexed past its own length.
+        let inserted_at = (ix + 1).min(pane.tabs.len());
+        pane.tabs.insert(inserted_at, copy);
+        pane.active = inserted_at;
+        pane.touch_mru(id);
+        // The duplicate lists for itself — the same hand-over [`Self::open_tab`] makes for an
+        // appended tab, and the reason the new tab is not an empty page forever.
+        self.list_at(slot, inserted_at, false, false);
+    }
+
+    /// [`Self::dispatch`]'s route, for a caller that clicked on nothing: the verb answers for the
+    /// pane's **shown** tab — the same index [`Self::close_shown_tab`] takes, under the same empty-pane
+    /// guard (a pane with no tab toasts, it does not underflow).
+    fn duplicate_shown_tab(&mut self, slot: PaneSlot) {
+        let Some(pane) = self.model.panes.get(&slot) else {
+            return;
+        };
+        if pane.tabs.is_empty() {
+            self.nothing_selected("duplicate tab");
+            return;
+        }
+        let ix = pane.active.min(pane.tabs.len() - 1);
+        self.duplicate_tab(slot, ix);
     }
 
     fn no_directory(&mut self, command: Command) {

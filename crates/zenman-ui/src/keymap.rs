@@ -97,6 +97,9 @@ pub enum Command {
     ToggleRightDrawer,
     /// `Ctrl+T` — a new tab in the focused pane (Go's `new-tab`).
     NewTab,
+    /// Copy the shown tab beside itself. Go's `duplicate-tab` (`tabs.js:365-367`) — **no chord**: Go's
+    /// registry (`shortcuts.js:7-31`) has none for it, only its tab-menu row did.
+    DuplicateTab,
     /// `Ctrl+W` — close the shown tab (Go's `close-tab`).
     CloseTab,
     /// `Ctrl+Tab` — the next tab (Go's `cycleTabs(1)`, `keyboard.js:205`).
@@ -177,6 +180,7 @@ impl Command {
         Self::ToggleLeftDrawer,
         Self::ToggleRightDrawer,
         Self::NewTab,
+        Self::DuplicateTab,
         Self::CloseTab,
         Self::NextTab,
         Self::PrevTab,
@@ -232,6 +236,7 @@ impl Command {
             Self::ToggleLeftDrawer => "Toggle places",
             Self::ToggleRightDrawer => "Toggle disks",
             Self::NewTab => "New tab",
+            Self::DuplicateTab => "Duplicate tab",
             Self::CloseTab => "Close tab",
             Self::NextTab => "Next tab",
             Self::PrevTab => "Previous tab",
@@ -605,6 +610,7 @@ const TABLE: &[(Command, &[Chord])] = &[
     (Command::QuadLayout, &[Chord::key(Key::F4)]),
     (Command::ToggleLeftDrawer, &[Chord::ctrl(Key::B)]),
     (Command::NewTab, &[Chord::ctrl(Key::T)]),
+    (Command::DuplicateTab, &[]),
     (Command::CloseTab, &[Chord::ctrl(Key::W)]),
     (Command::GoUp, &[Chord::key(Key::Backspace)]),
     (Command::SelectAll, &[Chord::ctrl(Key::A)]),

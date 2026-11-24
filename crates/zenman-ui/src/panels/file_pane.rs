@@ -76,6 +76,15 @@ pub enum PaneCommand {
         /// Where the menu should open.
         at: Pos2,
     },
+    /// Right-click on a **tab of the strip** — Go's `showTabContextMenu` (`tabs.js:351-386`). The menu
+    /// acts on the tab `ix` names, which is *not* necessarily the shown one: the right-click that opens
+    /// it must not switch tabs.
+    TabContext {
+        /// The strip index the click landed on.
+        ix: usize,
+        /// Where the menu should open.
+        at: Pos2,
+    },
     /// A column header was clicked.
     Sort(SortColumn),
     /// List ⇄ grid.

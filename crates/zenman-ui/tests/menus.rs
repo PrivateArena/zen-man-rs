@@ -24,10 +24,11 @@ use egui_kittest::Harness;
 use egui_kittest::kittest::{AccessKitNode, Queryable};
 
 use zenman_core::path::{AbsPath, FsPath};
-use zenman_core::store::config::{CustomAction, LayoutMode, PaneSlot};
+use zenman_core::store::config::{CustomAction, GroupColor, LayoutMode, PaneSlot, ViewMode};
 use zenman_ui::app::ZenApp;
 use zenman_ui::keymap::{Chord, KeyMap};
 use zenman_ui::menus::MenuTarget;
+use zenman_ui::panels::file_pane::PaneCommand;
 use zenman_ui::state::{Tab, panes_for};
 
 /// Frames to let the shell settle after a non-job action.
@@ -940,4 +941,270 @@ fn the_folder_menu_opens_the_chip_in_a_new_tab() {
         Some(beta.display().to_string()),
         "the new tab lists the chip, not the tab that was open ({inner:?})"
     );
+}
+
+// --------------------------------------------------------------------------- the tab-strip menu
+
+/// Go's `showTabContextMenu` (`tabs.js:351-386`) needs a tab that is *not* the shown one, or "the menu
+/// acts on the tab under the cursor" is the same assertion as "…on the shown tab".
+fn two_tab_harness(tag: &str) -> (Harness<'static, ZenApp>, PathBuf, PathBuf) {
+    let listing = common::listing_tree(tag);
+    let docs = listing.join("docs");
+    let session = common::session(tag);
+    let mut app = ZenApp::new(session, Vec::new());
+    app.set_layout(panes_for(LayoutMode::Single));
+    app.open_tab(PaneSlot::Left, fixture_path(&listing));
+    app.open_tab(PaneSlot::Left, fixture_path(&docs));
+    let harness = build_harness(app, egui::vec2(1200.0, 800.0));
+    (harness, listing, docs)
+}
+
+/// A point on the `ix`th tab. The tab's title is a `.selectable(false)` [`egui::Label`], so its node is
+/// queryable but not click-through — hence a *point*, fed to [`click_at`]. The same word is a
+/// breadcrumb chip and often a row name, and the strip is what tells them apart: the strip sits above
+/// the address strip, so the top-most match is the tab.
+fn tab_point(harness: &Harness<'static, ZenApp>, slot: PaneSlot, ix: usize) -> Pos2 {
+    let title = harness.state().model.panes[&slot].tabs[ix].title.clone();
+    harness
+        .query_all_by_label(&title)
+        .map(|node| node.rect())
+        .min_by(|a, b| a.min.y.total_cmp(&b.min.y))
+        .unwrap_or_else(|| panic!("{title:?} is drawn nowhere, so there is no tab to click"))
+        .center()
+}
+
+/// A point on a row of the open menu, picked by position: the strip's own `×` carries the hover name
+/// `Close tab` too (an icon-only button takes its tooltip text as its accessible name), so the label
+/// alone is ambiguous. The menu opens *at the pointer*, i.e. inside the strip's band, so its row is
+/// always the lowest of the matches.
+fn menu_row_point(harness: &Harness<'static, ZenApp>, label: &str) -> Pos2 {
+    harness
+        .query_all_by_label(label)
+        .map(|node| node.rect())
+        .max_by(|a, b| a.min.y.total_cmp(&b.min.y))
+        .unwrap_or_else(|| panic!("{label:?} is not a row of the open menu"))
+        .center()
+}
+
+/// The pane's tabs, cloned: a test that asserts a verb acted on one tab has to compare the whole
+/// strip, and `Tab` is `Clone`.
+fn pane(harness: &Harness<'static, ZenApp>, slot: PaneSlot) -> Vec<Tab> {
+    harness.state().model.panes[&slot].tabs.clone()
+}
+
+/// Go's `showTabContextMenu`, group by group, opened over a tab that is not the shown one — and the
+/// right-click leaves the shown tab alone, which is the whole difference between this menu and the
+/// listing's.
+#[test]
+fn right_clicking_a_tab_opens_the_tab_menu_and_switches_to_nothing() {
+    let (mut harness, _, docs) = two_tab_harness("menus-tab");
+    assert_eq!(
+        shown(&harness, PaneSlot::Left).path,
+        fixture_path(&docs),
+        "fixture: the second tab is the shown one"
+    );
+
+    let at = tab_point(&harness, PaneSlot::Left, 0);
+    click_at(&mut harness, at, PointerButton::Secondary);
+    assert!(is_open(&harness), "the tab right-click opened nothing");
+    let open = harness.state().menu.clone().unwrap();
+    assert_eq!(
+        open.target,
+        MenuTarget::Tab { ix: 0 },
+        "the menu must name the tab under the cursor"
+    );
+    assert_eq!(
+        open.slot,
+        PaneSlot::Left,
+        "the menu belongs to the pane that owns the strip"
+    );
+    assert_eq!(
+        labels(&harness),
+        [
+            "Close tab",
+            "Duplicate tab",
+            "Copy path",
+            "Copy name",
+            "Red Group",
+            "Blue Group",
+            "Green Group",
+            "Yellow Group",
+            "Purple Group",
+            "Remove Group",
+        ],
+        "`showTabContextMenu`'s rows, in `tabs.js:353-381`'s order"
+    );
+    assert_eq!(
+        harness.state().model.panes[&PaneSlot::Left].active,
+        1,
+        "a right-click does not switch tabs — Go's `showTabContextMenu` never called `switchTab`"
+    );
+}
+
+/// The verbs answer to the right-clicked tab, which is the one the pane is *not* showing.
+#[test]
+fn the_tab_menu_closes_the_tab_it_was_opened_over() {
+    let (mut harness, _, docs) = two_tab_harness("menus-tab-close");
+    let at = tab_point(&harness, PaneSlot::Left, 0);
+    click_at(&mut harness, at, PointerButton::Secondary);
+    let row = menu_row_point(&harness, "Close tab");
+    one_frame_click(&mut harness, row);
+    settle(&mut harness);
+    assert!(!is_open(&harness), "a chosen item always closes the menu");
+
+    let tabs = pane(&harness, PaneSlot::Left);
+    assert_eq!(tabs.len(), 1, "one tab was closed, not both");
+    assert_eq!(
+        tabs[0].path,
+        fixture_path(&docs),
+        "the *shown* tab was closed instead of the right-clicked one"
+    );
+}
+
+/// Go's `duplicateTab` (`tabs.js:365-367`) — of the tab under the cursor, beside it.
+#[test]
+fn the_tab_menu_duplicates_the_tab_it_was_opened_over() {
+    let (mut harness, listing, _) = two_tab_harness("menus-tab-dup");
+    // The right-clicked tab's own view and colour: the copy carries both, the listing carries none.
+    let app = harness.state_mut();
+    let tabs = &mut app
+        .model
+        .panes
+        .get_mut(&PaneSlot::Left)
+        .expect("fixture")
+        .tabs;
+    tabs[0].group = Some(GroupColor::A);
+    tabs[0].view = ViewMode::Grid;
+    let at = tab_point(&harness, PaneSlot::Left, 0);
+    click_at(&mut harness, at, PointerButton::Secondary);
+    let row = menu_row_point(&harness, "Duplicate tab");
+    one_frame_click(&mut harness, row);
+    settle(&mut harness);
+
+    let tabs = pane(&harness, PaneSlot::Left);
+    assert_eq!(tabs.len(), 3, "no tab was added");
+    assert_eq!(tabs[0].path, tabs[1].path, "the copy sits beside it");
+    assert_eq!(
+        tabs[1].path,
+        fixture_path(&listing),
+        "of the right-clicked tab"
+    );
+    assert_ne!(tabs[1].id, tabs[0].id, "a tab id is not reused");
+    assert_eq!(
+        tabs[1].group,
+        Some(GroupColor::A),
+        "the group colour travels with the copy"
+    );
+    assert_eq!(
+        tabs[1].view,
+        ViewMode::Grid,
+        "the view travels with the copy"
+    );
+    let pane = &harness.state().model.panes[&PaneSlot::Left];
+    assert_eq!(pane.active, 1, "the copy is the shown tab");
+}
+
+/// `Copy path` / `Copy name` on the tab, not on the selection nor on the shown tab — the `data-tab-id`
+/// half of Go's tab menu (`tabs.js:361`).
+#[test]
+fn the_tab_menu_copies_the_tab_it_was_opened_over() {
+    let (mut harness, listing, docs) = two_tab_harness("menus-tab-copy");
+    let at = tab_point(&harness, PaneSlot::Left, 0);
+    click_at(&mut harness, at, PointerButton::Secondary);
+    let row = menu_row_point(&harness, "Copy path");
+    one_frame_click(&mut harness, row);
+    assert_eq!(
+        copied(&harness),
+        Some(format!("{}\n", fixture_path(&listing))),
+        "`Copy path` copied the shown tab ({docs:?}) instead of the right-clicked one"
+    );
+
+    // …and `Copy name` is that tab's own last segment.
+    let at = tab_point(&harness, PaneSlot::Left, 0);
+    click_at(&mut harness, at, PointerButton::Secondary);
+    let row = menu_row_point(&harness, "Copy name");
+    one_frame_click(&mut harness, row);
+    assert_eq!(
+        copied(&harness),
+        Some("listing\n".to_string()),
+        "`Copy name` is the tab's name, `copy_lines`'s newline and all"
+    );
+}
+
+/// The tab-group block is the placeholder half of the menu: drawn so the shape matches Go's, greyed so
+/// it fires nothing (`a_greyed_item_fires_nothing`'s rule, from the tab menu).
+#[test]
+fn the_tab_menus_group_rows_are_greyed_and_fire_nothing() {
+    let (mut harness, _, _) = two_tab_harness("menus-tab-group");
+    let at = tab_point(&harness, PaneSlot::Left, 0);
+    click_at(&mut harness, at, PointerButton::Secondary);
+    assert!(is_open(&harness), "fixture");
+
+    let rows = rows(&harness);
+    for label in [
+        "Red Group",
+        "Blue Group",
+        "Green Group",
+        "Yellow Group",
+        "Purple Group",
+        "Remove Group",
+    ] {
+        assert!(
+            rows.iter()
+                .any(|(row, enabled, _)| row == label && !*enabled),
+            "{label} is not the greyed placeholder it is meant to be: {rows:?}"
+        );
+    }
+
+    let before = pane(&harness, PaneSlot::Left);
+    let row = menu_row_point(&harness, "Red Group");
+    one_frame_click(&mut harness, row);
+    harness.run();
+    assert!(
+        is_open(&harness),
+        "a placeholder click dismissed the menu it did not act on"
+    );
+    let after = pane(&harness, PaneSlot::Left);
+    assert_eq!(
+        after.iter().map(|tab| tab.id).collect::<Vec<_>>(),
+        before.iter().map(|tab| tab.id).collect::<Vec<_>>(),
+        "a placeholder click touched the strip"
+    );
+    assert_eq!(
+        harness.state().model.panes[&PaneSlot::Left].active,
+        1,
+        "and it switched tabs on the way"
+    );
+}
+
+/// The mirror of `a_menu_does_not_outlive_its_pane` for the tab the menu was opened over: the strip
+/// index the menu carries has to still name a tab. (It is the *last* tab here because closing an
+/// earlier one leaves the index alive, pointing at whatever shifted into its place — a different
+/// question, and not one a menu can answer for.)
+#[test]
+fn a_tab_menu_does_not_outlive_its_tab() {
+    let (mut harness, listing, _) = two_tab_harness("menus-tab-stale");
+    let at = tab_point(&harness, PaneSlot::Left, 1);
+    click_at(&mut harness, at, PointerButton::Secondary);
+    assert_eq!(
+        harness.state().menu.as_ref().map(|open| open.target),
+        Some(MenuTarget::Tab { ix: 1 }),
+        "fixture: the menu was opened over the last tab"
+    );
+
+    harness
+        .state_mut()
+        .run_command(PaneSlot::Left, PaneCommand::CloseTab(1));
+    harness.run();
+    assert!(
+        !is_open(&harness),
+        "a menu survived the tab it was opened over"
+    );
+    let tabs = pane(&harness, PaneSlot::Left);
+    assert_eq!(
+        tabs.len(),
+        1,
+        "the other tab is none of this menu's business"
+    );
+    assert_eq!(tabs[0].path, fixture_path(&listing));
 }

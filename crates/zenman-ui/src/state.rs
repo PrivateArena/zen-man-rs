@@ -399,6 +399,20 @@ impl Tab {
             pending: BTreeSet::new(),
         }
     }
+
+    /// A copy of this tab under a new id — Go's `duplicateTab` (`tabs.js:365-367`). The *view* travels
+    /// (`view`, `flat`, `sort`, colour) because duplicating a red grid tab is how you make a second red
+    /// grid tab; the listing, selection, scroll, history and group-collapse set do not, because the
+    /// duplicate refetches and a copied page would be stale the moment either tab refreshed.
+    #[must_use]
+    pub fn duplicate(&self, id: TabId) -> Self {
+        let mut tab = Self::new(id, self.path.clone(), self.title.clone());
+        tab.view = self.view;
+        tab.flat = self.flat;
+        tab.sort = self.sort;
+        tab.group = self.group;
+        tab
+    }
 }
 
 /// A page with no rows, the starting value of a tab before its first listing (step 8 swaps in the

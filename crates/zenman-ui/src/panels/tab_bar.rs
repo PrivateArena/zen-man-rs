@@ -21,6 +21,10 @@ pub enum TabCommand {
     Select(usize),
     /// Close it (step 9's write path is what makes a tab dirty; the button is here now).
     Close(usize),
+    /// The tab's own menu, opened over the tab `ix` names — Go's `showTabContextMenu`
+    /// (`tabs.js:351-386`). `at` is the pointer, because the menu opens under the cursor and not under
+    /// the tab (`positionElementSmartly`, `utils.js:21-44`).
+    Context { ix: usize, at: egui::Pos2 },
     /// A new tab in this pane.
     NewTab,
     /// Open / shut the overflow list.
@@ -218,11 +222,20 @@ pub fn show(
         }
         if close_response.clicked() {
             out.push(TabCommand::Close(ix));
-        } else if ui
-            .interact(tab_rect, id.with(("tab", ix)), egui::Sense::click())
-            .clicked()
-        {
-            out.push(TabCommand::Select(ix));
+        } else {
+            // One response for both buttons: `Sense::click()` answers *either*, and a right-click used
+            // to *select* the tab here. The menu owns the tab under the cursor instead — Go's
+            // `showTabContextMenu` never called `switchTab` — so the secondary press must not switch to
+            // it, and the primary press still does.
+            let tab = ui.interact(tab_rect, id.with(("tab", ix)), egui::Sense::click());
+            if tab.secondary_clicked() {
+                out.push(TabCommand::Context {
+                    ix,
+                    at: tab.interact_pointer_pos().unwrap_or(tab_rect.min),
+                });
+            } else if tab.clicked() {
+                out.push(TabCommand::Select(ix));
+            }
         }
     }
     // The overflow list, then the `+` button — both *after* the tabs, inside the strip's own rect.

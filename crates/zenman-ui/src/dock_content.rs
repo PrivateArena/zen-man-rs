@@ -332,6 +332,10 @@ impl PaneDock<'_> {
             match command {
                 TabCommand::Select(ix) => self.commands.push((slot, PaneCommand::SelectTab(ix))),
                 TabCommand::Close(ix) => self.commands.push((slot, PaneCommand::CloseTab(ix))),
+                TabCommand::Context { ix, at } => {
+                    self.commands
+                        .push((slot, PaneCommand::TabContext { ix, at }));
+                }
                 TabCommand::NewTab => self.commands.push((slot, PaneCommand::NewTab)),
                 TabCommand::ToggleOverflow => {
                     if let Some(pane) = self.model.panes.get_mut(&slot) {
