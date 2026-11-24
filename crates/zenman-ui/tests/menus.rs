@@ -1008,9 +1008,16 @@ fn right_clicking_a_tab_opens_the_tab_menu_and_switches_to_nothing() {
     click_at(&mut harness, at, PointerButton::Secondary);
     assert!(is_open(&harness), "the tab right-click opened nothing");
     let open = harness.state().menu.clone().unwrap();
+    // The id of the tab the point was taken on — `tab_point`'s `ix` and this `id` are the same tab,
+    // which is the whole content of the assertion below.
+    let first = harness.state().model.panes[&PaneSlot::Left].tabs[0].id;
     assert_eq!(
         open.target,
-        MenuTarget::Tab { ix: 0 },
+        MenuTarget::Tab {
+            id: first,
+            group: None,
+            multi: false,
+        },
         "the menu must name the tab under the cursor"
     );
     assert_eq!(
@@ -1025,14 +1032,19 @@ fn right_clicking_a_tab_opens_the_tab_menu_and_switches_to_nothing() {
             "Duplicate tab",
             "Copy path",
             "Copy name",
+            "New Tab Group",
             "Red Group",
             "Blue Group",
             "Green Group",
             "Yellow Group",
             "Purple Group",
+            "Orange Group",
+            "Cyan Group",
+            "Pink Group",
+            "Teal Group",
             "Remove Group",
         ],
-        "`showTabContextMenu`'s rows, in `tabs.js:353-381`'s order"
+        "`showTabContextMenu`'s rows, in `tabs.js:353-381`'s order, with the port's four extra colours"
     );
     assert_eq!(
         harness.state().model.panes[&PaneSlot::Left].active,
@@ -1142,70 +1154,104 @@ fn the_tab_menu_copies_the_tab_it_was_opened_over() {
     );
 }
 
-/// The tab-group block is the placeholder half of the menu: drawn so the shape matches Go's, greyed so
-/// it fires nothing (`a_greyed_item_fires_nothing`'s rule, from the tab menu).
+/// The tab-group block is live: `tabs.js:353-359`'s colour rows put the tab in a group of that colour,
+/// `New Tab Group` waits for a selection of two or more, and `Remove Group` waits for a tab that is in one
+/// — the enablement rules of `docs/tab-groups-design.md` §6, read the way this suite reads a listing
+/// menu's: off the specs and their predicates, not off the pixels.
 #[test]
-fn the_tab_menus_group_rows_are_greyed_and_fire_nothing() {
+fn the_tab_menus_group_block_groups_what_it_is_clicked_over() {
     let (mut harness, _, _) = two_tab_harness("menus-tab-group");
     let at = tab_point(&harness, PaneSlot::Left, 0);
     click_at(&mut harness, at, PointerButton::Secondary);
     assert!(is_open(&harness), "fixture");
 
-    let rows = rows(&harness);
-    for label in [
-        "Red Group",
-        "Blue Group",
-        "Green Group",
-        "Yellow Group",
-        "Purple Group",
-        "Remove Group",
-    ] {
-        assert!(
-            rows.iter()
-                .any(|(row, enabled, _)| row == label && !*enabled),
-            "{label} is not the greyed placeholder it is meant to be: {rows:?}"
-        );
-    }
+    let menu = rows(&harness);
+    let enabled = |label: &str| {
+        menu.iter()
+            .find(|(row, ..)| row == label)
+            .unwrap_or_else(|| panic!("{label} is not in the tab menu: {menu:?}"))
+            .1
+    };
+    assert!(
+        enabled("Red Group"),
+        "a colour row is always offered: that is how a group starts"
+    );
+    assert!(
+        !enabled("New Tab Group"),
+        "one tab is not a multi-selection, so the row that groups the selection is greyed: {menu:?}"
+    );
+    assert!(
+        !enabled("Remove Group"),
+        "the tab is in no group to be taken out of: {menu:?}"
+    );
 
-    let before = pane(&harness, PaneSlot::Left);
     let row = menu_row_point(&harness, "Red Group");
     one_frame_click(&mut harness, row);
-    harness.run();
+    settle(&mut harness);
     assert!(
-        is_open(&harness),
-        "a placeholder click dismissed the menu it did not act on"
+        !is_open(&harness),
+        "a live row closes the menu it was clicked in"
     );
-    let after = pane(&harness, PaneSlot::Left);
+
+    let pane = &harness.state().model.panes[&PaneSlot::Left];
+    let grouped: Vec<_> = pane.tabs.iter().filter_map(|tab| tab.group).collect();
     assert_eq!(
-        after.iter().map(|tab| tab.id).collect::<Vec<_>>(),
-        before.iter().map(|tab| tab.id).collect::<Vec<_>>(),
-        "a placeholder click touched the strip"
+        grouped,
+        vec![pane.tabs[0].group.expect("grouped")],
+        "the right-clicked tab got a group and no other tab did"
+    );
+    let gid = grouped[0];
+    assert_eq!(
+        pane.tab_color(Some(gid)),
+        Some(GroupColor::A),
+        "in the colour the row named"
+    );
+    assert_eq!(
+        pane.group(gid).expect("the new group").label(),
+        "Red",
+        "unnamed, so the chip says what colour it is"
     );
     assert_eq!(
         harness.state().model.panes[&PaneSlot::Left].active,
         1,
-        "and it switched tabs on the way"
+        "grouping is not a navigation"
+    );
+
+    // …and the same menu over the tab that now has one lights its own row up again.
+    let at = tab_point(&harness, PaneSlot::Left, 0);
+    click_at(&mut harness, at, PointerButton::Secondary);
+    let again = rows(&harness);
+    assert!(
+        again
+            .iter()
+            .any(|(row, enabled, _)| row == "Remove Group" && *enabled),
+        "`Remove Group` is still greyed over a tab that has a group: {again:?}"
     );
 }
 
-/// The mirror of `a_menu_does_not_outlive_its_pane` for the tab the menu was opened over: the strip
-/// index the menu carries has to still name a tab. (It is the *last* tab here because closing an
-/// earlier one leaves the index alive, pointing at whatever shifted into its place — a different
-/// question, and not one a menu can answer for.)
+/// The mirror of `a_menu_does_not_outlive_its_pane` for the tab the menu was opened over: the tab id
+/// the menu carries has to still name a tab. (It is the *last* tab here because closing a *different*
+/// one must leave this menu standing — the strip index this test used to carry would have survived
+/// that as a live number pointing at another tab, which is the whole reason it is an id now.)
 #[test]
 fn a_tab_menu_does_not_outlive_its_tab() {
     let (mut harness, listing, _) = two_tab_harness("menus-tab-stale");
     let at = tab_point(&harness, PaneSlot::Left, 1);
     click_at(&mut harness, at, PointerButton::Secondary);
+    let last = harness.state().model.panes[&PaneSlot::Left].tabs[1].id;
     assert_eq!(
         harness.state().menu.as_ref().map(|open| open.target),
-        Some(MenuTarget::Tab { ix: 1 }),
+        Some(MenuTarget::Tab {
+            id: last,
+            group: None,
+            multi: false,
+        }),
         "fixture: the menu was opened over the last tab"
     );
 
     harness
         .state_mut()
-        .run_command(PaneSlot::Left, PaneCommand::CloseTab(1));
+        .run_command(PaneSlot::Left, PaneCommand::CloseTab(last));
     harness.run();
     assert!(
         !is_open(&harness),

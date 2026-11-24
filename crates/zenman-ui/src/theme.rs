@@ -169,6 +169,27 @@ pub struct Tokens {
     pub tab_strip_min_width: f32,
     /// The `×` of a tab.
     pub tab_close_size: f32,
+    // ---- tab-group chip (`docs/tab-groups-design.md` §5) --------------------------------------
+    /// Height of a group's label chip inside the strip row — shorter than a tab, so the chip reads as
+    /// the group's handle and not as a tab that was clicked by accident.
+    pub group_chip_height: f32,
+    /// Text inset of the chip, on both sides of its label.
+    pub group_chip_padding: f32,
+    /// Gap between a chip and the run it heads.
+    pub group_chip_gap: f32,
+    /// Size of the chip's collapse chevron (drawn as a triangle, never as a glyph: the bundled fonts
+    /// do not guarantee one).
+    pub group_chevron: f32,
+    /// Widest a chip's label gets before it ellipsises — a long group name must not eat the strip.
+    pub group_label_max_width: f32,
+    /// Width of the drop bar a tab drag paints, reusing the accent bar's own weight.
+    pub group_drop_bar: f32,
+    /// Corner radius of the chip — past the chip's own half-height, so it is a pill at any font size.
+    pub group_chip_corner: u8,
+    /// Seconds the pointer must rest on a collapsed chip before its tab list flies out.
+    pub group_hover_open: f64,
+    /// Seconds the pointer may be gone from the chip *and* the flyout before it closes.
+    pub group_hover_grace: f64,
     /// Widest single breadcrumb segment.
     pub crumb_max_width: f32,
     /// Horizontal padding inside a crumb chip (`toolbar.css:85`, `padding: 2px 6px`).
@@ -320,6 +341,9 @@ pub struct Tokens {
     pub corner_radius: u8,
 }
 
+/// Luminance above which a chip's ink flips from the shell's text colour to its background colour.
+const CHIP_INK_SWITCH: f32 = 0.62;
+
 impl Tokens {
     /// The dark token set — the reference's only theme (§10 decision 7: match the current dark
     /// theme exactly).
@@ -387,6 +411,15 @@ impl Tokens {
             tab_new_button: 22.0,
             tab_strip_min_width: 120.0,
             tab_close_size: 14.0,
+            group_chip_height: 22.0,
+            group_chip_padding: 8.0,
+            group_chip_gap: 4.0,
+            group_chevron: 8.0,
+            group_label_max_width: 110.0,
+            group_drop_bar: 3.0,
+            group_chip_corner: 99,
+            group_hover_open: 0.28,
+            group_hover_grace: 0.12,
             crumb_max_width: 220.0,
             crumb_chip_padding: 6.0,
             crumb_separator_gap: 4.0,
@@ -512,6 +545,32 @@ impl Tokens {
             GroupColor::G => self.group_cyan,
             GroupColor::H => self.group_pink,
             GroupColor::I => self.group_teal,
+        }
+    }
+
+    /// The chip's body: the group's own colour, solid when the run is open.
+    ///
+    /// Kept in the palette (like every colour here) because the strip may not name a colour itself.
+    #[must_use]
+    pub fn group_chip_fill(self, group: GroupColor, collapsed: bool) -> Color32 {
+        let paint = self.group_color(group);
+        if collapsed {
+            // Folded: the same hue, washed out, so nine folded chips do not shout over the one open run.
+            paint.gamma_multiply(0.45)
+        } else {
+            paint
+        }
+    }
+
+    /// Ink for a chip filled with `group`'s colour: whichever of the shell's two text colours has the
+    /// contrast, by relative luminance.
+    #[must_use]
+    pub fn group_chip_ink(self, group: GroupColor) -> Color32 {
+        let [r, g, b, _] = self.group_color(group).to_normalized_gamma_f32();
+        if 0.299 * r + 0.587 * g + 0.114 * b > CHIP_INK_SWITCH {
+            self.bg_main
+        } else {
+            self.text_main
         }
     }
 

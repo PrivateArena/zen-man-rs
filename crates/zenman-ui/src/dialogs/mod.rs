@@ -44,6 +44,7 @@ use zenman_core::ops::paste::PasteMode;
 use zenman_core::path::AbsPath;
 use zenman_core::store::config::PaneSlot;
 
+use crate::state::GroupId;
 use crate::theme::Tokens;
 
 /// What an answer is about. Everything the command needs travels with the dialog, not with the
@@ -113,6 +114,16 @@ pub enum DialogKind {
     RenameWorkspace {
         /// The name it has now.
         name: String,
+    },
+    /// `Prompt` → the rename of one pane's tab group (`docs/tab-groups-design.md` §6). The subject is
+    /// the pane *and* the group, because a group id is per pane and the answer has to land in the
+    /// strip that asked — and because the group may have been closed while the prompt was up, which is
+    /// a no-op rather than a panic.
+    RenameTabGroup {
+        /// The pane whose strip owns the group.
+        slot: PaneSlot,
+        /// The group.
+        id: GroupId,
     },
     /// `Properties` (step 13b) — the subject is the path it printed, and the only answer is "close".
     Properties {

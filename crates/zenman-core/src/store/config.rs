@@ -287,11 +287,11 @@ impl GroupColor {
         }
     }
 
-    /// The colour's menu row label (`"Red group"`) — the spelling Go's tab menu used for its own group
-    /// rows, kept so the port's menu reads like the reference.
+    /// The colour's menu row label (`"Red Group"`) — Go's own spelling for its tab menu's group rows
+    /// (`tabs.js:353-359`), kept so the port's menu reads like the reference.
     #[must_use]
     pub fn label(self) -> String {
-        format!("{} group", self.name())
+        format!("{} Group", self.name())
     }
 
     /// Read one group letter, in either case. `None` for empty text and for anything that is not a
@@ -1171,7 +1171,7 @@ mod tests {
             "the menu walks ALL, so its order is the palette order"
         );
         assert_eq!(GroupColor::F.name(), "Orange");
-        assert_eq!(GroupColor::F.label(), "Orange group");
+        assert_eq!(GroupColor::F.label(), "Orange Group", "Go's spelling");
         // A..E are Go's; F..I are the port's, and Go must not be able to produce them.
         assert_eq!(GroupColor::parse_go("f"), None, "no such group in Go");
         assert_eq!(GroupColor::parse_letter("i"), Some(GroupColor::I));

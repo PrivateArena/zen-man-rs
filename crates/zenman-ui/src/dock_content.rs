@@ -20,7 +20,7 @@ use crate::panels::file_pane::{self, PaneCommand, PaneModel};
 use crate::panels::header::{self, HeaderCommand, WorkspaceBar};
 use crate::panels::nav_bar::{self, NavBarHints, NavBarModel};
 use crate::panels::tab_bar::{self, TabBarModel, TabCommand};
-use crate::state::Pane;
+use crate::state::{GroupId, GroupTarget, GroupVerb, Pane};
 use crate::theme::Tokens;
 
 /// What a drop on a pane body should produce (plan row: `UiCommand::PasteInto`). The command bus
@@ -47,6 +47,9 @@ pub struct PaneDock<'a> {
     pub commands: Vec<(PaneSlot, PaneCommand)>,
     /// The file drag in flight, cloned in so a body can offer its rows as drop targets (step 10c).
     pub drag: Option<crate::drag_drop::DragPayload>,
+    /// The chips every strip in this frame reported hovered, for the shell's hover state machine
+    /// (`docs/tab-groups-design.md` §7). Reported by the strip because only it knows the chip's rect.
+    pub tab_hovers: Vec<(PaneSlot, GroupId, Rect)>,
     /// The workspace control of the tab row: the session on screen, the stored ones, the autosave
     /// clock. Borrowed separately from `model` so the pane can drive it (plan §5.8 `header.rs`).
     pub workspaces: &'a mut WorkspaceBar,
@@ -313,6 +316,11 @@ impl PaneDock<'_> {
                     active: pane.active,
                     overflow_open: pane.tabs_overflow_open,
                     groups: &pane.groups,
+                    selected: &pane.tab_sel,
+                    // The hover flyout and the tab drag read these back (design §7, §8); the strip is
+                    // what owns the geometry either of them can trust.
+                    layout: tab_bar::StripLayout::default(),
+                    hovered: None,
                 };
                 let mut out = Vec::new();
                 let strip = Rect::from_min_max(
@@ -320,6 +328,11 @@ impl PaneDock<'_> {
                     whole.max,
                 );
                 tab_bar::show(ui, id, strip, &mut model, &tokens, &mut out);
+                // The chip the pointer rested on, if a strip reported one: the shell's hover state machine
+                // decides whether that means a flyout (design §7).
+                if let Some((gid, rect)) = model.hovered {
+                    self.tab_hovers.push((slot, gid, rect));
+                }
                 (out, model.overflow_open)
             }
             // A slot the model does not have draws no tabs — but the row is still its height, or the
@@ -331,11 +344,26 @@ impl PaneDock<'_> {
         }
         for command in commands {
             match command {
-                TabCommand::Select(ix) => self.commands.push((slot, PaneCommand::SelectTab(ix))),
-                TabCommand::Close(ix) => self.commands.push((slot, PaneCommand::CloseTab(ix))),
-                TabCommand::Context { ix, at } => {
+                TabCommand::Select { id, kind } => self
+                    .commands
+                    .push((slot, PaneCommand::SelectTab { id, kind })),
+                TabCommand::Close(id) => self.commands.push((slot, PaneCommand::CloseTab(id))),
+                TabCommand::Context { id, at } => {
                     self.commands
-                        .push((slot, PaneCommand::TabContext { ix, at }));
+                        .push((slot, PaneCommand::TabContext { id, at }));
+                }
+                TabCommand::ToggleGroup(id) => {
+                    self.commands.push((
+                        slot,
+                        PaneCommand::TabGroup {
+                            target: GroupTarget::Group(id),
+                            verb: GroupVerb::ToggleCollapse,
+                        },
+                    ));
+                }
+                TabCommand::GroupContext { id, at } => {
+                    self.commands
+                        .push((slot, PaneCommand::GroupContext { id, at }));
                 }
                 TabCommand::NewTab => self.commands.push((slot, PaneCommand::NewTab)),
                 TabCommand::ToggleOverflow => {
@@ -392,7 +420,7 @@ pub fn show(app: &mut ZenApp, ui: &mut Ui) {
     style.font = tokens.font();
     style.floating_background = tokens.bg_card;
 
-    let (out, mut dock_error, focus, intents, commands, header) = {
+    let ((out, mut dock_error, focus, intents, commands, header), hovers) = {
         // One read of the config per frame, not one per pane: the popup's rows and the disk line are
         // the same data in both, and `Session::workspaces` clones the whole config to answer.
         app.workspaces.refresh(app.session.workspaces());
@@ -408,6 +436,7 @@ pub fn show(app: &mut ZenApp, ui: &mut Ui) {
             jobs: &app.jobs,
             commands: Vec::new(),
             drag: app.drag.clone(),
+            tab_hovers: Vec::new(),
             workspaces: &mut app.workspaces,
             keys: &app.keys,
             disk,
@@ -426,12 +455,15 @@ pub fn show(app: &mut ZenApp, ui: &mut Ui) {
             ..
         } = output;
         (
-            actions,
-            error.map(|e| e.to_string()),
-            focused.as_ref().map(dock::slot_of),
-            std::mem::take(&mut content.intents),
-            std::mem::take(&mut content.commands),
-            std::mem::take(&mut content.header),
+            (
+                actions,
+                error.map(|e| e.to_string()),
+                focused.as_ref().map(dock::slot_of),
+                std::mem::take(&mut content.intents),
+                std::mem::take(&mut content.commands),
+                std::mem::take(&mut content.header),
+            ),
+            content.tab_hovers,
         )
     };
     if let Some(slot) = focus {
@@ -453,6 +485,9 @@ pub fn show(app: &mut ZenApp, ui: &mut Ui) {
     }
     // The pane's commands are the shell's per-frame input (plan §4.1): they run *after* the draw,
     // so a navigation never mutates the state another pane is painting from.
+    // The chips that were hovered this frame, handed on before the commands run: a fold that a command
+    // causes must not close a flyout the same frame opened.
+    app.tab_group_reports = hovers;
     for (slot, command) in commands {
         app.run_command(slot, command);
     }
@@ -555,6 +590,7 @@ mod tests {
             jobs: &jobs,
             commands: Vec::new(),
             drag: None,
+            tab_hovers: Vec::new(),
             workspaces: &mut crate::panels::header::WorkspaceBar::default(),
             keys: &crate::keymap::KeyMap::default(),
             disk: None,

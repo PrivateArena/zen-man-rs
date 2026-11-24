@@ -722,6 +722,57 @@ impl TabGroup {
     }
 }
 
+/// Which thing a [`GroupVerb`] acts on.
+///
+/// Two shapes because the feature has two entry points: the **chip** is the group itself, while a
+/// **tab**'s menu has to ask the pane which group that tab is in (design §6). Carrying the group id in
+/// the verb as well would let the two disagree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroupTarget {
+    /// The group's own menu, from its chip.
+    Group(GroupId),
+    /// A tab's menu: the group is whichever one holds this tab, and an ungrouped tab is the reason
+    /// `New`/`NewColor`/`Leave` exist.
+    Tab(TabId),
+}
+
+/// What the user asked a tab group to do (`docs/tab-groups-design.md` §6).
+///
+/// Which *tabs* a verb acts on is never in the verb: the menu rows are built from data and the pane's
+/// `tab_sel` is the truth by the time a row is clicked, so [`crate::app::ZenApp::run_group_command`]
+/// reads the selection then. Which *group* is [`GroupTarget`], not a payload of each variant.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GroupVerb {
+    /// Fold or unfold the run — the chip's own click, and the group menu's toggle row.
+    ToggleCollapse,
+    /// Group the selected tabs in the first colour no group of this pane holds.
+    New,
+    /// Group the selected tabs in a chosen colour — joining the group that already wears it, or
+    /// starting one. That is one verb and not two because a menu row cannot know which case it is in.
+    NewColor(GroupColor),
+    /// Take the selected tabs out of whichever group holds them; a group emptied dies with them.
+    Leave,
+    /// Release every tab of the group and forget the group. The tabs stay open — that is *ungroup*.
+    Ungroup,
+    /// Ask for a new name: the menu row, which opens the prompt. Its answer is
+    /// [`GroupVerb::Name`], so the prompt owns the text and this verb owns the model.
+    Rename,
+    /// Name a group. Empty means "back to being named after its colour", which is what an unnamed group
+    /// is (`TabGroup::label`).
+    Name {
+        /// The group the prompt was opened over, carried because the prompt outlives the menu.
+        id: GroupId,
+        /// The new label.
+        name: String,
+    },
+    /// Close every tab of the group, and the group with them.
+    Close,
+    /// Move the group to another colour — and, when another group already wears it, merge into it (§2).
+    Color(GroupColor),
+    /// Select every tab of the group, so the next verb can act on the run as one.
+    Select,
+}
+
 /// How a strip click changes the multi-selection (`SelKind` of the tab strip).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TabSelKind {
@@ -961,22 +1012,33 @@ impl Pane {
         self.active_tab().map(|tab| tab.id)
     }
 
-    /// Show `id` (the id-based half of `SelectTab`): clamps, records the range anchor and the MRU ring.
-    /// Never touches a group's `collapsed` — invariant 4 keeps the shown tab visible instead.
-    pub fn activate(&mut self, id: TabId) -> bool {
+    /// Show `id` and nothing else: the pane's index, the MRU ring. No selection change, no group is
+    /// unfolded — a <kbd>Ctrl</kbd>-click has to move the focus without throwing the multi-selection
+    /// away, and invariant 4 already keeps the shown tab visible.
+    pub fn show(&mut self, id: TabId) -> bool {
         let Some(ix) = self.tabs.iter().position(|tab| tab.id == id) else {
             return false;
         };
         self.active = ix;
-        self.tab_sel = BTreeSet::from([id]);
-        self.tab_sel_anchor = Some(id);
         self.touch_mru(id);
         true
     }
 
+    /// Show `id` **and** make the selection just that tab — what a plain click, a keyboard cycle and a
+    /// restored session all mean. The strip's own clicks go through [`Pane::show`] plus
+    /// [`Pane::select_tab`] instead, so <kbd>Ctrl</kbd> and <kbd>Shift</kbd> can reach the first two.
+    pub fn activate(&mut self, id: TabId) -> bool {
+        if !self.show(id) {
+            return false;
+        }
+        self.tab_sel = BTreeSet::from([id]);
+        self.tab_sel_anchor = Some(id);
+        true
+    }
+
     /// The strip's click handling: one tab, toggled, or the run from the anchor (see [`TabSelKind`]).
-    /// The shown tab always follows the click — a strip click selects *and* shows, as in a browser; the
-    /// rest of the set rides along for the verbs that need it.
+    /// Selection only — which tab is *shown* is [`Pane::show`]'s question, so a <kbd>Ctrl</kbd>-click can
+    /// add to a set without collapsing it back to one.
     pub fn select_tab(&mut self, id: TabId, kind: TabSelKind) -> bool {
         let Some(ix) = self.tabs.iter().position(|tab| tab.id == id) else {
             return false;
@@ -1656,7 +1718,10 @@ mod groups {
             .expect("three");
         // The first group pulled `c` up beside `a`; the second then pulled `f` beside `d`, where `d`
         // had landed. Both runs are tight, and neither swallowed the other.
-        assert_eq!(order(&pane), vec![ids[0], ids[2], ids[1], ids[3], ids[5], ids[4]]);
+        assert_eq!(
+            order(&pane),
+            vec![ids[0], ids[2], ids[1], ids[3], ids[5], ids[4]]
+        );
         assert_eq!(pane.members(red_a), vec![0, 1], "{:?}", order(&pane));
         assert_eq!(pane.members(red_b), vec![3, 4], "{:?}", order(&pane));
         pane.rename_group(red_a, "first");
@@ -1671,14 +1736,18 @@ mod groups {
         pane.create_group(gid, &[ids[0], ids[1]], GroupColor::B)
             .expect("two");
         assert!(pane.join_group(gid, &[ids[3]]));
-        assert_eq!(pane.members(gid), vec![0, 1, 2], "the joiner moved up to the run");
+        assert_eq!(
+            pane.members(gid),
+            vec![0, 1, 2],
+            "the joiner moved up to the run"
+        );
         assert_eq!(pane.group_of(ids[3]), Some(gid));
         // A tab that leaves by itself: the group lives on, the strip does not reorder.
         let before = order(&pane);
         assert_eq!(pane.leave_group(&[ids[3]]), 1);
         assert_eq!(order(&pane), before, "leaving is not a reorder");
         assert_eq!(pane.group_of(ids[3]), None, "it is gone from the group");
-        assert!(pane.join_group(GroupId(99), &[ids[2]]) == false, "no such group");
+        assert!(!pane.join_group(GroupId(99), &[ids[2]]), "no such group");
         pane.debug_assert_invariants();
     }
 
@@ -1733,7 +1802,11 @@ mod groups {
             "both runs moved together: {:?}",
             order(&pane)
         );
-        assert_eq!(pane.group_of(ids[3]), Some(keep), "nothing points at the dead id");
+        assert_eq!(
+            pane.group_of(ids[3]),
+            Some(keep),
+            "nothing points at the dead id"
+        );
         // The boring case: a colour nobody holds is one field write.
         pane.set_group_color(keep, GroupColor::I);
         assert_eq!(pane.group(keep).expect("kept").color, GroupColor::I);
@@ -1765,7 +1838,10 @@ mod groups {
         pane.select_tab(ids[0], TabSelKind::Toggle);
         pane.close_tabs(&[ids[0], ids[1]]);
         assert_eq!(order(&pane), vec![ids[2]]);
-        assert!(!pane.tab_sel.contains(&ids[0]), "a closed tab cannot be selected");
+        assert!(
+            !pane.tab_sel.contains(&ids[0]),
+            "a closed tab cannot be selected"
+        );
         assert_eq!(pane.active, 0, "the shown index stayed on the strip");
         assert_eq!(pane.active_id(), Some(ids[2]));
         assert!(pane.mru.iter().all(|id| *id == ids[2]));
@@ -1782,7 +1858,11 @@ mod groups {
     fn the_click_kinds_follow_the_modifiers() {
         let (mut pane, ids) = strip(&["a", "b", "c", "d"]);
         pane.activate(ids[1]);
-        assert_eq!(pane.selected_tabs(), vec![ids[1]], "a click shows and selects");
+        assert_eq!(
+            pane.selected_tabs(),
+            vec![ids[1]],
+            "a click shows and selects"
+        );
         pane.select_tab(ids[3], TabSelKind::Toggle);
         assert_eq!(pane.selected_tabs(), vec![ids[1], ids[3]], "ctrl adds");
         pane.select_tab(ids[3], TabSelKind::Toggle);
@@ -1804,7 +1884,10 @@ mod groups {
         pane.select_tab(ids[2], TabSelKind::Replace);
         assert_eq!(pane.selected_tabs(), vec![ids[2]]);
         assert_eq!(pane.active, 1, "a selection is not a navigation");
-        assert!(!pane.activate(TabId(99)), "an id this pane does not have is refused, not clamped");
+        assert!(
+            !pane.activate(TabId(99)),
+            "an id this pane does not have is refused, not clamped"
+        );
         assert!(!pane.select_tab(TabId(99), TabSelKind::Replace));
     }
 
@@ -1822,7 +1905,10 @@ mod groups {
             Some(ids[1]),
             "collapsing did not move the shown tab out from under the pane"
         );
-        assert!(pane.activate(ids[0]), "and activating inside it does not unfold it either");
+        assert!(
+            pane.activate(ids[0]),
+            "and activating inside it does not unfold it either"
+        );
         assert!(pane.group(gid).expect("kept").collapsed);
         // `items()` of the strip is what keeps this visible; the model only promises the id is honest.
         assert!(pane.members(gid).contains(&pane.active));
@@ -1838,11 +1924,19 @@ mod groups {
         pane.create_group(GroupId(7), &[ids[0], ids[2]], GroupColor::E)
             .expect("two");
         assert_eq!(pane.members(GroupId(7)), vec![0, 1]);
-        assert_eq!(pane.active_id(), Some(ids[2]), "the shown tab followed its id");
+        assert_eq!(
+            pane.active_id(),
+            Some(ids[2]),
+            "the shown tab followed its id"
+        );
         assert_eq!(pane.active, 1);
         let before = order(&pane);
         pane.compact();
-        assert_eq!(order(&pane), before, "compacting tidy state changes nothing");
+        assert_eq!(
+            order(&pane),
+            before,
+            "compacting tidy state changes nothing"
+        );
         // A pane with no groups at all is not touched by it either.
         let (mut plain, _) = strip(&["a", "b"]);
         plain.compact();
@@ -1853,7 +1947,8 @@ mod groups {
     fn a_duplicated_tab_stays_in_its_group() {
         let (mut pane, ids) = strip(&["a", "b"]);
         let gid = GroupId(1);
-        pane.create_group(gid, &[ids[0]], GroupColor::G).expect("one");
+        pane.create_group(gid, &[ids[0]], GroupColor::G)
+            .expect("one");
         let copy = Tab::duplicate(&pane.tabs[0], TabId(50));
         assert_eq!(copy.group, Some(gid), "Go's duplicateTab kept the colour");
         pane.tabs.insert(1, copy);
@@ -1869,7 +1964,11 @@ mod groups {
         assert_eq!(GroupId::from_store("g7"), Some(GroupId(7)));
         assert_eq!(GroupId::from_store("g"), None, "a bare prefix is not an id");
         assert_eq!(GroupId::from_store("g1x"), None);
-        assert_eq!(GroupId::from_store("tab_1_z"), None, "Go's tab ids are not group ids");
+        assert_eq!(
+            GroupId::from_store("tab_1_z"),
+            None,
+            "Go's tab ids are not group ids"
+        );
         let mut model = AppModel::new(LayoutMode::Single);
         assert_eq!(
             model.adopt_group_id("g41"),

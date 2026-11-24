@@ -35,7 +35,9 @@ use crate::dock::DockId;
 use crate::jobs_ui::JobSlot;
 use egui::widgets::text_edit::TextEditState;
 
-use crate::state::{FlatMode, RenameEditor, Selection, Tab};
+use crate::state::{
+    FlatMode, GroupId, GroupTarget, GroupVerb, RenameEditor, Selection, Tab, TabId, TabSelKind,
+};
 use crate::theme::Tokens;
 use crate::widgets::entry_row::{self, SelectionState, SizeLookup};
 use crate::widgets::virtual_list::{
@@ -77,11 +79,12 @@ pub enum PaneCommand {
         at: Pos2,
     },
     /// Right-click on a **tab of the strip** — Go's `showTabContextMenu` (`tabs.js:351-386`). The menu
-    /// acts on the tab `ix` names, which is *not* necessarily the shown one: the right-click that opens
+    /// acts on the tab `id` names, which is *not* necessarily the shown one: the right-click that opens
     /// it must not switch tabs.
     TabContext {
-        /// The strip index the click landed on.
-        ix: usize,
+        /// The tab the click landed on. An id and not a strip index, because the command is queued: by
+        /// the time it is applied a close or a reorder may have moved that index onto another tab.
+        id: TabId,
         /// Where the menu should open.
         at: Pos2,
     },
@@ -97,12 +100,39 @@ pub enum PaneCommand {
     LoadAll,
     /// Re-read the directory (`F5`).
     Refresh,
+    /// A tab-group verb and the group or tab it was aimed at — the chip's click, the tab menu and the
+    /// group menu all end up here (`docs/tab-groups-design.md` §6), each naming its subject by id because
+    /// a strip index is worth nothing once the run folds.
+    TabGroup {
+        /// Chip, or tab.
+        target: GroupTarget,
+        /// What to do.
+        verb: GroupVerb,
+    },
+    /// Right-click on a group's **chip**: the group's own menu, over the group `id` names.
+    GroupContext {
+        /// The group the click landed on.
+        id: GroupId,
+        /// Where the menu opens.
+        at: Pos2,
+    },
     /// A new tab in this pane.
     NewTab,
-    /// Show the tab at this index in the pane.
-    SelectTab(usize),
-    /// Close the tab at this index.
-    CloseTab(usize),
+    /// Show this tab, and select it that way. An id and not an index into [`crate::state::Pane::tabs`]:
+    /// a queued command must not act on a shifted index — the shell resolves the id when it applies the
+    /// command, and drops it when the tab is gone.
+    SelectTab {
+        /// The tab the click landed on.
+        id: TabId,
+        /// What the modifier keys said the click meant.
+        kind: TabSelKind,
+    },
+    /// Close this tab — likewise by id (see [`PaneCommand::SelectTab`]).
+    CloseTab(TabId),
+    /// Close these tabs in one step: the bulk form of the command above, and the only way to close
+    /// several at once, so a group that is wiped takes its MRU entries, its selection and its now-empty
+    /// group row with it exactly like a single close does.
+    CloseTabs(Vec<TabId>),
     /// Select every loaded row (Go's `selectAll`, `file-list.js:679-691`).
     SelectAll,
     /// Clear the selection (Go's `Esc`, which its key registry never wired).

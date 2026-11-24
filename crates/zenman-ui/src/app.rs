@@ -35,7 +35,7 @@ use zenman_core::session::{Receipt, Session, StartupNote};
 use zenman_core::store::config::{LayoutMode, PaneSlot, ThemeMode};
 
 use crate::dialogs::{
-    self, Answer, Choice, Confirm, ConfirmButton, DialogKind, Prompt, Validation,
+    self, Answer, Choice, Confirm, ConfirmButton, Dialog, DialogKind, Prompt, Validation,
 };
 use crate::dock::{self, Dock};
 use crate::jobs_ui::JobsUi;
@@ -47,7 +47,9 @@ use crate::panels::{
     header::HeaderCommand,
 };
 use crate::persist::Persisted;
-use crate::state::{AppModel, Tab, TabId, panes_for, quad_slots};
+use crate::state::{
+    AppModel, GroupId, GroupTarget, GroupVerb, Tab, TabId, TabSelKind, panes_for, quad_slots,
+};
 use crate::theme::{self, Tokens};
 use crate::widgets::toast;
 
@@ -84,8 +86,46 @@ pub enum MenuSubject {
     Listing(Option<usize>),
     /// A folder that is not a row — a breadcrumb chip (Go's `showFolderContextMenu` + `data-path`).
     Folder(FsPath),
-    /// One tab of the pane: Go's `showTabContextMenu` (`tabs.js:351`), named by its strip index.
-    Tab { ix: usize },
+    /// One tab of the pane: Go's `showTabContextMenu` (`tabs.js:351`), named by its [`TabId`] — the
+    /// strip index the click landed on is already stale by the time the menu is adopted one frame
+    /// later, which is the reason [`MenuRequest`] waits a frame at all.
+    Tab { id: TabId },
+    /// One tab group: the menu of its chip, which acts on the whole run. `Copy`-friendly because a
+    /// [`GroupId`](crate::state::GroupId) is one.
+    Group { id: GroupId },
+}
+
+/// A tab drag in flight: the pane that owns it, and the tab it carries. The *target* is not stored —
+/// it is recomputed from the strip's layout every frame, because that is the only geometry both the
+/// pointer and the tabs agree on (design §8).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TabDrag {
+    /// The pane whose strip started the drag. A drop into another pane is out of scope.
+    pub slot: PaneSlot,
+    /// The tab under the pointer when the drag began.
+    pub id: TabId,
+}
+
+/// The flyout that lists a collapsed group's tabs (Firefox's answer to "folded, but still usable").
+///
+/// `chip` and `popup` are both remembered because the popup *covers* the chip: the moment the pointer
+/// moves into the list, `Response::hovered` on the chip is false, and a keep-alive built on it closes the
+/// flyout before it can be read. So the test is the raw pointer position against the union of the two
+/// rects, and `popup` is last frame's rect (this frame's does not exist until it has been painted).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TabGroupHover {
+    /// The pane the chip belongs to.
+    pub slot: PaneSlot,
+    /// The group whose members are listed.
+    pub id: GroupId,
+    /// The chip's rect, as the strip reported it.
+    pub chip: egui::Rect,
+    /// When the pointer landed on the chip (`ctx.input(|i| i.time)`, seconds).
+    pub since: f64,
+    /// Last frame's popup rect, if it was drawn at all.
+    pub popup: Option<egui::Rect>,
+    /// When the pointer left both rects, `None` while it is inside either.
+    pub left: Option<f64>,
 }
 
 /// A context menu a panel asked for, waiting one frame to be drawn (see
@@ -143,6 +183,15 @@ pub struct ZenApp {
     pub archives_touched: bool,
     /// The file drag in flight (step 10c, `drag_drop`): `None` when the pointer is not dragging rows.
     pub drag: Option<crate::drag_drop::DragPayload>,
+    /// The tab a strip drag is carrying, and which pane's strip is carrying it: the tab list is *not*
+    /// reordered while the pointer is down (design §8), so this is the whole drag state — the target is
+    /// recomputed from the layout every frame.
+    pub tab_drag: Option<TabDrag>,
+    /// The collapsed chip whose tab list is flown out (`docs/tab-groups-design.md` §7). One at a time,
+    /// like `menu`, and for the same reason: it is a layer of its own with a keep-alive of its own.
+    pub tab_group_hover: Option<TabGroupHover>,
+    /// The chips the strips reported hovered this frame, consumed by [`Self::logic`].
+    pub tab_group_reports: Vec<(PaneSlot, GroupId, egui::Rect)>,
     /// The workspace control of a pane's tab row: the popup, its verbs, the `✓ Saved` chip and the
     /// autosave clock (plan §5.8 `panels/header.rs`, step 14b).
     pub workspaces: crate::panels::header::WorkspaceBar,
@@ -180,6 +229,9 @@ impl ZenApp {
             extracts: Vec::new(),
             archives_touched: false,
             drag: None,
+            tab_drag: None,
+            tab_group_hover: None,
+            tab_group_reports: Vec::new(),
             workspaces: crate::panels::header::WorkspaceBar::default(),
             log: crate::panels::action_log::LogPanel::default(),
             persist_at: None,
@@ -210,6 +262,9 @@ impl ZenApp {
             extracts: Vec::new(),
             archives_touched: false,
             drag: None,
+            tab_drag: None,
+            tab_group_hover: None,
+            tab_group_reports: Vec::new(),
             workspaces: crate::panels::header::WorkspaceBar::default(),
             log: crate::panels::action_log::LogPanel::default(),
             persist_at: None,
@@ -490,13 +545,13 @@ impl ZenApp {
                     at,
                 });
             }
-            PaneCommand::TabContext { ix, at } => {
+            PaneCommand::TabContext { id, at } => {
                 // Recorded, and nothing else: the tab menu acts on the tab under the cursor, so the
                 // right-click must not switch to it — Go's `showTabContextMenu` (`tabs.js:351-386`)
                 // never called `switchTab`, and neither does this.
                 self.context_request = Some(MenuRequest {
                     slot,
-                    subject: MenuSubject::Tab { ix },
+                    subject: MenuSubject::Tab { id },
                     at,
                 });
             }
@@ -568,23 +623,34 @@ impl ZenApp {
                     .unwrap_or(FsPath::ROOT);
                 self.open_tab(slot, path);
             }
-            PaneCommand::SelectTab(ix) => {
-                if let Some(pane) = self.model.panes.get_mut(&slot)
-                    && ix < pane.tabs.len()
-                {
-                    pane.active = ix;
-                    let id = pane.tabs[ix].id;
-                    pane.touch_mru(id);
+            PaneCommand::SelectTab { id, kind } => {
+                // Resolved now, not when the command was queued: a stale command is dropped, never
+                // clamped onto another tab. The click kind goes first, so the run a <kbd>Shift</kbd>
+                // click takes is the run of the anchor it left behind, and `activate` then follows the
+                // click — the pane shows what was clicked whatever the selection ended up as.
+                if let Some(pane) = self.model.panes.get_mut(&slot) {
+                    // Order matters: the range's anchor is whatever the *previous* click left, so the
+                    // selection is taken before `select_tab` moves it, and the pane then shows the tab
+                    // the click landed on (`show` does not touch the set it just built).
+                    if kind == TabSelKind::Replace {
+                        pane.activate(id);
+                    } else {
+                        pane.select_tab(id, kind);
+                        pane.show(id);
+                    }
                 }
             }
-            PaneCommand::CloseTab(ix) => {
-                if let Some(pane) = self.model.panes.get_mut(&slot)
-                    && ix < pane.tabs.len()
-                {
-                    let id = pane.tabs.remove(ix).id;
-                    pane.mru.retain(|existing| *existing != id);
-                    pane.active = pane.active.min(pane.tabs.len().saturating_sub(1));
-                }
+            PaneCommand::CloseTab(id) => self.close_tabs(slot, &[id]),
+            PaneCommand::CloseTabs(ids) => self.close_tabs(slot, &ids),
+            PaneCommand::TabGroup { target, verb } => self.run_group_command(slot, target, verb),
+            PaneCommand::GroupContext { id, at } => {
+                // Recorded like any other menu request, and likewise without selecting anything: the
+                // chip is not a tab, and a right-click that folded the run would be a surprise.
+                self.context_request = Some(MenuRequest {
+                    slot,
+                    subject: MenuSubject::Group { id },
+                    at,
+                });
             }
             PaneCommand::BeginDrag { ix } => self.begin_drag(slot, ix),
             PaneCommand::DropInto { ix, copy } => self.drop_into_row(slot, ix, copy),
@@ -1068,9 +1134,26 @@ impl ZenApp {
                 None => (MenuTarget::Background, None),
             },
             MenuSubject::Folder(path) => (MenuTarget::Folder, Some(path)),
-            // No field is added to `OpenMenu`: `target` already carries `ix` (and is `Copy`), so a
-            // fourth one would be a second spelling of the same number.
-            MenuSubject::Tab { ix } => (MenuTarget::Tab { ix }, None),
+            // No field is added to `OpenMenu`: `target` already carries the id (and is `Copy`), so a
+            // fourth one would be a second spelling of the same identity.
+            // The two facts the tab menu's group rows need come along for the ride, resolved **now** —
+            // from the tab the click landed on and the selection the right-click left behind, never from
+            // the pane's shown tab, which this menu says nothing about.
+            MenuSubject::Tab { id } => {
+                let pane = self.model.panes.get(&slot);
+                let group = pane.and_then(|pane| pane.group_of(id));
+                let multi = pane.is_some_and(|pane| pane.tab_sel.len() > 1);
+                (MenuTarget::Tab { id, group, multi }, None)
+            }
+            MenuSubject::Group { id } => {
+                let collapsed = self
+                    .model
+                    .panes
+                    .get(&slot)
+                    .and_then(|pane| pane.group(id))
+                    .is_some_and(|group| group.collapsed);
+                (MenuTarget::TabGroup { id, collapsed }, None)
+            }
         };
         self.menu = Some(OpenMenu {
             slot,
@@ -1123,6 +1206,9 @@ impl ZenApp {
     /// The context the builders ask about, derived from live state field by field — the plan row's
     /// "a `MenuContext` field that cannot be populated yet is a documented gap, not a hardcoded
     /// `true`".
+    ///
+    /// The two tab facts come from the **target**, not from the pane's shown tab: a tab menu says nothing
+    /// about the tab that happens to be on screen, and a chip menu has no tab at all.
     #[must_use]
     pub fn menu_context(&self, slot: PaneSlot, target: MenuTarget) -> MenuContext {
         let tab = self
@@ -1161,6 +1247,16 @@ impl ZenApp {
             // 14b: the real source. Go's `triggerRename` sent a selection of more than one row to
             // `batch-rename.js`, so "mid-batch" *is* "more than one row is selected".
             in_batch: tab.is_some_and(|tab| tab.sel.len() > 1),
+            // …and the tab menu's two, straight off the target (see the method's doc).
+            in_group: match target {
+                MenuTarget::Tab { group, .. } => group.is_some(),
+                MenuTarget::TabGroup { .. } => true,
+                _ => false,
+            },
+            multi_tab: match target {
+                MenuTarget::Tab { multi, .. } => multi,
+                _ => false,
+            },
             target,
         }
     }
@@ -1179,13 +1275,26 @@ impl ZenApp {
             self.menu = None;
         }
         // …nor its **tab**: a closed or dragged-away tab must not leave a menu whose verbs name
-        // nothing, so a tab menu is dropped the moment the strip no longer has that index.
+        // nothing, so a tab menu is dropped the moment the strip no longer has that id. By id, not by
+        // index: closing a tab shifts every index after it, and the menu would survive onto the tab
+        // that slid into its place.
         if self.menu.as_ref().is_some_and(|open| {
-            matches!(open.target, MenuTarget::Tab { ix } if self
+            matches!(open.target, MenuTarget::Tab { id, .. } if self
                 .model
                 .panes
                 .get(&open.slot)
-                .is_none_or(|pane| ix >= pane.tabs.len()))
+                .is_none_or(|pane| !pane.tabs.iter().any(|tab| tab.id == id)))
+        }) {
+            self.menu = None;
+        }
+        // …and a **chip** menu must not outlive its group, which the same argument covers: closing the
+        // last tab of a run buries the group, and its menu would be naming nothing.
+        if self.menu.as_ref().is_some_and(|open| {
+            matches!(open.target, MenuTarget::TabGroup { id, .. } if self
+                .model
+                .panes
+                .get(&open.slot)
+                .is_none_or(|pane| pane.group(id).is_none()))
         }) {
             self.menu = None;
         }
@@ -1210,27 +1319,39 @@ impl ZenApp {
         if outcome.close {
             self.menu = None;
         }
-        let tab_ix = match open.target {
-            MenuTarget::Tab { ix } => Some(ix),
+        let tab_id = match open.target {
+            MenuTarget::Tab { id, .. } => Some(id),
             _ => None,
         };
         for action in clicked {
             self.menu = None;
-            match (action, open.folder.clone(), tab_ix) {
+            match (action, open.folder.clone(), tab_id) {
+                // A tab-group row: the target this menu was opened over says what it means — a chip
+                // names its group, a tab names whichever group holds it — and the verb is resolved when
+                // the row is clicked, not when the rows were built (§6).
+                (MenuAction::Group(verb), ..) => {
+                    let Some(target) = Self::group_target(open.target) else {
+                        continue;
+                    };
+                    self.run_command(
+                        open.slot,
+                        PaneCommand::TabGroup {
+                            target,
+                            verb: verb.clone(),
+                        },
+                    );
+                }
                 (MenuAction::Command(command), Some(folder), _) => {
                     self.dispatch_folder(open.slot, command, &folder, ctx);
                 }
                 // The tab menu's rows name their own tab (Go's `data-tab-id`, `tabs.js:361`), so the
                 // verb runs against the tab under the cursor rather than the shown one.
-                (MenuAction::Command(command), None, Some(ix)) => {
-                    self.dispatch_tab(open.slot, command, ix, ctx);
+                (MenuAction::Command(command), None, Some(id)) => {
+                    self.dispatch_tab(open.slot, command, id, ctx);
                 }
                 (MenuAction::Command(command), None, None) => {
                     self.dispatch(open.slot, command, ctx)
                 }
-                // A placeholder row is built disabled, so `menus::show` never reports it as clicked;
-                // this arm exists because the type allows it, not because the shell can reach it.
-                (MenuAction::Placeholder, _, _) => {}
                 // Go's `custom-action-for-path` (`context-menu.js:710`): a folder menu's rows carry
                 // their own target, filtered *and* executed against the clicked path rather than
                 // against the pane's selection.
@@ -1580,12 +1701,12 @@ impl ZenApp {
     /// answer for the pane's *shown* tab; here they name the tab under the cursor, which is the whole
     /// point of the menu. Every other command is a row [`crate::menus::tab_menu`] does not draw, and is
     /// refused here rather than run against the shown tab by accident.
-    fn dispatch_tab(&mut self, slot: PaneSlot, command: Command, ix: usize, ctx: &egui::Context) {
+    fn dispatch_tab(&mut self, slot: PaneSlot, command: Command, id: TabId, ctx: &egui::Context) {
         let Some(tab) = self
             .model
             .panes
             .get(&slot)
-            .and_then(|pane| pane.tabs.get(ix))
+            .and_then(|pane| pane.tabs.iter().find(|tab| tab.id == id))
         else {
             self.notices.post(
                 toast::Level::Warning,
@@ -1597,8 +1718,8 @@ impl ZenApp {
         // have been drawn against a tab that closed before the click landed.
         let path = tab.path.clone();
         match command {
-            Command::CloseTab => self.run_command(slot, PaneCommand::CloseTab(ix)),
-            Command::DuplicateTab => self.duplicate_tab(slot, ix),
+            Command::CloseTab => self.run_command(slot, PaneCommand::CloseTab(id)),
+            Command::DuplicateTab => self.duplicate_tab(slot, id),
             Command::CopyPath | Command::CopyName => {
                 let named = command == Command::CopyName;
                 self.copy_lines(&[folder_text(&path, named)], ctx);
@@ -1612,17 +1733,19 @@ impl ZenApp {
 
     /// Go's `duplicateTab` (`tabs.js:365-367`): the copy opens **beside** its original — a browser's
     /// rule, and the reason the tab colour runs [`crate::panels::tab_bar::runs`] stays legible.
-    fn duplicate_tab(&mut self, slot: PaneSlot, ix: usize) {
-        let id = self.model.next_tab_id();
-        // Read the tab first: the insert below needs the pane mutably, and the menu can have been
-        // drawn against a tab that closed before the click landed.
-        let copy = self
-            .model
-            .panes
-            .get(&slot)
-            .and_then(|pane| pane.tabs.get(ix))
-            .map(|tab| tab.duplicate(id));
-        let Some(copy) = copy else {
+    ///
+    /// The original's position is resolved from `id` here, at apply time: the insert below needs the
+    /// pane mutably, and the menu can have been drawn against a tab that closed before the click landed
+    /// — which is a notice, never a copy of some other tab.
+    fn duplicate_tab(&mut self, slot: PaneSlot, id: TabId) {
+        let new_id = self.model.next_tab_id();
+        let read = self.model.panes.get(&slot).and_then(|pane| {
+            pane.tabs
+                .iter()
+                .position(|tab| tab.id == id)
+                .map(|ix| (pane.tabs[ix].duplicate(new_id), ix))
+        });
+        let Some((copy, ix)) = read else {
             self.notices.post(
                 toast::Level::Warning,
                 format!("{}: that tab is gone", Command::DuplicateTab.label()),
@@ -1637,14 +1760,14 @@ impl ZenApp {
         let inserted_at = (ix + 1).min(pane.tabs.len());
         pane.tabs.insert(inserted_at, copy);
         pane.active = inserted_at;
-        pane.touch_mru(id);
+        pane.touch_mru(new_id);
         // The duplicate lists for itself — the same hand-over [`Self::open_tab`] makes for an
         // appended tab, and the reason the new tab is not an empty page forever.
         self.list_at(slot, inserted_at, false, false);
     }
 
     /// [`Self::dispatch`]'s route, for a caller that clicked on nothing: the verb answers for the
-    /// pane's **shown** tab — the same index [`Self::close_shown_tab`] takes, under the same empty-pane
+    /// pane's **shown** tab — the same id [`Self::close_shown_tab`] takes, under the same empty-pane
     /// guard (a pane with no tab toasts, it does not underflow).
     fn duplicate_shown_tab(&mut self, slot: PaneSlot) {
         let Some(pane) = self.model.panes.get(&slot) else {
@@ -1655,7 +1778,8 @@ impl ZenApp {
             return;
         }
         let ix = pane.active.min(pane.tabs.len() - 1);
-        self.duplicate_tab(slot, ix);
+        let id = pane.tabs[ix].id;
+        self.duplicate_tab(slot, id);
     }
 
     fn no_directory(&mut self, command: Command) {
@@ -1969,6 +2093,20 @@ impl ZenApp {
             DialogKind::NewWorkspace => {
                 if choice == Choice::Ok && !text.is_empty() {
                     self.header_commands(vec![HeaderCommand::SaveNew(text)]);
+                }
+            }
+            DialogKind::RenameTabGroup { slot, id } => {
+                // The group may have been closed while the prompt was up; the verb then names nothing,
+                // and `run_group_command` says so by doing nothing. An empty answer is not refused here:
+                // that is the group's *unnamed* state, whose label is its colour.
+                if choice == Choice::Ok {
+                    self.run_command(
+                        slot,
+                        PaneCommand::TabGroup {
+                            target: GroupTarget::Group(id),
+                            verb: GroupVerb::Name { id, name: text },
+                        },
+                    );
                 }
             }
             DialogKind::RenameWorkspace { name } => {
@@ -2342,8 +2480,187 @@ impl ZenApp {
         }
     }
 
-    /// <kbd>Ctrl+W</kbd> — close the shown tab, with the pane's index bookkeeping identical to the
-    /// strip's own close button.
+    /// <kbd>Ctrl+W</kbd> — close the shown tab, with the pane's bookkeeping identical to the
+    /// strip's own close button: both are one [`PaneCommand::CloseTab`], i.e.
+    /// [`crate::state::Pane::close_tabs`].
+    /// The one way tabs are closed: [`Pane::close_tabs`] keeps `active`, the MRU ring, the strip's
+    /// multi-selection and the group table in step, which a bare `tabs.remove` does not — and then the
+    /// shown tab is listed, which is the half a caller must not forget.
+    fn close_tabs(&mut self, slot: PaneSlot, ids: &[TabId]) {
+        let shown = self
+            .model
+            .panes
+            .get(&slot)
+            .and_then(|pane| pane.active_tab())
+            .map_or(TabId::default(), |tab| tab.id);
+        let Some(pane) = self.model.panes.get_mut(&slot) else {
+            return;
+        };
+        pane.close_tabs(ids);
+        self.tab_group_hover = None;
+        if self.tab_drag.is_some_and(|drag| ids.contains(&drag.id)) {
+            self.tab_drag = None;
+        }
+        let Some((ix, id)) = pane
+            .active_tab()
+            .map(|tab| (pane.active, tab.id))
+            .filter(|(_, id)| *id != shown)
+        else {
+            return;
+        };
+        // The tab that took the focus was possibly never listed (a restore queues all but the shown
+        // one), so it is listed now — the same hand-over `activate` gets from a click.
+        self.list_at(slot, ix, false, false);
+        let _ = id;
+    }
+
+    /// A tab-group verb, applied to one pane (`docs/tab-groups-design.md` §6).
+    ///
+    /// Every chip click, every tab-menu row and every chip-menu row lands here, so the algebra in
+    /// [`crate::state::Pane`] is the only place a group changes and the invariants are checked in one
+    /// place too. The subject is resolved **first**: a merge mints an id, which is the model's counter
+    /// and cannot be touched while the pane is borrowed.
+    fn run_group_command(&mut self, slot: PaneSlot, target: GroupTarget, verb: GroupVerb) {
+        let (group, tabs) = match self.model.panes.get(&slot) {
+            None => return,
+            Some(pane) => match target {
+                // The chip's menu: the group is named, and "the tabs it acts on" are its run.
+                GroupTarget::Group(id) => (Some(id), pane.member_ids(id)),
+                // A tab's menu: the group is whichever holds it, and the tabs are the multi-selection
+                // when the click landed inside it — which the right-click just made true (§6).
+                GroupTarget::Tab(id) => {
+                    let group = pane.group_of(id);
+                    let tabs = if pane.tab_sel.contains(&id) {
+                        pane.selected_tabs()
+                    } else {
+                        vec![id]
+                    };
+                    (group, tabs)
+                }
+            },
+        };
+        // Two verbs cannot run inside the borrow of the pane the others need: closing tabs is the shell's
+        // own path (the MRU ring and the successor are its business), and renaming opens a dialog. They
+        // are recorded here and run after, which is why this is one exhaustive match and not a `return`
+        // sprinkled through it.
+        enum Deferred {
+            Nothing,
+            Close(Vec<TabId>),
+            Prompt(GroupId),
+        }
+        let mut deferred = Deferred::Nothing;
+        {
+            let fresh = self.model.next_group_id();
+            let Some(pane) = self.model.panes.get_mut(&slot) else {
+                return;
+            };
+            match verb {
+                GroupVerb::ToggleCollapse => {
+                    if let Some(id) = group {
+                        pane.toggle_collapsed(id);
+                    }
+                }
+                GroupVerb::New => {
+                    let color = pane.free_color();
+                    pane.create_group(fresh, &tabs, color);
+                }
+                GroupVerb::NewColor(color) => {
+                    // The colour already has a group here? Join it. That is what the nine menu rows mean
+                    // — "put these tabs in the red group" — and there is at most one of those per pane,
+                    // so the question has one answer.
+                    match pane
+                        .groups
+                        .iter()
+                        .find(|held| held.color == color)
+                        .map(|held| held.id)
+                    {
+                        Some(have) => {
+                            pane.join_group(have, &tabs);
+                        }
+                        None => {
+                            pane.create_group(fresh, &tabs, color);
+                        }
+                    }
+                }
+                GroupVerb::Leave => {
+                    pane.leave_group(&tabs);
+                }
+                GroupVerb::Ungroup => {
+                    if let Some(id) = group {
+                        pane.ungroup(id);
+                    }
+                }
+                GroupVerb::Name { id, name } => {
+                    pane.rename_group(id, &name);
+                }
+                GroupVerb::Color(color) => {
+                    if let Some(id) = group {
+                        pane.set_group_color(id, color);
+                    }
+                }
+                GroupVerb::Select => {
+                    if let Some(id) = group {
+                        pane.tab_sel = pane.member_ids(id).into_iter().collect();
+                        pane.tab_sel_anchor = pane.tab_sel.iter().next().copied();
+                    }
+                }
+                GroupVerb::Close => deferred = Deferred::Close(tabs),
+                GroupVerb::Rename => {
+                    if let Some(id) = group {
+                        deferred = Deferred::Prompt(id);
+                    }
+                }
+            }
+            pane.debug_assert_invariants();
+        }
+        match deferred {
+            Deferred::Nothing => {}
+            Deferred::Close(ids) => self.close_tabs(slot, &ids),
+            Deferred::Prompt(id) => self.rename_group_prompt(slot, id),
+        }
+        // A tab that went into a group, or out of one, may have made a chip appear or vanish: the flyout
+        // of a group that no longer exists must not stay on screen.
+        self.tab_group_hover = None;
+    }
+
+    /// Which thing a menu's target says a group verb is about (`docs/tab-groups-design.md` §6). The
+    /// listing's targets have no answer, which is why this is a total function returning `Option` rather
+    /// than a `match` the compiler could check for me: a background click cannot group anything.
+    #[must_use]
+    fn group_target(target: MenuTarget) -> Option<GroupTarget> {
+        match target {
+            MenuTarget::TabGroup { id, .. } => Some(GroupTarget::Group(id)),
+            MenuTarget::Tab { id, .. } => Some(GroupTarget::Tab(id)),
+            _ => None,
+        }
+    }
+
+    /// The prompt behind the chip menu's `Rename Group` row — the same path the workspace rename uses
+    /// ([`crate::panels::header::ZenApp_rename_workspace_prompt`]), including the empty answer, which is
+    /// how a group goes back to being named after its colour.
+    fn rename_group_prompt(&mut self, slot: PaneSlot, id: GroupId) {
+        let Some(group) = self
+            .model
+            .panes
+            .get(&slot)
+            .and_then(|pane| pane.group(id))
+            .cloned()
+        else {
+            return;
+        };
+        let mut prompt = Prompt::new(
+            DialogKind::RenameTabGroup { slot, id },
+            "Rename tab group",
+            format!("New name for the {:?} group:", group.color),
+            group.name.clone(),
+            "Rename",
+            Validation::None,
+        );
+        // The name is what is there already: select it, so typing replaces it (`rename_workspace_prompt`).
+        prompt.select = Some(group.name.chars().count());
+        self.open_dialog(Dialog::Prompt(prompt));
+    }
+
     fn close_shown_tab(&mut self, slot: PaneSlot) {
         let Some(pane) = self.model.panes.get(&slot) else {
             return;
@@ -2354,7 +2671,8 @@ impl ZenApp {
             return;
         };
         let ix = pane.active.min(pane.tabs.len() - 1);
-        self.run_command(slot, PaneCommand::CloseTab(ix));
+        let id = pane.tabs[ix].id;
+        self.run_command(slot, PaneCommand::CloseTab(id));
     }
 
     /// <kbd>Ctrl+Tab</kbd> / <kbd>Ctrl+Shift+Tab</kbd> — Go's `cycleTabs(dir)` (`keyboard.js:270-277`),
@@ -2369,9 +2687,11 @@ impl ZenApp {
         }
         let shown = pane.active.min(len - 1);
         let next = (shown as i32 + dir).rem_euclid(len as i32) as usize;
-        pane.active = next;
         let id = pane.tabs[next].id;
-        pane.touch_mru(id);
+        // The step is by position — a ring walk has to — but the *showing* goes through `activate`, so
+        // the id is what the pane is asked for: the MRU ring and the selection follow the shown tab the
+        // same way a strip click makes them.
+        pane.activate(id);
     }
 
     /// <kbd>Shift+Tab</kbd> / <kbd>Alt+Z</kbd> — the MRU walk. Go opens a held-modifier overlay
