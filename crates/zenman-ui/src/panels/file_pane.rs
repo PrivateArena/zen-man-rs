@@ -36,7 +36,8 @@ use crate::jobs_ui::JobSlot;
 use egui::widgets::text_edit::TextEditState;
 
 use crate::state::{
-    FlatMode, GroupId, GroupTarget, GroupVerb, RenameEditor, Selection, Tab, TabId, TabSelKind,
+    DropTarget, FlatMode, GroupId, GroupTarget, GroupVerb, RenameEditor, Selection, Tab, TabId,
+    TabSelKind,
 };
 use crate::theme::Tokens;
 use crate::widgets::entry_row::{self, SelectionState, SizeLookup};
@@ -127,6 +128,13 @@ pub enum PaneCommand {
         /// What the modifier keys said the click meant.
         kind: TabSelKind,
     },
+    /// A strip drag began on that tab (`docs/tab-groups-design.md` §8). The shell owns the drag — two
+    /// strips can be on screen and only one pane's tabs move — and the strip only reports the start and
+    /// the release, so the model is never reordered while the pointer is still down.
+    BeginTabDrag(TabId),
+    /// …and let go over that target, or on nothing at all (`None`, which cancels the drag and changes
+    /// no tab order).
+    EndTabDrag(Option<DropTarget>),
     /// Close this tab — likewise by id (see [`PaneCommand::SelectTab`]).
     CloseTab(TabId),
     /// Close these tabs in one step: the bulk form of the command above, and the only way to close

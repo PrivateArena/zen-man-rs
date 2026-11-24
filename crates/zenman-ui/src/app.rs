@@ -48,7 +48,8 @@ use crate::panels::{
 };
 use crate::persist::Persisted;
 use crate::state::{
-    AppModel, GroupId, GroupTarget, GroupVerb, Tab, TabId, TabSelKind, panes_for, quad_slots,
+    AppModel, DropTarget, GroupId, GroupTarget, GroupVerb, Tab, TabId, TabSelKind, panes_for,
+    quad_slots,
 };
 use crate::theme::{self, Tokens};
 use crate::widgets::toast;
@@ -640,6 +641,10 @@ impl ZenApp {
                     }
                 }
             }
+            PaneCommand::BeginTabDrag(id) => {
+                self.tab_drag = Some(TabDrag { slot, id });
+            }
+            PaneCommand::EndTabDrag(target) => self.end_tab_drag(slot, target),
             PaneCommand::CloseTab(id) => self.close_tabs(slot, &[id]),
             PaneCommand::CloseTabs(ids) => self.close_tabs(slot, &ids),
             PaneCommand::TabGroup { target, verb } => self.run_group_command(slot, target, verb),
@@ -874,6 +879,167 @@ impl ZenApp {
         // the log panel's event-driven/poll refresh, and the workspace autosave + `✓ Saved` chip.
         crate::panels::action_log::tick(self);
         self.tick_workspaces(now, dock_moved);
+        self.tick_group_hover(ctx);
+    }
+
+    /// The hover flyout's frame tick (`docs/tab-groups-design.md` §7): decide whether a collapsed chip
+    /// is being *looked at*, and keep the list alive while the pointer travels from the chip into it.
+    ///
+    /// Two things make this a state machine rather than one `hovered()` test. The strips report their
+    /// chips during the draw, so what is read here is last frame's report — the same hand-over
+    /// [`Self::context_request`] uses for the same reason. And once the popup exists it *covers* the
+    /// chip, so `Response::hovered` on the chip goes false exactly when the user reaches for a row: the
+    /// keep-alive therefore tests the raw pointer against the union of the two rects.
+    fn tick_group_hover(&mut self, ctx: &egui::Context) {
+        let now = ctx.input(|i| i.time);
+        let pointer = ctx.input(|i| i.pointer.hover_pos());
+        let reported = self.tab_group_reports.drain(..).next();
+        if let Some((slot, id, chip)) = reported {
+            match &mut self.tab_group_hover {
+                // Same chip, newer rect: the strip may have re-laid itself (another tab folded away).
+                Some(hover) if hover.slot == slot && hover.id == id => hover.chip = chip,
+                other => {
+                    *other = Some(TabGroupHover {
+                        slot,
+                        id,
+                        chip,
+                        since: now,
+                        popup: None,
+                        left: None,
+                    });
+                }
+            }
+        }
+        // A menu, a modal or a tab drag is a different kind of attention: the flyout steps aside.
+        if self.menu.is_some() || self.dialogs.is_open() || self.tab_drag.is_some() {
+            self.tab_group_hover = None;
+            return;
+        }
+        let Some(hover) = self.tab_group_hover.as_mut() else {
+            return;
+        };
+        // The group may have been closed, renamed or re-coloured since it was reported: an id that no
+        // longer names a group is not a flyout.
+        if !self
+            .model
+            .panes
+            .get(&hover.slot)
+            .is_some_and(|pane| pane.group(hover.id).is_some_and(|group| group.collapsed))
+        {
+            self.tab_group_hover = None;
+            return;
+        }
+        let inside = pointer.is_some_and(|at| {
+            hover
+                .chip
+                .union(hover.popup.unwrap_or(hover.chip))
+                .expand(self.tokens.group_hover_bridge)
+                .contains(at)
+        });
+        if inside {
+            hover.left = None;
+        } else if hover.left.is_none() {
+            hover.left = Some(now);
+        }
+        // A pointer that left the window is not "on its way to the list" — it is gone.
+        if pointer.is_none() {
+            hover.left = Some(now - self.tokens.group_hover_grace);
+        }
+        if hover
+            .left
+            .is_some_and(|left| now - left >= self.tokens.group_hover_grace)
+        {
+            self.tab_group_hover = None;
+            return;
+        }
+        // Nothing repaints an idle shell, so the two timers have to ask for the frames they need: the
+        // open delay if the hover has not reached it, the grace if the pointer is on its way out.
+        let wait = if inside && now - hover.since < self.tokens.group_hover_open {
+            Some(self.tokens.group_hover_open - (now - hover.since))
+        } else if !inside {
+            hover
+                .left
+                .map(|left| (self.tokens.group_hover_grace - (now - left)).max(0.0))
+        } else {
+            None
+        };
+        if let Some(secs) = wait {
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(secs.max(0.01)));
+        }
+    }
+
+    /// The list a collapsed group flies out (`docs/tab-groups-design.md` §7): one row per member tab,
+    /// drawn over the chip in the shell's own menu frame.
+    ///
+    /// Picking a row shows that tab and **leaves the group folded** — that is the point of the flyout,
+    /// and it is why the row is a plain `SelectTab` rather than an unfold plus a select.
+    fn show_group_hover(&mut self, ctx: &egui::Context) {
+        let Some(hover) = self.tab_group_hover else {
+            return;
+        };
+        if ctx.input(|i| i.time) - hover.since < self.tokens.group_hover_open {
+            return;
+        }
+        let Some(pane) = self.model.panes.get(&hover.slot) else {
+            return;
+        };
+        let shown = pane.active_id();
+        let rows: Vec<(TabId, String)> = pane
+            .member_ids(hover.id)
+            .iter()
+            .filter_map(|id| pane.tabs.iter().find(|tab| tab.id == *id))
+            .map(|tab| (tab.id, tab.title.clone()))
+            .collect();
+        if rows.is_empty() {
+            return;
+        }
+        let tokens = self.tokens;
+        let mut picked: Option<TabId> = None;
+        let area = egui::Area::new(egui::Id::unique(("zenman-group-hover", hover.id)))
+            .order(egui::Order::Foreground)
+            .movable(false)
+            .fixed_pos(hover.chip.left_bottom())
+            .constrain(true)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(tokens.bg_sidebar)
+                    .stroke(egui::Stroke::new(1.0, tokens.border))
+                    .corner_radius(egui::CornerRadius::same(tokens.menu_corner_radius))
+                    .inner_margin(egui::Margin::symmetric(0, tokens.menu_frame_pad_y as i8))
+                    .shadow(egui::Shadow {
+                        offset: [0, tokens.menu_shadow_offset_y],
+                        blur: tokens.menu_shadow_blur,
+                        spread: 0,
+                        color: tokens.menu_shadow,
+                    })
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+                        ui.set_min_width(hover.chip.width().max(tokens.tab_min_width));
+                        egui::ScrollArea::vertical()
+                            .max_height(tokens.group_hover_max_height)
+                            .show(ui, |ui| {
+                                for (id, title) in &rows {
+                                    let row =
+                                        ui.selectable_label(Some(*id) == shown, title.as_str());
+                                    if row.clicked() {
+                                        picked = Some(*id);
+                                    }
+                                }
+                            });
+                    });
+            });
+        if let Some(hover) = self.tab_group_hover.as_mut() {
+            hover.popup = Some(area.response.rect);
+        }
+        if let Some(id) = picked {
+            self.run_command(
+                hover.slot,
+                crate::panels::file_pane::PaneCommand::SelectTab {
+                    id,
+                    kind: crate::state::TabSelKind::Replace,
+                },
+            );
+        }
     }
 
     /// Re-list the tabs the engine's `DirChanged` events invalidated (plan §4.1/F2: coalesced by
@@ -955,6 +1121,9 @@ impl ZenApp {
         // module doc): a modal would block the pane the extraction repopulates.
         crate::dialogs::extract::show(self, ui, &tokens);
         self.draw_menu(ui.ctx());
+        // Above the menu: the flyout is what the pointer is reaching for, and a hover that opened a
+        // menu would have had it stepped aside for anyway (`tick_group_hover`).
+        self.show_group_hover(ui.ctx());
         // **Last**, above the menu: a modal is the only thing on screen that may answer a key, and
         // `handle_keys` has already stood down for it. Its answers run here, after the draw, exactly
         // like the pane commands — a dialog never touches the engine itself.
@@ -2512,6 +2681,42 @@ impl ZenApp {
         // one), so it is listed now — the same hand-over `activate` gets from a click.
         self.list_at(slot, ix, false, false);
         let _ = id;
+    }
+
+    /// The end of a strip drag: resolve what was being carried, move it, and let go of the state
+    /// (`docs/tab-groups-design.md` §8).
+    ///
+    /// Dragging a tab that is part of a multi-selection drags the selection — the browser rule, and the
+    /// one that makes "shift-click four tabs, drag them onto the chip" the whole of a group. A release
+    /// outside every rect cancels: the order is untouched, because a guess at a position is worse than
+    /// the drag not having happened.
+    fn end_tab_drag(&mut self, slot: PaneSlot, target: Option<DropTarget>) {
+        let Some(drag) = self.tab_drag.take() else {
+            return;
+        };
+        if drag.slot != slot {
+            return;
+        }
+        let Some(target) = target else {
+            return;
+        };
+        let carried = self
+            .model
+            .panes
+            .get(&slot)
+            .map(|pane| {
+                if pane.tab_sel.contains(&drag.id) {
+                    pane.selected_tabs()
+                } else {
+                    vec![drag.id]
+                }
+            })
+            .unwrap_or_else(|| vec![drag.id]);
+        let Some(pane) = self.model.panes.get_mut(&slot) else {
+            return;
+        };
+        pane.move_tabs(&carried, target);
+        pane.debug_assert_invariants();
     }
 
     /// A tab-group verb, applied to one pane (`docs/tab-groups-design.md` §6).

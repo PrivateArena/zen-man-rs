@@ -50,6 +50,10 @@ pub struct PaneDock<'a> {
     /// The chips every strip in this frame reported hovered, for the shell's hover state machine
     /// (`docs/tab-groups-design.md` §7). Reported by the strip because only it knows the chip's rect.
     pub tab_hovers: Vec<(PaneSlot, GroupId, Rect)>,
+    /// The tab drag the shell is carrying (`docs/tab-groups-design.md` §8), cloned in for painting: the
+    /// strip draws the drop bar and hit-tests the release, but the *model* is reordered once, by the
+    /// command the release emits.
+    pub tab_drag: Option<crate::app::TabDrag>,
     /// The workspace control of the tab row: the session on screen, the stored ones, the autosave
     /// clock. Borrowed separately from `model` so the pane can drive it (plan §5.8 `header.rs`).
     pub workspaces: &'a mut WorkspaceBar,
@@ -321,6 +325,12 @@ impl PaneDock<'_> {
                     // what owns the geometry either of them can trust.
                     layout: tab_bar::StripLayout::default(),
                     hovered: None,
+                    // Which pane carries a drag is the shell's answer; only that pane's strip draws the
+                    // bar for it, because a drop into a second pane is out of scope (design §8).
+                    dragging: self
+                        .tab_drag
+                        .filter(|drag| drag.slot == slot)
+                        .map(|drag| drag.id),
                 };
                 let mut out = Vec::new();
                 let strip = Rect::from_min_max(
@@ -364,6 +374,12 @@ impl PaneDock<'_> {
                 TabCommand::GroupContext { id, at } => {
                     self.commands
                         .push((slot, PaneCommand::GroupContext { id, at }));
+                }
+                TabCommand::DragStart(id) => {
+                    self.commands.push((slot, PaneCommand::BeginTabDrag(id)));
+                }
+                TabCommand::DragDrop(target) => {
+                    self.commands.push((slot, PaneCommand::EndTabDrag(target)));
                 }
                 TabCommand::NewTab => self.commands.push((slot, PaneCommand::NewTab)),
                 TabCommand::ToggleOverflow => {
@@ -437,6 +453,7 @@ pub fn show(app: &mut ZenApp, ui: &mut Ui) {
             commands: Vec::new(),
             drag: app.drag.clone(),
             tab_hovers: Vec::new(),
+            tab_drag: app.tab_drag,
             workspaces: &mut app.workspaces,
             keys: &app.keys,
             disk,
@@ -591,6 +608,7 @@ mod tests {
             commands: Vec::new(),
             drag: None,
             tab_hovers: Vec::new(),
+            tab_drag: None,
             workspaces: &mut crate::panels::header::WorkspaceBar::default(),
             keys: &crate::keymap::KeyMap::default(),
             disk: None,

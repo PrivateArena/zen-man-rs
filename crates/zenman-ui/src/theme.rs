@@ -190,6 +190,11 @@ pub struct Tokens {
     pub group_hover_open: f64,
     /// Seconds the pointer may be gone from the chip *and* the flyout before it closes.
     pub group_hover_grace: f64,
+    /// How far beyond the two rects the pointer still counts as "on its way": the flyout is anchored at
+    /// the chip's edge, and a 1 px seam between them would otherwise read as a leave.
+    pub group_hover_bridge: f32,
+    /// Tallest the flyout gets before it scrolls — nine tabs is a list, forty is a pane.
+    pub group_hover_max_height: f32,
     /// Widest single breadcrumb segment.
     pub crumb_max_width: f32,
     /// Horizontal padding inside a crumb chip (`toolbar.css:85`, `padding: 2px 6px`).
@@ -420,6 +425,8 @@ impl Tokens {
             group_chip_corner: 99,
             group_hover_open: 0.28,
             group_hover_grace: 0.12,
+            group_hover_bridge: 4.0,
+            group_hover_max_height: 240.0,
             crumb_max_width: 220.0,
             crumb_chip_padding: 6.0,
             crumb_separator_gap: 4.0,

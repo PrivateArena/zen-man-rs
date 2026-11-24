@@ -33,7 +33,7 @@ use egui::{Id, Rect, RichText, Ui, pos2, vec2};
 
 use zenman_core::store::config::GroupColor;
 
-use crate::state::{GroupId, Tab, TabGroup, TabId, TabSelKind};
+use crate::state::{DropTarget, GroupId, Tab, TabGroup, TabId, TabSelKind};
 use crate::theme::Tokens;
 
 /// What the strip asked for.
@@ -54,6 +54,11 @@ pub enum TabCommand {
     /// (`tabs.js:351-386`). `at` is the pointer, because the menu opens under the cursor and not under
     /// the tab (`positionElementSmartly`, `utils.js:21-44`).
     Context { id: TabId, at: egui::Pos2 },
+    /// A drag began on this tab (`docs/tab-groups-design.md` §8). The shell owns the drag; the strip
+    /// only reports where it started and what the pointer was over when it let go.
+    DragStart(TabId),
+    /// The drag let go over that target, or on nothing at all (`None`, which cancels it).
+    DragDrop(Option<DropTarget>),
     /// A new tab in this pane.
     NewTab,
     /// Open / shut the overflow list.
@@ -154,6 +159,40 @@ impl StripLayout {
             .find(|(item, _)| *item == want)
             .map(|(_, rect)| *rect)
     }
+
+    /// Where a dragged tab let go: a chip means "join that group", and which half of a tab the pointer
+    /// is in says whether it lands in front of that tab or behind it.
+    #[must_use]
+    pub fn drop_target(&self, at: egui::Pos2, tabs: &[Tab]) -> Option<DropTarget> {
+        let (item, rect) = self.rects.iter().find(|(_, rect)| rect.contains(at))?;
+        match *item {
+            StripItem::Group(id) => Some(DropTarget::OntoChip(id)),
+            StripItem::Tab(ix) => Some(if at.x < rect.center().x {
+                DropTarget::Before(tabs.get(ix)?.id)
+            } else {
+                DropTarget::After(tabs.get(ix)?.id)
+            }),
+        }
+    }
+
+    /// The same question, with the one place outside the items that means something: the strip's own
+    /// floor **after the last item** is the end of the strip ([`DropTarget::End`]), which is the only way
+    /// to reach it. Anywhere else off-item is a cancel, not a guess.
+    #[must_use]
+    pub fn drop_target_or_end(
+        &self,
+        at: egui::Pos2,
+        tabs: &[Tab],
+        strip: Rect,
+    ) -> Option<DropTarget> {
+        if let Some(target) = self.drop_target(at, tabs) {
+            return Some(target);
+        }
+        let (_, last) = self.rects.last()?;
+        let past_the_tail = at.x >= last.min.x && at.x <= strip.max.x;
+        let on_the_row = (at.y - last.center().y).abs() <= last.height();
+        (strip.contains(at) && past_the_tail && on_the_row).then_some(DropTarget::End)
+    }
 }
 
 /// The strip's input, and the three things it reports back.
@@ -174,6 +213,9 @@ pub struct TabBarModel<'a> {
     /// Out: the chip the pointer rested on, with its rect — the hover flyout's anchor. An **output**
     /// and not a command, because a pointer rests on a chip for sixty frames a second (design §7).
     pub hovered: Option<(GroupId, Rect)>,
+    /// The tab a drag is carrying, when the shell has one in flight. The strip does not own the drag —
+    /// `ZenApp::tab_drag` does, because two strips can be on screen and only one pane's tabs move.
+    pub dragging: Option<TabId>,
 }
 
 impl TabBarModel<'_> {
@@ -319,7 +361,7 @@ pub fn show(
         ui.painter()
             .hline(strip.x_range(), strip.max.y - 1.0, tokens.hairline());
     }
-    let laid = layout(ui, m, tokens, strip);
+    let mut laid = layout(ui, m, tokens, strip);
     let (overflow, rects) = (laid.overflow.clone(), laid.rects.clone());
     for (item, rect) in &rects {
         if !ui.is_rect_visible(*rect) {
@@ -400,7 +442,35 @@ pub fn show(
     if response.clicked() {
         out.push(TabCommand::NewTab);
     }
+    show_drag(ui, strip, &mut laid, m, tokens, out);
     m.layout = laid;
+}
+
+/// The tab drag: the bar that says where the tab will land, and the release that decides.
+///
+/// Painted after every item so it reads over their edges, and hit-tested against the raw pointer rather
+/// than a `hovered()` response — egui suppresses hover on the other widgets of a strip while a drag is
+/// running, which is exactly when the target is needed (design §8). The model is never reordered mid-drag:
+/// `Pane::move_tabs` runs once, on release.
+fn show_drag(
+    ui: &mut Ui,
+    strip: Rect,
+    laid: &mut StripLayout,
+    m: &mut TabBarModel<'_>,
+    tokens: &Tokens,
+    out: &mut Vec<TabCommand>,
+) {
+    let Some(_dragged) = m.dragging else {
+        return;
+    };
+    let pointer = ui.input(|i| i.pointer.interact_pos());
+    let target = pointer.and_then(|at| laid.drop_target_or_end(at, m.tabs, strip));
+    if let Some(target) = target {
+        paint_drop_bar(ui, laid, target, m.tabs, tokens);
+    }
+    if ui.input(|i| i.pointer.any_released()) {
+        out.push(TabCommand::DragDrop(target));
+    }
 }
 
 /// One tab of the strip: fill, border, group accent, label, close box, and the two clicks.
@@ -417,7 +487,7 @@ fn paint_tab(
     let id = id.with(("tab", tab.id));
     let selected = ix == m.active;
     let multi = m.selected.contains(&tab.id) && !selected;
-    let response = ui.interact(tab_rect, id, egui::Sense::click());
+    let response = ui.interact(tab_rect, id, egui::Sense::click_and_drag());
     let fill = if selected {
         tokens.bg_card
     } else if multi || response.hovered() {
@@ -508,6 +578,10 @@ fn paint_tab(
     }
     if close_response.clicked() {
         out.push(TabCommand::Close(tab.id));
+    } else if response.drag_started() {
+        // The strip does not carry a drag, it starts one: the shell owns the state, because the dock has
+        // two strips and only one pane's tabs are moving (design §8).
+        out.push(TabCommand::DragStart(tab.id));
     } else {
         // One response for both buttons: `Sense::click()` answers *either*, and a right-click used
         // to *select* the tab here. The menu owns the tab under the cursor instead — Go's
@@ -619,6 +693,57 @@ fn paint_chip(
     }
 }
 
+/// The line that says where the dragged tab will land — or, for a chip, the chip lighting up.
+fn paint_drop_bar(ui: &Ui, laid: &StripLayout, target: DropTarget, tabs: &[Tab], tokens: &Tokens) {
+    let found = |want: StripItem| {
+        laid.rects
+            .iter()
+            .find(|(item, _)| *item == want)
+            .map(|(_, rect)| *rect)
+    };
+    // The target names a tab by id and the layout knows it by index; the strip is where the two meet.
+    let rect_of = |want: TabId| {
+        tabs.iter()
+            .position(|tab| tab.id == want)
+            .and_then(|ix| found(StripItem::Tab(ix)))
+    };
+    let bar = |edge: f32, top: f32, bottom: f32| {
+        Rect::from_min_size(
+            pos2(edge - tokens.group_drop_bar / 2.0, top),
+            vec2(tokens.group_drop_bar, bottom - top),
+        )
+    };
+    let rect =
+        match target {
+            DropTarget::Before(id) => rect_of(id)
+                .map(|rect| bar(rect.min.x - tokens.tab_gap / 2.0, rect.min.y, rect.max.y)),
+            DropTarget::After(id) => rect_of(id)
+                .map(|rect| bar(rect.max.x + tokens.tab_gap / 2.0, rect.min.y, rect.max.y)),
+            DropTarget::OntoChip(gid) => found(StripItem::Group(gid)).map(|rect| {
+                // A chip is not a gap: the whole pill says "into this group".
+                Rect::from_center_size(
+                    rect.center(),
+                    vec2(rect.width(), tokens.group_chip_height.min(rect.height())),
+                )
+            }),
+            DropTarget::End => laid
+                .rects
+                .last()
+                .map(|(_, rect)| bar(rect.max.x + tokens.tab_gap, rect.min.y, rect.max.y)),
+        };
+    let Some(rect) = rect else { return };
+    if matches!(target, DropTarget::OntoChip(..)) {
+        ui.painter().rect_stroke(
+            rect,
+            egui::CornerRadius::same(tokens.group_chip_corner),
+            egui::Stroke::new(tokens.group_drop_bar / 2.0, tokens.accent),
+            egui::StrokeKind::Outside,
+        );
+    } else {
+        ui.painter().rect_filled(rect, 0.0, tokens.accent);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -695,6 +820,55 @@ mod tests {
         assert_eq!(
             items(&tabs, &groups, 2),
             vec![StripItem::Group(a), StripItem::Group(b), StripItem::Tab(2)]
+        );
+    }
+
+    #[test]
+    fn a_drop_lands_on_the_half_of_the_item_the_pointer_is_in() {
+        let laid = StripLayout {
+            rects: vec![
+                (
+                    StripItem::Group(GroupId(1)),
+                    Rect::from_min_size(pos2(0.0, 0.0), vec2(40.0, 20.0)),
+                ),
+                (
+                    StripItem::Tab(0),
+                    Rect::from_min_size(pos2(44.0, 0.0), vec2(100.0, 20.0)),
+                ),
+            ],
+            ..Default::default()
+        };
+        let tabs = [tab(1, Some(GroupId(1))), tab(2, None)];
+        assert_eq!(
+            laid.drop_target(pos2(10.0, 5.0), &tabs),
+            Some(DropTarget::OntoChip(GroupId(1))),
+            "a chip is a group, so it is a target of its own"
+        );
+        assert_eq!(
+            laid.drop_target(pos2(60.0, 5.0), &tabs),
+            Some(DropTarget::Before(TabId(1))),
+            "the left half of a tab is in front of it"
+        );
+        assert_eq!(
+            laid.drop_target(pos2(120.0, 5.0), &tabs),
+            Some(DropTarget::After(TabId(1))),
+            "and the right half behind it"
+        );
+        let strip = Rect::from_min_size(pos2(0.0, -5.0), vec2(400.0, 30.0));
+        // Past the last tab, on the row: the end of the strip, which has no rect of its own.
+        assert_eq!(
+            laid.drop_target_or_end(pos2(200.0, 5.0), &tabs, strip),
+            Some(DropTarget::End)
+        );
+        // Above the row, or out of the strip: nothing, and so a cancelled drag.
+        assert_eq!(
+            laid.drop_target_or_end(pos2(200.0, 2_000.0), &tabs, strip),
+            None
+        );
+        assert_eq!(
+            laid.drop_target_or_end(pos2(-40.0, 5.0), &tabs, strip),
+            None,
+            "in front of the first chip is not a gap the user can aim at"
         );
     }
 

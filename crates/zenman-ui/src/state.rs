@@ -773,6 +773,22 @@ pub enum GroupVerb {
     Select,
 }
 
+/// Where a dragged tab let go (`docs/tab-groups-design.md` §8).
+///
+/// Named by the tab or the chip the pointer was over, never by a gap index: the strip rebuilds its layout
+/// every frame and the command is applied after that, so a position would already be somebody else's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DropTarget {
+    /// In front of that tab, joining its group if it has one.
+    Before(TabId),
+    /// Behind that tab — which is how the tail of a run and the end of the strip are reached.
+    After(TabId),
+    /// Onto a chip: into that group, at the end of its run.
+    OntoChip(GroupId),
+    /// Past every item, on empty strip: the end of the strip, and of any group.
+    End,
+}
+
 /// How a strip click changes the multi-selection (`SelKind` of the tab strip).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TabSelKind {
@@ -1073,6 +1089,88 @@ impl Pane {
         }
         self.tab_sel
             .retain(|live| self.tabs.iter().any(|tab| tab.id == *live));
+        true
+    }
+
+    /// Move `tabs` to where the pointer let go (design §8).
+    ///
+    /// The moving tabs keep their relative order and travel as one block, in **tab-list** order (a
+    /// selection set is a set; moving in selection order would re-shuffle them). The landing decides the
+    /// membership: beside a tab of a group, or on a chip, means joining it — and if the block's new
+    /// neighbours belong to no group, the tabs leave theirs. `compact` then makes the run contiguous,
+    /// which is the difference between a drag that *reorders* a group and one that *abandons* it: the
+    /// block follows the pointer, and only an explicit landing outside a run releases it.
+    pub fn move_tabs(&mut self, tabs: &[TabId], target: DropTarget) -> bool {
+        let moving = self.resolve(tabs);
+        if moving.is_empty() {
+            return false;
+        }
+        let (anchor, join) = match target {
+            DropTarget::Before(id) => {
+                if !self.tabs.iter().any(|tab| tab.id == id) {
+                    return false;
+                }
+                (Some(id), self.group_of(id))
+            }
+            DropTarget::After(id) => {
+                if !self.tabs.iter().any(|tab| tab.id == id) {
+                    return false;
+                }
+                (Some(id), self.group_of(id))
+            }
+            DropTarget::OntoChip(group) => {
+                if self.group(group).is_none() {
+                    return false;
+                }
+                (None, Some(group))
+            }
+            DropTarget::End => (None, None),
+        };
+        // Read before the strip is emptied below: `active_id()` after the drain would answer `None`,
+        // and the shown tab would then be found by a stale *index* — which is the tab that moved.
+        let shown = self.active_id();
+        let mut moved: Vec<Tab> = Vec::with_capacity(moving.len());
+        let mut kept: Vec<Tab> = Vec::with_capacity(self.tabs.len());
+        for tab in self.tabs.drain(..) {
+            if moving.contains(&tab.id) {
+                moved.push(tab);
+            } else {
+                kept.push(tab);
+            }
+        }
+        let at = match (&anchor, join) {
+            // Onto a chip: after the last tab of that run — or, the run having just been emptied by
+            // this very drag, wherever the anchor tab would have been.
+            (None, Some(group)) => kept
+                .iter()
+                .rposition(|tab| tab.group == Some(group))
+                .map_or(kept.len(), |ix| ix + 1),
+            (None, None) => kept.len(),
+            (Some(id), _) => {
+                let ix = kept.iter().position(|tab| tab.id == *id).unwrap_or(0);
+                if matches!(target, DropTarget::After(..)) {
+                    ix + 1
+                } else {
+                    ix
+                }
+            }
+        };
+        for tab in &mut moved {
+            tab.group = join;
+        }
+        for (offset, tab) in moved.into_iter().enumerate() {
+            kept.insert(at + offset, tab);
+        }
+        self.tabs = kept;
+        if let Some(id) = shown {
+            self.active = self
+                .tabs
+                .iter()
+                .position(|tab| tab.id == id)
+                .unwrap_or(self.active.min(self.tabs.len().saturating_sub(1)));
+        }
+        self.prune_groups();
+        self.compact();
         true
     }
 
@@ -1955,6 +2053,116 @@ mod groups {
         pane.prune_groups();
         pane.compact();
         assert_eq!(pane.members(gid), vec![0, 1]);
+        pane.debug_assert_invariants();
+    }
+
+    #[test]
+    fn dropping_on_a_chip_folds_the_tab_into_that_run() {
+        let (mut pane, ids) = strip(&["a", "b", "c", "d"]);
+        let gid = GroupId(1);
+        pane.create_group(gid, &[ids[0], ids[1]], GroupColor::A)
+            .expect("two");
+        // d onto the chip: it joins, and lands at the tail of the run — not where it was dropped
+        // "between", because a chip is a group, not a gap.
+        assert!(pane.move_tabs(&[ids[3]], DropTarget::OntoChip(gid)));
+        assert_eq!(pane.members(gid), vec![0, 1, 2], "{:?}", order(&pane));
+        assert_eq!(order(&pane), vec![ids[0], ids[1], ids[3], ids[2]]);
+        assert_eq!(pane.group_of(ids[3]), Some(gid));
+        pane.debug_assert_invariants();
+    }
+
+    #[test]
+    fn dropping_in_a_run_joins_it_and_dropping_outside_one_leaves_it() {
+        let (mut pane, ids) = strip(&["a", "b", "c", "d", "e"]);
+        let gid = GroupId(1);
+        pane.create_group(gid, &[ids[1], ids[2]], GroupColor::B)
+            .expect("two");
+        // c is in the run; drop e in front of it → e joins, and the run stays one run.
+        assert!(pane.move_tabs(&[ids[4]], DropTarget::Before(ids[2])));
+        assert_eq!(
+            pane.group_of(ids[4]),
+            Some(gid),
+            "the neighbour's group is the landing"
+        );
+        assert_eq!(pane.members(gid), vec![1, 2, 3], "{:?}", order(&pane));
+        // …and now drag b out to the bare tail: it releases, and the rest of the run closes ranks.
+        let b = ids[1];
+        assert!(pane.move_tabs(&[b], DropTarget::End));
+        assert_eq!(
+            pane.group_of(b),
+            None,
+            "an explicit drop outside a run is how you leave one"
+        );
+        assert_eq!(pane.members(gid).len(), 2, "b left, c and e stayed");
+        assert_eq!(pane.tabs.last().map(|tab| tab.id), Some(b));
+        pane.debug_assert_invariants();
+    }
+
+    #[test]
+    fn the_whole_selection_moves_as_one_block_in_strip_order() {
+        let (mut pane, ids) = strip(&["a", "b", "c", "d", "e"]);
+        // Selected in the order a click can select them, which is not the order they sit in.
+        pane.select_tab(ids[3], TabSelKind::Replace);
+        pane.select_tab(ids[1], TabSelKind::Toggle);
+        pane.select_tab(ids[0], TabSelKind::Toggle);
+        let moving = pane.selected_tabs();
+        assert_eq!(
+            moving,
+            vec![ids[0], ids[1], ids[3]],
+            "strip order, whatever the order of the clicks"
+        );
+        assert!(pane.move_tabs(&moving, DropTarget::After(ids[4])));
+        assert_eq!(
+            order(&pane),
+            vec![ids[2], ids[4], ids[0], ids[1], ids[3]],
+            "the block kept its own order"
+        );
+        pane.debug_assert_invariants();
+    }
+
+    #[test]
+    fn a_move_ignores_a_tab_that_died_and_still_shows_the_one_it_showed() {
+        let (mut pane, ids) = strip(&["a", "b", "c"]);
+        pane.activate(ids[1]);
+        // The tab under the pointer closed between the drag and the release.
+        pane.close_tabs(&[ids[2]]);
+        assert!(!pane.move_tabs(&[ids[2]], DropTarget::Before(ids[0])));
+        assert_eq!(
+            order(&pane),
+            vec![ids[0], ids[1]],
+            "nothing moved, nothing vanished"
+        );
+        assert_eq!(
+            pane.active_id(),
+            Some(ids[1]),
+            "and the pane is still showing what it showed"
+        );
+        // A target that has died is a cancel too, never a drop at the end.
+        assert!(!pane.move_tabs(&[ids[0]], DropTarget::After(ids[2])));
+        assert!(
+            pane.move_tabs(&[ids[0]], DropTarget::End),
+            "the empty floor is still a place"
+        );
+        assert_eq!(order(&pane), vec![ids[1], ids[0]]);
+        assert_eq!(
+            pane.active_id(),
+            Some(ids[1]),
+            "and the shown tab followed its id, not its index"
+        );
+    }
+
+    #[test]
+    fn dragging_the_last_tab_of_a_run_out_buries_the_group() {
+        let (mut pane, ids) = strip(&["a", "b", "c"]);
+        let gid = GroupId(1);
+        pane.create_group(gid, &[ids[0]], GroupColor::C)
+            .expect("one");
+        assert!(pane.move_tabs(&[ids[0]], DropTarget::After(ids[2])));
+        assert!(
+            pane.group(gid).is_none(),
+            "the run is empty, so the row went with it (invariant 2)"
+        );
+        assert_eq!(order(&pane), vec![ids[1], ids[2], ids[0]]);
         pane.debug_assert_invariants();
     }
 
