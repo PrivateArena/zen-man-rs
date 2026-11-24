@@ -1591,3 +1591,298 @@ pub fn base_name_len(name: &str) -> usize {
         _ => name.len(),
     }
 }
+
+/// The group algebra, away from any widget: the four invariants of this module, one test each, plus the
+/// moves the strip and the menus make (`docs/tab-groups-design.md` §2).
+#[cfg(test)]
+mod groups {
+    use super::*;
+
+    /// A pane of `names` ungrouped tabs, and their ids in strip order.
+    fn strip(names: &[&str]) -> (Pane, Vec<TabId>) {
+        let mut pane = Pane::default();
+        let ids: Vec<TabId> = (1..=names.len()).map(|ix| TabId(ix as u64)).collect();
+        for (ix, name) in names.iter().enumerate() {
+            pane.tabs
+                .push(Tab::new(ids[ix], FsPath::ROOT, (*name).to_string()));
+        }
+        (pane, ids)
+    }
+
+    /// The strip order, as tab ids — what `compact` is allowed and not allowed to change.
+    fn order(pane: &Pane) -> Vec<TabId> {
+        pane.tabs.iter().map(|tab| tab.id).collect()
+    }
+
+    #[test]
+    fn a_group_is_one_contiguous_run_and_its_label_is_its_colour_until_it_is_named() {
+        let (mut pane, ids) = strip(&["one", "two", "three", "four", "five"]);
+        let gid = GroupId(1);
+        // Non-contiguous on purpose: tabs 0, 3 and 4 (the last *first*, which is where the user was).
+        pane.create_group(gid, &[ids[0], ids[4], ids[3]], GroupColor::A)
+            .expect("three live tabs");
+        assert_eq!(
+            pane.members(gid),
+            vec![0, 1, 2],
+            "the run sits where its first member was: {:?}",
+            order(&pane)
+        );
+        assert_eq!(
+            order(&pane),
+            vec![ids[0], ids[3], ids[4], ids[1], ids[2]],
+            "and the rest of the strip kept its order"
+        );
+        let group = pane.group(gid).expect("the group exists");
+        assert_eq!(group.label(), "Red", "unnamed means named after its colour");
+        assert!(group.is_unnamed() && !group.collapsed);
+        assert_eq!(pane.tab_color(Some(gid)), Some(GroupColor::A));
+        pane.rename_group(gid, "work");
+        assert_eq!(pane.group(gid).expect("still there").label(), "work");
+        // An empty (or blank) name is the *unnamed* state again, not a label of zero width.
+        pane.rename_group(gid, "   ");
+        assert_eq!(pane.group(gid).expect("still there").label(), "Red");
+        pane.debug_assert_invariants();
+    }
+
+    #[test]
+    fn two_groups_of_one_colour_are_still_two_groups() {
+        // Legal past the ninth group, and `compact` must key on identity: merging by colour here would
+        // silently fuse two groups that merely happen to look alike.
+        let (mut pane, ids) = strip(&["a", "b", "c", "d", "e", "f"]);
+        let (red_a, red_b) = (GroupId(1), GroupId(2));
+        pane.create_group(red_a, &[ids[0], ids[2]], GroupColor::A)
+            .expect("three");
+        pane.create_group(red_b, &[ids[3], ids[5]], GroupColor::A)
+            .expect("three");
+        // The first group pulled `c` up beside `a`; the second then pulled `f` beside `d`, where `d`
+        // had landed. Both runs are tight, and neither swallowed the other.
+        assert_eq!(order(&pane), vec![ids[0], ids[2], ids[1], ids[3], ids[5], ids[4]]);
+        assert_eq!(pane.members(red_a), vec![0, 1], "{:?}", order(&pane));
+        assert_eq!(pane.members(red_b), vec![3, 4], "{:?}", order(&pane));
+        pane.rename_group(red_a, "first");
+        assert_eq!(pane.group(red_b).expect("kept").label(), "Red");
+        pane.debug_assert_invariants();
+    }
+
+    #[test]
+    fn joining_and_leaving_keep_everything_consistent() {
+        let (mut pane, ids) = strip(&["a", "b", "c", "d"]);
+        let gid = GroupId(1);
+        pane.create_group(gid, &[ids[0], ids[1]], GroupColor::B)
+            .expect("two");
+        assert!(pane.join_group(gid, &[ids[3]]));
+        assert_eq!(pane.members(gid), vec![0, 1, 2], "the joiner moved up to the run");
+        assert_eq!(pane.group_of(ids[3]), Some(gid));
+        // A tab that leaves by itself: the group lives on, the strip does not reorder.
+        let before = order(&pane);
+        assert_eq!(pane.leave_group(&[ids[3]]), 1);
+        assert_eq!(order(&pane), before, "leaving is not a reorder");
+        assert_eq!(pane.group_of(ids[3]), None, "it is gone from the group");
+        assert!(pane.join_group(GroupId(99), &[ids[2]]) == false, "no such group");
+        pane.debug_assert_invariants();
+    }
+
+    #[test]
+    fn ungrouping_releases_the_tabs_and_closing_the_last_one_buries_the_group() {
+        let (mut pane, ids) = strip(&["a", "b", "c"]);
+        let gid = GroupId(1);
+        pane.create_group(gid, &[ids[0], ids[1]], GroupColor::C)
+            .expect("two");
+        // Ungroup: the tabs are still open, the record is not.
+        assert_eq!(pane.ungroup(gid), 2, "two tabs released");
+        assert_eq!(pane.tabs.len(), 3, "no tab was closed by ungrouping");
+        assert!(pane.group(gid).is_none());
+        assert_eq!(pane.tab_color(Some(gid)), None);
+        // And the same by closing: one tab left, one tab left none.
+        pane.create_group(gid, &[ids[0], ids[2]], GroupColor::C)
+            .expect("two again");
+        pane.close_tabs(&[ids[2]]);
+        assert!(pane.group(gid).is_some(), "one member is still a group");
+        pane.close_tabs(&[ids[0]]);
+        assert!(
+            pane.group(gid).is_none(),
+            "the last member closed, so the row went with it"
+        );
+        assert_eq!(pane.tabs.len(), 1);
+        pane.debug_assert_invariants();
+    }
+
+    #[test]
+    fn a_colour_clash_merges_and_forces_the_survivor_open() {
+        let (mut pane, ids) = strip(&["a", "b", "c", "d"]);
+        let (keep, gone) = (GroupId(1), GroupId(2));
+        pane.create_group(keep, &[ids[0], ids[1]], GroupColor::A)
+            .expect("two");
+        pane.create_group(gone, &[ids[2], ids[3]], GroupColor::F)
+            .expect("two");
+        pane.set_collapsed(gone, true);
+        assert_eq!(
+            pane.set_group_color(gone, GroupColor::A),
+            Some(keep),
+            "red was taken, so the merge lands on the group that held it"
+        );
+        assert_eq!(pane.groups.len(), 1, "one row, not two");
+        assert_eq!(pane.members(keep).len(), 4, "four tabs, one group");
+        assert!(
+            !pane.group(keep).expect("kept").collapsed,
+            "a merge never folds tabs the user was looking at"
+        );
+        assert_eq!(
+            pane.members(keep),
+            vec![0, 1, 2, 3],
+            "both runs moved together: {:?}",
+            order(&pane)
+        );
+        assert_eq!(pane.group_of(ids[3]), Some(keep), "nothing points at the dead id");
+        // The boring case: a colour nobody holds is one field write.
+        pane.set_group_color(keep, GroupColor::I);
+        assert_eq!(pane.group(keep).expect("kept").color, GroupColor::I);
+        assert_eq!(pane.group_of(ids[0]), Some(keep));
+        assert_eq!(pane.groups.len(), 1);
+        pane.debug_assert_invariants();
+    }
+
+    #[test]
+    fn free_colour_walks_the_palette_and_then_repeats() {
+        let (mut pane, ids) = strip(&["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"]);
+        for (ix, color) in GroupColor::ALL.iter().copied().enumerate() {
+            assert_eq!(pane.free_color(), color, "the {}th group", ix + 1);
+            pane.create_group(GroupId(ix as u64 + 1), &[ids[ix]], color)
+                .expect("one tab");
+        }
+        assert_eq!(
+            pane.free_color(),
+            GroupColor::A,
+            "past the ninth, colours repeat: a colour is an attribute, not an identity"
+        );
+        pane.debug_assert_invariants();
+    }
+
+    #[test]
+    fn closing_tabs_keeps_the_ring_the_selection_and_the_shown_index_honest() {
+        let (mut pane, ids) = strip(&["a", "b", "c"]);
+        pane.activate(ids[1]);
+        pane.select_tab(ids[0], TabSelKind::Toggle);
+        pane.close_tabs(&[ids[0], ids[1]]);
+        assert_eq!(order(&pane), vec![ids[2]]);
+        assert!(!pane.tab_sel.contains(&ids[0]), "a closed tab cannot be selected");
+        assert_eq!(pane.active, 0, "the shown index stayed on the strip");
+        assert_eq!(pane.active_id(), Some(ids[2]));
+        assert!(pane.mru.iter().all(|id| *id == ids[2]));
+        // Closing everything is legal and leaves no dangling state behind.
+        pane.close_tabs(&[ids[2]]);
+        assert!(pane.tabs.is_empty());
+        assert_eq!(pane.active, 0);
+        assert_eq!(pane.active_id(), None);
+        assert!(pane.tab_sel_anchor.is_none() || pane.tab_sel.is_empty());
+        pane.debug_assert_invariants();
+    }
+
+    #[test]
+    fn the_click_kinds_follow_the_modifiers() {
+        let (mut pane, ids) = strip(&["a", "b", "c", "d"]);
+        pane.activate(ids[1]);
+        assert_eq!(pane.selected_tabs(), vec![ids[1]], "a click shows and selects");
+        pane.select_tab(ids[3], TabSelKind::Toggle);
+        assert_eq!(pane.selected_tabs(), vec![ids[1], ids[3]], "ctrl adds");
+        pane.select_tab(ids[3], TabSelKind::Toggle);
+        assert_eq!(pane.selected_tabs(), vec![ids[1]], "ctrl again removes");
+        // A ctrl-click moved the anchor to itself on the way out, so the range runs from there.
+        pane.select_tab(ids[0], TabSelKind::Range);
+        assert_eq!(
+            pane.selected_tabs(),
+            vec![ids[0], ids[1], ids[2], ids[3]],
+            "shift ranges from the last click to here, in strip order, whatever is folded"
+        );
+        pane.select_tab(ids[1], TabSelKind::Replace);
+        pane.select_tab(ids[3], TabSelKind::Range);
+        assert_eq!(
+            pane.selected_tabs(),
+            vec![ids[1], ids[2], ids[3]],
+            "and from the anchor the plain click left"
+        );
+        pane.select_tab(ids[2], TabSelKind::Replace);
+        assert_eq!(pane.selected_tabs(), vec![ids[2]]);
+        assert_eq!(pane.active, 1, "a selection is not a navigation");
+        assert!(!pane.activate(TabId(99)), "an id this pane does not have is refused, not clamped");
+        assert!(!pane.select_tab(TabId(99), TabSelKind::Replace));
+    }
+
+    #[test]
+    fn folding_a_group_never_hides_the_tab_on_screen() {
+        let (mut pane, ids) = strip(&["a", "b", "c"]);
+        let gid = GroupId(1);
+        pane.create_group(gid, &[ids[0], ids[1]], GroupColor::D)
+            .expect("two");
+        pane.activate(ids[1]);
+        assert!(pane.toggle_collapsed(gid));
+        assert!(pane.group(gid).expect("kept").collapsed);
+        assert_eq!(
+            pane.active_id(),
+            Some(ids[1]),
+            "collapsing did not move the shown tab out from under the pane"
+        );
+        assert!(pane.activate(ids[0]), "and activating inside it does not unfold it either");
+        assert!(pane.group(gid).expect("kept").collapsed);
+        // `items()` of the strip is what keeps this visible; the model only promises the id is honest.
+        assert!(pane.members(gid).contains(&pane.active));
+        pane.debug_assert_invariants();
+    }
+
+    #[test]
+    fn compacting_follows_the_shown_tab_and_is_a_no_op_when_the_runs_are_already_tidy() {
+        let (mut pane, ids) = strip(&["a", "b", "c", "d"]);
+        pane.activate(ids[2]);
+        // `c` joins a group whose first member is `a`: the compact has to move `c`, and the shown tab
+        // is `c`, so `active` (which is an index) has to follow it by id.
+        pane.create_group(GroupId(7), &[ids[0], ids[2]], GroupColor::E)
+            .expect("two");
+        assert_eq!(pane.members(GroupId(7)), vec![0, 1]);
+        assert_eq!(pane.active_id(), Some(ids[2]), "the shown tab followed its id");
+        assert_eq!(pane.active, 1);
+        let before = order(&pane);
+        pane.compact();
+        assert_eq!(order(&pane), before, "compacting tidy state changes nothing");
+        // A pane with no groups at all is not touched by it either.
+        let (mut plain, _) = strip(&["a", "b"]);
+        plain.compact();
+        assert_eq!(plain.tabs.len(), 2);
+    }
+
+    #[test]
+    fn a_duplicated_tab_stays_in_its_group() {
+        let (mut pane, ids) = strip(&["a", "b"]);
+        let gid = GroupId(1);
+        pane.create_group(gid, &[ids[0]], GroupColor::G).expect("one");
+        let copy = Tab::duplicate(&pane.tabs[0], TabId(50));
+        assert_eq!(copy.group, Some(gid), "Go's duplicateTab kept the colour");
+        pane.tabs.insert(1, copy);
+        pane.prune_groups();
+        pane.compact();
+        assert_eq!(pane.members(gid), vec![0, 1]);
+        pane.debug_assert_invariants();
+    }
+
+    #[test]
+    fn ids_come_back_from_the_store_as_they_went() {
+        assert_eq!(GroupId(7).to_store(), "g7");
+        assert_eq!(GroupId::from_store("g7"), Some(GroupId(7)));
+        assert_eq!(GroupId::from_store("g"), None, "a bare prefix is not an id");
+        assert_eq!(GroupId::from_store("g1x"), None);
+        assert_eq!(GroupId::from_store("tab_1_z"), None, "Go's tab ids are not group ids");
+        let mut model = AppModel::new(LayoutMode::Single);
+        assert_eq!(
+            model.adopt_group_id("g41"),
+            GroupId(41),
+            "a restored group keeps the id it was saved with"
+        );
+        assert_eq!(
+            model.next_group_id(),
+            GroupId(42),
+            "and the allocator moved past it, so nothing can collide"
+        );
+        let fresh = model.adopt_group_id("nonsense");
+        assert_eq!(fresh, GroupId(43));
+        assert_ne!(model.next_group_id(), fresh);
+    }
+}
