@@ -51,6 +51,22 @@ toolchain block, not a code failure — see plan §9.2 step-16a). The `#[cfg(not
 MSRV: `rust-version = "1.95"` is **declared, not build-verified on the dev box** — the pinned
 channel is absent there (`rust-toolchain.toml` explains why the channel pin is `stable` instead).
 
+## The icon on all three desktops
+
+`zenman` embeds its own icon, so the window, the taskbar button, alt-tab and (on macOS 11+) the Dock
+tile are right from a bare `cargo run` — no `.desktop` file, no installer, no bundle:
+
+| | what carries it |
+|---|---|
+| Windows | the embedded PNG (`WM_SETICON`) + `assets/app-icon/zenman.ico` compiled into the `.exe` |
+| macOS | the embedded PNG (`setApplicationIconImage`), plus `zenman.icns` inside `ZenMan.app` (`scripts/make-app-bundle.sh`) |
+| Linux / X11 | the embedded PNG via `_NET_WM_ICON` |
+| Linux / Wayland | needs a `.desktop` file — which the compositor, not the process, reads. Opt in: `zenman --install-desktop-entry` writes the entry *and* the hicolor icons into `$XDG_DATA_HOME`, idempotently, and never overwrites a file it did not generate |
+
+The art in `assets/app-icon/` is generated from `assets/icons/prototype-icon.png` by
+`scripts/make-app-icon.py`; `cargo xtask app-icon` re-derives it and fails if a committed artefact has
+fallen behind. Details: [`docs/app-icon.md`](docs/app-icon.md).
+
 ## Your tabs come back, and portable mode
 
 **Session restore.** Every tab strip, the selected tab, the grid (one-, two- or four-pane), the divider

@@ -70,6 +70,31 @@ required beyond this file.
 | `assets/icons/video.svg` | MIT OR Apache-2.0 | camera | video rows |
 | `assets/icons/workspace.svg` | MIT OR Apache-2.0 | stacked layers | workspace switcher button |
 
+## `assets/app-icon/` — the application icon
+
+The mark the operating systems draw for zen-man itself: the three-folder/sparkle prototype artwork
+(`assets/icons/prototype-icon.png`, contributed to the project in 2026) matted off its field and
+re-laid out on a square canvas. Like the line icons above, it is original work of the zen-man-rs
+contributors and carries the workspace's **MIT OR Apache-2.0** dual licence.
+
+Everything except the prototype row is **generated** — by `scripts/make-app-icon.py`, which is the
+place to edit. Do not hand-edit a derived file: `cargo xtask app-icon` re-derives the master's pixels
+from the prototype and fails when they disagree, and `cargo xtask assets` fails when a file below is
+missing from this table.
+
+| File | Licence | Side | Used for |
+|---|---|---|---|
+| `assets/icons/prototype-icon.png` | MIT OR Apache-2.0 | 1024×579 | the source artwork; nothing reads it at runtime |
+| `assets/app-icon/zenman-master.png` | MIT OR Apache-2.0 | 1024 | master art: what `cargo xtask app-icon` re-derives and diffs |
+| `assets/app-icon/zenman.png` | MIT OR Apache-2.0 | 256 | `include_bytes!`-ed window/taskbar/Dock icon (`apps/zenman/src/app_icon.rs`) |
+| `assets/app-icon/zenman.ico` | MIT OR Apache-2.0 | 16–256 | Windows `RT_GROUP_ICON`, compiled in by `apps/zenman/build.rs` |
+| `assets/app-icon/zenman.icns` | MIT OR Apache-2.0 | 16–1024 | macOS `ZenMan.app/Contents/Resources` (`scripts/make-app-bundle.sh`) |
+| `assets/app-icon/linux/16x16.png` | MIT OR Apache-2.0 | 16 | hicolor entry, written by `zenman --install-desktop-entry` |
+| `assets/app-icon/linux/32x32.png` | MIT OR Apache-2.0 | 32 | hicolor entry (also the Wayland `app_id`-resolved tile) |
+| `assets/app-icon/linux/48x48.png` | MIT OR Apache-2.0 | 48 | hicolor entry |
+| `assets/app-icon/linux/128x128.png` | MIT OR Apache-2.0 | 128 | hicolor entry, GNOME app-grid size |
+| `assets/app-icon/linux/256x256.png` | MIT OR Apache-2.0 | 256 | hicolor entry, large panels and previews |
+
 ## Fonts
 
 None are vendored (plan §10 decision R9): the shell installs the `craft_ui::fonts::UiFonts` stack

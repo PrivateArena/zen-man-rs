@@ -1,4 +1,5 @@
-//! Build script: the craft-i18n catalog code-gen (plan §5.4/§5.9 `apps/zenman/build.rs` row).
+//! Build script: the craft-i18n catalog code-gen (plan §5.4/§5.9 `apps/zenman/build.rs` row), and the
+//! Windows executable icon.
 //!
 //! # The convention this copies, and where it is pinned
 //!
@@ -71,6 +72,8 @@ fn main() {
     // is the document the other locales are checked against.
     println!("cargo::rerun-if-changed=build.rs");
     println!("cargo::rerun-if-changed={}", default_i18n_dir().display());
+    let target = std::env::var("TARGET").unwrap_or_default();
+    windows_icon(&target);
     let body = generate();
     if let Err(e) = std::fs::write(out_dir.join("craft_i18n.rs"), body.text) {
         println!("cargo::error=writing {}: {e}", out_dir.display());
@@ -79,6 +82,45 @@ fn main() {
         if let Err(e) = std::fs::write(out_dir.join(&name), text) {
             println!("cargo::error=writing {name}: {e}");
         }
+    }
+}
+
+/// The Windows executable resource: the app icon as `RT_GROUP_ICON`.
+///
+/// # Why a build-time resource at all
+///
+/// The runtime icon (`apps/zenman/src/app_icon.rs`, `WM_SETICON`) only exists once a window does.
+/// Explorer, a desktop shortcut, "open file location", the taskbar's *pinned* tile and every
+/// thumbnail Windows draws from the binary itself all read the icon out of the executable's resource
+/// table, before anything runs — so without this the shipped `.exe` is the generic app tile no matter
+/// how good the in-window icon is.
+///
+/// # Why a warning and never an error
+///
+/// A missing icon is cosmetic; a build that stops is not. So a failure here is a `cargo:warning`, and
+/// the `*-pc-windows-gnu` case (which needs `windres`, unlike the MSVC case, whose `.res` writer is
+/// pure Rust and therefore works from any host) still produces a working binary. See
+/// `docs/app-icon.md` for what each platform then shows.
+fn windows_icon(target: &str) {
+    if !target.contains("windows") {
+        return;
+    }
+    let ico = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/app-icon/zenman.ico");
+    println!("cargo::rerun-if-changed={}", ico.display());
+    if !ico.is_file() {
+        println!(
+            "cargo::warning={}: run `scripts/make-app-icon.py` — the .exe would ship without an icon",
+            ico.display()
+        );
+        return;
+    }
+    let mut resource = winresource::WindowsResource::new();
+    // Relative to this crate, which is how `winresource` resolves it and how `cargo` reports it.
+    resource.set_icon("../../assets/app-icon/zenman.ico");
+    if let Err(e) = resource.compile() {
+        println!(
+            "cargo::warning=the Windows icon resource could not be compiled ({e}): the .exe ships without an icon"
+        );
     }
 }
 

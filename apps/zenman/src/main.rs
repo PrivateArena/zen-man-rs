@@ -31,8 +31,11 @@
 
 mod app;
 mod app_dirs;
+mod app_icon;
 mod config_boot;
 mod crash_guard;
+#[cfg(target_os = "linux")]
+mod desktop_entry;
 mod gpu_startup;
 mod i18n;
 mod single_instance;
@@ -97,6 +100,13 @@ struct Cli {
     /// With `--migrate-config`: actually write the `config.json.bak` backup and import the data.
     #[arg(long, requires = "migrate_config")]
     apply: bool,
+
+    /// Linux only: write the desktop entry and the icon-theme files a Wayland compositor needs to
+    /// show zen-man's icon and name, then exit 0 (`docs/app-icon.md`). X11 needs neither — the
+    /// window carries its own icon — and no other code path writes them.
+    #[cfg(target_os = "linux")]
+    #[arg(long)]
+    install_desktop_entry: bool,
 
     /// Do not claim the single-instance socket: run a second, independent copy (plan §5.9).
     #[arg(long)]
@@ -343,6 +353,23 @@ fn main() -> ExitCode {
         };
     }
 
+    // Desktop integration is its own command for the same reason the migration is: it writes files
+    // the app has no window for, and it has to work on a machine whose GPU ladder never runs. It is
+    // also the Wayland half of the icon story — see `docs/app-icon.md`.
+    #[cfg(target_os = "linux")]
+    if cli.install_desktop_entry {
+        return match desktop_entry::install(APP_ID, APP_TITLE, paths.home().as_deref()) {
+            Ok(report) => {
+                println!("{report}");
+                ExitCode::from(EXIT_OK)
+            }
+            Err(desktop_entry::InstallError(message)) => {
+                eprintln!("zenman: {message}");
+                ExitCode::from(EXIT_CONFIG)
+            }
+        };
+    }
+
     match crash_guard::guard("startup", || run_with_context(&cli, &paths)) {
         Ok(Ok(code)) => ExitCode::from(code),
         Ok(Err(BootError { code, message })) => {
@@ -353,6 +380,30 @@ fn main() -> ExitCode {
             eprintln!("zenman: {report}");
             ExitCode::from(EXIT_INTERNAL)
         }
+    }
+}
+
+/// The root window's identity and geometry: the part of [`eframe::NativeOptions`] that is not the
+/// GPU ladder or the persistence path.
+///
+/// `app_id` is the Wayland `app_id`, and therefore the desktop-entry basename
+/// [`desktop_entry`] writes — the two have to agree or a Wayland shell shows a generic tile
+/// (`docs/app-icon.md`). The icon is the X11 half of the same story: it travels with the window, so
+/// no desktop file is needed for the taskbar, the title bar and the alt-tab switcher to show it, and
+/// eframe additionally hands it to `WM_SETICON` on Windows and to `setApplicationIconImage` (the Dock
+/// tile) on macOS. A build whose embedded PNG will not decode simply keeps eframe's default icon —
+/// an unbranded window beats a boot that stops to complain about its own picture.
+fn viewport_builder() -> egui::ViewportBuilder {
+    let builder = egui::ViewportBuilder::default()
+        .with_app_id(APP_ID)
+        .with_title(APP_TITLE)
+        .with_inner_size([1440.0, 900.0])
+        .with_min_inner_size([900.0, 480.0])
+        .with_drag_and_drop(true);
+    match app_icon::window_icon() {
+        Some(icon) => builder.with_icon(icon),
+        // `None` leaves eframe's own default icon in place: an unbranded window still opens.
+        None => builder,
     }
 }
 
@@ -532,12 +583,7 @@ fn run_with_context(cli: &Cli, paths: &app_dirs::AppPaths) -> Result<u8, BootErr
     }
 
     let mut options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_app_id(APP_ID)
-            .with_title(APP_TITLE)
-            .with_inner_size([1440.0, 900.0])
-            .with_min_inner_size([900.0, 480.0])
-            .with_drag_and_drop(true),
+        viewport: viewport_builder(),
         // Window/UI state, plan §2.2's craft-settings policy. `ui.ron` needs the `persistence` feature,
         // which `egui`'s own dock state also uses from step 7 on.
         persistence_path: Some(paths.config.join("ui.ron")),

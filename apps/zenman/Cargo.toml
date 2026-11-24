@@ -47,6 +47,13 @@ rustix = { version = "1.1.6" }
 [build-dependencies]
 # `build.rs` is pure Rust over `serde_json::Value` — no bash, no python, no derive macros.
 serde_json = { workspace = true }
+# The Windows executable icon (`RT_GROUP_ICON` from `assets/app-icon/zenman.ico`); `build.rs`'s
+# `windows_icon`. Deliberately *not* under `[target.'cfg(windows)'.build-dependencies]`: build
+# dependencies are resolved for the host, so gating them on the target's OS is what breaks the
+# cross-compile from Linux that `xtask ci`'s cross-target rung stands on. It costs one crate — MIT OR
+# Apache-2.0, and every one of its own dependencies is already in `Cargo.lock` — and on a non-Windows
+# target the code path returns before it is used.
+winresource = "0.1"
 
 [features]
 # Embed the `CRAFT_I18N_DIR` catalogs. Off by default; the generated file is only compiled when on.

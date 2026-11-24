@@ -29,7 +29,9 @@ argv / file:// URI  ->  apps/zenman (Cli, single_instance, gpu_startup, config_b
 zen-man-rs/
   Cargo.toml                    workspace table + [patch.crates-io] egui/winit revs, lints, profiles
   .cargo/config.toml            `cargo xtask` alias
-  apps/zenman/src/              main app app_dirs config_boot gpu_startup single_instance crash_guard i18n
+  apps/zenman/src/              main app app_dirs app_icon config_boot gpu_startup single_instance crash_guard i18n
+                                  (+ desktop_entry, linux-only `--install-desktop-entry`)
+assets/app-icon/                generated application icon set (master PNG, runtime PNG, .ico, .icns, hicolor ladder)
   apps/zenman/                  + build.rs (i18n catalog), i18n/en.json, tests/gpu_fallback.rs
   crates/zenman-ui/src/         app state dock dock_content keymap theme persist jobs_ui drag_drop icons
   crates/zenman-ui/src/panels/  file_pane side_panel breadcrumb nav_bar header tab_bar status_bar action_log
@@ -56,6 +58,7 @@ zen-man-rs/
 | `cargo xtask snapshots` | xtask/src/main.rs + crates/zenman-ui/tests/snapshots.rs | Rasterised kittest/wgpu snapshot rendering |
 | `cargo xtask fixture-tree` | xtask/src/fixture_tree.rs | Regenerates `tests/fixtures` and its manifest via scripts/make-fixtures.py |
 | `cargo xtask assets` | xtask/src/assets.rs | Checks `assets/icons` files against the attribution/licence table |
+| `cargo xtask app-icon` | xtask/src/app_icon.rs + scripts/make-app-icon.py | Checks the application-icon set: valid containers, right sizes, embedded paths, and pixels re-derived from the prototype |
 | `scripts/build.sh` | scripts/build.sh | Preflight + `--locked` release build, `--check`, `--smoke`, `--install`, `--dist` |
 | `scripts/capture-golden.sh` | scripts/capture-golden.sh | Captures Go reference output for the golden set |
 
@@ -72,7 +75,11 @@ zen-man-rs/
 | apps/zenman/src/single_instance.rs | Unix socket/PID claim-or-focus so a second launch forwards its targets to the first window | ~718 | `enum Claim`, `SingleInstanceGuard`, `take_requests() -> Vec<Request>`, `socket_path()` |
 | apps/zenman/src/crash_guard.rs | Panic hook writing timestamped reports + per-frame guard turning panics into reported errors | ~154 | `install_hook(dir)`, `guard<T, E>(what, f) -> Result<Result<T, E>, String>`, `report_dir()` |
 | apps/zenman/src/i18n.rs | Reader for the build-script-generated catalog; English passthrough when feature off | ~73 | `embedded_locales() -> Vec<&'static str>`, `embedded_locale_count() -> usize`, `translations_available()` |
-| apps/zenman/build.rs | Compiles `i18n/*.json` into a Rust source catalog (`CRAFT_I18N_DIR`) | ~311 | `collect(dir) -> Result<Vec<LocaleCatalog>, String>`, `parse_json_catalog(path)`, `render(rows) -> String` |
+| apps/zenman/build.rs | Compiles `i18n/*.json` into a Rust source catalog (`CRAFT_I18N_DIR`), and the Windows `RT_GROUP_ICON` from `assets/app-icon/zenman.ico` (`winresource`; warn-not-fail) | ~360 | `collect(dir) -> Result<Vec<LocaleCatalog>, String>`, `parse_json_catalog(path)`, `render(rows) -> String`, `windows_icon(target)` |
+| apps/zenman/src/app_icon.rs | The application icon: the embedded 256px PNG, decoded once into `egui::IconData` for the window/taskbar/Dock, plus the hicolor ladder the Linux installer writes | ~75 | `window_icon() -> Option<IconData>`, `HICOLOR: [(u32, &[u8]); 5]`, `HICOLOR_FILE` |
+| apps/zenman/src/desktop_entry.rs | Linux only (`--install-desktop-entry`): writes `$XDG_DATA_HOME/applications/<app_id>.desktop` + the hicolor PNGs; never touches a file it did not generate | ~340 | `install(app_id, title, home) -> Result<Report, InstallError>`, `render(app_id, title, exe) -> String` |
+| scripts/make-app-icon.py | Derives the whole `assets/app-icon/` set from the prototype artwork (matte → crop → square canvas → ladder), and checks the committed set | ~380 | `build_master`, `matte_from_field`, `generate`, `check`, `--check`/`--preview` |
+| scripts/make-app-bundle.sh | macOS only: builds `ZenMan.app` (Info.plist + `zenman.icns`) around the built binary and re-registers it with Launch Services | ~100 | shell, no exports |
 | apps/zenman/tests/gpu_fallback.rs | Drives the compiled binary (`CARGO_BIN_EXE_zenman`) through `--safe-gpu --smoke` | ~205 | no exports |
 | apps/zenman/tests/session_boot.rs | Drives the same binary twice over one settings tree: the session that was saved is the session that reloads, and a folder argument is not reported as a restore | ~415 | no exports |
 | crates/zenman-ui/src/lib.rs | UI crate module surface; re-exports `craft_ui` so the binary needs no direct egui-widget dep | ~68 | `pub mod app..widgets`, `pub use craft_ui` |
@@ -173,6 +180,7 @@ persist: craft-settings (dock/tabs) + store::config (ZenConfig: workspaces.defau
 | Change pane/dock layout or restart persistence | `crates/zenman-ui/src/dock.rs`, `dock_content.rs`, `crates/zenman-ui/src/persist.rs`, `crates/zenman-core/src/store/config.rs` (`LayoutMode`, `PaneSlot`) |
 | Change colours, fonts or the Go palette parity | `crates/zenman-ui/src/theme.rs` (`Tokens`), `crates/zenman-ui/tests/snapshots.rs`, `docs/parity/` |
 | Add an icon or fix icon mapping | `crates/zenman-ui/src/icons.rs` (`icon_for`), `assets/icons/`, `xtask/src/assets.rs`, `ATTRIBUTION.md` |
+| Change the **application** icon (window/taskbar/Dock/Explorer), its sizes, or the Linux/Wayland entry | `docs/app-icon.md`, `scripts/make-app-icon.py`, `assets/app-icon/`, `apps/zenman/src/app_icon.rs`, `apps/zenman/src/desktop_entry.rs`, `apps/zenman/build.rs`, `xtask/src/app_icon.rs` |
 | Change CLI flags, startup, GPU fallback or single-instance hand-off | `apps/zenman/src/main.rs`, `apps/zenman/src/gpu_startup.rs`, `single_instance.rs`, `config_boot.rs`, `app_dirs.rs` (portable layout), `apps/zenman/tests/gpu_fallback.rs`, `apps/zenman/tests/session_boot.rs` |
 | Add or change a tab group (chip, fold, colour, menu verb, drag) | `crates/zenman-ui/src/state.rs` (the algebra + invariants), `crates/zenman-ui/src/panels/tab_bar.rs` (`items`/`layout`/chips), `crates/zenman-ui/src/app.rs` (`run_group_command`, `end_tab_drag`, `tick_group_hover`), `crates/zenman-ui/src/menus/mod.rs` (`tab_menu`/`group_menu`), `docs/tab-groups-design.md`, `tests/tab_groups.rs` + `tests/menus.rs` |
 | Change what the session saves or restores | `crates/zenman-ui/src/panels/header.rs` (`workspace_session`, `apply_workspace`, `restore_last_session`, `flush_session`), `crates/zenman-core/src/services/workspaces.rs` (`Autosave`, `RESERVED`), `crates/zenman-core/src/store/config.rs` (`Workspace`/`TabSession`), `crates/zenman-ui/tests/workspaces.rs`, `docs/contracts.md` → "Session save and restore" |

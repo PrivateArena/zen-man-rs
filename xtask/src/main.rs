@@ -32,6 +32,7 @@ use std::process::{Command, Stdio};
 
 use serde_json::Value;
 
+mod app_icon;
 mod assets;
 mod contracts;
 mod cross_target;
@@ -56,6 +57,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         "deps" => deps(),
         "licenses" => licenses(),
         "assets" => assets::assets(),
+        "app-icon" => app_icon::app_icon(),
         "snapshots" => snapshots(),
         "parity" => {
             let root = workspace_root()?;
@@ -66,13 +68,16 @@ fn run() -> Result<(), Box<dyn Error>> {
         "golden-index" => contracts::golden_index(&workspace_root()?.join("tests/golden")),
         "help" | "-h" | "--help" => {
             println!(
-                "usage: cargo xtask <ci|deps|licenses|assets|snapshots|parity|contracts|fixture-tree|golden-index>"
+                "usage: cargo xtask <ci|deps|licenses|assets|app-icon|snapshots|parity|contracts|fixture-tree|golden-index>"
             );
             println!(
                 "  parity is plan §7 step 15's human gate: it pairs docs/parity/*.png with the snapshots/ baselines"
             );
             println!(
                 "  fixture-tree and golden-index are the two step-2 gates that `contracts` also runs"
+            );
+            println!(
+                "  assets answers \"is this licensed\" and app-icon \"is this the right picture at the right size\""
             );
             Ok(())
         }
@@ -103,6 +108,9 @@ fn ci() -> Result<(), Box<dyn Error>> {
     // own check, and it runs here (and as `cargo xtask assets`) rather than inside `licenses`, so
     // that `licenses` stays the one thing its name says — cargo metadata against `deny.toml`.
     assets::assets()?;
+    // The other half of the same claim: `assets` reads licences, `app-icon` reads the icon containers
+    // and the sizes `build.rs`, the bundle script and `--install-desktop-entry` each depend on.
+    app_icon::app_icon()?;
     snapshot_artefact_gate()?;
     parity_gate()?;
     println!("xtask ci: all gates green");

@@ -371,7 +371,7 @@ fn override_dir(
 
 /// `$XDG_<NAME>`, when it is an absolute path (a relative one is meaningless to the spec and is
 /// ignored here rather than resolved against the cwd).
-fn xdg_base(name: &str) -> Option<PathBuf> {
+pub(crate) fn xdg_base(name: &str) -> Option<PathBuf> {
     let value = std::env::var_os(name)?;
     let path = Path::new(&value);
     path.is_absolute().then(|| path.to_path_buf())
