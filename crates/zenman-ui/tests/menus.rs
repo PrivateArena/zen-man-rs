@@ -301,6 +301,144 @@ fn right_clicking_a_row_opens_go_row_menu_with_the_keymaps_hints() {
     }
 }
 
+/// The multi-selection workflow: several rows are ctrl-clicked, then the menu is opened on one of
+/// them. Go's `handlePaneContextMenu` selected the row **only when it was unselected**
+/// (`file-list.js:19-27`), so the set survives and every row of the menu acts on all of them.
+#[test]
+fn right_clicking_a_row_inside_the_selection_keeps_the_whole_set() {
+    let dir = tree("menus-keep-sel", &["a.txt", "b.txt", "c.md", "d.txt"]);
+    let mut harness = pane_harness("menus-keep-sel", &dir);
+
+    // The ctrl-click ladder of the report: three rows in, `d.txt` left out.
+    harness.get_by_label("a.txt").click();
+    settle(&mut harness);
+    for name in ["b.txt", "c.md"] {
+        harness.get_by_label(name).click_modifiers(Modifiers {
+            ctrl: true,
+            ..Default::default()
+        });
+        settle(&mut harness);
+    }
+    assert_eq!(
+        shown(&harness, PaneSlot::Left).sel.len(),
+        3,
+        "three rows in"
+    );
+
+    // Right-click *inside* the set: the set is the menu's subject, unchanged.
+    right_click(&mut harness, "b.txt");
+    settle(&mut harness);
+    let tab = shown(&harness, PaneSlot::Left);
+    assert_eq!(
+        tab.sel.len(),
+        3,
+        "the right-click collapsed the multi-selection"
+    );
+    assert!(
+        tab.sel.contains("a.txt") && tab.sel.contains("c.md"),
+        "and it lost a row it should not have"
+    );
+    assert!(
+        labels(&harness).iter().any(|label| label == "Rename batch"),
+        "the menu still speaks of a batch: {:?}",
+        labels(&harness)
+    );
+    harness.get_by_label_contains("3 items selected");
+
+    // Close this menu before opening the next: a live popup covers the rows beneath it, and the
+    // pointer would hit the menu instead of `d.txt`.
+    harness
+        .input_mut()
+        .events
+        .push(Chord::key(egui::Key::Escape).event());
+    settle(&mut harness);
+    assert!(!is_open(&harness), "Escape closed nothing");
+
+    // Right-click *outside* the set: the pointer names a new subject, so the set does collapse — one
+    // row, and the menu's `Copy`/`Cut` pair act on it alone.
+    right_click(&mut harness, "d.txt");
+    settle(&mut harness);
+    let tab = shown(&harness, PaneSlot::Left);
+    assert_eq!(
+        tab.sel.len(),
+        1,
+        "a row outside the selection becomes the selection"
+    );
+    assert!(tab.sel.contains("d.txt"));
+    assert!(
+        labels(&harness).iter().any(|label| label == "Rename"),
+        "and the row menu is a single-row one again: {:?}",
+        labels(&harness)
+    );
+}
+
+/// The same fold seen from the command side, without a pointer: `Context` with a row index must not
+/// re-select a row that is already selected (`Selection::fold_right_click`).
+#[test]
+fn a_context_command_on_a_selected_row_leaves_the_anchor_alone() {
+    let dir = tree("menus-keep-anchor", &["a.txt", "b.txt", "c.md"]);
+    let mut harness = pane_harness("menus-keep-anchor", &dir);
+    let at = Pos2::new(200.0, 200.0);
+    let keys = |harness: &Harness<'static, ZenApp>| {
+        shown(harness, PaneSlot::Left)
+            .entries
+            .entries
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect::<Vec<_>>()
+    };
+    // Select the first two rows, then right-click the second one by its index.
+    harness.get_by_label("a.txt").click();
+    settle(&mut harness);
+    let names = keys(&harness);
+    let second = names
+        .iter()
+        .position(|n| n == "b.txt")
+        .expect("sorted listing");
+    let first = names
+        .iter()
+        .position(|n| n == "a.txt")
+        .expect("sorted listing");
+    harness.get_by_label("b.txt").click_modifiers(Modifiers {
+        ctrl: true,
+        ..Default::default()
+    });
+    settle(&mut harness);
+    let anchor = shown(&harness, PaneSlot::Left)
+        .sel
+        .origin()
+        .map(str::to_string);
+    harness.state_mut().run_command(
+        PaneSlot::Left,
+        PaneCommand::Context {
+            ix: Some(second),
+            at,
+        },
+    );
+    settle(&mut harness);
+    let tab = shown(&harness, PaneSlot::Left);
+    assert_eq!(tab.sel.len(), 2, "the pair survives its own right-click");
+    assert_eq!(
+        tab.sel.origin().map(str::to_string),
+        anchor,
+        "and the range anchor is where the left-click left it"
+    );
+    // …but a right-click on a row that was *not* part of it does switch the subject.
+    harness.state_mut().run_command(
+        PaneSlot::Left,
+        PaneCommand::Context {
+            ix: Some(first + 2),
+            at,
+        },
+    );
+    settle(&mut harness);
+    assert_eq!(
+        shown(&harness, PaneSlot::Left).sel.len(),
+        1,
+        "a fresh row takes the menu"
+    );
+}
+
 #[test]
 fn right_clicking_a_directory_row_adds_go_directory_block() {
     // `nested_tree` gives real directory rows (`alpha`, `beta`) — the `isDir` half of Go's branch.

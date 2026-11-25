@@ -268,6 +268,34 @@ impl Selection {
         }
     }
 
+    /// Fold a right-click on the row `ix` into the selection.
+    ///
+    /// The rule is Go's `handlePaneContextMenu` (`file-list.js:19-27`), which called `selectPath`
+    /// **only when the row was not already selected**: a row inside the current selection leaves it
+    /// untouched, so the multi-selection a ctrl-click ladder built is what the menu acts on. A row
+    /// outside it becomes the whole selection — the menu has to have *some* subject, and the pointer
+    /// has just named it. Either way the row ends up selected, which is why the same call serves the
+    /// two-finger-open and the left-click-then-menu workflows.
+    ///
+    /// Returns `false` when `ix` is not a row of the order, which changes nothing.
+    pub fn fold_right_click<'a>(
+        &mut self,
+        ix: usize,
+        key_at: impl Fn(usize) -> Option<&'a str>,
+    ) -> bool {
+        let Some(key) = key_at(ix) else {
+            return false;
+        };
+        if self.keys.contains(key) {
+            // Already in: the set and the range anchor both stay exactly where the last click left them.
+            return true;
+        }
+        self.keys.clear();
+        self.keys.insert(key.to_string());
+        self.origin = Some(key.to_string());
+        true
+    }
+
     /// Select every row of the visual order (Go's `selectAll`, `file-list.js:679-691`).
     pub fn select_all<'a>(&mut self, len: usize, key_at: impl Fn(usize) -> Option<&'a str>) {
         for index in 0..len {
@@ -1712,6 +1740,44 @@ mod tests {
             "the selection survives exactly as far as the rows do"
         );
         assert_eq!(sel.origin(), Some("kept"), "and so does the anchor");
+    }
+
+    /// The listing half of the same rule as [`Pane::right_click_selection`]: a right-click on a row
+    /// already in the selection leaves the multi-selection alone; one outside it replaces it.
+    #[test]
+    fn a_right_click_folds_the_row_selection_onto_what_it_hit() {
+        let keys = |ix: usize| match ix {
+            0 => Some("a"),
+            1 => Some("b"),
+            2 => Some("c"),
+            _ => None,
+        };
+        let mut sel = Selection::new();
+        sel.apply(SelKind::Single, 0, 3, keys);
+        sel.apply(SelKind::Add, 2, 3, keys);
+        assert_eq!(sel.len(), 2, "a and c");
+        assert_eq!(sel.origin(), Some("c"), "ctrl-click moved the anchor");
+        // Inside the set: untouched — same two keys, same anchor.
+        assert!(sel.fold_right_click(2, keys), "a row of the listing");
+        assert_eq!(
+            sel.len(),
+            2,
+            "the multi-selection survived its own right-click"
+        );
+        assert!(sel.contains("a") && sel.contains("c"));
+        assert_eq!(sel.origin(), Some("c"), "and so did the range anchor");
+        // Outside the set: the pointer names the new subject.
+        assert!(sel.fold_right_click(1, keys));
+        assert_eq!(sel.len(), 1, "one row, not three");
+        assert!(sel.contains("b"));
+        assert_eq!(
+            sel.origin(),
+            Some("b"),
+            "a fresh anchor for a fresh subject"
+        );
+        // A row that is gone is not a target, and changes nothing.
+        assert!(!sel.fold_right_click(9, keys));
+        assert_eq!(sel.len(), 1);
     }
 
     #[test]

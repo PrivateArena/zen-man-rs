@@ -571,7 +571,9 @@ impl ZenApp {
             PaneCommand::Context { ix, at } => {
                 // Recorded, not drawn: the menu is adopted next frame (`open_requested_menu`), and a
                 // right-click that selects its row is already half the behaviour (Go's
-                // `handlePaneContextMenu:19-27`).
+                // `handlePaneContextMenu:19-27`) — but only *half*: Go selected the row **unless it was
+                // already selected**, so right-clicking into a multi-selection keeps it and the menu acts
+                // on the whole set. `Selection::fold_right_click` is that rule.
                 self.context_request = Some(MenuRequest {
                     slot,
                     subject: MenuSubject::Listing(ix),
@@ -580,18 +582,8 @@ impl ZenApp {
                 if let Some(ix) = ix
                     && let Some(tab) = self.tab_mut_of(slot)
                 {
-                    let keys: Vec<String> = tab
-                        .entries
-                        .entries
-                        .iter()
-                        .map(|e| crate::state::Tab::row_key(e).to_string())
-                        .collect();
-                    tab.sel.apply(
-                        crate::widgets::virtual_list::SelKind::Single,
-                        ix,
-                        keys.len(),
-                        |i| keys.get(i).map(String::as_str),
-                    );
+                    tab.sel
+                        .fold_right_click(ix, |i| tab.entries.entries.get(i).map(Tab::row_key));
                 }
             }
             PaneCommand::Sort(column) => {
