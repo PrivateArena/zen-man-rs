@@ -59,8 +59,8 @@
 
 use egui::text::LayoutJob;
 use egui::{
-    Area, Color32, CornerRadius, Frame, Id, Margin, Order, Pos2, Rect, Shadow, Stroke, Ui, Vec2,
-    WidgetInfo,
+    Area, Color32, CornerRadius, Frame, Id, LayerId, Margin, Order, Painter, Pos2, Rect, Shadow,
+    Stroke, Ui, Vec2, WidgetInfo,
 };
 
 use zenman_core::services::actions::{self, ActionContext};
@@ -706,6 +706,40 @@ pub struct MenuStyle<'a> {
     pub tokens: &'a Tokens,
 }
 
+/// The popup's border, in points: the frame's stroke, and part of how far a row's corner sits inside
+/// the frame's rounded one ([`hover_corners`]).
+const FRAME_BORDER: u8 = 1;
+
+/// A popup's own box, measured off the row text **before** any row is drawn.
+///
+/// The measurement has to come first, because an `Area` sizes itself to its content: left to itself
+/// the first (sizing) pass runs at egui's `spacing.default_area_size` — 600 pt — every row then paints
+/// all of it, and the frame is frozen at that width for as long as it lives, [`Ui::set_min_width`]
+/// notwithstanding. That is why the rows take their width from here rather than from
+/// `available_width`, and why the area is *seeded* with it (`Area::default_size`): the popup hugs the
+/// widest label + chord pair from its very first frame.
+#[derive(Clone, Copy)]
+struct Geometry {
+    /// The content width: Go's 180 pt floor (`context-menu.css:8`), the widest row, or
+    /// [`Tokens::menu_max_width`], whichever is smallest.
+    width: f32,
+    /// The icon column every row reserves — the whole menu's, not the row's own, so a label never
+    /// shifts sideways depending on whether *its* item has a glyph.
+    icon_column: f32,
+    /// Rows + rules + frame padding: the height the sizing pass should assume.
+    height: f32,
+}
+
+impl Geometry {
+    /// The area's seed size: the content box plus the frame's border on both sides of it.
+    fn seed(&self) -> Vec2 {
+        Vec2::new(
+            self.width + 2.0 * f32::from(FRAME_BORDER),
+            self.height + 2.0 * f32::from(FRAME_BORDER),
+        )
+    }
+}
+
 #[must_use]
 pub fn show(
     ctx: &egui::Context,
@@ -717,15 +751,26 @@ pub fn show(
     out: &mut Vec<MenuAction>,
 ) -> MenuOutcome {
     let MenuStyle { keys, tokens } = style;
+    // Measured with the popup layer's own painter: the rows are not laid out yet, so this is the only
+    // moment the text can be sized. Same fonts, same layer, so the numbers cannot disagree with
+    // whatever [`row`] later paints.
+    let geometry = geometry(
+        &ctx.layer_painter(LayerId::new(Order::Foreground, id)),
+        groups,
+        menu_ctx,
+        keys,
+        tokens,
+    );
     let area = Area::new(id)
         .order(Order::Foreground)
         .movable(false)
+        .default_size(geometry.seed())
         .fixed_pos(at)
         .constrain(true)
         .show(ctx, |ui| {
             Frame::new()
                 .fill(tokens.bg_sidebar)
-                .stroke(Stroke::new(1.0, tokens.border))
+                .stroke(Stroke::new(f32::from(FRAME_BORDER), tokens.border))
                 .corner_radius(CornerRadius::same(tokens.menu_corner_radius))
                 .inner_margin(Margin::symmetric(0, tokens.menu_frame_pad_y as i8))
                 .shadow(Shadow {
@@ -736,17 +781,26 @@ pub fn show(
                 })
                 .show(ui, |ui| {
                     ui.spacing_mut().item_spacing = Vec2::ZERO;
-                    let width = content_width(ui, groups, keys, menu_ctx, tokens);
-                    ui.set_min_width(width);
-                    for (gi, group) in groups.iter().enumerate() {
-                        if group.is_empty() {
-                            continue;
+                    ui.set_min_width(geometry.width);
+                    // A row's top or bottom edge is `FRAME_BORDER + menu_frame_pad_y` inside the frame's
+                    // own edge, which is as deep as the corner arc reaches: today's tokens leave a
+                    // hovered end row exactly `radius - inset = 0` to round.
+                    let inset = FRAME_BORDER + tokens.menu_frame_pad_y;
+                    let total = groups.iter().map(|group| group.len()).sum::<usize>();
+                    let mut drawn = 0;
+                    let mut first = true;
+                    for group in groups.iter().filter(|group| !group.is_empty()) {
+                        // The rule goes *between* two groups: an empty leading group must not buy the
+                        // popup a rule across its own top edge.
+                        if !first {
+                            separator(ui, tokens, geometry.width);
                         }
-                        if gi > 0 {
-                            separator(ui, tokens);
-                        }
+                        first = false;
                         for spec in group {
-                            row(ui, spec, menu_ctx, keys, tokens, out);
+                            let corners =
+                                hover_corners(drawn, total, tokens.menu_corner_radius, inset);
+                            row(ui, spec, menu_ctx, keys, tokens, geometry, corners, out);
+                            drawn += 1;
                         }
                     }
                 });
@@ -762,24 +816,29 @@ pub fn show(
     MenuOutcome { rect, close }
 }
 
-/// The frame's own width: Go's `min-width: 180px` (`context-menu.css:8`) grown to fit the widest
-/// label + chord pair, and never past the screen.
-fn content_width(
-    ui: &Ui,
+/// Every row of the popup, measured — see [`Geometry`] for why this happens before the draw.
+fn geometry(
+    painter: &Painter,
     groups: &[Vec<MenuSpec>],
-    keys: &KeyMap,
     menu_ctx: &MenuContext,
+    keys: &KeyMap,
     tokens: &Tokens,
-) -> f32 {
-    let painter = ui.painter();
-    let mut widest = tokens.menu_min_width;
+) -> Geometry {
+    let icon_column = if groups.iter().flatten().any(|spec| spec.icon.is_some()) {
+        tokens.row_icon_size + tokens.menu_icon_gap
+    } else {
+        0.0
+    };
+    let mut width = tokens.menu_min_width;
+    let mut rows = 0_usize;
+    let mut rules = 0_usize;
     for group in groups {
+        if group.is_empty() {
+            continue;
+        }
+        rules += usize::from(rows > 0);
+        rows += group.len();
         for spec in group {
-            let icon = if spec.icon.is_some() {
-                tokens.row_icon_size + tokens.menu_icon_gap
-            } else {
-                0.0
-            };
             let label = painter
                 .layout_job(singleline(
                     &spec.label,
@@ -805,12 +864,33 @@ fn content_width(
                         .x
                         + tokens.menu_hint_gap
                 });
-            widest = widest.max(icon + label + hint + 2.0 * tokens.menu_item_pad_x);
+            width = width.max(icon_column + label + hint + 2.0 * tokens.menu_item_pad_x);
         }
     }
-    // Never the whole screen: an over-long custom-action name wraps into the label budget instead
-    // of pushing the frame off the pane it belongs to.
-    widest.min(tokens.menu_max_width)
+    Geometry {
+        // Never the whole screen: an over-long custom-action name wraps into the label budget instead
+        // of pushing the frame off the pane it belongs to.
+        width: width.min(tokens.menu_max_width),
+        icon_column,
+        height: rows as f32 * tokens.menu_item_height
+            + rules as f32 * (1.0 + 2.0 * f32::from(tokens.menu_separator_gap))
+            + 2.0 * f32::from(tokens.menu_frame_pad_y),
+    }
+}
+
+/// The rounded corners of one row's hover fill.
+///
+/// The frame is rounded (`context-menu.css:6-9`), the rows are not: a row that touches a corner may
+/// only round away what `inset` (the border and the frame's vertical padding, so how far inside the
+/// frame's outer edge its own edge is) has not already eaten of the arc. A square fill where the arc
+/// still curves would paint a hard corner over the frame's rounding; a fill rounded *past* the arc
+/// leaves a nick of bare frame colour at the popup's corner.
+#[must_use]
+fn hover_corners(index: usize, total: usize, radius: u8, inset: u8) -> CornerRadius {
+    let r = radius.saturating_sub(inset);
+    let (nw, ne) = if index == 0 { (r, r) } else { (0, 0) };
+    let (sw, se) = if index + 1 == total { (r, r) } else { (0, 0) };
+    CornerRadius { nw, ne, sw, se }
 }
 
 /// One item: the interact rect first (so the row owns its own click), the pixels after.
@@ -821,17 +901,19 @@ fn row(
     menu_ctx: &MenuContext,
     keys: &KeyMap,
     tokens: &Tokens,
+    geometry: Geometry,
+    corners: CornerRadius,
     out: &mut Vec<MenuAction>,
 ) {
     let enabled = spec.enabled(menu_ctx);
-    let size = Vec2::new(ui.available_width(), tokens.menu_item_height);
+    // The measured popup width, never `available_width` — see [`Geometry`].
+    let size = Vec2::new(geometry.width, tokens.menu_item_height);
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
     let hint = spec.hint(keys);
     if ui.is_rect_visible(rect) {
         let hovered = enabled && response.hovered();
         if hovered {
-            ui.painter()
-                .rect_filled(rect, CornerRadius::ZERO, tokens.bg_hover);
+            ui.painter().rect_filled(rect, corners, tokens.bg_hover);
         }
         let colour = if !enabled {
             tokens.disabled_text
@@ -847,13 +929,20 @@ fn row(
             let side = tokens.row_icon_size;
             icons::paint(
                 ui,
-                Rect::from_min_size(Pos2::new(x, rect.center().y), Vec2::splat(side)),
+                // Centred *on* the row's mid-line: `Rect::from_min_size` at that y hangs the whole
+                // glyph below it, which is what made the icon look like it had sunk out of the text.
+                Rect::from_center_size(
+                    Pos2::new(x + side / 2.0, rect.center().y),
+                    Vec2::splat(side),
+                ),
                 icon,
                 side,
                 colour,
             );
-            x += side + tokens.menu_icon_gap;
         }
+        // The column is the menu's, not the row's: a glyphless item's label lines up with its
+        // neighbours' instead of starting half an icon early.
+        x += geometry.icon_column;
         let budget = rect.max.x - x - tokens.menu_item_pad_x;
         let hint_width = hint.as_ref().map_or(0.0, |hint| {
             ui.painter()
@@ -866,7 +955,11 @@ fn row(
                 .size()
                 .x
         });
-        let show_hint = enabled && hint_width + tokens.menu_hint_gap <= budget;
+        // A row with no hint of its own must not be charged the gap: `hint_width` is 0.0 for a custom
+        // action and for a tab-group verb alike, and the old test (`0 + gap <= budget`) was therefore
+        // always true — it squeezed 24 pt out of a label that had nothing to sit against, which is what
+        // wrapped `Select Tabs in Group` onto the row below it.
+        let show_hint = hint.is_some() && enabled && hint_width + tokens.menu_hint_gap <= budget;
         let label_width = budget
             - if show_hint {
                 hint_width + tokens.menu_hint_gap
@@ -918,12 +1011,9 @@ fn row(
 }
 
 /// The rule between two groups (`context-menu.css:29-33`: 1 px of `--border-color`, `margin: 5px 0`).
-fn separator(ui: &mut Ui, tokens: &Tokens) {
+fn separator(ui: &mut Ui, tokens: &Tokens, width: f32) {
     let height = 1.0 + 2.0 * f32::from(tokens.menu_separator_gap);
-    let (rect, _) = ui.allocate_exact_size(
-        Vec2::new(ui.available_width(), height),
-        egui::Sense::hover(),
-    );
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), egui::Sense::hover());
     ui.painter()
         .hline(rect.x_range(), rect.center().y, tokens.hairline());
 }
@@ -1598,6 +1688,45 @@ mod tests {
         assert!(
             !shape.to_lowercase().contains("select") && !shape.to_lowercase().contains("invert"),
             "the reference has no selection block to be missing: {shape}"
+        );
+    }
+
+    #[test]
+    fn the_hover_fill_rounds_only_what_the_frame_padding_leaves_of_the_corner() {
+        // The frame is rounded, the rows are not (`hover_corners`): a row's edge already sits
+        // `border + menu_frame_pad_y` inside the frame, so today's tokens (6 pt arc, 6 pt inset) leave
+        // the end rows square — which is what is flush, not what a naive `radius - 1` would give.
+        let (radius, inset) = (6, 6);
+        for row in [
+            hover_corners(0, 3, radius, inset),
+            hover_corners(2, 3, radius, inset),
+        ] {
+            assert_eq!((row.nw, row.ne, row.sw, row.se), (0, 0, 0, 0));
+        }
+        // Shrink the padding and the end rows owe the arc an answer: top row rounds its top corners,
+        // the last row its bottom ones, a lone row all four, the middle of three none.
+        let shallow = 6 - 4;
+        let first = hover_corners(0, 3, radius, 4);
+        assert_eq!(
+            (first.nw, first.ne, first.sw, first.se),
+            (shallow, shallow, 0, 0)
+        );
+        let middle = hover_corners(1, 3, radius, 4);
+        assert_eq!((middle.nw, middle.ne, middle.sw, middle.se), (0, 0, 0, 0));
+        let last = hover_corners(2, 3, radius, 4);
+        assert_eq!(
+            (last.nw, last.ne, last.sw, last.se),
+            (0, 0, shallow, shallow)
+        );
+        let alone = hover_corners(0, 1, radius, 4);
+        assert_eq!(
+            (alone.nw, alone.ne, alone.sw, alone.se),
+            (shallow, shallow, shallow, shallow)
+        );
+        assert_eq!(
+            hover_corners(0, 1, 1, 4).nw,
+            0,
+            "a frame rounder than the inset it sits in has nothing left to round"
         );
     }
 

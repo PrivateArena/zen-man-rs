@@ -223,6 +223,16 @@ fn drawn_nodes(harness: &Harness<'static, ZenApp>, label: &str) -> usize {
     harness.query_all_by_label(label).count()
 }
 
+/// The width of the row the popup drew for `label` — its own interact rect, which is the popup's box.
+fn width_of(harness: &Harness<'static, ZenApp>, label: &str) -> f32 {
+    harness
+        .query_all_by_label(label)
+        .next()
+        .unwrap_or_else(|| panic!("the popup drew no row named {label}"))
+        .rect()
+        .width()
+}
+
 // ------------------------------------------------------------------------------- the tests
 
 #[test]
@@ -1264,4 +1274,161 @@ fn a_tab_menu_does_not_outlive_its_tab() {
         "the other tab is none of this menu's business"
     );
     assert_eq!(tabs[0].path, fixture_path(&listing));
+}
+
+#[test]
+fn the_popup_is_as_wide_as_its_rows_and_not_as_wide_as_eguis_default_area() {
+    // An `Area` sizes itself to its content, and the content used to paint all of its
+    // `available_width` — which on the frame a popup opens is egui's `spacing.default_area_size`
+    // (600 pt). The frame therefore froze at 600 pt for as long as it lived, hundreds of points of it
+    // empty space between a label and its chord, and `set_min_width` could never take it back down.
+    // The honest box is the widest label + chord pair: above this menu's 180 pt floor, below its
+    // 420 pt ceiling, and the same width for every row of the popup.
+    let dir = tree("menus-width", &["a.txt"]);
+    let mut harness = pane_harness("menus-width", &dir);
+    right_click(&mut harness, "a.txt");
+    assert!(is_open(&harness), "the right-click opened nothing");
+
+    let tokens = harness.state().tokens;
+    let widths: Vec<f32> = labels(&harness)
+        .iter()
+        .map(|label| width_of(&harness, label))
+        .collect();
+    let width = widths[0];
+    assert!(
+        widths.iter().all(|w| *w == width),
+        "the rows of one popup disagree about their width: {widths:?}"
+    );
+    assert!(
+        width > tokens.menu_min_width && width <= tokens.menu_max_width,
+        "the popup is {width:.1} pt wide, outside the ({} , {}] band its own rows fall in \
+         — it is sizing to the area's default, or to the floor instead of to a row",
+        tokens.menu_min_width,
+        tokens.menu_max_width,
+    );
+}
+
+#[test]
+fn a_rows_glyph_sits_on_its_midline_and_a_glyphless_row_still_reserves_the_column() {
+    // Two ways a row used to miss its neighbours: `Rect::from_min_size` at the row's mid-line hung the
+    // whole glyph *below* it — a 16 pt icon with its top at the centre, so it read as sunk out of the
+    // text — and each label started after whichever glyph *its own* row happened to have, so
+    // `Change permissions`, a custom action drawn without one, began half an icon left of `Rename`
+    // above it. Both are measured off the painted pixels, because both are about pixels.
+    let dir = tree("menus-alignment", &["a.txt"]);
+    let mut harness = pane_harness("menus-alignment", &dir);
+    right_click(&mut harness, "a.txt");
+    let tokens = harness.state().tokens;
+    // The same rule `tests/snapshots.rs` states: no adapter, no pixels — skip out loud rather than
+    // turn a machine without a raster device red.
+    let Ok(image) = harness.render() else {
+        println!("SKIP: no raster adapter, and this test measures painted pixels");
+        return;
+    };
+    let (width, height) = (image.width(), image.height());
+    let scale = harness.ctx.pixels_per_point();
+    let row = |label: &str| {
+        harness
+            .query_all_by_label(label)
+            .next()
+            .unwrap_or_else(|| panic!("the popup drew no row named {label}"))
+            .rect()
+    };
+    // Luminance rather than one channel: the muted chord, the danger rows and a greyed row's text are
+    // all ink, while the frame's fill — and a hovered row's, 40-odd — are not.
+    const INK: u32 = 60;
+    let ink = |x: u32, y: u32| {
+        let p = image.get_pixel(x, y).0;
+        (u32::from(p[0]) + u32::from(p[1]) + u32::from(p[2])) / 3 > INK
+    };
+    // A row's own band, and a span of its columns, both clamped to the image.
+    let band = |rect: &egui::Rect| {
+        ((rect.min.y * scale).floor().max(0.0) as u32)
+            ..((rect.max.y * scale).ceil().min(height as f32 - 1.0) as u32)
+    };
+    let columns = |from: f32, to: f32| {
+        ((from * scale).floor().max(0.0) as u32)
+            ..((to * scale).ceil().min(width as f32 - 1.0) as u32)
+    };
+    let label_column = |rect: &egui::Rect| {
+        rect.min.x + tokens.menu_item_pad_x + tokens.row_icon_size + tokens.menu_icon_gap
+    };
+    // Everything a row reserves for its glyph: the whole icon column, gap included.
+    let reserved = |rect: &egui::Rect| {
+        columns(
+            rect.min.x + tokens.menu_item_pad_x,
+            label_column(rect) - 1.0,
+        )
+    };
+    let any_ink = |xs: std::ops::Range<u32>, ys: &std::ops::Range<u32>| {
+        xs.clone().any(|x| ys.clone().any(|y| ink(x, y)))
+    };
+
+    // The "Properties" glyph is a ring, so its ink is symmetric about its box's centre — the honest
+    // thing to weigh against the row's mid-line.
+    let ring = row("Properties");
+    let ring_band = band(&ring);
+    let slot = columns(
+        ring.min.x + tokens.menu_item_pad_x,
+        ring.min.x + tokens.menu_item_pad_x + tokens.row_icon_size,
+    );
+    let painted: Vec<u32> = ring_band
+        .clone()
+        .filter(|y| slot.clone().any(|x| ink(x, *y)))
+        .collect();
+    assert!(
+        !painted.is_empty(),
+        "nothing was painted in the Properties row's icon column"
+    );
+    let (top, bottom) = (painted[0] as f32, painted[painted.len() - 1] as f32);
+    let midline = ring.center().y * scale;
+    assert!(
+        ((top + bottom) / 2.0 - midline).abs() <= 2.0,
+        "the glyph's ink spans {top}..{bottom} around the row's mid-line at {midline}: it is not centred"
+    );
+
+    // The column belongs to the menu: the row that has a glyph fills it, the one that has none leaves
+    // it empty rather than starting its label an icon early.
+    let (glyphed, glyphless) = (row("Rename"), row("Change permissions"));
+    assert!(
+        any_ink(reserved(&glyphed), &band(&glyphed)),
+        "the Rename row's glyph is missing from its own icon column"
+    );
+    assert!(
+        !any_ink(reserved(&glyphless), &band(&glyphless)),
+        "a row with no glyph paints inside the menu's icon column, so no two labels can line up"
+    );
+    // Where each label's ink starts. `Rename` and `Change permissions` begin with different letters,
+    // and letters carry different side bearings, so this compares columns to the pixel rather than
+    // demanding the same one: 2 pt is a bearing, 26 pt is the icon column this test exists to guard.
+    let label_ink = |rect: &egui::Rect| {
+        columns(label_column(rect), rect.min.x + 200.0)
+            .find(|x| band(rect).clone().any(|y| ink(*x, y)))
+            .unwrap_or_else(|| panic!("{}: no label was painted", rect.min.x))
+    };
+    let (glyphed_label, glyphless_label) = (label_ink(&glyphed), label_ink(&glyphless));
+    assert!(
+        glyphed_label.abs_diff(glyphless_label) <= 2,
+        "labels start {glyphed_label} and {glyphless_label} px along: different columns"
+    );
+}
+
+#[test]
+fn the_next_popup_measures_its_own_rows_instead_of_inheriting_the_last_ones_width() {
+    // The menu layer's id is **stable** across openings (it is why `menus::show` pins the area with
+    // `fixed_pos`), and an `Area` remembers its size — so a popup that measured itself after a wider
+    // one kept the wider frame, and a three-row menu wore 50 pt of another menu's empty space. The
+    // rows ask for their own measured width every frame rather than for the area's remembered one.
+    let dir = tree("menus-retuned", &["a.txt", "b.txt", "c.md"]);
+    let mut harness = pane_harness("menus-retuned", &dir);
+    right_click(&mut harness, "a.txt");
+    let row_menu = width_of(&harness, "Rename");
+    close_menu(&mut harness);
+    right_click_background(&mut harness);
+    assert!(is_open(&harness), "the background menu never opened");
+    let background_menu = width_of(&harness, "New folder");
+    assert!(
+        background_menu < row_menu,
+        "the {background_menu:.1} pt background menu kept the {row_menu:.1} pt row menu's frame",
+    );
 }
