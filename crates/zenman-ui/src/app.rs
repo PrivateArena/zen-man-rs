@@ -441,6 +441,13 @@ impl ZenApp {
     pub fn run_command(&mut self, slot: PaneSlot, command: PaneCommand) {
         match command {
             PaneCommand::Navigate(path) => {
+                // A pane with no tab has nothing to navigate: Go's `navigateTo` returned silently
+                // (`navigation.js:55-58`), which is what made a fresh pane feel unresponsive. The
+                // click is unambiguous about intent, so the port opens the tab instead.
+                if self.tab_mut_of(slot).is_none() {
+                    self.open_tab(slot, path);
+                    return;
+                }
                 self.remember_selection(slot);
                 if let Some(tab) = self.tab_mut_of(slot) {
                     tab.navigate_to(path.clone(), tab_title(&path));
@@ -853,6 +860,49 @@ impl ZenApp {
         };
         self.model.layout = keep_mode;
         dock::set_layout(&mut self.model, &mut self.dock, slots);
+        // Go's `updateLayout` seeds every new pane with a tab; without it a 2/4-pane grid opens
+        // panels the user cannot drive at all.
+        self.fill_empty_panes();
+    }
+
+    /// Give every pane of the current grid that has no tab a tab on the directory the user was
+    /// looking at — Go's `updateLayout` (`split-view.js:47-57`, `68-74`), which is why a fresh split
+    /// or quad pane in the original was never blank.
+    ///
+    /// Without it the new pane has no address bar to type in, nothing to list, and every
+    /// tab-dependent command (sidebar navigation, `Up`, the ribbon) bails on its `active_tab()`, so
+    /// the pane reads as dead. The source is the directory in view (any pane's shown tab, since the
+    /// active one may itself be empty); the active pane is not moved, so focus stays where the user
+    /// left it, and panes that already have tabs are left alone — a toggle back and forth preserves
+    /// them.
+    ///
+    /// A grid where **nothing** has a tab is left alone too: that is the start-of-run case, and the
+    /// caller (apps/zenman) answers it with the home directory rather than Go's `/` fallback — the
+    /// same reason the port refuses to open on the server's cwd. Returns the number of panes seeded.
+    pub fn fill_empty_panes(&mut self) -> usize {
+        let source = match self
+            .model
+            .panes
+            .iter()
+            .find(|(_, pane)| !pane.tabs.is_empty())
+            .and_then(|(_, pane)| pane.active_tab())
+        {
+            // Any tabbed pane, not necessarily the active one: the source is only "the directory the
+            // user was looking at", and an active pane that is itself empty has nothing to offer.
+            Some(tab) => tab.path.clone(),
+            None => return 0,
+        };
+        let empty: Vec<PaneSlot> = self
+            .model
+            .panes
+            .iter()
+            .filter(|(_, pane)| pane.tabs.is_empty())
+            .map(|(slot, _)| *slot)
+            .collect();
+        for slot in &empty {
+            self.open_tab(*slot, source.clone());
+        }
+        empty.len()
     }
 
     /// Per-frame non-drawing work (plan §5.7: poll jobs, drain events, request repaint while
@@ -3223,6 +3273,55 @@ pub(crate) mod tests {
         app.set_layout(quad_slots());
         assert!(app.model.quad());
         assert!(app.dock.layout.validate().is_ok());
+    }
+
+    #[test]
+    fn a_new_pane_of_the_grid_gets_a_tab_on_the_directory_in_view() {
+        let session = memory_session();
+        let mut app = ZenApp::new(session, Vec::new());
+        app.set_layout(panes_for(LayoutMode::Single));
+        // Nothing has a tab yet, which is the start-of-run case: seeding it with `/` would take the
+        // start away from the caller (apps/zenman opens the user's home).
+        assert_eq!(app.fill_empty_panes(), 0, "an all-empty grid seeds nothing");
+        app.open_tab(PaneSlot::Left, FsPath::ROOT);
+
+        app.set_layout(panes_for(LayoutMode::Split));
+        assert_eq!(
+            shown(&app, PaneSlot::Right),
+            Some(FsPath::ROOT),
+            "the new pane of a split opens on the directory the user was looking at (Go's \
+             `updateLayout`, split-view.js:68-74)"
+        );
+        assert_eq!(
+            app.model.active_pane,
+            PaneSlot::Left,
+            "and seeding does not steal the focus"
+        );
+
+        app.set_layout(quad_slots());
+        for slot in [PaneSlot::LeftBottom, PaneSlot::RightBottom] {
+            assert_eq!(
+                shown(&app, slot),
+                Some(FsPath::ROOT),
+                "the quad seeds both bottom panes ({slot:?})"
+            );
+        }
+        // Panes that already have tabs keep them, and one tab is all a pane gets.
+        app.set_layout(panes_for(LayoutMode::Single));
+        app.set_layout(quad_slots());
+        for slot in quad_slots() {
+            let pane = &app.model.panes[&slot];
+            assert_eq!(pane.tabs.len(), 1, "{slot:?} is not re-seeded: {pane:?}");
+        }
+
+        /// The shown tab's path, or `None` for a pane with nothing to show.
+        fn shown(app: &ZenApp, slot: PaneSlot) -> Option<FsPath> {
+            app.model
+                .panes
+                .get(&slot)
+                .and_then(|pane| pane.active_tab())
+                .map(|tab| tab.path.clone())
+        }
     }
 
     #[test]

@@ -7,10 +7,12 @@
 
 mod common;
 
+use std::path::Path;
+
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 
-use zenman_core::path::FsPath;
+use zenman_core::path::{AbsPath, FsPath};
 use zenman_core::store::config::{LayoutMode, PaneSlot};
 use zenman_ui::app::ZenApp;
 use zenman_ui::state::{Tab, panes_for, quad_slots};
@@ -45,6 +47,27 @@ fn shell_harness(app: ZenApp) -> Harness<'static, ZenApp> {
             },
             app,
         )
+}
+
+/// A press-and-release at one point of the window: what a click on a pane body is, with no widget
+/// to grab hold of.
+fn press_at(harness: &mut Harness<'static, ZenApp>, at: egui::Pos2) {
+    for pressed in [true, false] {
+        harness.input_mut().events.push(egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        });
+    }
+    harness.run();
+}
+
+/// The fixture directory as the shell's path type.
+fn fixture_path(path: &Path) -> FsPath {
+    FsPath::from_abs(
+        AbsPath::try_from(path).unwrap_or_else(|e| panic!("{}: {e}", path.display())),
+    )
 }
 
 /// Click the first control of one name. Every pane carries its own navigation ribbon, so a window
@@ -156,6 +179,50 @@ fn drawers_toggle_from_their_ribbon_buttons() {
     // The left drawer's header is Go's `Zen-Man` (`index.html:21`) — the product name belongs to the
     // drawer and the window title, not to the global header.
     harness.get_by_label("Zen-Man");
+}
+
+#[test]
+fn the_layout_button_opens_a_pane_that_is_already_live() {
+    // The reported defect: the 2-pane button drew a second panel with no address bar, so nothing
+    // (sidebar, ribbon, keys) could drive it. Go's `updateLayout` seeds it; this is that, through the
+    // real control and a real click.
+    let tag = "shell-live-pane";
+    let dir = common::listing_tree(tag);
+    let session = common::session(tag);
+    let mut app = ZenApp::new(session, Vec::new());
+    app.set_layout(panes_for(LayoutMode::Single));
+    app.open_tab(PaneSlot::Left, fixture_path(&dir));
+    let mut harness = shell_harness(app);
+    harness.run();
+
+    click_chrome(&mut harness, "2-pane");
+    let paths: Vec<Option<FsPath>> = quad_slots()
+        .into_iter()
+        .filter(|slot| harness.state().model.panes.contains_key(slot))
+        .map(|slot| {
+            harness
+                .state()
+                .model
+                .panes
+                .get(&slot)
+                .and_then(|pane| pane.active_tab())
+                .map(|tab| tab.path.clone())
+        })
+        .collect();
+    assert_eq!(
+        paths,
+        vec![Some(fixture_path(&dir)); 2],
+        "both panes of the split show a directory — neither is a dead panel"
+    );
+
+    // A press in the new pane's body focuses it (the whole pane is the click target, as in Go's
+    // `setupPaneListeners`), which is what makes the drawer's rows land there.
+    press_at(&mut harness, egui::pos2(1_100.0, 500.0));
+    assert_eq!(
+        harness.state().model.active_pane,
+        PaneSlot::Right,
+        "the new pane takes the focus on a click in its listing"
+    );
 }
 
 #[test]

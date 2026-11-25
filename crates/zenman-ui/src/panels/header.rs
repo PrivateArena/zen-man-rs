@@ -781,6 +781,10 @@ impl ZenApp {
         } else {
             slots.first().copied().unwrap_or(PaneSlot::Left)
         };
+        // Go restores a workspace and then runs `updateLayout` (`workspace.js:75-79` → the
+        // `setSplitView`/`setQuadView` it calls), which seeds any pane the session left with no tab.
+        // A pane named by the file with an empty tab list is exactly that case.
+        self.fill_empty_panes();
         applied
     }
 

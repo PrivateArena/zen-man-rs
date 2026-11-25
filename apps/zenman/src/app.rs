@@ -168,6 +168,9 @@ impl ShellApp {
                 shell.open_tab(slot, folder.clone());
             }
         }
+        // A split or quad run that came back with an empty pane gets the same seed Go's
+        // `updateLayout` gives one, so no panel of the grid opens dead on the first frame.
+        shell.fill_empty_panes();
         Self {
             shell,
             smoke_after,

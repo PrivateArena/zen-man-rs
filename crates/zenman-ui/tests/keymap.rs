@@ -457,6 +457,23 @@ fn f3_and_f4_toggle_the_grid_and_the_quad() {
     assert_eq!(harness.state().model.panes.len(), 1);
     press_command(&mut harness, Command::SplitLayout);
     assert_eq!(harness.state().model.panes.len(), 2, "F3 opens the split");
+    // Go's `updateLayout` seeds a new pane with the directory in view (`split-view.js:68-74`); a
+    // pane without a tab has no address bar and takes no sidebar navigation.
+    assert_eq!(
+        shown_path(harness.state(), PaneSlot::Right),
+        Some(fixture_path(&dir)),
+        "the new pane opens on the directory the user was looking at"
+    );
+    assert_eq!(
+        harness.state().model.active_pane,
+        PaneSlot::Left,
+        "and the seeding leaves the focus alone"
+    );
+    settle(&mut harness);
+    assert!(
+        !names(shown(&harness, PaneSlot::Right)).is_empty(),
+        "the new pane reads its directory — the blank \"no directory\" panel is the bug"
+    );
     press_command(&mut harness, Command::SplitLayout);
     assert_eq!(
         harness.state().model.panes.len(),
@@ -466,8 +483,24 @@ fn f3_and_f4_toggle_the_grid_and_the_quad() {
     press_command(&mut harness, Command::QuadLayout);
     assert_eq!(harness.state().model.panes.len(), 4, "F4 opens the quad");
     assert!(harness.state().model.quad());
+    for slot in [PaneSlot::LeftBottom, PaneSlot::RightBottom] {
+        assert_eq!(
+            shown_path(harness.state(), slot),
+            Some(fixture_path(&dir)),
+            "{slot:?} is live too"
+        );
+    }
     press_command(&mut harness, Command::QuadLayout);
     assert_eq!(harness.state().model.panes.len(), 1, "F4 toggles back too");
+}
+
+/// The shown tab's path of one pane.
+fn shown_path(app: &ZenApp, slot: PaneSlot) -> Option<FsPath> {
+    app.model
+        .panes
+        .get(&slot)
+        .and_then(|pane| pane.active_tab())
+        .map(|tab| tab.path.clone())
 }
 
 /// <kbd>Shift+Delete</kbd> must destroy nothing *until the confirmation is answered* (plan **D6**), and

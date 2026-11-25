@@ -167,6 +167,48 @@ fn a_place_row_navigates_the_active_pane_through_the_pane_seam() {
 }
 
 #[test]
+fn a_place_row_opens_a_tab_in_a_pane_that_has_none() {
+    let tag = "side-navigate-empty";
+    let dir = common::listing_tree(tag);
+    let mut app = app(tag, &dir);
+    // A second pane with no tab at all — the shape a fresh split used to arrive in.
+    app.set_layout(panes_for(LayoutMode::Split));
+    let ids: Vec<_> = app.model.panes[&PaneSlot::Right]
+        .tabs
+        .iter()
+        .map(|tab| tab.id)
+        .collect();
+    app.model
+        .panes
+        .get_mut(&PaneSlot::Right)
+        .expect("the split has a right pane")
+        .close_tabs(&ids);
+    assert!(app.model.panes[&PaneSlot::Right].tabs.is_empty());
+    app.model.active_pane = PaneSlot::Right;
+
+    let places = app.session.places();
+    let disk = places
+        .disks
+        .first()
+        .unwrap_or_else(|| panic!("there is always a root filesystem"));
+    // Go's `navigateTo` bailed here (`navigation.js:55-58`) and the click was simply lost; the port
+    // opens the tab the click asked for.
+    app.run_side_panel_command(
+        SidePanelCommand::navigate(&disk.mount_point).expect("a mount point is absolute"),
+    );
+    assert_eq!(
+        shown_path(&app, PaneSlot::Right),
+        Some(FsPath::from_abs(abs(Path::new(&disk.mount_point)))),
+        "the drive row opened its directory in the empty pane"
+    );
+    assert_eq!(
+        app.model.active_pane,
+        PaneSlot::Right,
+        "and stayed where the user had focused"
+    );
+}
+
+#[test]
 fn an_unreachable_place_is_a_typed_state_not_a_dead_row() {
     let tag = "side-missing";
     let dir = common::listing_tree(tag);
