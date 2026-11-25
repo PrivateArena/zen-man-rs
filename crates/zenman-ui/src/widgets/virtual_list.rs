@@ -14,7 +14,10 @@
 //! * **Reaching the bottom emits `LoadMore` exactly once.** [`ScrollState::load_more_fired`] is the
 //!   latch; the pane clears it when the row count changes.
 
-use egui::{Id, Modifiers, Pos2, Rect, Response, ScrollArea, Sense, Ui, Vec2};
+use egui::{
+    Event, Id, InputOptions, Modifiers, MouseWheelSource, MouseWheelUnit, Pos2, Rect, Response,
+    ScrollArea, Sense, TouchPhase, Ui, Vec2,
+};
 
 /// The flex ratios of the list's columns (plan row: `3/0/1/1.5` and `2.5/2.5/0.8/1.2`).
 ///
@@ -231,7 +234,97 @@ pub struct GridSpec<'a> {
     pub gap: f32,
 }
 
+/// How many times further a wheel notch throws the list than egui would take it.
+///
+/// egui's notch is `InputOptions::line_scroll_speed` — 40 pt on native, exactly one row of the
+/// token table — so one click of the wheel moves one row. In a 1 000-file listing that is 1 000
+/// clicks, which is why the list gears it up: one notch throws eight rows (eight times as far in
+/// the grid, whose row is a tile taller than a line). The one number to change if the finger still
+/// tires.
+pub const WHEEL_NOTCH_MULTIPLIER: f32 = 8.0;
+
+/// The delta below which a `Point`-unit wheel event is a finger rather than a notch.
+///
+/// egui's own threshold for the same question (`WheelState::on_wheel_event`); a ratcheted wheel in
+/// point units reports ~14 pt a click, a trackpad a handful of points at a time.
+const WHEEL_NOTCH_POINTS: f32 = 8.0;
+
+/// Make the wheel move the list one notch per notch, instead of over a few frames.
+///
+/// egui low-pass filters discrete wheel input: `WheelState::after_events` applies a fraction of the
+/// notch each frame with a ~100 ms time constant and keeps the remainder in its own accumulator,
+/// which the [`ScrollArea`] cannot refuse. In a file list that reads as slow, animated scrolling
+/// that stutters between repaints, so the scroller restates the delta instead: the raw events of
+/// this frame become the *whole* delta of this frame, and a frame with no wheel event gets a delta
+/// of zero, which drops the rest of the smear.
+///
+/// Writing the *delta* rather than the offset leaves egui in charge of clamping, of the scroll bar,
+/// of `stick_to_bottom` and of bottom-of-list detection, so only the timing of the movement
+/// changes — and the distance, through [`WHEEL_NOTCH_MULTIPLIER`], which is applied to notches
+/// only. A trackpad keeps egui's units: its events are already an absolute finger distance, and
+/// gearing those would make one millimetre of finger throw a screenful.
+///
+/// Nothing is taken while the pointer is elsewhere, or over another layer: a dialog, a menu or a
+/// side panel under the pointer keeps egui's own scrolling for itself.
+fn immediate_wheel(ui: &Ui, area: Rect) {
+    // `is_enabled` mirrors egui's own gate: a disabled pane (another one is modal) must not eat the
+    // wheel, and `rect_contains_pointer` is false when a dialog, a menu or another layer is on top.
+    if !ui.is_enabled() || !ui.rect_contains_pointer(area) {
+        return;
+    }
+    let options = ui.ctx().options(|o| o.input_options);
+    let page = ui.ctx().viewport_rect().height();
+    let step = ui.input(|i| wheel_step(&i.events, &options, page));
+    ui.input_mut(|i| i.smooth_scroll_delta.y = step);
+}
+
+/// The wheel scroll of one frame, in points, in the same space egui's own reader writes.
+///
+/// The mirror of `WheelState::on_wheel_event`: only `Move` carries a scroll, the zoom chord belongs
+/// to zooming, and the horizontal chord lands on an axis a vertical-only list does not scroll.
+/// `page` is what one page unit is worth (egui uses the screen height).
+fn wheel_step(events: &[Event], options: &InputOptions, page: f32) -> f32 {
+    let mut step = 0.0;
+    for event in events {
+        let Event::MouseWheel {
+            unit,
+            delta,
+            phase,
+            modifiers,
+            source,
+        } = event
+        else {
+            continue;
+        };
+        let ours = matches!(phase, TouchPhase::Move)
+            && !modifiers.matches_any(options.zoom_modifier)
+            && !(modifiers.matches_any(options.horizontal_scroll_modifier)
+                && !modifiers.matches_any(options.vertical_scroll_modifier));
+        if !ours {
+            continue;
+        }
+        let points = match unit {
+            MouseWheelUnit::Point => delta.y,
+            MouseWheelUnit::Line => options.line_scroll_speed * delta.y,
+            MouseWheelUnit::Page => page * delta.y,
+        };
+        // Is this click of the wheel a ratchet, or a finger sliding?
+        let notch = match unit {
+            MouseWheelUnit::Line => true,
+            MouseWheelUnit::Point => {
+                matches!(source, MouseWheelSource::Wheel) || delta.length() >= WHEEL_NOTCH_POINTS
+            }
+            // A page is already a screenful — `Page_Up` in wheel clothing.
+            MouseWheelUnit::Page => false,
+        };
+        step += points * if notch { WHEEL_NOTCH_MULTIPLIER } else { 1.0 };
+    }
+    step
+}
+
 /// Paint a virtualised list of `rows` rows.
+///
+/// The wheel is the scroller's own to read ([`immediate_wheel`]).
 ///
 /// `paint` draws one row into `ui` inside `hit.rect` and returns the event it produced (usually
 /// [`RowEvent::Select`] / [`RowEvent::Activate`], derived from `hit.response` — the scroller owns
@@ -259,6 +352,8 @@ pub fn show_list(
     let mut at_bottom = false;
     let height = metrics.height.max(1.0);
     let modifiers = ui.input(|i| i.modifiers);
+    let area = ui.available_rect_before_wrap();
+    immediate_wheel(ui, area);
     let out = ScrollArea::vertical()
         .id_salt(list_id(id))
         .auto_shrink([false, false])
@@ -342,6 +437,8 @@ pub fn show_grid(
     let mut last = grid_rows;
     let mut at_bottom = false;
     let modifiers = ui.input(|i| i.modifiers);
+    let area = ui.available_rect_before_wrap();
+    immediate_wheel(ui, area);
     let out = ScrollArea::vertical()
         .id_salt(grid_id(id))
         .auto_shrink([false, false])
@@ -587,5 +684,157 @@ mod tests {
         let (events, painted) = frame(0, &mut scroll);
         assert_eq!(painted, 0);
         assert!(events.is_empty(), "{events:?}");
+    }
+
+    /// One frame of [`show_list`] on a context that outlives it, so the wheel can be followed
+    /// across frames. `dy` is the notch's own delta (`Point` units; negative scrolls down).
+    fn wheel_frame(ctx: &Context, scroll: &mut ScrollState, time: f64, dy: f32) {
+        let metrics = metrics();
+        let mut events = vec![egui::Event::PointerMoved(Pos2::new(200.0, 200.0))];
+        if dy != 0.0 {
+            events.push(egui::Event::MouseWheel {
+                unit: MouseWheelUnit::Point,
+                delta: vec2(0.0, dy),
+                phase: TouchPhase::Move,
+                source: egui::MouseWheelSource::Wheel,
+                modifiers: Modifiers::default(),
+            });
+        }
+        let mut output = ctx.run_ui(
+            RawInput {
+                time: Some(time),
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(400.0, VIEWPORT))),
+                events,
+                ..RawInput::default()
+            },
+            |ui| {
+                show_list(
+                    ui,
+                    ListSpec {
+                        id: Id::unique("wheel-pane"),
+                        rows: 1_000,
+                        metrics: &metrics,
+                        has_more: false,
+                    },
+                    |ix| Id::unique(("wheel-row", ix)),
+                    |_ui, _ix, _hit| None,
+                    scroll,
+                );
+            },
+        );
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn one_wheel_notch_moves_the_list_in_one_frame() {
+        // The anti-smoothing gate: egui's own path would apply ~15 % of a 40 pt notch on the first
+        // frame (a 16 ms frame against a 100 ms time constant) and dribble the rest in after it.
+        let ctx = Context::default();
+        let mut scroll = ScrollState::default();
+        wheel_frame(&ctx, &mut scroll, 0.0, 0.0);
+        assert_eq!(scroll.y, 0.0, "a frame with no wheel does not scroll");
+        wheel_frame(&ctx, &mut scroll, 0.016, -ROW); // one notch towards the bottom
+        assert!(
+            (scroll.y - WHEEL_NOTCH_MULTIPLIER).abs() < 0.01,
+            "one notch must move {WHEEL_NOTCH_MULTIPLIER} rows at once, moved {y}",
+            y = scroll.y
+        );
+        wheel_frame(&ctx, &mut scroll, 0.032, 0.0);
+        let settled = scroll.y;
+        wheel_frame(&ctx, &mut scroll, 0.048, 0.0);
+        assert_eq!(scroll.y, settled, "the notch must not keep arriving");
+    }
+
+    #[test]
+    fn the_wheel_step_mirrors_eguis_own_reader_and_gears_only_the_notch() {
+        let options = InputOptions::default();
+        let notch = |unit, dy: f32, source, modifiers| {
+            vec![Event::MouseWheel {
+                unit,
+                delta: vec2(0.0, dy),
+                phase: TouchPhase::Move,
+                source,
+                modifiers,
+            }]
+        };
+        let wheel = egui::MouseWheelSource::Wheel;
+        let finger = egui::MouseWheelSource::Trackpad;
+        let none = Modifiers::default();
+        let gear = WHEEL_NOTCH_MULTIPLIER;
+        assert_eq!(wheel_step(&[], &options, 400.0), 0.0);
+        assert_eq!(
+            wheel_step(
+                &notch(MouseWheelUnit::Point, -18.0, wheel, none),
+                &options,
+                400.0
+            ),
+            -18.0 * gear,
+            "a wheel's point notch is geared"
+        );
+        assert_eq!(
+            wheel_step(
+                &notch(MouseWheelUnit::Line, -1.0, wheel, none),
+                &options,
+                400.0
+            ),
+            -options.line_scroll_speed * gear,
+            "a line notch is the input option's speed, geared"
+        );
+        assert_eq!(
+            wheel_step(
+                &notch(MouseWheelUnit::Point, -2.0, finger, none),
+                &options,
+                400.0
+            ),
+            -2.0,
+            "a finger scrolls the distance it travelled, not eight times it"
+        );
+        assert_eq!(
+            wheel_step(
+                &notch(MouseWheelUnit::Page, 1.0, wheel, none),
+                &options,
+                400.0
+            ),
+            400.0,
+            "a page is already a screenful: the screen egui measures, ungeared"
+        );
+        let ctrl = Modifiers {
+            ctrl: true,
+            ..Modifiers::default()
+        };
+        let shift = Modifiers {
+            shift: true,
+            ..Modifiers::default()
+        };
+        assert_eq!(
+            wheel_step(
+                &notch(MouseWheelUnit::Point, -18.0, wheel, ctrl),
+                &options,
+                400.0
+            ),
+            0.0,
+            "ctrl+wheel zooms, and egui reads that from the same events"
+        );
+        assert_eq!(
+            wheel_step(
+                &notch(MouseWheelUnit::Point, -18.0, wheel, shift),
+                &options,
+                400.0
+            ),
+            0.0,
+            "shift+wheel is an axis the vertical-only list does not scroll"
+        );
+        let start = vec![Event::MouseWheel {
+            unit: MouseWheelUnit::Point,
+            delta: vec2(0.0, -18.0),
+            phase: TouchPhase::Start,
+            source: finger,
+            modifiers: none,
+        }];
+        assert_eq!(
+            wheel_step(&start, &options, 400.0),
+            0.0,
+            "only Move scrolls"
+        );
     }
 }
