@@ -4,17 +4,22 @@
 //! One strip, three groups, laid out from the pane's own width:
 //!
 //! ```text
-//! [back][fwd][up]  Root / home / jang  [edit] | [view][refresh][walk][all][none] | [history][places][actions][2-pane][4-pane]
+//! [back][fwd][up][reload]  Root / home / jang  [edit] | [walk][all][none] | [history][places][actions] | [menu]
 //! ```
 //!
-//! * the history and up buttons and the crumb trail are [`crate::panels::breadcrumb`]'s — this file
-//!   does not re-lay them out, it only decides how much room it leaves them;
-//! * the **pane tools** (`grid`, `refresh`, the recursive-listing dropdown, select all / none) used to
-//!   be a separate 50 px row per pane with *text* buttons;
-//! * the **global buttons** (action history, the two drawers, the two layout switches) used to be a
-//!   window-wide header bar with text labels and printed chords. They are now the pane's, because
-//!   the pane's chrome is the only chrome left. A state that is one per window reads the same from
-//!   either end of it, which is what a browser's per-stack toolbar means.
+//! * the history, up and reload buttons and the crumb trail are [`crate::panels::breadcrumb`]'s —
+//!   this file does not re-lay them out, it only decides how much room it leaves them. Reload rides
+//!   with them because that is where a browser's user looks for it, and because the ribbon's room is
+//!   what the address strip is competing for;
+//! * the **pane tools** (the recursive-listing dropdown, select all / none) used to be a separate
+//!   50 px row per pane with *text* buttons;
+//! * the **global buttons** (action history, the two drawers) used to be a window-wide header bar
+//!   with text labels and printed chords. They are now the pane's, because the pane's chrome is the
+//!   only chrome left. A state that is one per window reads the same from either end of it, which is
+//!   what a browser's per-stack toolbar means;
+//! * the **modes** — the listing's view, the two layout switches — are behind [`app_menu`], the one
+//!   button that is always inline. A toggle is not an action: it wants a state on screen and a place
+//!   to grow into, and a 24 px square gives it neither.
 //!
 //! # Width
 //!
@@ -30,6 +35,7 @@
 
 use egui::{Align, Layout, Rect, Response, RichText, Sense, Ui, vec2};
 
+use crate::panels::app_menu::{self, Entry};
 use crate::panels::breadcrumb::{self, BreadcrumbModel};
 use crate::panels::file_pane::PaneCommand;
 use crate::panels::header::HeaderCommand;
@@ -106,8 +112,6 @@ pub fn show(
     // The pane's own tools mean nothing without a tab to apply them to.
     let pane_tools: Vec<Slot> = if m.address.is_some() {
         vec![
-            Slot::Pane(PaneCommand::ToggleGrid),
-            Slot::Pane(PaneCommand::Refresh),
             Slot::Flat,
             Slot::Pane(PaneCommand::SelectAll),
             Slot::Pane(PaneCommand::SelectNone),
@@ -119,12 +123,13 @@ pub fn show(
         Slot::Global(HeaderCommand::ToggleLog),
         Slot::Global(HeaderCommand::ToggleLeftDrawer),
         Slot::Global(HeaderCommand::ToggleRightDrawer),
-        Slot::Global(HeaderCommand::ToggleSplit),
-        Slot::Global(HeaderCommand::ToggleQuad),
     ];
     // The address bar is the subject of this row: the ribbon gets what the row has left after its
-    // floor ([`Tokens::nav_trail_min_width`]), and the widest shape that fits is the one drawn.
-    let budget = (whole.width() - tokens.nav_trail_min_width).max(0.0);
+    // floor ([`Tokens::nav_trail_min_width`]), and the widest shape that fits is the one drawn. The
+    // menu button is taken off first — it is the one control that never folds, so its square is
+    // spent before the folding decision is made, not a variable in it.
+    let permanent = tokens.nav_button + tokens.nav_gap;
+    let budget = (whole.width() - tokens.nav_trail_min_width - permanent).max(0.0);
     let mut folded: Vec<Slot> = Vec::new();
     let (shown_tools, shown_globals) =
         if ribbon_width(tokens, pane_tools.len() + globals.len()) <= budget {
@@ -137,7 +142,8 @@ pub fn show(
             folded.extend(globals.iter().cloned());
             (Vec::new(), Vec::new())
         };
-    let count = shown_tools.len() + shown_globals.len() + usize::from(!folded.is_empty());
+    // The menu button, the overflow button if the bar folded, and whatever survived the fold.
+    let count = shown_tools.len() + shown_globals.len() + usize::from(!folded.is_empty()) + 1;
     let right = ribbon_width(tokens, count);
     // The ribbon sits flush with the pane's right edge; the address strip takes all the rest.
     let ribbon_rect = Rect::from_min_max(
@@ -152,7 +158,7 @@ pub fn show(
     );
     crate::widgets::in_rect(ui, trail_rect, Layout::left_to_right(Align::Center), |ui| {
         match &mut m.address {
-            Some(address) => breadcrumb::show(ui, address, tokens, out),
+            Some(address) => breadcrumb::show(ui, address, tokens, Some(&m.hints.refresh), out),
             None => {
                 // The bar of a pane with nothing listed: the room is kept, the affordances are not.
                 ui.label(
@@ -169,6 +175,9 @@ pub fn show(
         Layout::right_to_left(Align::Center),
         |ui| {
             ui.spacing_mut().item_spacing = vec2(tokens.nav_gap, 0.0);
+            // First allocated, so — right to left — furthest right: the parent button owns the corner
+            // a browser's user already reads as "the rest of this toolbar".
+            app_menu::show(ui, tokens, &menu_entries(m), out, global);
             if !folded.is_empty() {
                 draw_overflow(ui, tokens, &folded, m, out, global);
             }
@@ -203,7 +212,7 @@ pub fn icon_button(ui: &mut Ui, tokens: &Tokens, icon: &str, tooltip: &str) -> R
 /// [`icon_button`] with the two things a *toggle* needs: the accent frame that says "this is the
 /// mode on screen" (Go's `.btn-global.active`, `workspace.css:36-58`), and the name the a11y tree
 /// gets, when the tooltip is a sentence rather than a label.
-fn icon_button_state(
+pub(crate) fn icon_button_state(
     ui: &mut Ui,
     tokens: &Tokens,
     icon: &str,
@@ -276,7 +285,7 @@ fn paint_slot(
     out: &mut Vec<PaneCommand>,
     global: &mut Vec<HeaderCommand>,
 ) {
-    let icon = slot.icon(m.grid);
+    let icon = slot.icon();
     let response = icon_button_state(
         ui,
         tokens,
@@ -299,6 +308,41 @@ fn paint_slot(
             }
         }
     }
+}
+
+/// The panel's tiles, in tile order: the listing's view while there is a listing to view, then the
+/// two layout switches (`app_menu.rs`). This is the whole of the folded row of the reference's
+/// toolbar — the view toggle, `F3`, `F4` — and the entry point for what comes next.
+#[must_use]
+fn menu_entries(m: &NavBarModel<'_>) -> Vec<Entry> {
+    let mut entries = Vec::new();
+    if m.address.is_some() {
+        // The button names the *other* mode, which is what clicking it gives you; it is not a
+        // state indicator, so it takes no accent frame (`Slot::selected` used to say the same).
+        let label = if m.grid { "List view" } else { "Grid view" };
+        entries.push(Entry::new(
+            if m.grid { "list" } else { "grid" },
+            label,
+            label,
+            false,
+            PaneCommand::ToggleGrid,
+        ));
+    }
+    entries.push(Entry::new(
+        "split",
+        "2-pane",
+        format!("2-pane ({})", m.hints.split),
+        m.split,
+        HeaderCommand::ToggleSplit,
+    ));
+    entries.push(Entry::new(
+        "quad",
+        "4-pane",
+        format!("4-pane ({})", m.hints.quad),
+        m.quad,
+        HeaderCommand::ToggleQuad,
+    ));
+    entries
 }
 
 /// The three recursive-listing modes, as menu rows in Go's own words (`main.js`'s flat-view
@@ -374,25 +418,15 @@ fn overflow_rows(
 }
 
 impl Slot {
-    /// The glyph. `grid` and `list` describe the *other* mode, which is what the button offers.
-    fn icon(&self, grid: bool) -> &'static str {
+    /// The glyph.
+    fn icon(&self) -> &'static str {
         match self {
-            Slot::Pane(PaneCommand::ToggleGrid) => {
-                if grid {
-                    "list"
-                } else {
-                    "grid"
-                }
-            }
-            Slot::Pane(PaneCommand::Refresh) => "refresh",
             Slot::Pane(PaneCommand::SelectAll) => "select-all",
             Slot::Pane(PaneCommand::SelectNone) => "select-none",
             Slot::Flat => "tree",
             Slot::Global(HeaderCommand::ToggleLog) => "history",
             Slot::Global(HeaderCommand::ToggleLeftDrawer) => "folder-open",
             Slot::Global(HeaderCommand::ToggleRightDrawer) => "terminal",
-            Slot::Global(HeaderCommand::ToggleSplit) => "split",
-            Slot::Global(HeaderCommand::ToggleQuad) => "quad",
             // A control this file does not name: the generic affordance, still reachable by name.
             Slot::Global(_) | Slot::Pane(_) => "menu",
         }
@@ -401,16 +435,12 @@ impl Slot {
     /// The accessible name: two words, no sentence, so an icon-only control stays reachable.
     fn name(&self) -> &'static str {
         match self {
-            Slot::Pane(PaneCommand::ToggleGrid) => "view",
-            Slot::Pane(PaneCommand::Refresh) => "refresh",
             Slot::Pane(PaneCommand::SelectAll) => "select all",
             Slot::Pane(PaneCommand::SelectNone) => "select none",
             Slot::Flat => "recursive listing",
             Slot::Global(HeaderCommand::ToggleLog) => "history",
             Slot::Global(HeaderCommand::ToggleLeftDrawer) => "places",
             Slot::Global(HeaderCommand::ToggleRightDrawer) => "custom actions",
-            Slot::Global(HeaderCommand::ToggleSplit) => "2-pane",
-            Slot::Global(HeaderCommand::ToggleQuad) => "4-pane",
             Slot::Global(_) | Slot::Pane(_) => "more",
         }
     }
@@ -418,14 +448,6 @@ impl Slot {
     /// The row text of the overflow popup — the same words as the tooltip, chord included.
     fn text(&self, m: &NavBarModel<'_>) -> String {
         match self {
-            Slot::Pane(PaneCommand::ToggleGrid) => {
-                if m.grid {
-                    "List view".to_string()
-                } else {
-                    "Grid view".to_string()
-                }
-            }
-            Slot::Pane(PaneCommand::Refresh) => format!("Refresh ({})", m.hints.refresh),
             Slot::Pane(PaneCommand::SelectAll) => "Select all".to_string(),
             Slot::Pane(PaneCommand::SelectNone) => "Select none".to_string(),
             Slot::Flat => format!("Recursive listing: {}", m.flat.label()),
@@ -434,8 +456,6 @@ impl Slot {
             }
             Slot::Global(HeaderCommand::ToggleLeftDrawer) => "Places".to_string(),
             Slot::Global(HeaderCommand::ToggleRightDrawer) => "Custom actions".to_string(),
-            Slot::Global(HeaderCommand::ToggleSplit) => format!("2-pane ({})", m.hints.split),
-            Slot::Global(HeaderCommand::ToggleQuad) => format!("4-pane ({})", m.hints.quad),
             Slot::Global(_) | Slot::Pane(_) => "Action".to_string(),
         }
     }
@@ -453,8 +473,6 @@ impl Slot {
             Slot::Global(HeaderCommand::ToggleLog) => m.log_open,
             Slot::Global(HeaderCommand::ToggleLeftDrawer) => m.left_drawer,
             Slot::Global(HeaderCommand::ToggleRightDrawer) => m.right_drawer,
-            Slot::Global(HeaderCommand::ToggleSplit) => m.split,
-            Slot::Global(HeaderCommand::ToggleQuad) => m.quad,
             _ => false,
         }
     }

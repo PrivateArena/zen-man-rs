@@ -105,6 +105,8 @@ enum Scene {
     Index { tag: &'static str, running: bool },
     /// The address field, open on the path it stands for.
     Address { tag: &'static str },
+    /// The navigation bar's parent menu, open over the pane's listing.
+    AppMenu { tag: &'static str },
 }
 
 /// Which drawer [`Scene::Drawer`] opens.
@@ -152,6 +154,7 @@ const REFERENCE_MAP: &[(&str, &str, &str)] = &[
     ("14-quick-find.png", "15-quick-find.png", "quick-find over a finished walk (D6)"),
     ("15-address-bar.png", "", "the address field open over its own path — ours alone: Go's bar was a native `<input>`, and no reference screenshot shows it open"),
     ("16-folder-menu.png", "", "the folder menu a sidebar row opens — ours alone: the Go reference's is the same popup as its breadcrumb's, and no reference screenshot shows either"),
+    ("17-parent-menu.png", "", "the navigation bar's parent menu, open over the listing — ours alone: the reference toolbar has no second level, so nothing shows one"),
 ];
 
 /// The `REFERENCE_MAP` row of one baseline: its Go reference (empty when it has none) and the note.
@@ -198,6 +201,7 @@ impl Scene {
             Self::BatchRename { .. } => "13-batch-rename.png",
             Self::QuickFind { .. } => "14-quick-find.png",
             Self::Address { .. } => "15-address-bar.png",
+            Self::AppMenu { .. } => "17-parent-menu.png",
         }
     }
 
@@ -214,6 +218,7 @@ impl Scene {
             | Self::BatchRename { tag }
             | Self::QuickFind { tag }
             | Self::Address { tag }
+            | Self::AppMenu { tag }
             | Self::Index { tag, .. } => tag,
         }
     }
@@ -289,6 +294,7 @@ impl Scene {
             Self::BatchRename { tag }
             | Self::QuickFind { tag }
             | Self::Address { tag }
+            | Self::AppMenu { tag }
             | Self::Drawer { tag, .. }
             | Self::ActionLog { tag }
             | Self::Index { tag, .. } => {
@@ -429,6 +435,20 @@ fn drive(harness: &mut Harness<'static, ZenApp>) {
     settle(harness);
 }
 
+/// Open the navigation bar's parent menu with the real click, and prove the tiles came: a baseline
+/// of a popup that silently failed to open would still be a plausible-looking picture (`app_menu.rs`).
+fn drive_app_menu(harness: &mut Harness<'static, ZenApp>) {
+    settle(harness);
+    harness.get_by_label("menu").click();
+    settle(harness);
+    for name in ["Grid view", "2-pane", "4-pane"] {
+        assert!(
+            harness.query_all_by_label(name).count() > 0,
+            "the parent menu did not open its tiles: {name:?} is not on screen"
+        );
+    }
+}
+
 fn settle(harness: &mut Harness<'static, ZenApp>) {
     for _ in 0..SETTLE {
         harness.run();
@@ -464,6 +484,7 @@ fn render(scene: &Scene) -> Option<RgbaImage> {
         Scene::BatchRename { tag } => drive_batch_rename(&mut harness, tag),
         Scene::QuickFind { .. } => drive_quick_find(&mut harness),
         Scene::Address { .. } => drive_address(&mut harness),
+        Scene::AppMenu { .. } => drive_app_menu(&mut harness),
         Scene::Index { running, .. } => drive_index(&mut harness, *running),
     }
 
@@ -1333,6 +1354,19 @@ fn address_bar_snapshot_renders_or_skips_with_a_reason() {
     };
     let Some(image) = render(&scene) else { return };
     assert_covers(&image, 0.2, "a listing with its address field open");
+}
+
+#[test]
+fn parent_menu_snapshot_renders_or_skips_with_a_reason() {
+    let scene = Scene::AppMenu {
+        tag: "snap-app-menu",
+    };
+    let Some(image) = render(&scene) else { return };
+    assert_covers(
+        &image,
+        0.2,
+        "a listing with the navigation bar's parent menu open",
+    );
 }
 
 #[test]

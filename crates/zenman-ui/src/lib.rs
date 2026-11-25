@@ -8,7 +8,7 @@
 //! theme, icons, dock, dock_content, state, app, jobs_ui, persist    §5.7  step 7   (this step)
 //! widgets/{toast,disk_meter}                                        §5.8  step 7   (this step)
 //! widgets/{virtual_list,entry_row}                                  §5.8  step 8
-//! panels/{header,nav_bar,breadcrumb,tab_bar,file_pane,side_panel,action_log,status_bar}  §5.8
+//! panels/{header,app_menu,nav_bar,breadcrumb,tab_bar,file_pane,side_panel,action_log,status_bar}  §5.8
 //! dialogs/{mod,quick_find,search_manager,batch_rename,properties,action_editor}  §5.8  steps 10-13
 //! keymap, menus, drag_drop                                          §5.8  steps 10, 13
 //! ```

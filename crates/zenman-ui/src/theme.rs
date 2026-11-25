@@ -261,6 +261,21 @@ pub struct Tokens {
     pub nav_trail_min_width: f32,
     /// Horizontal inset of a pane's chrome rows.
     pub chrome_pad_x: f32,
+    // ---- the ribbon's parent menu (`panels/app_menu.rs`) -----------------------------------------
+    /// How many tiles one row of the parent menu holds.
+    pub menu_columns: u8,
+    /// One tile's width: the caption's measure, and the panel's.
+    pub menu_tile_width: f32,
+    /// One tile's height.
+    pub menu_tile_height: f32,
+    /// The gap between two tiles, and between the panel's header and its first row.
+    pub menu_tile_gap: f32,
+    /// The parent menu's frame padding — its own, because the panel's width is derived from it.
+    pub menu_tile_pad: f32,
+    /// The tile's glyph box.
+    pub menu_tile_icon_size: f32,
+    /// The tile's caption: smaller than a menu row, which is what buys three tiles across.
+    pub menu_label_size: f32,
     // ---- step 14b (workspace vocabulary, the action log, the two new dialogs) --------------------
     /// Width of the workspace popup.
     pub workspace_select_width: f32,
@@ -457,6 +472,13 @@ impl Tokens {
             nav_group_gap: 8.0,
             nav_trail_min_width: 340.0,
             chrome_pad_x: 6.0,
+            menu_columns: 3,
+            menu_tile_width: 84.0,
+            menu_tile_height: 62.0,
+            menu_tile_gap: 6.0,
+            menu_tile_pad: 8.0,
+            menu_tile_icon_size: 22.0,
+            menu_label_size: 11.0,
             workspace_select_width: 240.0,
             chip_pad: 6.0,
             log_row_height: 54.0,

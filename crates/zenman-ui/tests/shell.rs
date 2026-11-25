@@ -63,11 +63,15 @@ fn press_at(harness: &mut Harness<'static, ZenApp>, at: egui::Pos2) {
     harness.run();
 }
 
+/// Open one pane's parent menu and let the panel appear (`app_menu.rs`).
+fn open_app_menu(harness: &mut Harness<'static, ZenApp>) {
+    click_chrome(harness, "menu");
+    harness.run();
+}
+
 /// The fixture directory as the shell's path type.
 fn fixture_path(path: &Path) -> FsPath {
-    FsPath::from_abs(
-        AbsPath::try_from(path).unwrap_or_else(|e| panic!("{}: {e}", path.display())),
-    )
+    FsPath::from_abs(AbsPath::try_from(path).unwrap_or_else(|e| panic!("{}: {e}", path.display())))
 }
 
 /// Click the first control of one name. Every pane carries its own navigation ribbon, so a window
@@ -112,10 +116,17 @@ fn chrome_controls_reach_the_widget_tree_and_the_layout_button_reaches_the_state
     harness.run();
     // The navigation bar's global group: every one of them an icon with an accessible name, the
     // chord living in the tooltip rather than the label (`nav_bar.rs`). There is no single-pane
-    // button: Go's two layout buttons *are* the F3/F4 chords and toggle themselves off.
-    for name in ["history", "places", "custom actions", "2-pane", "4-pane"] {
+    // button: Go's two layout buttons *are* the F3/F4 chords and toggle themselves off — and they
+    // are no longer icons in the bar, but tiles behind the parent menu (`app_menu.rs`).
+    for name in ["history", "places", "custom actions", "menu"] {
         harness.get_by_label(name);
     }
+    assert_eq!(
+        harness.query_all_by_label("4-pane").count(),
+        0,
+        "a tile of the parent menu was drawn before the menu was opened"
+    );
+    open_app_menu(&mut harness);
     // Plan **D7**: one chord table, two front ends. The button no longer prints its key, so the
     // tooltip is what has to agree with the keymap — and it is read out of `KeyMap::hint`.
     let hint = harness
@@ -130,9 +141,9 @@ fn chrome_controls_reach_the_widget_tree_and_the_layout_button_reaches_the_state
             .query_all_by_label_contains(&format!("4-pane ({hint})"))
             .count()
             > 0,
-        "the ribbon's tooltip did not carry `KeyMap::hint`'s chord ({hint})"
+        "the menu's tooltip did not carry `KeyMap::hint`'s chord ({hint})"
     );
-    // Clicking the quad button must change the *state*, not just the picture.
+    // Clicking the quad tile must change the *state*, not just the picture.
     click_chrome(&mut harness, "4-pane");
     let app = harness.state();
     assert!(app.model.quad(), "the grid must follow the button");
@@ -141,7 +152,7 @@ fn chrome_controls_reach_the_widget_tree_and_the_layout_button_reaches_the_state
         "and the dock layout must stay valid"
     );
     assert_eq!(app.model.panes.len(), 4);
-    // The same button again is the off-state — plan F3's regression path, driven through the real
+    // The same tile again is the off-state — plan F3's regression path, driven through the real
     // control that now owns it.
     click_chrome(&mut harness, "4-pane");
     assert!(
@@ -152,11 +163,66 @@ fn chrome_controls_reach_the_widget_tree_and_the_layout_button_reaches_the_state
     click_chrome(&mut harness, "2-pane");
     assert_eq!(harness.state().model.panes.len(), 2);
     click_chrome(&mut harness, "2-pane");
-    assert_eq!(
-        harness.state().model.panes.len(),
-        1,
+    assert!(
+        !harness.state().model.quad() && harness.state().model.layout_mode_is_consistent(),
         "and 2-pane toggles too"
     );
+    assert_eq!(harness.state().model.panes.len(), 1);
+}
+
+#[test]
+fn the_parent_menu_survives_its_tiles_and_closes_only_when_it_is_told_to() {
+    let mut harness = harness();
+    harness.run();
+    open_app_menu(&mut harness);
+    assert!(
+        menu_is_open(&harness),
+        "the panel did not open behind the button"
+    );
+
+    // A tile is a switch, and the panel is what shows which way it is set: clicking one may not
+    // cost the panel, or reading the second answer means opening the menu twice.
+    click_chrome(&mut harness, "2-pane");
+    assert_eq!(harness.state().model.panes.len(), 2, "the switch flipped");
+    assert!(
+        menu_is_open(&harness),
+        "a click on a tile closed the panel it was clicked in"
+    );
+    click_chrome(&mut harness, "4-pane");
+    assert_eq!(harness.state().model.panes.len(), 4);
+    assert!(
+        menu_is_open(&harness),
+        "and the same for a second tile, in a bar that changed shape underneath"
+    );
+
+    // The header's `X` is the panel's own way out.
+    click_chrome(&mut harness, "Close menu");
+    assert!(
+        !menu_is_open(&harness),
+        "the close button left the panel on screen"
+    );
+
+    // A click anywhere else is the other way out.
+    open_app_menu(&mut harness);
+    press_at(&mut harness, egui::pos2(200.0, 600.0));
+    assert!(
+        !menu_is_open(&harness),
+        "a click outside the panel left it on screen"
+    );
+
+    // And the parent button itself, which is how every other bar button behaves.
+    open_app_menu(&mut harness);
+    click_chrome(&mut harness, "menu");
+    assert!(
+        !menu_is_open(&harness),
+        "the parent button did not close the panel it had opened"
+    );
+}
+
+/// `true` while the parent menu's tiles are on screen: the panel exists in the a11y tree exactly
+/// when it is open (`app_menu.rs`).
+fn menu_is_open(harness: &Harness<'static, ZenApp>) -> bool {
+    harness.query_all_by_label("4-pane").count() > 0
 }
 
 #[test]
@@ -195,6 +261,7 @@ fn the_layout_button_opens_a_pane_that_is_already_live() {
     let mut harness = shell_harness(app);
     harness.run();
 
+    open_app_menu(&mut harness);
     click_chrome(&mut harness, "2-pane");
     let paths: Vec<Option<FsPath>> = quad_slots()
         .into_iter()

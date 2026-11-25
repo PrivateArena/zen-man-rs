@@ -35,7 +35,16 @@ pub struct BreadcrumbModel<'a> {
 ///
 /// The caller owns the row: [`crate::panels::nav_bar`] reserves this band, paints its background and
 /// leaves the trail everything the ribbon does not take.
-pub fn show(ui: &mut Ui, m: &mut BreadcrumbModel<'_>, tokens: &Tokens, out: &mut Vec<PaneCommand>) {
+///
+/// `refresh_hint` is the chord of the reload button that rides between `..` and the chips — `Some`
+/// when there is a listing to reload, with the keymap's own spelling of it (plan **D7**).
+pub fn show(
+    ui: &mut Ui,
+    m: &mut BreadcrumbModel<'_>,
+    tokens: &Tokens,
+    refresh_hint: Option<&str>,
+    out: &mut Vec<PaneCommand>,
+) {
     let height = tokens.toolbar_height;
     egui::Frame::new()
         .fill(tokens.transparent)
@@ -45,18 +54,28 @@ pub fn show(ui: &mut Ui, m: &mut BreadcrumbModel<'_>, tokens: &Tokens, out: &mut
                 vec2(ui.available_width(), height),
                 egui::Layout::left_to_right(egui::Align::Center),
                 |ui| {
-                    let back = icon_button(ui, "chevron-left", "Back", m.can_back, tokens);
+                    let back = icon_button(ui, "chevron-left", "Back", None, m.can_back, tokens);
                     if back.clicked() && m.can_back {
                         out.push(PaneCommand::Back);
                     }
                     let forward =
-                        icon_button(ui, "chevron-right", "Forward", m.can_forward, tokens);
+                        icon_button(ui, "chevron-right", "Forward", None, m.can_forward, tokens);
                     if forward.clicked() && m.can_forward {
                         out.push(PaneCommand::Forward);
                     }
-                    let up = icon_button(ui, "arrow-up", "Parent directory", true, tokens);
+                    let up = icon_button(ui, "arrow-up", "Parent directory", None, true, tokens);
                     if up.clicked() {
                         out.push(PaneCommand::Up);
+                    }
+                    // Reload belongs with the navigation buttons, where a browser's user reaches for
+                    // it — the pane's own ribbon is the part of the row that has to give way.
+                    if let Some(hint) = refresh_hint {
+                        let text = format!("Refresh ({hint})");
+                        if icon_button(ui, "refresh", &text, Some(REFRESH_LABEL), true, tokens)
+                            .clicked()
+                        {
+                            out.push(PaneCommand::Refresh);
+                        }
                     }
                     if *m.editing {
                         edit_field(ui, m, tokens, out);
@@ -84,6 +103,11 @@ pub fn show(ui: &mut Ui, m: &mut BreadcrumbModel<'_>, tokens: &Tokens, out: &mut
 /// The volume / store root, named the way the reference names it (`navigation.js:190`,
 /// `<span class="breadcrumb-segment" data-path="/">Root</span>`).
 const ROOT_LABEL: &str = "Root";
+
+/// The reload button's accessible name: the ribbon's word for it, which is the name the shell's
+/// tests and its screen-reader users already know. The tooltip is the sentence with the chord
+/// (`nav_bar::Slot::{name, text}` says the same thing the other way round).
+const REFRESH_LABEL: &str = "refresh";
 
 /// What stands in for the segments a narrow trail had to hide. `…` is in the glyph-guard set
 /// (`theme.rs::every_glyph_the_shell_paints_has_a_face_in_the_installed_stack`).
@@ -542,6 +566,7 @@ fn icon_button(
     ui: &mut Ui,
     icon: &str,
     tooltip: &str,
+    name: Option<&str>,
     enabled: bool,
     tokens: &Tokens,
 ) -> egui::Response {
@@ -565,11 +590,11 @@ fn icon_button(
         crate::icons::paint(ui, rect, icon, tokens.row_icon_size, tint);
     }
     let response = response.on_hover_text(if enabled {
-        tooltip.to_string()
+        tooltip.to_owned()
     } else {
         format!("{tooltip}: nowhere to go")
     });
-    let label = tooltip.to_owned();
+    let label = name.unwrap_or(tooltip).to_owned();
     response.widget_info(|| {
         let mut info = egui::WidgetInfo::new(egui::Role::Button);
         info.label = Some(label.clone());

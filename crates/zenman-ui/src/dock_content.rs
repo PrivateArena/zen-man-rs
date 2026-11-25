@@ -224,8 +224,8 @@ impl PaneDock<'_> {
             .extend(commands.into_iter().map(|cmd| (slot, cmd)));
     }
 
-    /// The navigation bar (plan §5.8 `breadcrumb.rs`, `nav_bar.rs`): the address strip and the icon
-    /// ribbon, in the one row the pane owns.
+    /// The navigation bar (plan §5.8 `breadcrumb.rs`, `nav_bar.rs`): the address strip, the icon
+    /// ribbon and the parent menu behind its last button, in the one row the pane owns.
     fn nav_row(&mut self, ui: &mut Ui, slot: PaneSlot) {
         let tokens = self.tokens;
         let quad = self.model.quad();

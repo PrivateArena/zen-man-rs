@@ -82,15 +82,12 @@ fn pane_app(tag: &str, dir: &Path) -> ZenApp {
 }
 
 /// Every chrome control a user can click without opening a popup, by the name it answers to: the
-/// workspace button of the tab row and the global group of the navigation ribbon.
-const INTERACTIVE: [&str; 6] = [
-    "workspace",
-    "history",
-    "places",
-    "custom actions",
-    "2-pane",
-    "4-pane",
-];
+/// workspace button of the tab row, the global group of the navigation ribbon, and the parent menu
+/// that folds the modes away (`app_menu.rs`).
+const INTERACTIVE: [&str; 5] = ["workspace", "history", "places", "custom actions", "menu"];
+
+/// The tiles behind that parent button.
+const MENU_TILES: [&str; 3] = ["Grid view", "2-pane", "4-pane"];
 
 /// Click the first control of one name: every pane carries its own chrome, so a window-level control
 /// exists once per pane in a grid, and `get_by_label`'s "exactly one" is the wrong demand.
@@ -114,6 +111,11 @@ fn click_first(harness: &mut Harness<'static, ZenApp>, label: &str) {
 /// How many times the shell drew a chrome string (the a11y tree is what a click can reach).
 fn drawn(harness: &Harness<'static, ZenApp>, label: &str) -> usize {
     harness.query_all_by_label(label).count()
+}
+
+/// `true` while the pane's parent menu is open, which is the only time its tiles are on screen.
+fn menu_is_open(harness: &Harness<'static, ZenApp>) -> bool {
+    harness.query_all_by_label("4-pane").count() > 0
 }
 
 #[test]
@@ -156,14 +158,12 @@ fn every_interactive_chrome_control_is_reachable_at_800_px() {
     // click is dropped when the window is small. The ribbon's globals and the pane tools both stay
     // inline here — the address strip's floor is what folds them, and 800 px is above it.
     let dir = tree("ws-800", &["a.txt"]);
-    let harness = build(pane_app("ws-800", &dir), egui::vec2(800.0, 600.0));
-    for name in INTERACTIVE.iter().chain(&[
-        "view",
-        "refresh",
-        "recursive listing",
-        "select all",
-        "select none",
-    ]) {
+    let mut harness = build(pane_app("ws-800", &dir), egui::vec2(800.0, 600.0));
+    for name in
+        INTERACTIVE
+            .iter()
+            .chain(&["refresh", "recursive listing", "select all", "select none"])
+    {
         let mut inside = 0;
         for node in harness.query_all_by_label(name) {
             // A control drawn past the window's edge is named but unreachable: egui still records
@@ -177,6 +177,67 @@ fn every_interactive_chrome_control_is_reachable_at_800_px() {
             "{name:?} is not inside the 800 px window — the chrome dropped or pushed out a control"
         );
     }
+    // The folded half, too: the panel is anchored to a button in the corner, so this is where a
+    // narrow window would otherwise clip it.
+    click_first(&mut harness, "menu");
+    assert!(
+        menu_is_open(&harness),
+        "the parent menu did not open in an 800 px window"
+    );
+    for name in MENU_TILES {
+        let inside = harness
+            .query_all_by_label(name)
+            .filter(|node| node.rect().max.x <= 800.0 && node.rect().min.x >= 0.0)
+            .count();
+        assert!(
+            inside > 0,
+            "{name:?} is not inside the 800 px window once the parent menu is open"
+        );
+    }
+    // And they are the grid the panel was sized for: three tiles of the token size, in order, on
+    // one line — a panel that wrapped or shrank its tiles would pass the reachability test alone.
+    let rects: Vec<egui::Rect> = MENU_TILES
+        .iter()
+        .map(|name| {
+            harness
+                .query_all_by_label(name)
+                .next()
+                .unwrap_or_else(|| panic!("{name:?} has no tile of its own"))
+                .rect()
+        })
+        .collect();
+    let tokens = zenman_ui::theme::Tokens::dark();
+    for rect in &rects {
+        assert_eq!(
+            (rect.width(), rect.height()),
+            (tokens.menu_tile_width, tokens.menu_tile_height),
+            "a tile was not the size the panel's width was derived from"
+        );
+    }
+    assert!(
+        rects[0].min.x < rects[1].min.x && rects[1].min.x < rects[2].min.x,
+        "the tiles are not in the order the menu lists them: {rects:?}"
+    );
+    assert!(
+        (rects[0].center().y - rects[2].center().y).abs() < 0.5,
+        "the tiles wrapped onto more than one row: {rects:?}"
+    );
+
+    // Where the reload button ended up: a browser's user reaches for it beside the address, so it
+    // rides after `..` and not after the pane tools.
+    let rect_of = |label: &str| {
+        harness
+            .query_all_by_label(label)
+            .next()
+            .unwrap_or_else(|| panic!("{label:?} is not in the widget tree"))
+            .rect()
+    };
+    let up = rect_of("Parent directory");
+    let reload = rect_of("refresh");
+    assert!(
+        reload.min.x >= up.max.x && reload.min.x - up.max.x < 20.0,
+        "reload is not the button right after the parent-directory one: {up:?} then {reload:?}"
+    );
 }
 
 #[test]
