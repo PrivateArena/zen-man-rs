@@ -20,8 +20,9 @@ mod common;
 
 use std::path::{Path, PathBuf};
 
-use egui::Key;
+use egui::{Key, PointerButton, Pos2};
 use egui_kittest::Harness;
+use egui_kittest::kittest::Queryable;
 
 use zenman_core::path::{AbsPath, FsPath};
 use zenman_core::services::search_index::{IndexEntry, IndexSearchResults};
@@ -29,6 +30,7 @@ use zenman_core::session::{Session, SessionPaths};
 use zenman_core::store::config::{LayoutMode, PaneSlot, ZenConfig};
 use zenman_ui::app::ZenApp;
 use zenman_ui::dialogs::Dialog;
+use zenman_ui::dialogs::ResultMenu;
 use zenman_ui::dialogs::search_manager::{self, ManagerRequest, SearchManager};
 use zenman_ui::keymap::{Chord, Command};
 use zenman_ui::state::panes_for;
@@ -647,4 +649,183 @@ fn enter_on_a_row_navigates_through_the_answer_seam() {
         "and the tab took the new title ({})",
         shown.title
     );
+}
+
+// ---------------------------------------------------------------------- the table's menu
+//
+// The manager's rows answer a right-click with Go's `showSearchResultContextMenu`
+// (`context-menu.js:173-197`, raised by `search-manager.js:378-389`) — and so, since this round, do the
+// find dialog's, which is the point of drawing the same rows in both.
+
+/// Click a node by name in one frame, so a clipboard write is still in [`Harness::output`].
+fn click_row(harness: &mut Harness<'static, ZenApp>, label: &str) {
+    harness.get_by_label(label).click();
+    harness.step();
+}
+
+/// Right-click a result row and wait until its menu has been *painted* — the frame the right-click
+/// landed in only arms it.
+fn right_click_row(harness: &mut Harness<'static, ZenApp>, name: &str) {
+    harness.get_by_label(name).click_secondary();
+    common::settle_until(harness, "the row's menu", |h| {
+        matches!(h.state().dialogs.active(),
+            Some(Dialog::SearchManager(m)) if m.menu_shown())
+    });
+}
+
+fn manager_menu_rows() -> Vec<String> {
+    let specs = ResultMenu::specs();
+    specs
+        .iter()
+        .flat_map(|group| group.iter())
+        .map(|spec| spec.label.clone())
+        .collect()
+}
+
+#[test]
+fn right_clicking_a_result_row_raises_the_same_menu_the_find_dialog_has() {
+    let root = tree("sm-row-menu");
+    let mut harness = manager_harness("sm-row-menu", &root);
+    open_manager(&mut harness);
+    rebuild_through_dialog(&mut harness);
+    let hits = query(&mut harness, "ext:md", 50).hits;
+    assert!(
+        hits.iter().any(|hit| hit.name == "readme.md"),
+        "the index answers `md` with the nested note: {:?}",
+        names(&hits)
+    );
+    right_click_row(&mut harness, "readme.md");
+    let m = manager(&harness);
+    assert_eq!(
+        manager_menu_rows(),
+        [
+            "Open",
+            "Open Containing Folder",
+            "Open Containing Folder in New Tab",
+            "Copy Path",
+            "Copy Name",
+        ]
+        .map(str::to_string),
+        "Go's five rows, in his order (`context-menu.js:175-193`)"
+    );
+    assert_eq!(
+        m.cursor,
+        Some(1),
+        "the right-click selected the row first, as `search-manager.js:380-384` did"
+    );
+    assert_eq!(
+        m.menu_target(),
+        Some((abs(&root.join("docs/readme.md")), false)),
+        "the menu knows which row it is a menu of"
+    );
+}
+
+#[test]
+fn the_manager_reveals_the_row_in_its_folder() {
+    let root = tree("sm-reveal");
+    let mut harness = manager_harness("sm-reveal", &root);
+    open_manager(&mut harness);
+    rebuild_through_dialog(&mut harness);
+    query(&mut harness, "ext:md", 50);
+    right_click_row(&mut harness, "readme.md");
+    click_row(&mut harness, "Open Containing Folder");
+    common::settle_until(&mut harness, "the folder of the row", |h| {
+        h.state().dialogs.active().is_none()
+            && h.state()
+                .model
+                .panes
+                .get(&PaneSlot::Left)
+                .and_then(|p| p.active_tab())
+                .is_some_and(|t| t.sel.contains("readme.md"))
+    });
+    let tab = harness
+        .state()
+        .model
+        .panes
+        .get(&PaneSlot::Left)
+        .and_then(|p| p.active_tab())
+        .expect("a tab");
+    assert!(
+        tab.path.to_string().ends_with("/docs"),
+        "the pane went to the row's folder: {}",
+        tab.path
+    );
+    assert!(
+        !harness
+            .state()
+            .dialogs
+            .active()
+            .is_some_and(|d| matches!(d, Dialog::SearchManager(_))),
+        "Go closes the manager to reveal (`context-menu.js:691`), and so does the port"
+    );
+}
+
+/// A dismissed menu is not an answer: the panel keeps its place, its query and its rebuild poll.
+#[test]
+fn a_click_outside_the_menu_leaves_the_manager_up() {
+    let root = tree("sm-menu-away");
+    let mut harness = manager_harness("sm-menu-away", &root);
+    open_manager(&mut harness);
+    rebuild_through_dialog(&mut harness);
+    query(&mut harness, "ext:md", 50);
+    right_click_row(&mut harness, "readme.md");
+    // A press on something in the card that is not the menu. `notes.md`, the other row, is a name the
+    // pane behind also paints, so its node is ambiguous; the paging control is not.
+    harness.get_by_label("< prev").click();
+    common::settle_until(&mut harness, "the menu gone", |h| {
+        matches!(h.state().dialogs.active(),
+            Some(Dialog::SearchManager(m)) if m.menu_target().is_none())
+    });
+    let m = manager(&harness);
+    assert_eq!(
+        m.cursor,
+        Some(1),
+        "the panel outlives its menu, and the row it spoke about is where the pointer left it"
+    );
+    assert_eq!(
+        m.page, 0,
+        "and the click that dismissed the menu did not also turn the page"
+    );
+}
+
+/// Go closes the manager on a click outside it (`search-manager.js:311-319`).
+#[test]
+fn a_click_outside_the_card_dismisses_the_manager() {
+    let root = tree("sm-away");
+    let mut harness = manager_harness("sm-away", &root);
+    open_manager(&mut harness);
+    click_at(&mut harness, Pos2::new(20.0, 880.0));
+    common::settle_until(&mut harness, "the panel gone", |h| {
+        h.state().dialogs.active().is_none()
+    });
+}
+
+/// The ✕ at the top of the card, which is the port's own door (Go's browser gave every dialog a frame
+/// and a way out of it).
+#[test]
+fn the_close_button_answers_the_manager() {
+    let root = tree("sm-close");
+    let mut harness = manager_harness("sm-close", &root);
+    open_manager(&mut harness);
+    click_row(&mut harness, "Close (Escape)");
+    common::settle_until(&mut harness, "the panel gone", |h| {
+        h.state().dialogs.active().is_none()
+    });
+}
+
+/// A raw pointer press+release at one point — the void outside a card is no node.
+fn click_at(harness: &mut Harness<'static, ZenApp>, at: Pos2) {
+    harness
+        .input_mut()
+        .events
+        .push(egui::Event::PointerMoved(at));
+    for pressed in [true, false] {
+        harness.input_mut().events.push(egui::Event::PointerButton {
+            pos: at,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        });
+    }
+    harness.run();
 }

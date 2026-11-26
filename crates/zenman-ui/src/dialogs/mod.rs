@@ -12,6 +12,15 @@
 //! second dialog rather than silently replacing the first, which is the "only one dialog at a time"
 //! modal-safety rule.
 //!
+//! # The three doors out
+//!
+//! Every card answers <kbd>Escape</kbd>. Two of them — the search dialogs, the ones a user opens to
+//! *look* at something and then dismisses — also answer the pointer: the `close_button` at the end of
+//! their title row, and [`ResultMenu`]'s click outside the card, which is Go's own document-click
+//! handler (`quick-find.js:207-215`, `search-manager.js:311-319`). The prompt and confirm cards keep
+//! the keyboard to themselves on purpose: a half-typed name should not die because the pointer
+//! drifted.
+//!
 //! # How a result becomes a command (plan §4.1)
 //!
 //! A dialog never touches the engine. [`Dialogs::show`] returns [`Answer`]s, and the caller
@@ -27,6 +36,7 @@ pub mod extract;
 pub mod prompt;
 pub mod properties;
 pub mod quick_find;
+pub mod result_menu;
 pub mod search_manager;
 
 pub use action_editor::{ActionEditor, ActionOutcome};
@@ -36,6 +46,7 @@ pub use extract::ExtractProgress;
 pub use prompt::{Prompt, Validation};
 pub use properties::{PropertiesDialog, Subject as PropertiesSubject};
 pub use quick_find::{QuickFind, QuickOutcome, QuickRequest};
+pub use result_menu::{MenuShot, ResultMenu};
 pub use search_manager::{IndexOutcome, SearchManager};
 
 use egui::{Align2, Area, CornerRadius, Id, Order, Ui, Vec2};
@@ -213,7 +224,8 @@ impl Answer {
                     QuickOutcome::Activate { .. }
                     | QuickOutcome::Closed { .. }
                     | QuickOutcome::DeleteFound { .. }
-                    | QuickOutcome::Reveal { .. },
+                    | QuickOutcome::Reveal { .. }
+                    | QuickOutcome::RevealInNewTab { .. },
                 ..
             } => Choice::Ok,
             Self::Index { .. } | Self::Batch { .. } | Self::Action { .. } => Choice::Ok,
@@ -335,6 +347,47 @@ impl Dialogs {
         out
     }
 }
+
+/// The ✕ at the end of a dialog's title row — the pointer's answer to <kbd>Escape</kbd>.
+///
+/// Go prints none: `index.html:566-571` opens its cards in `.modal-box`es whose only close is the
+/// backdrop click, because a browser window always has a title bar. A port whose cards are frameless
+/// `Area`s has neither, so the keyboard was the only door — and a dialog you can only leave with a key
+/// you have to be told about is a dialog you get stuck in.
+///
+/// The *icon*, not the glyph, because "✕" has no face in the bundled stack (plan §2's rule 11) — and
+/// an accessible name, because the harness fails a widget that has none and a painted square has
+/// naturally no text to derive one from.
+pub(crate) fn close_button(ui: &mut Ui, tokens: &Tokens) -> bool {
+    let side = tokens.row_height.min(tokens.nav_button);
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(side), egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        if response.hovered() {
+            ui.painter().rect_filled(
+                rect,
+                CornerRadius::same(tokens.crumb_corner_radius),
+                tokens.bg_hover,
+            );
+        }
+        let tint = if response.hovered() {
+            tokens.text_main
+        } else {
+            tokens.text_muted
+        };
+        crate::icons::paint(ui, rect, "close", tokens.row_icon_size, tint);
+    }
+    let response = response.on_hover_text(CLOSE_TIP);
+    response.widget_info(|| {
+        let mut info = egui::WidgetInfo::new(egui::Role::Button);
+        info.label = Some(CLOSE_TIP.to_string());
+        info
+    });
+    response.clicked()
+}
+
+/// The close button's hover text, which doubles as its accessible name — so a test can call the button
+/// by the same words a user is offered.
+const CLOSE_TIP: &str = "Close (Escape)";
 
 /// The dim over the shell, on its own layer: `Order::Middleware` sits above the panels
 /// (`Order::Background`) and below the dialog card (`Order::Foreground`). It allocates **no input

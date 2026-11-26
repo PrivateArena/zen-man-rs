@@ -1264,7 +1264,7 @@ impl ZenApp {
         }
         // The manager's non-closing requests (Rebuild / Apply / the watch toggle) run here, after the
         // draw, exactly like the answers — a dialog still never calls the engine itself.
-        crate::dialogs::search_manager::drain(self);
+        crate::dialogs::search_manager::drain(self, ui.ctx());
         // …and the quick-find footer's (`Copy Found`, `Cut Found`, `Copy Path`, `Copy Name`), which
         // need `ctx` for the *text* clipboard and a dialog that must stay open.
         crate::dialogs::quick_find::drain(self, ui.ctx());
@@ -1751,6 +1751,11 @@ impl ZenApp {
                 (MenuAction::Command(command), None, None) => {
                     self.dispatch(open.slot, command, ctx)
                 }
+                // A search result's menu is not drawn here: the dialog that owns the row draws it and
+                // answers it (`dialogs::result_menu`), because this menu is the *pane's* — its rows speak
+                // about the pane's selection, and a result row is not one. Getting here would mean a
+                // `MenuTarget::Result` had been adopted into the shell's slot, which nothing does.
+                (MenuAction::Result(_), ..) => {}
                 // Go's `custom-action-for-path` (`context-menu.js:710`): a folder menu's rows carry
                 // their own target, filtered *and* executed against the clicked path rather than
                 // against the pane's selection.
@@ -2410,22 +2415,44 @@ impl ZenApp {
     }
 
     /// Reveal one row in the folder that holds it — Go's `executeItemAction(…, 'reveal')`, which
-    /// `quick-find.js:321-325` hangs on the result row's right-click: navigate to the parent, make the
-    /// row the selection, scroll onto it.
+    /// `quick-find.js:321-325` hangs on the result row's right-click and `context-menu.js:690-698` on
+    /// the search menu's `Open Containing Folder`: navigate to the parent, make the row the selection,
+    /// scroll onto it.
     fn reveal_in_parent(&mut self, slot: PaneSlot, path: AbsPath) {
+        let Some(parent) = self.arm_reveal(slot, &path) else {
+            return;
+        };
+        self.navigate_shown(slot, parent);
+    }
+
+    /// The same, in a tab of its own — Go's `reveal-search-result-new-tab` (`:700-707`), which calls
+    /// `createTab(…, parentDir)` and then `switchTab`. [`Self::open_tab`] does both and lists the new
+    /// tab, so all that is left is the promise, which names the *tab that is now shown*.
+    fn reveal_in_new_tab(&mut self, slot: PaneSlot, path: AbsPath) {
+        let Some(parent) = self.arm_reveal(slot, &path) else {
+            return;
+        };
+        self.open_tab(slot, parent);
+    }
+
+    /// Promise the reveal, and answer the question both verbs ask first: which folder has to be
+    /// listed. `None`, with a toast, for a path with no parent — the filesystem root, which is a row
+    /// the index can hand back.
+    #[must_use]
+    fn arm_reveal(&mut self, slot: PaneSlot, path: &AbsPath) -> Option<FsPath> {
         let Some(parent) = path.parent() else {
             self.notices.post(
                 toast::Level::Warning,
                 format!("reveal: {} has no parent folder", path.to_string_lossy()),
             );
-            return;
+            return None;
         };
         self.reveal = Some(Reveal {
             slot,
-            path,
+            path: path.clone(),
             widened: false,
         });
-        self.navigate_shown(slot, FsPath::from_abs(parent));
+        Some(FsPath::from_abs(parent))
     }
 
     /// The second half of a reveal, once per frame: when the pane's listing carries the promised row,
@@ -2571,6 +2598,12 @@ impl ZenApp {
                 crate::dialogs::IndexOutcome::Activate { slot, path, is_dir } => {
                     self.activate_path(slot, path, is_dir);
                 }
+                crate::dialogs::IndexOutcome::Reveal { slot, path } => {
+                    self.reveal_in_parent(slot, path);
+                }
+                crate::dialogs::IndexOutcome::RevealInNewTab { slot, path } => {
+                    self.reveal_in_new_tab(slot, path);
+                }
                 crate::dialogs::IndexOutcome::Closed { rebuild } => {
                     // Escape is Go's `closeSearchManager`: the rebuild it started is cancelled, so a
                     // dismissed dialog never leaves a walk running behind the shell.
@@ -2608,6 +2641,9 @@ impl ZenApp {
                 }
                 crate::dialogs::QuickOutcome::Reveal { slot, path } => {
                     self.reveal_in_parent(slot, path);
+                }
+                crate::dialogs::QuickOutcome::RevealInNewTab { slot, path } => {
+                    self.reveal_in_new_tab(slot, path);
                 }
             }
             return;

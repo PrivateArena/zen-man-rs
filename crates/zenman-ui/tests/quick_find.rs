@@ -25,7 +25,7 @@ mod common;
 
 use std::path::{Path, PathBuf};
 
-use egui::Key;
+use egui::{Key, PointerButton, Pos2};
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 
@@ -39,6 +39,7 @@ use zenman_core::session::Origin;
 use zenman_core::store::config::{LayoutMode, PaneSlot};
 use zenman_ui::app::ZenApp;
 use zenman_ui::dialogs::Dialog;
+use zenman_ui::dialogs::ResultMenu;
 use zenman_ui::dialogs::quick_find::{QuickFind, deliver};
 use zenman_ui::keymap::{Chord, Command};
 use zenman_ui::state::{Tab, panes_for};
@@ -915,31 +916,188 @@ fn the_found_paths_are_the_matches_under_the_search_root() {
     );
 }
 
-// --------------------------------------------------------------------------- the row's reveal
+// ---------------------------------------------------------------------- the row's menu
+//
+// A right-click on a result row raises Go's search-result menu (`context-menu.js:173-197`) — the same
+// five rows the search manager raises (`search-manager.js:378-389`), so the gesture means one thing in
+// both dialogs. Go's find dialog skipped the menu and revealed straight away; the port kept the action
+// and gave it the menu that names it.
 
-/// Go's right-click on a result row is not a menu — it is `executeItemAction(index, 'reveal')`
-/// (`quick-find.js:321-325`, `:405-421`): close the overlay, open the row's folder, leave the row
-/// selected and on screen. The port's second half cannot happen in the same frame, because a folder
-/// the pane has never listed is a job, not a fact.
+/// The rows the menu draws, in the order the shell would paint them.
+fn menu_rows() -> Vec<String> {
+    let specs = ResultMenu::specs();
+    specs
+        .iter()
+        .flat_map(|group| group.iter())
+        .map(|spec| spec.label.clone())
+        .collect()
+}
+
+/// A raw pointer press+release at one point — for the space that is no node at all, the void outside a
+/// card being the case that needs it.
+fn click_at(harness: &mut Harness<'static, ZenApp>, at: Pos2) {
+    harness
+        .input_mut()
+        .events
+        .push(egui::Event::PointerMoved(at));
+    for pressed in [true, false] {
+        harness.input_mut().events.push(egui::Event::PointerButton {
+            pos: at,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        });
+    }
+    harness.run();
+}
+
+/// Click the `skip`-th node labelled `label`, in the order the frame allocated them, and stop on the
+/// frame that answered: two nodes can share a label — the footer's `Copy Name` button and the menu's
+/// `Copy Name` row — so a test that means one of them says which, and [`Harness::output`] only keeps
+/// the last frame's clipboard commands.
+fn click_node(harness: &mut Harness<'static, ZenApp>, label: &str, skip: usize) {
+    harness
+        .query_all_by_label(label)
+        .nth(skip)
+        .unwrap_or_else(|| panic!("no node named {label} #{skip}"))
+        .click();
+    harness.step();
+}
+
+/// Click a menu row by name, arming nothing: the name is unique to the menu.
+fn click_menu_row(harness: &mut Harness<'static, ZenApp>, label: &str) {
+    assert_eq!(
+        harness.query_all_by_label(label).count(),
+        1,
+        "{label} is not a menu row's unique name"
+    );
+    click_node(harness, label, 0);
+}
+
+/// Right-click a row, then arm the menu: the frame the press lands in draws nothing, because a menu that
+/// is asked for and drawn in one frame is closed again by the press that asked for it.
+fn right_click_row(harness: &mut Harness<'static, ZenApp>, name: &str) {
+    harness.get_by_label(name).click_secondary();
+    // Not merely "a menu exists": its rows only exist once it has been painted, which is the frame
+    // after the right-click. A click sent before that is a click on the card behind.
+    common::settle_until(harness, "the row's menu", |h| {
+        matches!(h.state().dialogs.active(),
+            Some(Dialog::QuickFind(f)) if f.menu_shown())
+    });
+}
+
+/// The five rows are the ones Go's `showSearchResultContextMenu` builds, in his order, and the right-click
+/// leaves the row under the cursor — `search-manager.js:380-384` selects before it shows.
 #[test]
-fn right_clicking_a_row_opens_its_folder_with_the_row_selected() {
-    let root = scratch("qf-reveal");
+fn right_clicking_a_row_raises_the_menu_on_that_row() {
+    let dir = common::listing_tree("qf-row-menu");
+    let mut harness = pane_harness("qf-row-menu", &dir);
+    open_find(&mut harness);
+    assert_eq!(
+        menu_rows(),
+        [
+            "Open",
+            "Open Containing Folder",
+            "Open Containing Folder in New Tab",
+            "Copy Path",
+            "Copy Name",
+        ]
+        .map(str::to_string),
+        "Go's five rows, in his order (`context-menu.js:175-193`)"
+    );
+    // A query first: with an empty field the dialog paints no rows, and the row the pointer would
+    // reach belongs to the pane behind. `row-04` matches rows the pane has not painted.
+    let rows = find_rows(&mut harness, "row-04");
+    assert_eq!(
+        rows.first().map(String::as_str),
+        Some("row-0400.txt"),
+        "the first of {} rows",
+        rows.len()
+    );
+    right_click_row(&mut harness, "row-0400.txt");
+    let at = quick_find(&harness);
+    assert_eq!(
+        at.cursor,
+        Some(0),
+        "the menu speaks about the row the pointer was on"
+    );
+    assert_eq!(
+        at.menu_target().map(|(path, _)| path),
+        Some(abs(&dir).join("row-0400.txt").expect("joins")),
+        "the row's own absolute path, not its folder's"
+    );
+    assert!(
+        shown(&harness).sel.is_empty(),
+        "a menu in a dialog selects nothing in the pane behind it"
+    );
+}
+
+/// `Copy Name` on a row writes the one name — and the card stays open with the menu gone, because
+/// copying is not an answer to anything. Legacy closed both dialogs for every menu row
+/// (`context-menu.js:683`); for a copy that only made the user open the dialog again.
+#[test]
+fn the_menu_copies_one_row_and_leaves_the_card_up() {
+    let root = scratch("qf-row-copy");
     common::remove_tree(&root);
     std::fs::create_dir_all(root.join("deep")).expect("fixture dir");
     for name in ["top.log", "deep/mid.log"] {
         std::fs::write(root.join(name), "x\n").expect("fixture file");
     }
-    let mut harness = pane_harness("qf-reveal", &root);
+    let mut harness = pane_harness("qf-row-copy", &root);
     open_find(&mut harness);
     edit_quick_find(&mut harness, |find| find.recursive = true);
     let rows = find_rows(&mut harness, ".log");
+    assert_eq!(rows, vec!["deep/mid.log", "top.log"], "both rows");
+    assert_eq!(copied_text(&harness), None, "no copy has happened yet");
+    right_click_row(&mut harness, "mid.log");
+    // Two nodes carry `Copy Name`: the footer's button (which would copy *every* match) and the menu's
+    // row, drawn after the card. The menu is the later one.
+    click_node(&mut harness, "Copy Name", 1);
     assert_eq!(
-        rows,
-        vec!["deep/mid.log".to_string(), "top.log".to_string()],
-        "the recursive walk, in `WalkDir`'s order"
+        copied_text(&harness).as_deref(),
+        Some("mid.log\n"),
+        "the row's name, and only the row's — `Copy Found` would have written both"
     );
-    harness.get_by_label("mid.log").click_secondary();
-    common::settle_until(&mut harness, "the revealed row", |h| {
+    let at = quick_find(&harness);
+    assert!(
+        at.menu_target().is_none(),
+        "a clicked menu does not stay open"
+    );
+    assert!(
+        harness
+            .state()
+            .dialogs
+            .active()
+            .is_some_and(|d| matches!(d, Dialog::QuickFind(_))),
+        "copying leaves the list up to be read"
+    );
+    let tab = shown(&harness);
+    assert_eq!(
+        tab.path.to_string(),
+        root.to_string_lossy(),
+        "and the pane behind stays where it was"
+    );
+}
+
+/// `Open Containing Folder`: Go's `reveal-search-result` (`context-menu.js:690-698`), which closes the
+/// search manager, navigates the pane to `parentDir` and leaves the row in `pathSelections[parentDir]`.
+/// The port's second half cannot happen in the same frame: a folder the pane never listed is a job, not a
+/// fact.
+#[test]
+fn the_menu_opens_the_row_s_folder_and_selects_the_row() {
+    let root = scratch("qf-menu-reveal");
+    common::remove_tree(&root);
+    std::fs::create_dir_all(root.join("deep")).expect("fixture dir");
+    for name in ["top.log", "deep/mid.log"] {
+        std::fs::write(root.join(name), "x\n").expect("fixture file");
+    }
+    let mut harness = pane_harness("qf-menu-reveal", &root);
+    open_find(&mut harness);
+    edit_quick_find(&mut harness, |find| find.recursive = true);
+    find_rows(&mut harness, ".log");
+    right_click_row(&mut harness, "mid.log");
+    click_menu_row(&mut harness, "Open Containing Folder");
+    common::settle_until(&mut harness, "the folder of the row", |h| {
         h.state().dialogs.active().is_none() && shown(h).sel.contains("mid.log")
     });
     let tab = shown(&harness);
@@ -953,13 +1111,159 @@ fn right_clicking_a_row_opens_its_folder_with_the_row_selected() {
         vec!["mid.log".to_string()],
         "the reveal is the whole selection, as Go's `selectedPaths.clear()` then `add` made it"
     );
+}
+
+/// `Open Containing Folder in New Tab` — Go's `reveal-search-result-new-tab` (`:700-707`), which calls
+/// `createTab(parentDir)` and then `switchTab`, so the pane's own tab is left alone and the row appears
+/// in a fresh one.
+#[test]
+fn the_new_tab_row_reveals_the_row_in_a_tab_of_its_own() {
+    let root = scratch("qf-menu-tab");
+    common::remove_tree(&root);
+    std::fs::create_dir_all(root.join("deep")).expect("fixture dir");
+    for name in ["top.log", "deep/mid.log"] {
+        std::fs::write(root.join(name), "x\n").expect("fixture file");
+    }
+    let mut harness = pane_harness("qf-menu-tab", &root);
+    let before = harness.state().model.panes[&PaneSlot::Left].tabs.len();
+    open_find(&mut harness);
+    edit_quick_find(&mut harness, |find| find.recursive = true);
+    find_rows(&mut harness, ".log");
+    right_click_row(&mut harness, "mid.log");
+    click_menu_row(&mut harness, "Open Containing Folder in New Tab");
+    common::settle_until(&mut harness, "the new tab", |h| {
+        h.state().dialogs.active().is_none() && shown(h).sel.contains("mid.log")
+    });
+    let pane = &harness.state().model.panes[&PaneSlot::Left];
+    assert_eq!(
+        pane.tabs.len(),
+        before + 1,
+        "the folder got a tab of its own, as Go's `createTab` gave it"
+    );
     assert!(
-        !harness
+        shown(&harness).path.to_string().ends_with("/deep"),
+        "and the pane now shows that tab"
+    );
+}
+
+// --------------------------------------------------------------------------- the mouse's doors
+//
+// Both search dialogs answer <kbd>Escape</kbd>, and always did. Everything else the user reaches for a
+// pointer — a ✕ on the card, a click outside it — is legacy's, not Go's (`quick-find.js:207-215` closes
+// on a document click; neither card has a close button, because a browser frames one for them).
+
+/// The ✕ at the end of the title row answers exactly what <kbd>Escape</kbd> answers, teardown included.
+#[test]
+fn the_close_button_in_the_title_row_answers_the_dialog() {
+    let dir = common::listing_tree("qf-close-x");
+    let mut harness = pane_harness("qf-close-x", &dir);
+    open_find(&mut harness);
+    find_rows(&mut harness, "row-04");
+    click_menu_row(&mut harness, "Close (Escape)");
+    common::settle_until(&mut harness, "the card gone", |h| {
+        h.state().dialogs.active().is_none()
+    });
+    assert!(
+        !harness.state().session.live_search().is_some_and(|_| false),
+        "the answer is the same one the key gives"
+    );
+}
+
+/// A press outside the card dismisses it — and on the frame the card appeared, it does not: the press
+/// that walked the user to the card must not also be the press that throws it away.
+#[test]
+fn a_click_outside_the_card_dismisses_it() {
+    let dir = common::listing_tree("qf-outside");
+    let mut harness = pane_harness("qf-outside", &dir);
+    open_find(&mut harness);
+    find_rows(&mut harness, "row-04");
+    // The card is centred; the far corner of the status bar is not on it, nor on any of its rows.
+    click_at(&mut harness, Pos2::new(20.0, 880.0));
+    common::settle_until(&mut harness, "the card gone", |h| {
+        h.state().dialogs.active().is_none()
+    });
+    assert!(
+        !shown(&harness).sel.contains("row-0400.txt"),
+        "dismissing a find selects nothing in the pane behind"
+    );
+}
+
+/// The press that opens a card is not the press that closes it. A pointer-driven open (a toolbar
+/// button, a menu row) puts both in the same frame, and a dialog that answered its own opening click
+/// would be impossible to open with the mouse at all.
+#[test]
+fn a_card_does_not_close_on_the_press_that_opened_it() {
+    let dir = common::listing_tree("qf-outside-open");
+    let mut harness = pane_harness("qf-outside-open", &dir);
+    // The click is queued before the frame that draws the card for the first time.
+    harness
+        .input_mut()
+        .events
+        .push(egui::Event::PointerMoved(Pos2::new(20.0, 880.0)));
+    for pressed in [true, false] {
+        harness.input_mut().events.push(egui::Event::PointerButton {
+            pos: Pos2::new(20.0, 880.0),
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        });
+    }
+    let ctx = harness.ctx.clone();
+    harness
+        .state_mut()
+        .dispatch(PaneSlot::Left, Command::QuickFind, &ctx);
+    harness.step();
+    assert!(
+        harness
             .state()
             .dialogs
             .active()
             .is_some_and(|d| matches!(d, Dialog::QuickFind(_))),
-        "Go closes the overlay to reveal (`:375`), and so does the port"
+        "the frame that opened the card is not the frame that closes it"
+    );
+    harness.run();
+    assert!(
+        harness
+            .state()
+            .dialogs
+            .active()
+            .is_some_and(|d| matches!(d, Dialog::QuickFind(_))),
+        "and the press does not leak into the frames after it"
+    );
+}
+
+/// A dismissed menu is not an answer: a press outside it takes the menu off and leaves the dialog, the
+/// cursor and the pane alone.
+#[test]
+fn a_click_outside_the_menu_only_takes_the_menu_off() {
+    let dir = common::listing_tree("qf-row-away");
+    let mut harness = pane_harness("qf-row-away", &dir);
+    open_find(&mut harness);
+    find_rows(&mut harness, "row-04");
+    right_click_row(&mut harness, "row-0404.txt");
+    // A press on a row *above* the anchor: inside the card, outside the menu, which hangs below.
+    harness.get_by_label("row-0400.txt").click();
+    common::settle_until(&mut harness, "the menu gone", |h| {
+        h.state()
+            .dialogs
+            .active()
+            .map(|d| match d {
+                Dialog::QuickFind(f) => f.menu_target().is_none(),
+                _ => false,
+            })
+            .unwrap_or(false)
+    });
+    let at = quick_find(&harness);
+    assert_eq!(
+        at.cursor,
+        Some(0),
+        "the card outlives its menu, and the click reached the row it landed on"
+    );
+    let tab = shown(&harness);
+    assert!(
+        tab.path.to_string().ends_with("/listing"),
+        "nothing was navigated: {}",
+        tab.path
     );
 }
 
@@ -979,7 +1283,8 @@ fn revealing_a_row_below_the_page_loads_the_rest_and_scrolls_onto_it() {
     find_rows(&mut harness, "row-04");
     // `row-0400.txt` sits past the loaded page of the pane's listing, and it is the first row the
     // dialog paints — so it is reachable by the pointer without any scrolling of the dialog.
-    harness.get_by_label("row-0400.txt").click_secondary();
+    right_click_row(&mut harness, "row-0400.txt");
+    click_menu_row(&mut harness, "Open Containing Folder");
     common::settle_until(&mut harness, "the far row", |h| {
         h.state().dialogs.active().is_none() && shown(h).sel.contains("row-0400.txt")
     });

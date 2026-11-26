@@ -19,6 +19,15 @@
 //!
 //! # What the port does differently, and why
 //!
+//! * **A right-click on a result row raises the menu, and the menu is the find dialog's.** Go wired
+//!   that row to `showSearchResultContextMenu` (`search-manager.js:378-389`) while the find dialog's
+//!   right-click revealed straight away (`quick-find.js:321-325`) — one gesture, two meanings. Both
+//!   rows now answer with [`menus::search_menu`]'s five, drawn by [`ResultMenu`]. Its two copy rows
+//!   also leave the card *open*, where Go closed it (`closeSearchManager()` runs for every one of his
+//!   rows, `context-menu.js:683`): copying a second path should not mean opening the panel twice.
+//! * **The pointer has two doors: a ✕ and a click outside.** Go had the second
+//!   (`search-manager.js:311-319`) and needed no first, because a browser frames its own dialogs. Both
+//!   answer exactly what <kbd>Escape</kbd> answers, rebuild-cancel included.
 //! * Go's status poll was a `setInterval` per open overlay; here the poll is 1 s **and** an
 //!   event-driven refresh on `EngineEvent::IndexChanged` ([`notify`]), so pressing Rebuild repaints the
 //!   status on the job's own terminal event instead of up to a second later — the same improvement
@@ -59,7 +68,10 @@ use zenman_core::store::config::PaneSlot;
 use crate::app::ZenApp;
 use crate::dialogs::confirm::modal_frame;
 use crate::dialogs::prompt::consume_key;
-use crate::dialogs::{Answer, Dialog, DialogKind};
+use crate::dialogs::result_menu::{MenuShot, ResultMenu, dismiss_by_click, pointer_at};
+use crate::dialogs::{Answer, Dialog, DialogKind, close_button};
+use crate::keymap::KeyMap;
+use crate::menus::ResultVerb;
 use crate::theme::Tokens;
 use crate::widgets::disk_meter::format_size;
 
@@ -278,12 +290,47 @@ pub enum IndexOutcome {
         /// Directory rows navigate; file rows open.
         is_dir: bool,
     },
+    /// A row's menu: `Open Containing Folder` — close the panel, navigate `slot` to the row's
+    /// **parent**, and select the row there. Go's `reveal-search-result` (`context-menu.js:690-698`).
+    Reveal {
+        /// The pane that owns the answer.
+        slot: PaneSlot,
+        /// The matched item, whose parent becomes the pane's directory.
+        path: AbsPath,
+    },
+    /// The same row's `… in New Tab` twin (`context-menu.js:700-707`).
+    RevealInNewTab {
+        /// The pane that gets the tab.
+        slot: PaneSlot,
+        /// The matched item, whose parent gets a tab of its own.
+        path: AbsPath,
+    },
     /// <kbd>Escape</kbd>: Go's `closeSearchManager`, which stops the rebuild poll. The shell cancels
     /// the rebuild job when one is still running.
     Closed {
         /// The rebuild job this opening started, if any.
         rebuild: Option<JobId>,
     },
+}
+
+impl IndexOutcome {
+    /// The answer a result row's menu gives, or `None` when the row copies instead: `Copy Path` and
+    /// `Copy Name` change no pane and close no panel, which is why they are not outcomes at all (and
+    /// why Go, which closed the manager for *every* menu row, made copying two paths into a ritual).
+    #[must_use]
+    pub fn from_verb(
+        verb: ResultVerb,
+        slot: PaneSlot,
+        path: AbsPath,
+        is_dir: bool,
+    ) -> Option<Self> {
+        match verb {
+            ResultVerb::Open => Some(Self::Activate { slot, path, is_dir }),
+            ResultVerb::Reveal => Some(Self::Reveal { slot, path }),
+            ResultVerb::RevealInNewTab => Some(Self::RevealInNewTab { slot, path }),
+            ResultVerb::CopyPath | ResultVerb::CopyName => None,
+        }
+    }
 }
 
 /// The dialog's state — the plan's `SearchManager { query, pills, page, limit, hits, matched, capped,
@@ -355,6 +402,11 @@ pub struct SearchManager {
     pub painted: usize,
     /// The engine's inbox (see [`drain`]).
     pub requests: Vec<ManagerRequest>,
+    /// A row's context menu, open (see [`ResultMenu`]).
+    menu: Option<ResultMenu>,
+    /// The answer a menu row gave, waiting for the next frame's [`Self::show`] to hand it over: the menu
+    /// is drawn after the card, so its click is one draw late.
+    pending: Option<IndexOutcome>,
 }
 
 impl SearchManager {
@@ -402,6 +454,8 @@ impl SearchManager {
             dispatched: 0,
             painted: 0,
             requests: Vec::new(),
+            menu: None,
+            pending: None,
         }
     }
 
@@ -456,6 +510,8 @@ impl SearchManager {
         self.matched = 0;
         self.capped = false;
         self.cursor = None;
+        // A menu over a row of a table that is about to be replaced speaks about nothing.
+        self.menu = None;
     }
 
     /// The request the field describes, once the debounce has elapsed (`None` while it holds, or when
@@ -488,6 +544,7 @@ impl SearchManager {
             return false;
         }
         self.hits = result.entries.clone();
+        self.menu = None;
         self.matched = usize::try_from(result.total_matched).unwrap_or(usize::MAX);
         self.capped = result.capped;
         self.cursor = if result.entries.is_empty() {
@@ -554,9 +611,49 @@ impl SearchManager {
     /// The row the cursor is on, as the path Go would act on.
     #[must_use]
     pub fn activate_target(&self) -> Option<(AbsPath, bool)> {
-        let hit = self.cursor.and_then(|ix| self.hits.get(ix))?;
+        self.cursor.and_then(|ix| self.hit_target(ix))
+    }
+
+    /// One row of the table, as the path it names and its kind. Both row verbs (Enter, and the menu's
+    /// five rows) need it, and a `rel_path` the index cannot answer is no row.
+    #[must_use]
+    pub fn hit_target(&self, ix: usize) -> Option<(AbsPath, bool)> {
+        let hit = self.hits.get(ix)?;
         let path = AbsPath::from_path(&hit.rel_path).ok()?;
         Some((path, hit.is_dir))
+    }
+
+    /// The row the open menu speaks about, as a path and a kind — `None` when no menu is up or the row
+    /// has left the table. Resolving it here (rather than handing out an index) is what lets the shell
+    /// act on a row that may have been refilled underneath it.
+    #[must_use]
+    pub fn menu_target(&self) -> Option<(AbsPath, bool)> {
+        self.menu.as_ref().and_then(|m| self.hit_target(m.row()))
+    }
+
+    /// `true` once the open menu has been *painted*, which is the first frame in which a click can reach
+    /// one of its rows: the frame it was asked for only arms it ([`ResultMenu`]'s one-frame wait).
+    #[must_use]
+    pub fn menu_shown(&self) -> bool {
+        self.menu.as_ref().is_some_and(|m| m.rect().is_some())
+    }
+
+    /// Open a row's menu, selecting the row first — Go's handler does exactly that
+    /// (`search-manager.js:380-384`: `selectedIndex = idx; highlightSelectedRow();`).
+    pub fn open_menu(&mut self, row: usize, at: egui::Pos2) {
+        self.cursor = Some(row);
+        self.menu = Some(ResultMenu::new(row, at));
+    }
+
+    /// Draw the open menu and report its click — the dialog's `drain` is the only caller, for the reason
+    /// [`ResultMenu`] opens with: the card is allocated on the menu's layer and *earlier*, so a menu
+    /// drawn where the pane's are drawn would sit under the dialog that asked for it.
+    #[must_use]
+    pub fn draw_menu(&mut self, keys: &KeyMap, tokens: &Tokens, ctx: &egui::Context) -> MenuShot {
+        match &mut self.menu {
+            Some(menu) => menu.show(keys, tokens, ctx),
+            None => MenuShot::Open,
+        }
     }
 
     /// Fold the draft's text buffers back into it (`worker_text` is a field of the plan's config).
@@ -585,6 +682,12 @@ impl SearchManager {
     /// Draw it; `Some(answer)` only when the user has closed it (the requests stay open — a config
     /// panel that vanished on Save would be a worse editor than Go's).
     pub fn show(&mut self, ui: &mut Ui, tokens: &Tokens) -> Option<Answer> {
+        // A menu row answered last frame. It is drawn *after* this method (the card is on the same layer
+        // and allocated later, so it would cover a menu drawn here), which makes its click arrive one
+        // draw late — and it outranks the keys, because the pointer already decided.
+        if let Some(outcome) = self.pending.take() {
+            return Some(self.answered(outcome));
+        }
         let enter = consume_key(ui, Key::Enter);
         let escape = consume_key(ui, Key::Escape);
         if consume_key(ui, Key::ArrowDown) {
@@ -593,7 +696,14 @@ impl SearchManager {
         if consume_key(ui, Key::ArrowUp) {
             self.move_cursor(-1);
         }
-        let mut outcome = if escape {
+        let menu_open = self.menu.is_some();
+        let mut outcome = if escape && menu_open {
+            // The menu is the top of the stack, so <kbd>Escape</kbd> takes it off rather than the panel
+            // underneath — one keypress, one thing closed, which is what Go's handler could not do
+            // (`search-manager.js:236` had no menu of its own to take off).
+            self.menu = None;
+            None
+        } else if escape {
             Some(IndexOutcome::Closed {
                 rebuild: self.rebuild,
             })
@@ -617,7 +727,13 @@ impl SearchManager {
         let watch_error = self.watch_error.clone();
         let mut clicked: Option<usize> = None;
         let mut activated: Option<usize> = None;
+        let mut close = false;
         let mut fresh = self.fresh;
+        // The frame the card appears in must not be the frame a click outside it answers: the press that
+        // opened it is still in this frame's input.
+        let opening = fresh;
+        // Where the menu was painted last frame, for the click-outside test at the end.
+        let menu_rect = self.menu.as_ref().and_then(|m| m.rect());
         let area = Area::new(ui.scope_id().with("zenman-search-manager"))
             .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
             .order(Order::Foreground)
@@ -625,6 +741,21 @@ impl SearchManager {
             .show(ui.ctx(), |ui| {
                 modal_frame(tokens, ui, width, |ui| {
                     ui.spacing_mut().item_spacing = Vec2::new(0.0, tokens.dialog_gap);
+                    // The panel's own door. Go's card has none — the browser frames every dialog
+                    // (`search-manager.html` has none either) and this card has no frame to inherit one
+                    // from, so before this the only way out with a pointer was a click outside.
+                    //
+                    // It rides a row of its own rather than sitting in the card's vertical directly: a
+                    // `with_layout` child placed in a vertical ui is given everything below the cursor,
+                    // which the shrink-wrapping `Area` then measures as its own height — the whole card
+                    // slid down off the screen, one frame after another.
+                    ui.horizontal(|ui| {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if close_button(ui, tokens) {
+                                close = true;
+                            }
+                        });
+                    });
                     // ---- the query field and its operator chips
                     ui.horizontal(|ui| {
                         let before = self.query.clone();
@@ -824,11 +955,26 @@ impl SearchManager {
                                         font.clone(),
                                         tokens.text_muted,
                                     );
-                                    if resp.clicked() {
+                                    // Read the row's own data *before* the verbs below, which need
+                                    // `&mut self` and so cannot run while `hit` is still borrowed.
+                                    let label = hit.name.clone();
+                                    if resp.secondary_clicked() {
+                                        // Go's `contextmenu` on a result row (`search-manager.js:378-389`):
+                                        // select it, then raise the menu — the same five rows the find
+                                        // dialog raises, so one gesture means one thing in both.
+                                        self.open_menu(ix, pointer_at(ui, &resp));
+                                    } else if resp.clicked() {
                                         clicked = Some(ix);
                                     } else if resp.double_clicked() {
                                         activated = Some(ix);
                                     }
+                                    // One accessible node per row, named like the find dialog's rows: a
+                                    // row the pointer can act on is a row the a11y tree should carry.
+                                    resp.widget_info(|| {
+                                        let mut info = egui::WidgetInfo::new(egui::Role::Button);
+                                        info.label = Some(label.as_str().into());
+                                        info
+                                    });
                                 }
                             });
                     } else {
@@ -945,7 +1091,19 @@ impl SearchManager {
                     }
                 });
             });
-        let _ = area;
+        // The two doors that are not the keyboard: the ✕ at the top of the card, and Go's document-level
+        // click handler (`search-manager.js:311-319`), which this panel had never honoured — the dim
+        // behind the card deliberately takes no input, so the test is the press against the card's rect
+        // (and the row menu's, which floats outside it) rather than a response from the dim.
+        let clicked_out = dismiss_by_click(ui, area.response.rect, menu_rect, opening);
+        if close || clicked_out {
+            self.menu = None;
+            if outcome.is_none() {
+                outcome = Some(IndexOutcome::Closed {
+                    rebuild: self.rebuild,
+                });
+            }
+        }
         if let Some(ix) = activated {
             self.cursor = Some(ix);
             outcome = self
@@ -959,10 +1117,16 @@ impl SearchManager {
             self.cursor = Some(ix);
         }
         self.fresh = fresh;
-        outcome.map(|outcome| Answer::Index {
+        outcome.map(|outcome| self.answered(outcome))
+    }
+
+    /// Wrap an outcome in the answer that carries it — the one place this panel's [`DialogKind`] is
+    /// spelled, so the menu's late answer and the keyboard's cannot drift apart.
+    fn answered(&self, outcome: IndexOutcome) -> Answer {
+        Answer::Index {
             kind: DialogKind::SearchManager { slot: self.slot },
             outcome,
-        })
+        }
     }
 }
 
@@ -1273,11 +1437,44 @@ pub fn notify(app: &mut ZenApp) {
 
 /// Run the dialog's requests (the shell's half of the one-way door: this is where the engine is
 /// called, after the draw, exactly like the pane commands).
-pub fn drain(app: &mut ZenApp) {
-    let requests = match app.dialogs.active_mut() {
-        Some(Dialog::SearchManager(m)) => std::mem::take(&mut m.requests),
-        _ => return,
+pub fn drain(app: &mut ZenApp, ctx: &egui::Context) {
+    // The panel is taken out rather than borrowed, because drawing its menu wants `&app.keys` and
+    // `&app.tokens` while the menu's own state lives inside the panel.
+    let Some(mut dialog) = app.dialogs.take() else {
+        return;
     };
+    let mut copy: Option<(AbsPath, bool)> = None;
+    let requests = if let Dialog::SearchManager(m) = &mut dialog {
+        match m.draw_menu(&app.keys, &app.tokens, ctx) {
+            MenuShot::Open => {}
+            MenuShot::Dismissed => m.menu = None,
+            MenuShot::Picked(verb) => {
+                // Resolved while the table is still the one the click landed on: a rebuild or a new
+                // query between now and the answer would make row 10 another file's row 10.
+                let target = m.menu_target();
+                m.menu = None;
+                if let Some((path, is_dir)) = target {
+                    match IndexOutcome::from_verb(verb, m.slot, path.clone(), is_dir) {
+                        // A navigating row answers, which is what closes the panel — Go's `open`,
+                        // `reveal` and `revealNewTab` rows each `closeSearchManager()` first
+                        // (`context-menu.js:683-706`).
+                        Some(outcome) => m.pending = Some(outcome),
+                        // A copying row answers nothing, so nothing closes: the point of the row is to
+                        // read a path off the table the user is still looking at.
+                        None => copy = Some((path, verb == ResultVerb::CopyName)),
+                    }
+                }
+            }
+        }
+        std::mem::take(&mut m.requests)
+    } else {
+        app.dialogs.put(dialog);
+        return;
+    };
+    app.dialogs.put(dialog);
+    if let Some((path, named)) = copy {
+        app.found_copy_text(std::slice::from_ref(&path), named, ctx);
+    }
     for request in requests {
         match request {
             ManagerRequest::Rebuild => match app.session.index_rebuild() {

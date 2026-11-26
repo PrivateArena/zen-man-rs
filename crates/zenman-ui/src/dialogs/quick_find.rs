@@ -38,12 +38,19 @@
 //!   met underneath: `Copy`/`Cut Found` go through [`Session::clipboard_store`], which publishes
 //!   `file://` URIs through `ops::clipboard::publish_system` exactly as Go's `writeToSystemClipboard`
 //!   did (`api/ops.go:549-575`), so no new clipboard dependency is involved.
-//! * **A reveal takes two frames.** Go's right-click on a row (`:321-325`) called
-//!   `executeItemAction(index, 'reveal')`, which navigated to the row's parent and selected the row on
-//!   a 150 ms timer — its tab had every entry in memory already. Here the parent may never have been
-//!   listed, so `QuickOutcome::Reveal` asks for the navigation and `ZenApp::apply_reveal` discharges
-//!   the promise on the frame the row exists (widening a paged listing once, the way the pane's own
-//!   `Load all items` does, when the row is past the page).
+//! * **A right-click raises the search manager's menu, not a reveal.** Go's handler called
+//!   `executeItemAction(index, 'reveal')` straight away (`:321-325`), and its manager raised
+//!   `showSearchResultContextMenu` — the same gesture meaning two different things in the two dialogs.
+//!   The port draws [`menus::search_menu`]'s five rows in both (see [`ResultMenu`]), with the reveal as
+//!   one of the rows it names.
+//! * **A reveal takes two frames.** Go's could not tell you that, because its tab held every entry in
+//!   memory and navigated on a 150 ms timer. Here the row's folder may never have been listed, so
+//!   `QuickOutcome::Reveal` asks for the navigation and `ZenApp::apply_reveal` discharges the promise
+//!   on the frame the row exists — widening a paged listing once, the way the pane's own
+//!   `Load all items` verb does, when the row is past the page.
+//! * **The pointer has two doors: a ✕ and a click outside.** Go had the second
+//!   (`quick-find.js:207-215`) and needed no first, because a browser frames its own dialogs. Both
+//!   answer exactly what <kbd>Escape</kbd> answers, cancel and all.
 //! * There is **no hidden-files toggle**, because Go has none (its live search never filtered
 //!   dot-files — plan §2.3), so the query keeps core's Go-parity [`HiddenPolicy::Include`].
 //! * Go persists the three toggles in `localStorage`; the port keeps them per-opening (plan D-list:
@@ -80,7 +87,10 @@ use zenman_core::store::config::PaneSlot;
 use crate::app::ZenApp;
 use crate::dialogs::confirm::modal_frame;
 use crate::dialogs::prompt::consume_key;
-use crate::dialogs::{Answer, Dialog, DialogKind};
+use crate::dialogs::result_menu::{MenuShot, ResultMenu, dismiss_by_click, pointer_at};
+use crate::dialogs::{Answer, Dialog, DialogKind, close_button};
+use crate::keymap::KeyMap;
+use crate::menus::ResultVerb;
 use crate::theme::Tokens;
 use crate::widgets::disk_meter::format_size;
 
@@ -182,16 +192,45 @@ pub enum QuickOutcome {
         /// Every match, in list order.
         paths: Vec<AbsPath>,
     },
-    /// Right-click on a row: Go's `executeItemAction(index, 'reveal')` (`:321-325`, `:405-421`) —
-    /// close the overlay, navigate `slot` to the row's **parent** directory, and select the row
-    /// there. The path is the row's own, not its parent's: *where* to look is the shell's business
-    /// once it has the row.
+    /// A row's menu: `Open Containing Folder` — close the card, navigate `slot` to the row's **parent**
+    /// directory, and select the row there. The path is the row's own, not its parent's: *where* to look
+    /// is the shell's business once it has the row. Go answers this row of the search manager's menu
+    /// here (`context-menu.js:690-698`); its find dialog had no menu, so right-click went straight to
+    /// the action (`quick-find.js:321-325`).
     Reveal {
         /// The pane that owns the answer.
         slot: PaneSlot,
         /// The matched item, whose parent becomes the pane's directory.
         path: AbsPath,
     },
+    /// The same row's `… in New Tab` twin (`context-menu.js:700-707`: `createTab(parent)`, then
+    /// `switchTab`, then `pathSelections[parent] = {path}` — which is this port's [`Self::Reveal`]
+    /// promise, made against a tab that did not exist a moment ago).
+    RevealInNewTab {
+        /// The pane that gets the tab.
+        slot: PaneSlot,
+        /// The matched item, whose parent gets a tab of its own.
+        path: AbsPath,
+    },
+}
+
+impl QuickOutcome {
+    /// The answer a result row's menu gives, or `None` when the row copies instead: `Copy Path` and
+    /// `Copy Name` change no pane and close no card, which is why they are not outcomes at all.
+    #[must_use]
+    pub fn from_verb(
+        verb: ResultVerb,
+        slot: PaneSlot,
+        path: AbsPath,
+        is_dir: bool,
+    ) -> Option<Self> {
+        match verb {
+            ResultVerb::Open => Some(Self::Activate { slot, path, is_dir }),
+            ResultVerb::Reveal => Some(Self::Reveal { slot, path }),
+            ResultVerb::RevealInNewTab => Some(Self::RevealInNewTab { slot, path }),
+            ResultVerb::CopyPath | ResultVerb::CopyName => None,
+        }
+    }
 }
 
 /// What a footer button asked the shell to do to the match set. Not an [`Answer`]: `Dialogs::show`
@@ -262,6 +301,11 @@ pub struct QuickFind {
     requested: Option<SearchQuery>,
     /// The footer's verbs, waiting for [`drain`] (which runs them as the shell, not as the dialog).
     pub requests: Vec<QuickRequest>,
+    /// A row's context menu, open (see [`ResultMenu`]).
+    menu: Option<ResultMenu>,
+    /// The answer a menu row gave, waiting for the next frame's [`Self::show`] to hand it over: the menu
+    /// is drawn after the card, so its click is one draw late.
+    pending: Option<QuickOutcome>,
 }
 
 impl QuickFind {
@@ -289,6 +333,8 @@ impl QuickFind {
             deferred: 0,
             requested: None,
             requests: Vec::new(),
+            menu: None,
+            pending: None,
         }
     }
 
@@ -305,8 +351,8 @@ impl QuickFind {
         self.cursor.and_then(|ix| self.hit_target(ix))
     }
 
-    /// One row of the list, as the path it names and its kind. The two row verbs (Enter, and the
-    /// right-click's reveal) both need it, and a `rel_path` the root cannot answer is no row.
+    /// One row of the list, as the path it names and its kind. Every row verb needs it — Enter, and
+    /// each of the menu's five — and a `rel_path` the root cannot answer is no row.
     #[must_use]
     pub fn hit_target(&self, ix: usize) -> Option<(AbsPath, bool)> {
         let hit = self.results.get(ix)?;
@@ -332,6 +378,39 @@ impl QuickFind {
             .iter()
             .filter_map(|hit| self.root.join_rel(&hit.rel_path).ok())
             .collect()
+    }
+
+    /// The row the open menu speaks about, as a path and a kind — `None` when no menu is up or the row
+    /// has left the list. Resolving it here (rather than handing out the index) is what lets the shell
+    /// act on a row that may have been refilled underneath it.
+    #[must_use]
+    pub fn menu_target(&self) -> Option<(AbsPath, bool)> {
+        self.menu.as_ref().and_then(|m| self.hit_target(m.row()))
+    }
+
+    /// `true` once the open menu has been *painted*, which is the first frame in which a click can
+    /// reach one of its rows: the frame it was asked for only arms it ([`ResultMenu`]'s one-frame wait).
+    #[must_use]
+    pub fn menu_shown(&self) -> bool {
+        self.menu.as_ref().is_some_and(|m| m.rect().is_some())
+    }
+
+    /// Open a row's menu. The row becomes the cursor first, exactly as the search manager's handler
+    /// selected it before asking for the menu (`search-manager.js:380-384`).
+    pub fn open_menu(&mut self, row: usize, at: egui::Pos2) {
+        self.cursor = Some(row);
+        self.menu = Some(ResultMenu::new(row, at));
+    }
+
+    /// Draw the open menu and report its click — a dialog's `drain` is the only caller, for the reason
+    /// [`ResultMenu`] opens with: the card is allocated on the menu's layer and *earlier*, so a menu
+    /// drawn where the pane's are drawn would sit under the dialog that asked for it.
+    #[must_use]
+    pub fn draw_menu(&mut self, keys: &KeyMap, tokens: &Tokens, ctx: &egui::Context) -> MenuShot {
+        match &mut self.menu {
+            Some(menu) => menu.show(keys, tokens, ctx),
+            None => MenuShot::Open,
+        }
     }
 
     /// Lift the footer's pending verbs out of the dialog, resolved to the paths they act on.
@@ -387,11 +466,14 @@ impl QuickFind {
         self.total = None;
         self.status = SearchStatus::default();
         self.cursor = None;
+        // A menu over a row of a list that is about to be replaced speaks about nothing.
+        self.menu = None;
     }
 
     /// Paint an answer the origin check accepted: rows, count, cursor to Go's first row.
     fn apply(&mut self, result: Arc<SearchResults>) {
         self.results = result.hits.clone();
+        self.menu = None;
         self.status = result.status.clone();
         self.total = Some(result.status.total_matched);
         self.cursor = if result.hits.is_empty() {
@@ -461,6 +543,12 @@ impl QuickFind {
     /// Draw it; `Some(answer)` once the user has answered (which closes the dialog — the
     /// teardown runs in `ZenApp::answer`, not here).
     pub fn show(&mut self, ui: &mut Ui, tokens: &Tokens) -> Option<Answer> {
+        // A menu row answered last frame. It is drawn *after* this method (the card is on the same layer
+        // and allocated later, so it would cover a menu drawn here), which makes its click arrive one
+        // draw late — and it outranks the keys, because the pointer already decided.
+        if let Some(outcome) = self.pending.take() {
+            return Some(self.answered(outcome));
+        }
         // Read the decisive keys *before* the field, and consume them (the prompt's rule: a
         // focused `TextEdit` would otherwise swallow <kbd>Enter</kbd>, and the arrows belong to
         // the list — `quick-find.js:329-343` binds them on the input itself).
@@ -472,7 +560,14 @@ impl QuickFind {
         if consume_key(ui, Key::ArrowUp) {
             self.move_cursor(-1);
         }
-        let mut outcome = if escape {
+        let menu_open = self.menu.is_some();
+        let mut outcome = if escape && menu_open {
+            // The menu is the top of the stack, so <kbd>Escape</kbd> takes it off rather than the card
+            // underneath: one keypress, one thing closed — what every desktop menu does, and what Go's
+            // handler could not (`quick-find.js:329` had no menu to close).
+            self.menu = None;
+            None
+        } else if escape {
             Some(QuickOutcome::Closed {
                 slot: self.slot,
                 job: self.job,
@@ -493,9 +588,14 @@ impl QuickFind {
         let title = format!("Finding in: {}", self.root.as_path().display());
         let mut clicked: Option<usize> = None;
         let mut activated: Option<usize> = None;
-        let mut revealed: Option<usize> = None;
+        let mut close = false;
         let mut delete_found = false;
         let mut fresh = self.fresh;
+        // The frame the card appears in must not be the frame a click outside it answers: the press that
+        // opened it (a chord, or the footer row of a menu) is still in this frame's input.
+        let opening = fresh;
+        // Where the menu was painted last frame, for the click-outside test below.
+        let menu_rect = self.menu.as_ref().and_then(|m| m.rect());
         let status = self.status_text();
         let error = self.error.clone();
         let show_empty = !self.busy
@@ -543,6 +643,14 @@ impl QuickFind {
                     });
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new(&title).color(tokens.text_muted));
+                        // The port's own door: Go's card has no close button, because the browser frames
+                        // every dialog (`index.html:566-571` has none) and this one has no frame to
+                        // inherit one from. It answers exactly what <kbd>Escape</kbd> answers.
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if close_button(ui, tokens) {
+                                close = true;
+                            }
+                        });
                     });
                     ui.horizontal(|ui| {
                         ui.label(
@@ -668,9 +776,13 @@ impl QuickFind {
                                                 );
                                             }
                                             if resp.secondary_clicked() {
-                                                // Go's right-click on a row (`:321-325`): not a menu, the
-                                                // reveal itself — `executeItemAction(index, 'reveal')`.
-                                                revealed = Some(ix);
+                                                // Go's `contextmenu` handler: the search manager selects the
+                                                // row and raises its menu (`search-manager.js:378-389`).
+                                                // The find dialog's handler revealed instead
+                                                // (`quick-find.js:321-325`), but a two-row answer to the
+                                                // manager's five would make one gesture mean two things,
+                                                // so both dialogs now mean [`menus::search_menu`].
+                                                self.open_menu(ix, pointer_at(ui, &resp));
                                             } else if resp.clicked() {
                                                 if resp.double_clicked() {
                                                     activated = Some(ix);
@@ -751,15 +863,19 @@ impl QuickFind {
         } else if let Some(ix) = clicked {
             self.cursor = Some(ix);
         }
-        // The reveal is Go's other row verb, and it closes the overlay for the same reason Enter
-        // does: the answer is a *navigation* of the pane, which the shell owns.
-        if revealed.is_some() && outcome.is_none() {
-            outcome = revealed
-                .and_then(|ix| self.hit_target(ix))
-                .map(|(path, _)| QuickOutcome::Reveal {
+        // The two doors that are not the keyboard: the ✕ at the end of the title row, and Go's
+        // document-level click handler (`quick-find.js:207-215`) — which this dialog had never honoured,
+        // because the dim behind the card deliberately takes no input, so the test is the press against
+        // the card's rect (and the row menu's, which floats outside it) rather than a response from it.
+        let clicked_out = dismiss_by_click(ui, area.response.rect, menu_rect, opening);
+        if close || clicked_out {
+            self.menu = None;
+            if outcome.is_none() {
+                outcome = Some(QuickOutcome::Closed {
                     slot: self.slot,
-                    path,
+                    job: self.job,
                 });
+            }
         }
         // <kbd>Escape</kbd> already answered the dialog above; a footer click in the same frame as a
         // dismissal is not a second answer, so the key wins.
@@ -773,10 +889,16 @@ impl QuickFind {
             }
         }
         self.fresh = fresh;
-        outcome.map(|outcome| Answer::Quick {
+        outcome.map(|outcome| self.answered(outcome))
+    }
+
+    /// Wrap an outcome in the answer that carries it — the one place this dialog's [`DialogKind`] is
+    /// spelled, so the menu's late answer and the keyboard's cannot drift apart.
+    fn answered(&self, outcome: QuickOutcome) -> Answer {
+        Answer::Quick {
             kind: DialogKind::QuickFind { slot: self.slot },
             outcome,
-        })
+        }
     }
 }
 
@@ -840,18 +962,54 @@ struct QuickBatch {
 /// same reason — a config panel
 /// and a find footer both have work to do that must not cost them their window.
 pub fn drain(app: &mut ZenApp, ctx: &egui::Context) {
-    let batch = match app.dialogs.active_mut() {
-        Some(Dialog::QuickFind(find)) => find.take_batch(),
-        _ => None,
+    // The dialog is taken out rather than borrowed, because drawing its menu wants `&app.keys` and
+    // `&app.tokens` while the menu's own state lives inside the dialog.
+    let Some(mut dialog) = app.dialogs.take() else {
+        return;
     };
-    let Some(batch) = batch else { return };
-    for request in &batch.requests {
-        match request {
-            QuickRequest::CopyFound => app.found_clipboard(&batch.paths, ClipOp::Copy),
-            QuickRequest::CutFound => app.found_clipboard(&batch.paths, ClipOp::Cut),
-            QuickRequest::CopyPaths => app.found_copy_text(&batch.paths, false, ctx),
-            QuickRequest::CopyNames => app.found_copy_text(&batch.paths, true, ctx),
+    let mut copy: Option<(AbsPath, bool)> = None;
+    let batch = if let Dialog::QuickFind(find) = &mut dialog {
+        match find.draw_menu(&app.keys, &app.tokens, ctx) {
+            MenuShot::Open => {}
+            MenuShot::Dismissed => find.menu = None,
+            MenuShot::Picked(verb) => {
+                // Resolved while the list is still the one the click landed on: by the next frame a walk
+                // may have refilled it, and row 10 would then be another file's row 10.
+                let target = find.menu_target();
+                find.menu = None;
+                if let Some((path, is_dir)) = target {
+                    match QuickOutcome::from_verb(verb, find.slot, path.clone(), is_dir) {
+                        // A navigating row answers, which is what closes the card — Go's `open`, `reveal`
+                        // and `revealNewTab` rows each `closeSearchManager()` first
+                        // (`context-menu.js:683-706`). It is the *card* that answers, not this function,
+                        // so the reveal's promise is armed inside `ZenApp::answer`: the frame that
+                        // removes the card is the frame that starts the listing.
+                        Some(outcome) => find.pending = Some(outcome),
+                        // A copying row answers nothing, so nothing closes: the point of the row is to
+                        // read a path off the list the user is still looking at.
+                        None => copy = Some((path, verb == ResultVerb::CopyName)),
+                    }
+                }
+            }
         }
+        find.take_batch()
+    } else {
+        app.dialogs.put(dialog);
+        return;
+    };
+    app.dialogs.put(dialog);
+    if let Some(batch) = batch {
+        for request in &batch.requests {
+            match request {
+                QuickRequest::CopyFound => app.found_clipboard(&batch.paths, ClipOp::Copy),
+                QuickRequest::CutFound => app.found_clipboard(&batch.paths, ClipOp::Cut),
+                QuickRequest::CopyPaths => app.found_copy_text(&batch.paths, false, ctx),
+                QuickRequest::CopyNames => app.found_copy_text(&batch.paths, true, ctx),
+            }
+        }
+    }
+    if let Some((path, named)) = copy {
+        app.found_copy_text(std::slice::from_ref(&path), named, ctx);
     }
 }
 

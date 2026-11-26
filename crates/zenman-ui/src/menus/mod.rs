@@ -18,7 +18,8 @@
 //! | `showContextMenu` (`context-menu.js:42-131`) — a row, or the empty pane | [`file_menu`] (`MenuTarget::Row` / `Background`) |
 //! | `showFolderContextMenu` (`:134-156`), the breadcrumb (`navigation.js:215`) and sidebar (`sidebar.js:36,93,131`) | [`folder_menu`], wired to the breadcrumb chips by [`crate::panels::breadcrumb`] |
 //! | `showTabContextMenu` (`tabs.js:351-386`) | [`tab_menu`] |
-//! | `showSearchResultContextMenu` (`:159-177`) | [`search_menu`] |
+//! | `showSearchResultContextMenu` (`:173-197`) | [`search_menu`], drawn by [`crate::dialogs::ResultMenu`]
+//!   over a row of either search dialog's list |
 //! | *no header/tray menu exists in Go at all* (`index.html:623` is the single `#context-menu` div) | none built |
 //!
 //! Deviations from the plan row, each with its reason:
@@ -55,9 +56,12 @@
 //!   `patterns` filter is that step's, and a click on a custom row is reported, never run.
 //! * **Tab groups** ([`tab_menu`]'s greyed rows) are step **14**'s workspaces; `Duplicate Tab` is here
 //!   ([`Command::DuplicateTab`]), the six group rows are not.
-//! * **Open Containing Folder** ([`search_menu`]'s missing rows): the shell half landed with quick
-//!   find's right-click — [`ZenApp::reveal_in_parent`](crate::app::ZenApp) navigates and selects — but
-//!   the rows themselves wait on a menu aimed at a *path* rather than at a pane's selection.
+//! * **The `MenuTarget::Result` rows are drawn by their dialog, not by the shell.** A pane's menu is
+//!   the shell's own (`ZenApp::draw_menu`), built from the shown tab's selection and dispatched
+//!   against it. A search result is neither, and the card would cover a menu drawn where the panes'
+//!   menus are drawn — so [`crate::dialogs::ResultMenu`] draws [`search_menu`] itself, from the
+//!   dialog's `drain`. `menu_for`'s `MenuTarget::Result` arm is what it would answer through the
+//!   shell's slot, which is why it exists and why nothing uses it.
 
 use egui::text::LayoutJob;
 use egui::{
@@ -85,15 +89,93 @@ pub enum MenuAction {
     /// tabs it lands on is resolved from the menu's own target when the row is clicked
     /// (`docs/tab-groups-design.md` §6), so the spec stays the data this module insists on being.
     Group(GroupVerb),
+    /// One row of a **search result's** menu ([`search_menu`], Go's `showSearchResultContextMenu`,
+    /// `search-manager.js:376-390`). Not a [`Command`] either, for [`Self::Group`]'s reason: the
+    /// keyboard has no binding for "open the folder that holds this row", and adding one to
+    /// [`Command::ALL`] would put a chord on a verb Go never gave it. Which *row* is the owner's
+    /// business — the path is not in the spec, so the spec stays data.
+    Result(ResultVerb),
 }
 
 impl MenuAction {
-    /// The [`Command`] half, `None` for a custom action and for a placeholder.
+    /// The [`Command`] half — what clicking the row *runs* — `None` for a custom action, a tab-group
+    /// verb and a search-result row, whose verbs belong to the menu's owner, not to the keymap.
     #[must_use]
     pub fn command(&self) -> Option<Command> {
         match self {
             Self::Command(command) => Some(*command),
+            Self::Custom(_) | Self::Group(..) | Self::Result(..) => None,
+        }
+    }
+
+    /// The [`Command`] whose *binding* the row prints, which is not always the one it runs: a
+    /// [`Self::Result`] row acts on a path the pane has not selected, so [`Self::command`] is `None` for
+    /// it and would print no hint, while `context-menu.js:177` prints `open`'s chord beside the words.
+    /// Two accessors, because *what to run* and *what to say* are genuinely different questions here.
+    #[must_use]
+    pub fn chord(&self) -> Option<Command> {
+        match self {
+            Self::Command(command) => Some(*command),
+            Self::Result(verb) => verb.command(),
             Self::Custom(_) | Self::Group(..) => None,
+        }
+    }
+}
+
+/// What a search result's menu row does to the row it was opened over — Go's five `data-action`s
+/// (`context-menu.js:175-193`), in its order. The two containing-folder rows are spelled `Reveal` /
+/// `RevealInNewTab` because that is what the shell calls the action (`ZenApp::reveal_in_parent`, and
+/// Go's own `reveal-search-result*` handlers beside it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResultVerb {
+    /// Go's `data-action="open"`: a folder navigates, a file opens — the row's own double-click.
+    Open,
+    /// `data-action="reveal"` — open the row's folder in the pane.
+    Reveal,
+    /// `data-action="revealNewTab"` — the same, in a tab of its own.
+    RevealInNewTab,
+    /// `data-action="copyPath"` — the row's own absolute path, as text.
+    CopyPath,
+    /// `data-action="copyName"` — just its name.
+    CopyName,
+}
+
+impl ResultVerb {
+    /// Go's exact wording (`context-menu.js:176-192`), which is the label the row prints.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Open => "Open",
+            Self::Reveal => "Open Containing Folder",
+            Self::RevealInNewTab => "Open Containing Folder in New Tab",
+            Self::CopyPath => "Copy Path",
+            Self::CopyName => "Copy Name",
+        }
+    }
+
+    /// The rows that move the pane, and therefore close the dialog that asked ([`ResultVerb::Open`]
+    /// and the two reveals); `false` for the two copy rows, which leave the dialog where it is.
+    ///
+    /// Go closes the search manager on every row (`closeSearchManager()` at `:683,691,701`) — the copy
+    /// rows included, which is a bad day for anyone copying two paths, so the port keeps the card up for
+    /// them and drops it only when the pane is about to change underneath it.
+    #[must_use]
+    pub const fn navigates(self) -> bool {
+        matches!(self, Self::Open | Self::Reveal | Self::RevealInNewTab)
+    }
+
+    /// The keyboard's own verb for the same words, `None` when it has none. [`Self::label`]'s partner:
+    /// `context-menu.js:177,188-192` prints `getShortcutDisplay('open'|'copy-path'|'copy-name')` beside
+    /// these rows, and the port prints a hint only when the keymap really owns it — which is why the two
+    /// folder rows have none, and why [`Command::Reveal`] (reveal in the *operating system's* file
+    /// manager) is not the command behind `Open Containing Folder`.
+    #[must_use]
+    pub const fn command(self) -> Option<Command> {
+        match self {
+            Self::Open => Some(Command::Open),
+            Self::CopyPath => Some(Command::CopyPath),
+            Self::CopyName => Some(Command::CopyName),
+            Self::Reveal | Self::RevealInNewTab => None,
         }
     }
 }
@@ -141,6 +223,11 @@ pub enum MenuTarget {
         /// Whether the run is folded, which is what decides the label of the collapse row.
         collapsed: bool,
     },
+    /// One row of a search result list — the find dialog's or the search manager's. Which row is not
+    /// here (a path is not `Copy`, and [`MenuContext`] carries this enum) and not in
+    /// [`MenuAction::Result`] either: the dialog that owns the menu holds the row and resolves it,
+    /// exactly as [`Self::Tab`] holds an id its owner resolves.
+    Result,
 }
 
 /// Everything a builder may ask about. Every field is derived by
@@ -247,7 +334,8 @@ impl MenuSpec {
     /// The chord this command answers, straight out of the keymap (D7 — never a copy of it).
     #[must_use]
     pub fn chord(&self, keys: &KeyMap) -> Option<Chord> {
-        self.command()
+        self.action
+            .chord()
             .and_then(|command| keys.bindings_for(command).first().copied())
     }
 
@@ -343,7 +431,10 @@ pub fn file_menu(
         MenuTarget::Background
         | MenuTarget::Folder
         | MenuTarget::Tab { .. }
-        | MenuTarget::TabGroup { .. } => {
+        | MenuTarget::TabGroup { .. }
+        // [`menu_for`] answers [`MenuTarget::Result`] with [`search_menu`] above; like the other three,
+        // it never reaches here.
+        | MenuTarget::Result => {
             let mut groups = vec![vec![
                 item(Command::Paste, paste_here, icon_paste(ctx)),
                 item(Command::PasteLink, paste_link_here, Some("link")),
@@ -428,6 +519,9 @@ pub fn menu_for(
         MenuTarget::Folder => folder_menu(actions, sel),
         MenuTarget::Tab { .. } => tab_menu(ctx.tab_count.max(1)),
         MenuTarget::TabGroup { collapsed, .. } => group_menu(collapsed),
+        // Reached by nobody yet: a dialog's menu is built by [`crate::dialogs::ResultMenu`], which has
+        // no pane to ask for a target. Here so that `MenuTarget` picks its builder in one place.
+        MenuTarget::Result => search_menu(),
         MenuTarget::Background | MenuTarget::Row { .. } => file_menu(ctx, sel, actions),
     }
 }
@@ -577,21 +671,40 @@ fn in_group(ctx: &MenuContext) -> bool {
     ctx.in_group
 }
 
-/// A search-result menu (Go's `showSearchResultContextMenu`, `context-menu.js:159-177`).
+/// A search-result menu (Go's `showSearchResultContextMenu`, `context-menu.js:173-197`), which is what
+/// **both** search dialogs answer a right-click with: the search manager raises it straight
+/// (`search-manager.js:378-389`) and the find dialog used to skip it — Go's `quick-find.js:321-325` went
+/// to `executeItemAction(index, 'reveal')` — but a two-row answer to the manager's five makes the same
+/// gesture mean two things, so the port gave the find dialog the manager's menu instead of the reverse.
 ///
-/// `Open Containing Folder` and its `… in New Tab` twin (`:164-169`) are the search manager's, i.e.
-/// step 12's — they need a *path* target, not the pane's selection, so they are not here yet. The
-/// action itself is: quick find's right-click goes straight to
-/// [`ZenApp::reveal_in_parent`](crate::app::ZenApp), which is the row Go's menu would have run.
+/// No row is greyed: every one acts on the row's own path, which always exists and is never read-only
+/// in the way a listing's Delete is. The `… in New Tab` twin keeps Go's adjacency (`:182-183`, no
+/// separator between the three) and the copy pair keeps its (`:185`).
 #[must_use]
 pub fn search_menu() -> Vec<Vec<MenuSpec>> {
     shrink(vec![
-        vec![item(Command::Open, always, Some("external-link"))],
         vec![
-            item(Command::CopyPath, always, Some("document")),
-            item(Command::CopyName, always, Some("file")),
+            result_item(ResultVerb::Open, Some("external-link")),
+            result_item(ResultVerb::Reveal, Some("folder-open")),
+            result_item(ResultVerb::RevealInNewTab, Some("plus")),
+        ],
+        vec![
+            result_item(ResultVerb::CopyPath, Some("document")),
+            result_item(ResultVerb::CopyName, Some("file")),
         ],
     ])
+}
+
+/// One of [`search_menu`]'s rows. `MenuTarget::Result`, so a row can never be read as a row of the
+/// listing behind the dialog.
+fn result_item(verb: ResultVerb, icon: Option<&'static str>) -> MenuSpec {
+    spec(
+        MenuAction::Result(verb),
+        verb.label().to_string(),
+        icon,
+        false,
+        always,
+    )
 }
 
 /// The custom-action group: `services::actions::for_context`, the same predicate the action
@@ -1446,7 +1559,7 @@ mod tests {
             .flatten()
             .filter_map(|spec| match &spec.action {
                 MenuAction::Custom(a) => Some(a.name.as_str()),
-                MenuAction::Command(_) | MenuAction::Group(..) => None,
+                MenuAction::Command(_) | MenuAction::Group(..) | MenuAction::Result(..) => None,
             })
             .collect();
         assert_eq!(names, ["on-files", "everywhere"]);
@@ -1468,7 +1581,7 @@ mod tests {
             .flatten()
             .filter_map(|spec| match &spec.action {
                 MenuAction::Custom(a) => Some(a.name.clone()),
-                MenuAction::Command(_) | MenuAction::Group(..) => None,
+                MenuAction::Command(_) | MenuAction::Group(..) | MenuAction::Result(..) => None,
             })
             .collect();
         assert_eq!(dir_names, ["on-dirs", "everywhere"]);
@@ -1479,7 +1592,7 @@ mod tests {
             .flatten()
             .filter_map(|spec| match &spec.action {
                 MenuAction::Custom(a) => Some(a.name.clone()),
-                MenuAction::Command(_) | MenuAction::Group(..) => None,
+                MenuAction::Command(_) | MenuAction::Group(..) | MenuAction::Result(..) => None,
             })
             .collect();
         assert_eq!(bg_names, ["everywhere", "bg-only"]);
@@ -1594,13 +1707,17 @@ mod tests {
                 .any(|spec| spec.label == "Expand Group"),
             "the fold's row says which way it goes"
         );
-        // `showSearchResultContextMenu` (`context-menu.js:159-177`) minus the step-12 rows.
+        // `showSearchResultContextMenu` (`context-menu.js:173-197`): Go's five rows, in its order, with
+        // the chords its own `getShortcutDisplay` prints (`:177,188-192`) — and none on the two rows the
+        // keyboard has no verb for.
         assert_eq!(
             labels(&search_menu()),
             [
                 "Open Enter",
-                "Copy path Alt+Shift+C",
-                "Copy name Ctrl+Alt+C",
+                "Open Containing Folder ",
+                "Open Containing Folder in New Tab ",
+                "Copy Path Alt+Shift+C",
+                "Copy Name Ctrl+Alt+C",
             ]
         );
         // The folder and search menus have nothing to be greyed by: their target is the click.
