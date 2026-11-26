@@ -41,6 +41,7 @@ use crate::panels::file_pane::PaneCommand;
 use crate::panels::header::HeaderCommand;
 use crate::state::FlatMode;
 use crate::theme::Tokens;
+use crate::zoom::ZoomStatus;
 
 /// The current state of everything the bar shows.
 pub struct NavBarModel<'a> {
@@ -62,6 +63,9 @@ pub struct NavBarModel<'a> {
     pub left_drawer: bool,
     /// The custom-actions drawer is open.
     pub right_drawer: bool,
+    /// The window's zoom level, and the two bounds of the parent menu's row (`zoom.rs`). One per
+    /// window, like the drawers: the scale is what the *window* is drawn at, not what one pane is.
+    pub zoom: ZoomStatus,
     /// The chord text the tooltips quote (`F3`, `Ctrl+H`) — [`crate::keymap::KeyMap::hint_text`],
     /// never a second table (plan **D7**).
     pub hints: NavBarHints,
@@ -177,7 +181,7 @@ pub fn show(
             ui.spacing_mut().item_spacing = vec2(tokens.nav_gap, 0.0);
             // First allocated, so — right to left — furthest right: the parent button owns the corner
             // a browser's user already reads as "the rest of this toolbar".
-            app_menu::show(ui, tokens, &menu_entries(m), out, global);
+            app_menu::show(ui, tokens, &menu_entries(m), m.zoom, out, global);
             if !folded.is_empty() {
                 draw_overflow(ui, tokens, &folded, m, out, global);
             }

@@ -694,6 +694,28 @@ impl Session {
         Ok(bookmarks)
     }
 
+    /// The shell's UI zoom, in per cent ([`ZenConfig::zoom_percent`]): the same write path as the
+    /// bookmarks' — validate, save atomically, adopt — so a zoom click and a favourite click cannot
+    /// end up with two different ideas about what `config.json` holds.
+    ///
+    /// The *level* is the shell's business (its `zoom.rs` does the stepping and the debouncing); this
+    /// is only the durability half, which is why it takes a per cent rather than a scale factor.
+    ///
+    /// # Errors
+    /// As [`ZenConfig::validate`] — out of range is refused before anything is written — plus
+    /// [`CoreError::Io`] for the write itself.
+    pub fn set_zoom_percent(&self, percent: u32) -> Result<(), CoreError> {
+        let mut candidate = self.config();
+        if candidate.zoom_percent == percent {
+            return Ok(());
+        }
+        candidate.zoom_percent = percent;
+        candidate.validate()?;
+        candidate.save(&self.inner.paths.config)?;
+        *lock(&self.inner.config) = candidate;
+        Ok(())
+    }
+
     /// Run `f` with the single connection.
     ///
     /// This — not a stored `Connection` — is what plan §5.4's "the DB is a private field" correction
@@ -2625,7 +2647,9 @@ mod tests {
 
     use crate::path::FsPath;
     use crate::platform::stub::Unsupported;
-    use crate::store::config::ZenConfig;
+    use crate::store::config::{
+        DEFAULT_ZOOM_PERCENT, MAX_ZOOM_PERCENT, MIN_ZOOM_PERCENT, ZenConfig,
+    };
     use std::fs;
     use std::path::PathBuf;
 
@@ -2785,6 +2809,88 @@ mod tests {
             before,
             "a refusal changes no bytes"
         );
+        drop(again);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn the_zoom_level_round_trips_through_the_settings_file_and_a_refusal_changes_nothing() {
+        // The parent menu's `− | 100% | +` row is the shell's, the *level* is `config.json`'s: a
+        // restart has to come back at the same scale, which is what `zenman-ui`'s `zoom.rs` pays this
+        // write path for.
+        let dir = temp_dir("zoom");
+        let paths = paths(&dir);
+        let (session, _notes) = Session::open(
+            paths.clone(),
+            ZenConfig::default(),
+            Arc::new(Unsupported::new()),
+            crate::limits::Limits::default(),
+        )
+        .expect("a session opens over a fresh directory");
+        assert_eq!(
+            session.config().zoom_percent,
+            DEFAULT_ZOOM_PERCENT,
+            "a fresh shell is at the native scale"
+        );
+        session
+            .set_zoom_percent(110)
+            .expect("a level inside the range is written");
+        assert_eq!(session.config().zoom_percent, 110, "the live config agrees");
+        assert_eq!(
+            ZenConfig::load(&paths.config)
+                .expect("the written file parses")
+                .zoom_percent,
+            110,
+            "and the file carries it"
+        );
+        // The same level again is the no-op the shell's debounce relies on, not a second write.
+        let before = fs::read(&paths.config).expect("the file is there");
+        session
+            .set_zoom_percent(110)
+            .expect("writing the current level is not an error");
+        assert_eq!(
+            fs::read(&paths.config).expect("the file is still there"),
+            before,
+            "and it changes no bytes"
+        );
+        drop(session);
+        let (again, _notes) = Session::open(
+            paths.clone(),
+            ZenConfig::load(&paths.config).expect("reopen reads what was written"),
+            Arc::new(Unsupported::new()),
+            crate::limits::Limits::default(),
+        )
+        .expect("the session reopens on the saved level");
+        assert_eq!(
+            again.config().zoom_percent,
+            110,
+            "the level survives a restart"
+        );
+        // --- refusals: a hand-edited level outside egui's own zoom range is a mistake, not a clamp
+        for percent in [MIN_ZOOM_PERCENT - 1, MAX_ZOOM_PERCENT + 1, 10_000] {
+            let err = again
+                .set_zoom_percent(percent)
+                .expect_err("a level egui cannot draw at is refused");
+            assert!(matches!(err, CoreError::Config { .. }), "{err}");
+        }
+        assert_eq!(
+            again.config().zoom_percent,
+            110,
+            "a refusal changes no value"
+        );
+        assert_eq!(
+            fs::read(&paths.config).expect("the file is still there"),
+            before,
+            "a refusal changes no bytes"
+        );
+        // Both ends of the range *are* writable: `Ctrl`+`-` and `Ctrl`+`+` reach them, and a level the
+        // keyboard can ask for but the file refuses to hold would be lost on the next restart.
+        again
+            .set_zoom_percent(MIN_ZOOM_PERCENT)
+            .expect("the floor is a level");
+        again
+            .set_zoom_percent(MAX_ZOOM_PERCENT)
+            .expect("the ceiling is a level");
         drop(again);
         cleanup(&dir);
     }

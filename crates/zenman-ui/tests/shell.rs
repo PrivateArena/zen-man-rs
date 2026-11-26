@@ -171,6 +171,61 @@ fn chrome_controls_reach_the_widget_tree_and_the_layout_button_reaches_the_state
 }
 
 #[test]
+fn the_zoom_row_steps_the_shell_and_the_level_reaches_the_config() {
+    let mut harness = harness();
+    harness.run();
+    // The row is the parent menu's, and its three cells carry a name even where they show a glyph.
+    for name in ["zoom out", "reset zoom", "zoom in"] {
+        assert_eq!(
+            harness.query_all_by_label(name).count(),
+            0,
+            "{name:?} belongs to the menu, and the menu is closed"
+        );
+    }
+    open_app_menu(&mut harness);
+    for name in ["zoom out", "reset zoom", "zoom in"] {
+        assert!(
+            harness.query_all_by_label(name).count() > 0,
+            "{name:?} is not in the widget tree"
+        );
+    }
+    assert_eq!(
+        harness.state().zoom.percent(),
+        100,
+        "the config's own default level"
+    );
+    // One click is ten per cent, printed, and handed to egui (`zoom.rs`).
+    click_chrome(&mut harness, "zoom in");
+    assert_eq!(harness.state().zoom.percent(), 110);
+    assert!(
+        (harness.ctx.zoom_factor() - 1.1).abs() < 0.001,
+        "the whole UI follows the row"
+    );
+    assert_eq!(harness.state().zoom.status().caption(), "110%");
+    click_chrome(&mut harness, "zoom out");
+    click_chrome(&mut harness, "zoom out");
+    assert_eq!(harness.state().zoom.percent(), 90);
+    assert!(
+        (harness.ctx.zoom_factor() - 0.9).abs() < 0.001,
+        "and the row can go back down past where it started"
+    );
+    // The level the row is at is the level the next boot starts at, through the shell's own flush —
+    // the one `flush_session` calls on the way out, debounce ignored.
+    harness
+        .state_mut()
+        .flush_zoom()
+        .expect("the level is writable");
+    assert_eq!(harness.state().session.config().zoom_percent, 90);
+    // The middle cell is the reset, and it is inert at 100% — so it is reached for from 90%.
+    click_chrome(&mut harness, "reset zoom");
+    assert_eq!(harness.state().zoom.percent(), 100);
+    assert!(
+        (harness.ctx.zoom_factor() - 1.0).abs() < 0.001,
+        "and the scale is the native one again"
+    );
+}
+
+#[test]
 fn the_parent_menu_survives_its_tiles_and_closes_only_when_it_is_told_to() {
     let mut harness = harness();
     harness.run();

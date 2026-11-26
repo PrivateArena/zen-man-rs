@@ -159,6 +159,9 @@ pub struct ZenApp {
     pub theme: ThemeMode,
     /// The design tokens for the current theme.
     pub tokens: Tokens,
+    /// The UI zoom (`zoom.rs`): the parent menu's `− | 100% | +` row, egui's scale factor, and
+    /// `config.json`'s `zoomPercent`.
+    pub zoom: crate::zoom::Zoom,
     /// The boot report lines (GPU profile, startup notes): the first one is the status bar's note.
     pub boot_lines: Vec<String>,
     /// The context menu a panel asked for last frame, waiting to be adopted by
@@ -210,6 +213,7 @@ impl ZenApp {
     #[must_use]
     pub fn new(session: Session, boot_lines: Vec<String>) -> Self {
         let theme = session.config().theme;
+        let zoom = crate::zoom::Zoom::from_config(session.config().zoom_percent);
         let persist = Persisted::memory();
         let layout = persist.settings.get().layout;
         Self {
@@ -221,6 +225,7 @@ impl ZenApp {
             persist,
             theme,
             tokens: Tokens::default(),
+            zoom,
             boot_lines,
             context_request: None,
             menu: None,
@@ -244,6 +249,7 @@ impl ZenApp {
     #[must_use]
     pub fn with_persist(session: Session, boot_lines: Vec<String>, persist: Persisted) -> Self {
         let theme = session.config().theme;
+        let zoom = crate::zoom::Zoom::from_config(session.config().zoom_percent);
         let layout = persist.settings.get().layout;
         let mut app = Self {
             dock: dock::default_workspace(layout),
@@ -254,6 +260,7 @@ impl ZenApp {
             persist,
             theme,
             tokens: Tokens::default(),
+            zoom,
             boot_lines,
             context_request: None,
             menu: None,
@@ -924,6 +931,16 @@ impl ZenApp {
         self.reload_stale();
         let now = Instant::now();
         self.last_frame = now;
+        // The zoom's frame tick: hand egui the level the row or the chord asked for, and write it to
+        // `config.json` once its own debounce has elapsed (`zoom.rs`).
+        if let Some(percent) = self.zoom.tick(ctx, now)
+            && let Err(e) = self.session.set_zoom_percent(percent)
+        {
+            self.notices.post(
+                toast::Level::Error,
+                format!("could not save the zoom: {}", e.user_message()),
+            );
+        }
         let dock_moved = dock::persist_pending(ctx, now);
         if dock_moved {
             let snap = self.snapshot();

@@ -20,6 +20,10 @@
 //! accessible name, so the word on screen is the word a test or a screen reader uses), a hover
 //! line that may repeat it with its chord, and the command a click reports. The list itself lives
 //! in [`crate::panels::nav_bar::menu_entries`] — one place, because the panel is the bar's.
+//!
+//! The one thing in here that is not a tile is the zoom row: the `− | 100% | +` strip Firefox puts at
+//! the top of its application menu, because a zoom wants its level *printed*, and a tile of a number
+//! is a control the user has to open twice to read.
 
 use std::sync::Arc;
 
@@ -32,6 +36,8 @@ use egui::{
 use super::file_pane::PaneCommand;
 use super::header::HeaderCommand;
 use crate::theme::Tokens;
+use crate::zoom::ZoomStatus;
+use zenman_core::store::config::DEFAULT_ZOOM_PERCENT;
 
 /// The panel's title, and the parent button's tooltip: the shortest name that says what the button
 /// is for without naming today's two tiles and going stale on tomorrow's third.
@@ -45,6 +51,19 @@ const CLOSE: &str = "Close menu";
 
 /// What the panel's popup is keyed by, under the pane's own [`egui::Id`] — see [`show`].
 const POPUP_KEY: &str = "app-menu";
+
+/// The zoom row's cells, left to right: the accessible name, then the hover line. The names are the
+/// searchable words (`−` and `+` are not), the hover lines quote egui's own chords — the row is the
+/// button half of what `egui::gui_zoom` already answers, and those chords are not in the shell's
+/// keymap, so plan **D7**'s one-table rule has nothing to say about them.
+const ZOOM_CELLS: [(&str, &str); 3] = [
+    ("zoom out", "Zoom out (Ctrl+-)"),
+    ("reset zoom", "Reset zoom (Ctrl+0)"),
+    ("zoom in", "Zoom in (Ctrl++)"),
+];
+
+/// The row's minus: U+2212, the typographic sign Firefox prints, not the ASCII hyphen of a filename.
+const ZOOM_MINUS: &str = "\u{2212}";
 
 /// What clicking a tile reports, in the bar's own two command kinds.
 #[derive(Clone, Debug, PartialEq)]
@@ -118,6 +137,7 @@ pub fn show(
     ui: &mut Ui,
     tokens: &Tokens,
     entries: &[Entry],
+    zoom: ZoomStatus,
     out: &mut Vec<PaneCommand>,
     global: &mut Vec<HeaderCommand>,
 ) {
@@ -132,7 +152,7 @@ pub fn show(
         .width(panel_width(tokens))
         .accessible_name(TITLE)
         .open_memory(response.clicked().then_some(SetOpenCommand::Toggle));
-    if let Some(body) = popup.show(|ui| draw_panel(ui, tokens, entries, out, global))
+    if let Some(body) = popup.show(|ui| draw_panel(ui, tokens, entries, zoom, out, global))
         && body.inner
     {
         Popup::close_id(ui.ctx(), popup_id);
@@ -178,6 +198,7 @@ fn draw_panel(
     ui: &mut Ui,
     tokens: &Tokens,
     entries: &[Entry],
+    zoom: ZoomStatus,
     out: &mut Vec<PaneCommand>,
     global: &mut Vec<HeaderCommand>,
 ) -> bool {
@@ -204,6 +225,9 @@ fn draw_panel(
         }
     });
     ui.add_space(tokens.menu_tile_gap);
+    zoom_row(ui, tokens, zoom, global);
+    ui.separator();
+    ui.add_space(tokens.menu_tile_gap);
 
     let columns = usize::from(tokens.menu_columns).max(1);
     for (row_ix, row) in entries.chunks(columns).enumerate() {
@@ -229,6 +253,125 @@ fn draw_panel(
         });
     }
     close
+}
+
+/// The zoom strip: `− | 100% | +`, three equal cells across the panel, the level printed in the middle
+/// one — Firefox's own row, and the reason it is not a tile: the number is the state.
+///
+/// Laid out and hit-tested by hand rather than by a layout, because the row has to reach both edges
+/// of a fixed-width panel and divide it exactly in three — the same reason the header above it is
+/// painted ([`draw_panel`]). A cell with nothing left to give is dimmed, inert and announced as
+/// disabled: the floor and the ceiling are egui's, and the row says so instead of clicking into a
+/// no-op.
+fn zoom_row(ui: &mut Ui, tokens: &Tokens, zoom: ZoomStatus, global: &mut Vec<HeaderCommand>) {
+    let row = Rect::from_min_size(
+        ui.cursor().min,
+        vec2(ui.available_width(), tokens.menu_item_height),
+    );
+    let cell_width = row.width() / ZOOM_CELLS.len() as f32;
+    for (ix, (name, tooltip)) in ZOOM_CELLS.iter().enumerate() {
+        let x = row.min.x + cell_width * ix as f32;
+        let cell = Rect::from_min_size(pos2(x, row.min.y), vec2(cell_width, row.height()));
+        let ZoomCell {
+            glyph,
+            command,
+            live,
+            value,
+        } = zoom_cell(zoom, ix);
+        let response = ui.allocate_rect(cell, Sense::click());
+        if ui.is_rect_visible(cell) {
+            if live && response.hovered() {
+                ui.painter().rect_filled(
+                    cell,
+                    CornerRadius::same(tokens.menu_corner_radius),
+                    tokens.bg_hover,
+                );
+            }
+            let tint = if !live {
+                tokens.disabled_text
+            } else if response.hovered() {
+                tokens.text_main
+            } else {
+                tokens.text_muted
+            };
+            ui.painter().text(
+                cell.center(),
+                Align2::CENTER_CENTER,
+                &glyph,
+                FontId::proportional(tokens.font_size),
+                tint,
+            );
+        }
+        let response = if live {
+            response.on_hover_text(*tooltip)
+        } else {
+            response
+        };
+        let label = (*name).to_owned();
+        response.widget_info(|| {
+            let mut info = WidgetInfo::new(Role::Button);
+            info.label = Some(label.clone());
+            // The row's own `add_enabled` (`nav_bar::icon_button_state`'s accent frame is its visual
+            // half): without this a screen reader is offered a button that does nothing.
+            info.enabled = live;
+            // And the number the row exists to print, in the tree as well as on the screen.
+            info.value = value;
+            info
+        });
+        if live && response.clicked() {
+            global.push(command);
+        }
+    }
+    // The two dividers, painted after every fill: a hovered cell's own rect reaches the line, and
+    // `bg_hover` is opaque.
+    for edge in 1..ZOOM_CELLS.len() {
+        if ui.is_rect_visible(row) {
+            ui.painter().vline(
+                row.min.x + cell_width * edge as f32,
+                egui::Rangef::new(row.min.y + tokens.nav_gap, row.max.y - tokens.nav_gap),
+                tokens.hairline(),
+            );
+        }
+    }
+    ui.advance_cursor_after_rect(row);
+}
+
+/// One cell of the zoom row.
+struct ZoomCell {
+    /// The text: a glyph, or the level itself for the cell that prints it.
+    glyph: String,
+    /// What a click means.
+    command: HeaderCommand,
+    /// Whether there is anything this cell could do at the current level.
+    live: bool,
+    /// The level, for the a11y tree of the cell that *prints* it — `None` for the two glyph cells,
+    /// whose names are already their whole meaning.
+    value: Option<f64>,
+}
+
+/// The `ix`th cell: what it says, what clicking it means, and whether it has anything left to give
+/// (`ZoomStatus`'s two bounds, and the native scale for the middle one).
+fn zoom_cell(zoom: ZoomStatus, ix: usize) -> ZoomCell {
+    match ix {
+        0 => ZoomCell {
+            glyph: ZOOM_MINUS.to_owned(),
+            command: HeaderCommand::ZoomOut,
+            live: !zoom.at_min,
+            value: None,
+        },
+        1 => ZoomCell {
+            glyph: zoom.caption(),
+            command: HeaderCommand::ZoomReset,
+            live: zoom.percent != DEFAULT_ZOOM_PERCENT,
+            value: Some(f64::from(zoom.percent)),
+        },
+        _ => ZoomCell {
+            glyph: "+".to_owned(),
+            command: HeaderCommand::ZoomIn,
+            live: !zoom.at_max,
+            value: None,
+        },
+    }
 }
 
 /// One tile: the glyph over its caption, the pair centred in the tile's own box.

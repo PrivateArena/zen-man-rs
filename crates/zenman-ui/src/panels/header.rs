@@ -72,6 +72,13 @@ pub enum HeaderCommand {
     ToggleSplit,
     /// The `F4` chord's button: the four-pane grid.
     ToggleQuad,
+    /// The zoom row's `+`: ten per cent bigger (`zoom.rs`). Window-wide, like the layout switches —
+    /// the scale is the *window's*, not one pane's listing.
+    ZoomIn,
+    /// The zoom row's `−`: ten per cent smaller.
+    ZoomOut,
+    /// The zoom row's number: back to the native scale, the way <kbd>Ctrl</kbd>+<kbd>0</kbd> does.
+    ZoomReset,
 }
 
 /// The pane chrome's workspace control: one button that names the session on screen, a popup that
@@ -525,12 +532,32 @@ impl ZenApp {
                 }
                 HeaderCommand::ToggleSplit => self.toggle_split_layout(),
                 HeaderCommand::ToggleQuad => self.toggle_quad_layout(),
+                HeaderCommand::ZoomIn => self.zoom.zoom_in(),
+                HeaderCommand::ZoomOut => self.zoom.zoom_out(),
+                HeaderCommand::ZoomReset => self.zoom.reset(),
             }
         }
     }
 
+    /// The zoom level `config.json` does not have yet, written now — **debounce ignored**, the same
+    /// bargain [`Self::flush_session`] makes for the workspace: a quit inside the 1.5 s window used to
+    /// lose the level, and the level is the one setting the next boot is judged by.
+    ///
+    /// No-ops when the file is already current, so the shutdown path can call it unconditionally.
+    ///
+    /// # Errors
+    /// The config write's own failure, in words.
+    pub fn flush_zoom(&mut self) -> Result<(), String> {
+        let Some(percent) = self.zoom.pending() else {
+            return Ok(());
+        };
+        self.session
+            .set_zoom_percent(percent)
+            .map_err(|e| format!("zoom {percent}%: {}", e.user_message()))
+    }
+
     /// Write whatever the autosave is still holding, **ignoring the debounce** (window close, and the
-    /// smoke run's self-close).
+    /// smoke run's self-close): the pending workspace, and the pending zoom level ([`Self::flush_zoom`]).
     ///
     /// Go had no such path: its only save was the 1.5 s `setTimeout` and nothing ran on exit, so a
     /// quit inside the window lost the tab opened, closed or navigated in the last second and a half.
@@ -542,16 +569,26 @@ impl ZenApp {
     /// # Errors
     /// The config write's own failure, in words: the only caller is a shutdown path, which prints.
     pub fn flush_session(&mut self, now: Instant) -> Result<(), String> {
+        // Both halves get their attempt, and both are reported: a zoom write that fails must not cost
+        // the user the session the next boot reloads (and the other way round), which is why this
+        // collects rather than chains with `?`.
+        let mut failures = Vec::new();
+        if let Err(e) = self.flush_zoom() {
+            failures.push(e);
+        }
         let Some(pending) = self.workspaces.take_pending() else {
-            return Ok(());
+            return failures.pop().map_or(Ok(()), Err);
         };
         match self.session.workspace_save(&pending.name, &pending.session) {
             Ok(()) => {
                 self.workspaces.mark_saved(now);
                 self.workspaces.refresh(self.session.workspaces());
-                Ok(())
+                failures.pop().map_or(Ok(()), Err)
             }
-            Err(e) => Err(format!("workspace {}: {}", pending.name, e.user_message())),
+            Err(e) => {
+                failures.push(format!("workspace {}: {}", pending.name, e.user_message()));
+                Err(failures.join("; "))
+            }
         }
     }
 

@@ -435,13 +435,13 @@ fn drive(harness: &mut Harness<'static, ZenApp>) {
     settle(harness);
 }
 
-/// Open the navigation bar's parent menu with the real click, and prove the tiles came: a baseline
+/// Open the navigation bar's parent menu with the real click, and prove the panel came: a baseline
 /// of a popup that silently failed to open would still be a plausible-looking picture (`app_menu.rs`).
 fn drive_app_menu(harness: &mut Harness<'static, ZenApp>) {
     settle(harness);
     harness.get_by_label("menu").click();
     settle(harness);
-    for name in ["Grid view", "2-pane", "4-pane"] {
+    for name in ["Grid view", "2-pane", "4-pane", "zoom in", "reset zoom"] {
         assert!(
             harness.query_all_by_label(name).count() > 0,
             "the parent menu did not open its tiles: {name:?} is not on screen"

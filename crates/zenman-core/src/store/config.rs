@@ -46,6 +46,18 @@ pub const CURRENT_CONFIG_VERSION: ConfigVersion = 1;
 /// "unversioned legacy" and upgrades it.
 pub const GO_LEGACY_VERSION: ConfigVersion = 0;
 
+/// The zoom the shell starts at when the config says nothing: the native scale.
+pub const DEFAULT_ZOOM_PERCENT: u32 = 100;
+/// One click of the zoom buttons: the shell's `−`/`+` tiles move by this much (`panels/app_menu.rs`
+/// draws the row, `zenman-ui`'s `zoom.rs` does the arithmetic).
+pub const ZOOM_STEP_PERCENT: u32 = 10;
+/// The smallest [`ZenConfig::zoom_percent`] the shell will draw at, and the smallest egui's own
+/// `Ctrl+-` chord goes to (`egui::gui_zoom::MIN_ZOOM_FACTOR`, 0.2). One bound for both front ends,
+/// because two bounds would mean a keyboard zoom the config then refuses to save.
+pub const MIN_ZOOM_PERCENT: u32 = 20;
+/// The largest, for the same reason (`egui::gui_zoom::MAX_ZOOM_FACTOR`, 5.0).
+pub const MAX_ZOOM_PERCENT: u32 = 500;
+
 /// Where the theme comes from. The Go app had no theme setting at all (its web UI followed the
 /// browser), so this is a port addition; `System` is the default so the port does not fight the
 /// desktop.
@@ -565,6 +577,18 @@ pub struct ZenConfig {
     pub sort: SortSpec,
     /// List column widths.
     pub column_widths: ColumnWidths,
+    /// The shell's UI zoom, in per cent of the native scale: the `− | 100% | +` row of the parent
+    /// menu (`zenman-ui`'s `zoom.rs`). One value, two front ends — the shell sets egui's
+    /// `zoom_factor` from it, and egui's own <kbd>Ctrl</kbd>+<kbd>+</kbd> chord is read back into it,
+    /// so a keyboard zoom survives a restart too. The range is egui's own (`gui_zoom`'s 0.2–5.0),
+    /// which is what makes the chord unable to leave a level this file refuses to hold.
+    ///
+    /// Out of range is a config error rather than a silent clamp, the house rule for every validated
+    /// field: a hand-edited `5000` is a mistake the user deserves to hear about. Note the standing
+    /// consequence of that rule (`apps/zenman`'s `config_boot`): a file that fails validation boots
+    /// on the defaults and the *next* save rewrites it, so a hand-edit is best made with the app
+    /// closed and the value inside `zoomPercent`'s own range.
+    pub zoom_percent: u32,
     /// Directory page size; `None` = `Limits::dir_page_default`.
     pub page_size: Option<usize>,
     /// Interface language tag (`en-US`), or empty for "follow the system".
@@ -600,6 +624,7 @@ impl Default for ZenConfig {
             show_hidden: true,
             sort: SortSpec::DEFAULT_SORT,
             column_widths: ColumnWidths::default(),
+            zoom_percent: DEFAULT_ZOOM_PERCENT,
             page_size: None,
             language: String::new(),
             history_limit: None,
@@ -687,6 +712,15 @@ impl ZenConfig {
                     msg: format!("{name} must be a finite width in 0.0..=100000.0, got {value}"),
                 });
             }
+        }
+        if self.zoom_percent < MIN_ZOOM_PERCENT || self.zoom_percent > MAX_ZOOM_PERCENT {
+            return Err(CoreError::Config {
+                msg: format!(
+                    "zoomPercent must be a percentage in {MIN_ZOOM_PERCENT}..={MAX_ZOOM_PERCENT} \
+                     (egui's own zoom range), got {}",
+                    self.zoom_percent
+                ),
+            });
         }
         if let Some(size) = self.page_size
             && (size == 0 || size > MAX_PAGE_SIZE)

@@ -59,6 +59,10 @@ pub struct PaneDock<'a> {
     pub workspaces: &'a mut WorkspaceBar,
     /// The keymap, for the chord text the ribbon's tooltips quote (plan **D7**).
     pub keys: &'a KeyMap,
+    /// The window's zoom level for the parent menu's row, as the [`crate::zoom::ZoomStatus`] copy
+    /// (`zoom.rs`). Copied rather than borrowed from the shell: the row paints it and the command it
+    /// emits mutates it, in the same frame.
+    pub zoom: crate::zoom::ZoomStatus,
     /// Free/total bytes of the data volume, for the workspace popup.
     pub disk: Option<(u64, u64)>,
     /// What the chrome asked the shell to do, drained by [`show`].
@@ -275,6 +279,7 @@ impl PaneDock<'_> {
             log_open,
             left_drawer,
             right_drawer,
+            zoom: self.zoom,
             hints,
         };
         nav_bar::show(ui, &mut model, &tokens, &mut out, &mut global);
@@ -456,6 +461,7 @@ pub fn show(app: &mut ZenApp, ui: &mut Ui) {
             tab_drag: app.tab_drag,
             workspaces: &mut app.workspaces,
             keys: &app.keys,
+            zoom: app.zoom.status(),
             disk,
             header: Vec::new(),
         };
@@ -611,6 +617,7 @@ mod tests {
             tab_drag: None,
             workspaces: &mut crate::panels::header::WorkspaceBar::default(),
             keys: &crate::keymap::KeyMap::default(),
+            zoom: crate::zoom::ZoomStatus::default(),
             disk: None,
             header: Vec::new(),
         };

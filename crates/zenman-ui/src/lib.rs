@@ -55,6 +55,7 @@ pub mod persist;
 pub mod state;
 pub mod theme;
 pub mod widgets;
+pub mod zoom;
 
 /// The plan step this crate is implemented up to (plan §5.1 `lib.rs` row; `apps/zenman` echoes it).
 ///

@@ -609,6 +609,12 @@ fn run_with_context(cli: &Cli, paths: &app_dirs::AppPaths) -> Result<u8, BootErr
             // persisted theme, before the first frame draws anything.
             zenman_ui::theme::fonts::install(&cc.egui_ctx);
             zenman_ui::theme::apply(&cc.egui_ctx, session.config().theme);
+            // The zoom `config.json` carries, before the first frame: eframe has already restored
+            // `ui.ron`'s own `zoom_factor` by now (`create_egui_context`), and the config is the file
+            // the user edits — so the config wins, and nothing is drawn at the stale scale. The
+            // shell's first tick asks for the same level again, which egui ignores (`zoom.rs`).
+            cc.egui_ctx
+                .set_zoom_factor(zenman_ui::zoom::factor_of(session.config().zoom_percent));
             Ok(Box::new(app::ShellApp::new(
                 &app_paths,
                 boot,
