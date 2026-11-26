@@ -212,7 +212,8 @@ impl Answer {
                 outcome:
                     QuickOutcome::Activate { .. }
                     | QuickOutcome::Closed { .. }
-                    | QuickOutcome::DeleteFound { .. },
+                    | QuickOutcome::DeleteFound { .. }
+                    | QuickOutcome::Reveal { .. },
                 ..
             } => Choice::Ok,
             Self::Index { .. } | Self::Batch { .. } | Self::Action { .. } => Choice::Ok,

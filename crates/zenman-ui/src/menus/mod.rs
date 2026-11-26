@@ -55,7 +55,9 @@
 //!   `patterns` filter is that step's, and a click on a custom row is reported, never run.
 //! * **Tab groups** ([`tab_menu`]'s greyed rows) are step **14**'s workspaces; `Duplicate Tab` is here
 //!   ([`Command::DuplicateTab`]), the six group rows are not.
-//! * **Open Containing Folder** ([`search_menu`]'s missing rows) is step **12**'s search manager.
+//! * **Open Containing Folder** ([`search_menu`]'s missing rows): the shell half landed with quick
+//!   find's right-click — [`ZenApp::reveal_in_parent`](crate::app::ZenApp) navigates and selects — but
+//!   the rows themselves wait on a menu aimed at a *path* rather than at a pane's selection.
 
 use egui::text::LayoutJob;
 use egui::{
@@ -578,7 +580,9 @@ fn in_group(ctx: &MenuContext) -> bool {
 /// A search-result menu (Go's `showSearchResultContextMenu`, `context-menu.js:159-177`).
 ///
 /// `Open Containing Folder` and its `… in New Tab` twin (`:164-169`) are the search manager's, i.e.
-/// step 12's — they need a *path* target, not the pane's selection, so they are not here yet.
+/// step 12's — they need a *path* target, not the pane's selection, so they are not here yet. The
+/// action itself is: quick find's right-click goes straight to
+/// [`ZenApp::reveal_in_parent`](crate::app::ZenApp), which is the row Go's menu would have run.
 #[must_use]
 pub fn search_menu() -> Vec<Vec<MenuSpec>> {
     shrink(vec![

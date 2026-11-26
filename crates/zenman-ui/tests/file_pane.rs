@@ -18,6 +18,7 @@ use egui_kittest::kittest::{AccessKitNode, Queryable};
 use zenman_core::path::{AbsPath, FsPath};
 use zenman_core::store::config::{LayoutMode, PaneSlot, SortColumn, ViewMode};
 use zenman_ui::app::ZenApp;
+use zenman_ui::keymap::Command;
 use zenman_ui::panels::file_pane::PaneCommand;
 use zenman_ui::state::{FlatMode, Tab, panes_for};
 
@@ -1141,5 +1142,49 @@ fn a_double_click_on_a_directory_navigates_and_never_launches() {
         shown(&harness).path,
         fixture_path(&dir.join("docs")),
         "and the pane shows it"
+    );
+}
+
+#[test]
+fn a_keyboard_move_below_the_view_moves_the_view_too() {
+    // `ScrollState::y` is an *output*: the scroller re-derives it from egui's own scroll state every
+    // frame. The cursor-keeping code used to write it and call that scrolling — which selected a row
+    // nobody could see. The scroller answers a one-shot request instead, and this is the test that
+    // the request is what the code now sends.
+    let mut harness = pane_harness("move-jump");
+    let ctx = harness.ctx.clone();
+    assert_eq!(
+        shown(&harness).scroll.y,
+        0.0,
+        "the listing starts at the top"
+    );
+    harness
+        .state_mut()
+        .dispatch(PaneSlot::Left, Command::MoveBottom, &ctx);
+    settle(&mut harness);
+    let tab = shown(&harness);
+    assert_eq!(tab.sel.len(), 1, "the bottom row is the selection");
+    assert!(
+        tab.scroll.y > 100.0,
+        "the view followed the cursor: {} rows down",
+        tab.scroll.y
+    );
+    let last = tab.entries.entries.iter().position(|entry| {
+        tab.sel
+            .keys()
+            .iter()
+            .any(|key| key == &entry.name || key == &entry.rel_path)
+    });
+    let Some(last) = last else {
+        panic!(
+            "the selected row is not in the listing: {:?}",
+            tab.sel.keys()
+        );
+    };
+    assert!(
+        (tab.scroll.first..tab.scroll.last).contains(&last),
+        "and the row it selected is on screen (row {last}, painted {}..{})",
+        tab.scroll.first,
+        tab.scroll.last
     );
 }

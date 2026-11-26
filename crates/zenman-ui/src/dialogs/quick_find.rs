@@ -38,6 +38,12 @@
 //!   met underneath: `Copy`/`Cut Found` go through [`Session::clipboard_store`], which publishes
 //!   `file://` URIs through `ops::clipboard::publish_system` exactly as Go's `writeToSystemClipboard`
 //!   did (`api/ops.go:549-575`), so no new clipboard dependency is involved.
+//! * **A reveal takes two frames.** Go's right-click on a row (`:321-325`) called
+//!   `executeItemAction(index, 'reveal')`, which navigated to the row's parent and selected the row on
+//!   a 150 ms timer — its tab had every entry in memory already. Here the parent may never have been
+//!   listed, so `QuickOutcome::Reveal` asks for the navigation and `ZenApp::apply_reveal` discharges
+//!   the promise on the frame the row exists (widening a paged listing once, the way the pane's own
+//!   `Load all items` does, when the row is past the page).
 //! * There is **no hidden-files toggle**, because Go has none (its live search never filtered
 //!   dot-files — plan §2.3), so the query keeps core's Go-parity [`HiddenPolicy::Include`].
 //! * Go persists the three toggles in `localStorage`; the port keeps them per-opening (plan D-list:
@@ -176,6 +182,16 @@ pub enum QuickOutcome {
         /// Every match, in list order.
         paths: Vec<AbsPath>,
     },
+    /// Right-click on a row: Go's `executeItemAction(index, 'reveal')` (`:321-325`, `:405-421`) —
+    /// close the overlay, navigate `slot` to the row's **parent** directory, and select the row
+    /// there. The path is the row's own, not its parent's: *where* to look is the shell's business
+    /// once it has the row.
+    Reveal {
+        /// The pane that owns the answer.
+        slot: PaneSlot,
+        /// The matched item, whose parent becomes the pane's directory.
+        path: AbsPath,
+    },
 }
 
 /// What a footer button asked the shell to do to the match set. Not an [`Answer`]: `Dialogs::show`
@@ -286,7 +302,14 @@ impl QuickFind {
     /// (`quick-find.js:389-396`: `currentPath + rel_path`).
     #[must_use]
     pub fn activate_target(&self) -> Option<(AbsPath, bool)> {
-        let hit = self.cursor.and_then(|ix| self.results.get(ix))?;
+        self.cursor.and_then(|ix| self.hit_target(ix))
+    }
+
+    /// One row of the list, as the path it names and its kind. The two row verbs (Enter, and the
+    /// right-click's reveal) both need it, and a `rel_path` the root cannot answer is no row.
+    #[must_use]
+    pub fn hit_target(&self, ix: usize) -> Option<(AbsPath, bool)> {
+        let hit = self.results.get(ix)?;
         let path = self.root.join_rel(&hit.rel_path).ok()?;
         Some((path, hit.is_dir()))
     }
@@ -470,6 +493,7 @@ impl QuickFind {
         let title = format!("Finding in: {}", self.root.as_path().display());
         let mut clicked: Option<usize> = None;
         let mut activated: Option<usize> = None;
+        let mut revealed: Option<usize> = None;
         let mut delete_found = false;
         let mut fresh = self.fresh;
         let status = self.status_text();
@@ -643,7 +667,11 @@ impl QuickFind {
                                                     tokens.text_muted,
                                                 );
                                             }
-                                            if resp.clicked() {
+                                            if resp.secondary_clicked() {
+                                                // Go's right-click on a row (`:321-325`): not a menu, the
+                                                // reveal itself — `executeItemAction(index, 'reveal')`.
+                                                revealed = Some(ix);
+                                            } else if resp.clicked() {
                                                 if resp.double_clicked() {
                                                     activated = Some(ix);
                                                 } else {
@@ -722,6 +750,16 @@ impl QuickFind {
                 });
         } else if let Some(ix) = clicked {
             self.cursor = Some(ix);
+        }
+        // The reveal is Go's other row verb, and it closes the overlay for the same reason Enter
+        // does: the answer is a *navigation* of the pane, which the shell owns.
+        if revealed.is_some() && outcome.is_none() {
+            outcome = revealed
+                .and_then(|ix| self.hit_target(ix))
+                .map(|(path, _)| QuickOutcome::Reveal {
+                    slot: self.slot,
+                    path,
+                });
         }
         // <kbd>Escape</kbd> already answered the dialog above; a footer click in the same frame as a
         // dismissal is not a second answer, so the key wins.

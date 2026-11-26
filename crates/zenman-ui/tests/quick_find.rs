@@ -914,3 +914,102 @@ fn the_found_paths_are_the_matches_under_the_search_root() {
         "each rel_path resolves against the search root"
     );
 }
+
+// --------------------------------------------------------------------------- the row's reveal
+
+/// Go's right-click on a result row is not a menu — it is `executeItemAction(index, 'reveal')`
+/// (`quick-find.js:321-325`, `:405-421`): close the overlay, open the row's folder, leave the row
+/// selected and on screen. The port's second half cannot happen in the same frame, because a folder
+/// the pane has never listed is a job, not a fact.
+#[test]
+fn right_clicking_a_row_opens_its_folder_with_the_row_selected() {
+    let root = scratch("qf-reveal");
+    common::remove_tree(&root);
+    std::fs::create_dir_all(root.join("deep")).expect("fixture dir");
+    for name in ["top.log", "deep/mid.log"] {
+        std::fs::write(root.join(name), "x\n").expect("fixture file");
+    }
+    let mut harness = pane_harness("qf-reveal", &root);
+    open_find(&mut harness);
+    edit_quick_find(&mut harness, |find| find.recursive = true);
+    let rows = find_rows(&mut harness, ".log");
+    assert_eq!(
+        rows,
+        vec!["deep/mid.log".to_string(), "top.log".to_string()],
+        "the recursive walk, in `WalkDir`'s order"
+    );
+    harness.get_by_label("mid.log").click_secondary();
+    common::settle_until(&mut harness, "the revealed row", |h| {
+        h.state().dialogs.active().is_none() && shown(h).sel.contains("mid.log")
+    });
+    let tab = shown(&harness);
+    assert!(
+        tab.path.to_string().ends_with("/deep"),
+        "the pane went to the row's parent, not to the search root: {}",
+        tab.path
+    );
+    assert_eq!(
+        tab.selected_names(),
+        vec!["mid.log".to_string()],
+        "the reveal is the whole selection, as Go's `selectedPaths.clear()` then `add` made it"
+    );
+    assert!(
+        !harness
+            .state()
+            .dialogs
+            .active()
+            .is_some_and(|d| matches!(d, Dialog::QuickFind(_))),
+        "Go closes the overlay to reveal (`:375`), and so does the port"
+    );
+}
+
+/// The same reveal for a row the pane has never *read*: the loaded page stops at
+/// [`zenman_ui::state::DEFAULT_PAGE_SIZE`], so the shell has to widen it — the pane's own
+/// `Load all items` verb — before there is a row to select.
+#[test]
+fn revealing_a_row_below_the_page_loads_the_rest_and_scrolls_onto_it() {
+    let dir = common::listing_tree("qf-reveal-deep");
+    let mut harness = pane_harness("qf-reveal-deep", &dir);
+    let loaded = shown(&harness).entries.entries.len();
+    assert!(
+        loaded < 450,
+        "the fixture is a paged listing: {loaded} rows loaded"
+    );
+    open_find(&mut harness);
+    find_rows(&mut harness, "row-04");
+    // `row-0400.txt` sits past the loaded page of the pane's listing, and it is the first row the
+    // dialog paints — so it is reachable by the pointer without any scrolling of the dialog.
+    harness.get_by_label("row-0400.txt").click_secondary();
+    common::settle_until(&mut harness, "the far row", |h| {
+        h.state().dialogs.active().is_none() && shown(h).sel.contains("row-0400.txt")
+    });
+    let tab = shown(&harness);
+    assert!(
+        tab.entries.entries.len() > loaded,
+        "the reveal widened the page from {loaded} rows to {}",
+        tab.entries.entries.len()
+    );
+    assert!(
+        !tab.has_more,
+        "and it read the directory, not one more page"
+    );
+    assert!(
+        tab.scroll.y > 100.0,
+        "the scroller moved onto the row ({} rows down, in rows)",
+        tab.scroll.y
+    );
+    // The painted span is the proof the jump reached *that* row, not merely somewhere down the list
+    // (`FlatMode::Off`, so the listing order is the visual order).
+    let row = tab
+        .entries
+        .entries
+        .iter()
+        .position(|entry| entry.name == "row-0400.txt")
+        .expect("the revealed row is loaded");
+    assert!(
+        (tab.scroll.first..tab.scroll.last).contains(&row),
+        "row {row} is selected but not painted ({}..{})",
+        tab.scroll.first,
+        tab.scroll.last
+    );
+}

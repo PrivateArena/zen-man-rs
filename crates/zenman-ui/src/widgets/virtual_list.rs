@@ -176,6 +176,13 @@ pub struct ScrollState {
     pub last: usize,
     /// The `LoadMore` latch.
     pub load_more_fired: bool,
+    /// A row the shell asked to be brought on screen, in **visual rows** — the reveal of a search
+    /// hit, or a keyboard move onto a row the page has painted past.
+    ///
+    /// An *input*, unlike the four fields above: [`show_list`] / [`show_grid`] take it, so the request
+    /// lives for exactly the frame that acts on it and a scroll the user makes afterwards is never
+    /// fought over. `None` means "leave the view where it is", which is every ordinary frame.
+    pub jump_to_row: Option<usize>,
 }
 
 impl ScrollState {
@@ -351,46 +358,55 @@ pub fn show_list(
     let mut last = rows;
     let mut at_bottom = false;
     let height = metrics.height.max(1.0);
+    // The one-shot scroll request, if the shell made one (see [`ScrollState::jump_to_row`]). Read
+    // *before* the area is built, because egui takes an explicit offset in `begin()` and stores the
+    // state from it — so the jump lands on this frame and survives the frames that follow it.
+    let jump = scroll.jump_to_row.take().map(|row| row as f32 * height);
     let modifiers = ui.input(|i| i.modifiers);
     let area = ui.available_rect_before_wrap();
     immediate_wheel(ui, area);
-    let out = ScrollArea::vertical()
+    let mut area_spec = ScrollArea::vertical()
         .id_salt(list_id(id))
-        .auto_shrink([false, false])
-        .stick_to_bottom(scroll.stick_bottom)
-        .show_viewport(ui, |ui, visible| {
-            // The content box: `rows` rows tall, in the scroll area's own content coordinates.
-            {
-                ui.set_height(rows as f32 * height);
-                let lo =
-                    ((visible.min.y / height).floor() as usize).saturating_sub(metrics.overscan);
-                let hi = (((visible.max.y / height).ceil() as usize) + metrics.overscan).min(rows);
-                let lo = lo.min(rows);
-                first = lo;
-                last = hi;
-                at_bottom = rows > 0 && visible.max.y >= rows as f32 * height - height;
-                let left = ui.max_rect().min.x;
-                let top = ui.max_rect().min.y;
-                let width = ui.max_rect().width();
-                painted = hi.saturating_sub(lo);
-                for ix in lo..hi {
-                    let rect = Rect::from_min_size(
-                        Pos2::new(left, top + ix as f32 * height),
-                        Vec2::new(width, height),
-                    );
-                    let response = ui.interact(rect, row_ix_to_key(ix), Sense::click_and_drag());
-                    let hit = RowHit {
-                        rect,
-                        response: &response,
-                        metrics,
-                        modifiers,
-                    };
-                    if let Some(event) = paint(ui, ix, &hit) {
-                        events.push(event);
-                    }
+        .auto_shrink([false, false]);
+    if let Some(offset) = jump {
+        // A requested position outranks the bottom latch: the row the shell just named is the thing
+        // to look at, and `stick_to_bottom` would fight it on the frames after this one.
+        area_spec = area_spec.vertical_scroll_offset(offset);
+    } else {
+        area_spec = area_spec.stick_to_bottom(scroll.stick_bottom);
+    }
+    let out = area_spec.show_viewport(ui, |ui, visible| {
+        // The content box: `rows` rows tall, in the scroll area's own content coordinates.
+        {
+            ui.set_height(rows as f32 * height);
+            let lo = ((visible.min.y / height).floor() as usize).saturating_sub(metrics.overscan);
+            let hi = (((visible.max.y / height).ceil() as usize) + metrics.overscan).min(rows);
+            let lo = lo.min(rows);
+            first = lo;
+            last = hi;
+            at_bottom = rows > 0 && visible.max.y >= rows as f32 * height - height;
+            let left = ui.max_rect().min.x;
+            let top = ui.max_rect().min.y;
+            let width = ui.max_rect().width();
+            painted = hi.saturating_sub(lo);
+            for ix in lo..hi {
+                let rect = Rect::from_min_size(
+                    Pos2::new(left, top + ix as f32 * height),
+                    Vec2::new(width, height),
+                );
+                let response = ui.interact(rect, row_ix_to_key(ix), Sense::click_and_drag());
+                let hit = RowHit {
+                    rect,
+                    response: &response,
+                    metrics,
+                    modifiers,
+                };
+                if let Some(event) = paint(ui, ix, &hit) {
+                    events.push(event);
                 }
             }
-        });
+        }
+    });
     scroll.y = (out.state.clamped_offset().y / height).max(0.0);
     scroll.painted = painted;
     scroll.first = first.min(last);
@@ -436,55 +452,63 @@ pub fn show_grid(
     let mut first = grid_rows;
     let mut last = grid_rows;
     let mut at_bottom = false;
+    // The one-shot jump, in tile rows: the shell names a *row*, and the grid packs `columns` of them
+    // into each band of tiles.
+    let jump = scroll
+        .jump_to_row
+        .take()
+        .map(|row| (row / columns.max(1)) as f32 * tile_height);
     let modifiers = ui.input(|i| i.modifiers);
     let area = ui.available_rect_before_wrap();
     immediate_wheel(ui, area);
-    let out = ScrollArea::vertical()
+    let mut area_spec = ScrollArea::vertical()
         .id_salt(grid_id(id))
-        .auto_shrink([false, false])
-        .stick_to_bottom(scroll.stick_bottom)
-        .show_viewport(ui, |ui, visible| {
-            ui.set_height(grid_rows as f32 * tile_height);
-            let lo =
-                ((visible.min.y / tile_height).floor() as usize).saturating_sub(metrics.overscan);
-            let hi =
-                (((visible.max.y / tile_height).ceil() as usize) + metrics.overscan).min(grid_rows);
-            let lo = lo.min(grid_rows);
-            first = lo;
-            last = hi;
-            at_bottom =
-                grid_rows > 0 && visible.max.y >= grid_rows as f32 * tile_height - tile_height;
-            let left = ui.max_rect().min.x;
-            let top = ui.max_rect().min.y;
-            let width = ui.max_rect().width();
-            painted = hi.saturating_sub(lo) * columns;
-            for grid_row in lo..hi {
-                for column in 0..columns {
-                    let ix = grid_row * columns + column;
-                    if ix >= rows {
-                        continue;
-                    }
-                    let rect = Rect::from_min_size(
-                        Pos2::new(
-                            left + column as f32 * (tile + gap),
-                            top + grid_row as f32 * tile_height,
-                        ),
-                        Vec2::new(tile, tile),
-                    );
-                    let response = ui.interact(rect, row_ix_to_key(ix), Sense::click_and_drag());
-                    let _ = width;
-                    let hit = RowHit {
-                        rect,
-                        response: &response,
-                        metrics,
-                        modifiers,
-                    };
-                    if let Some(event) = paint(ui, ix, &hit) {
-                        events.push(event);
-                    }
+        .auto_shrink([false, false]);
+    if let Some(offset) = jump {
+        area_spec = area_spec.vertical_scroll_offset(offset);
+    } else {
+        area_spec = area_spec.stick_to_bottom(scroll.stick_bottom);
+    }
+    let out = area_spec.show_viewport(ui, |ui, visible| {
+        ui.set_height(grid_rows as f32 * tile_height);
+        let lo = ((visible.min.y / tile_height).floor() as usize).saturating_sub(metrics.overscan);
+        let hi =
+            (((visible.max.y / tile_height).ceil() as usize) + metrics.overscan).min(grid_rows);
+        let lo = lo.min(grid_rows);
+        first = lo;
+        last = hi;
+        at_bottom = grid_rows > 0 && visible.max.y >= grid_rows as f32 * tile_height - tile_height;
+        let left = ui.max_rect().min.x;
+        let top = ui.max_rect().min.y;
+        let width = ui.max_rect().width();
+        painted = hi.saturating_sub(lo) * columns;
+        for grid_row in lo..hi {
+            for column in 0..columns {
+                let ix = grid_row * columns + column;
+                if ix >= rows {
+                    continue;
+                }
+                let rect = Rect::from_min_size(
+                    Pos2::new(
+                        left + column as f32 * (tile + gap),
+                        top + grid_row as f32 * tile_height,
+                    ),
+                    Vec2::new(tile, tile),
+                );
+                let response = ui.interact(rect, row_ix_to_key(ix), Sense::click_and_drag());
+                let _ = width;
+                let hit = RowHit {
+                    rect,
+                    response: &response,
+                    metrics,
+                    modifiers,
+                };
+                if let Some(event) = paint(ui, ix, &hit) {
+                    events.push(event);
                 }
             }
-        });
+        }
+    });
     scroll.y = (out.state.clamped_offset().y / tile_height).max(0.0);
     scroll.painted = painted;
     scroll.first = first.min(last);

@@ -296,6 +296,17 @@ impl Selection {
         true
     }
 
+    /// Select one key, by name, and make it the range anchor.
+    ///
+    /// The index-taking [`Self::apply`] is the right seam for a click, because the row the pointer
+    /// landed on *is* its index in the visual order. A reveal names a key instead — the row may be
+    /// inside a folded group, where the order has no index for it at all.
+    pub fn select_key(&mut self, key: &str) {
+        self.keys.clear();
+        self.keys.insert(key.to_string());
+        self.origin = Some(key.to_string());
+    }
+
     /// Select every row of the visual order (Go's `selectAll`, `file-list.js:679-691`).
     pub fn select_all<'a>(&mut self, len: usize, key_at: impl Fn(usize) -> Option<&'a str>) {
         for index in 0..len {

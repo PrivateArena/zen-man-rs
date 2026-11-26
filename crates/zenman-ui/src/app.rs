@@ -211,6 +211,26 @@ pub struct ZenApp {
     /// ([`Self::refresh_clip`]), so the four panes share one build and a cleared clipboard dims
     /// nothing the very next frame.
     clip: ClipView,
+    /// A row a reveal has promised to put on screen, waiting for the listing that holds it
+    /// ([`Self::reveal_in_parent`]).
+    reveal: Option<Reveal>,
+}
+
+/// A reveal in flight: the navigation has been asked for, the selection cannot happen yet.
+///
+/// Go could do both in one function because its listing was already in memory (`navigateTo`, then
+/// `selectedPaths.add` and `scrollIntoView` on a 150 ms timer, `quick-find.js:405-421`). Here the
+/// parent directory may never have been listed, so the promise is kept in the shell and discharged
+/// by [`ZenApp::apply_reveal`] on the frame the row exists — which is also the frame the scroller
+/// is told to move.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Reveal {
+    /// The pane being navigated.
+    slot: PaneSlot,
+    /// The item to select and scroll onto, once its directory is on screen.
+    path: AbsPath,
+    /// The page has already been widened once to reach it (Go never paged; the port does).
+    widened: bool,
 }
 
 /// What one frame knows about the session's copy/cut queue, derived once for the four panes and the
@@ -266,6 +286,7 @@ impl ZenApp {
             persist_at: None,
             last_frame: Instant::now(),
             clip: ClipView::default(),
+            reveal: None,
         }
     }
 
@@ -302,6 +323,7 @@ impl ZenApp {
             persist_at: None,
             last_frame: Instant::now(),
             clip: ClipView::default(),
+            reveal: None,
         };
         // `restore` needs the store and the app apart (the store lives *in* the app), so lift it
         // out, restore, and put it back.
@@ -961,6 +983,9 @@ impl ZenApp {
         // reason: after the event drain, so an answer never races the request that superseded it.
         crate::dialogs::search_manager::tick(self, ctx);
         self.reload_stale();
+        // The reveal's second half: a row can only be selected and scrolled onto once its directory
+        // is on screen, which is a frame later when the pane has never listed it.
+        self.apply_reveal();
         let now = Instant::now();
         self.last_frame = now;
         // The zoom's frame tick: hand egui the level the row or the chord asked for, and write it to
@@ -2384,6 +2409,116 @@ impl ZenApp {
         }
     }
 
+    /// Reveal one row in the folder that holds it — Go's `executeItemAction(…, 'reveal')`, which
+    /// `quick-find.js:321-325` hangs on the result row's right-click: navigate to the parent, make the
+    /// row the selection, scroll onto it.
+    fn reveal_in_parent(&mut self, slot: PaneSlot, path: AbsPath) {
+        let Some(parent) = path.parent() else {
+            self.notices.post(
+                toast::Level::Warning,
+                format!("reveal: {} has no parent folder", path.to_string_lossy()),
+            );
+            return;
+        };
+        self.reveal = Some(Reveal {
+            slot,
+            path,
+            widened: false,
+        });
+        self.navigate_shown(slot, FsPath::from_abs(parent));
+    }
+
+    /// The second half of a reveal, once per frame: when the pane's listing carries the promised row,
+    /// select it and ask the scroller to bring it on screen. A row that has no listing to live in — a
+    /// pane that failed, moved on, or never had it — drops the promise quietly, which is what Go's
+    /// `setTimeout(…, 150)` did when its query for the row came back empty.
+    fn apply_reveal(&mut self) {
+        let Some(reveal) = self.reveal.clone() else {
+            return;
+        };
+        let Some(name) = reveal
+            .path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+        else {
+            self.reveal = None;
+            return;
+        };
+        // Read the pane, then act on it: widening the page needs `&mut self`, which no borrow of the
+        // tab may span.
+        enum Step {
+            /// The listing this row belongs to has not arrived.
+            Wait,
+            /// Nothing to reveal any more.
+            Gone,
+            /// The row is past the page: read the whole directory, once.
+            Widen,
+            /// The row, as its listing index.
+            Here(usize),
+        }
+        let step = match self
+            .model
+            .panes
+            .get(&reveal.slot)
+            .and_then(|pane| pane.active_tab())
+        {
+            None => Step::Gone,
+            Some(tab) if tab.error.is_some() => Step::Gone,
+            // The tab has been steered somewhere else (the user, or a `DirChanged` reload of another
+            // directory): this row is not what that pane is looking at.
+            Some(tab) if !lists_parent(tab, &reveal.path) => Step::Gone,
+            // The rows on screen are still the *previous* directory's.
+            Some(tab) if tab.entries.path != tab.path => Step::Wait,
+            Some(tab) => match row_named(tab, &name) {
+                Some(ix) => Step::Here(ix),
+                // A paged listing is the one case the shell can fix: the pane's own
+                // `Load all items` verb is the call, and it is made once.
+                None if tab.has_more && !reveal.widened => Step::Widen,
+                None => Step::Gone,
+            },
+        };
+        match step {
+            Step::Wait => {}
+            Step::Gone => self.reveal = None,
+            Step::Widen => {
+                if let Some(ix) = self
+                    .model
+                    .panes
+                    .get(&reveal.slot)
+                    .map(|pane| pane.active.min(pane.tabs.len().saturating_sub(1)))
+                {
+                    self.list_at(reveal.slot, ix, false, true);
+                }
+                if let Some(pending) = self.reveal.as_mut() {
+                    pending.widened = true;
+                }
+            }
+            Step::Here(ix) => {
+                self.reveal = None;
+                let Some(tab) = self.tab_mut_of(reveal.slot) else {
+                    return;
+                };
+                let Some(entry) = tab.entries.entries.get(ix) else {
+                    // The page turned over between the read and the write. Nothing is owed: the row
+                    // was there a moment ago and a reload will say where it is now.
+                    return;
+                };
+                // A folded group has no row on screen to reveal, so the reveal opens it (Go's flat
+                // listing had nothing to open).
+                let group = crate::panels::file_pane::group_of(entry);
+                tab.collapsed_groups.remove(&group);
+                let key = crate::state::Tab::row_key(entry).to_string();
+                tab.sel.select_key(&key);
+                // The scroller wants the *visual* row: the entry's index plus every group header in
+                // front of it. `RowOrder` owns its data, so it does not keep the tab borrowed.
+                let order = RowOrder::build(tab);
+                if let Some(row) = (0..order.len()).find(|row| order.entry_ix(*row) == Some(ix)) {
+                    tab.scroll.jump_to_row = Some(row);
+                }
+            }
+        }
+    }
+
     /// Turn a dialog answer into the command it stands for (plan §4.1). Called after the draw, like
     /// the pane commands, so a dialog can never mutate state another pane is painting from.
     pub fn answer(&mut self, answer: Answer) {
@@ -2470,6 +2605,9 @@ impl ZenApp {
                     // menu's two destructive rows use, which is why this dialog had to close first —
                     // the stack holds one modal, and the *bytes* wait for the answer.
                     self.open_found_delete_confirm(slot, paths);
+                }
+                crate::dialogs::QuickOutcome::Reveal { slot, path } => {
+                    self.reveal_in_parent(slot, path);
                 }
             }
             return;
@@ -3235,11 +3373,13 @@ impl ZenApp {
             len,
             |ix| rows.get(ix).map(String::as_str),
         );
-        // Keep the cursor on screen: `ScrollState::y` counts *rows*, and the painted span is the
-        // page (`ScrollState::first..last`, written by the scroller every frame).
+        // Keep the cursor on screen. `ScrollState::y` is an *output* — the scroller re-derives it from
+        // egui's own scroll state every frame — so the old `tab.scroll.y = target` write could not
+        // move the view, and a keyboard move down off the page selected a row nobody could see. The
+        // request field is the input the scroller answers.
         let from = tab.scroll.y;
         if (target as f32) >= from + page as f32 || (target as f32) < from {
-            tab.scroll.y = target as f32;
+            tab.scroll.jump_to_row = Some(target);
         }
     }
 
@@ -3482,6 +3622,25 @@ pub fn tab_title(path: &FsPath) -> String {
         Some(name) if !name.is_empty() => name.to_string(),
         _ => "/".to_string(),
     }
+}
+
+/// `true` when `tab` is the pane that holds `path` — the directory the reveal asked for, and the one
+/// its rows are keyed against.
+fn lists_parent(tab: &crate::state::Tab, path: &AbsPath) -> bool {
+    path.parent()
+        .is_some_and(|parent| tab.path == FsPath::from_abs(parent))
+}
+
+/// The listing row a revealed name answers to, or `None` when the page does not carry it.
+///
+/// The name is the whole test in a plain listing, where a row is its own entry; in a flat one the
+/// same name can appear at two depths, and then the *first* is what Go's `selectedPaths.add(itemPath)`
+/// matched too (its `rel_path` was the full path from the search root, not from the listing).
+fn row_named(tab: &crate::state::Tab, name: &str) -> Option<usize> {
+    tab.entries
+        .entries
+        .iter()
+        .position(|entry| crate::state::Tab::row_key(entry) == name)
 }
 
 /// The first three names of a doomed set, plus Go's `and N more` tail — the line both destructive
