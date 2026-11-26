@@ -502,7 +502,7 @@ fn conflict_scene(tag: &str) -> (Harness<'static, ZenApp>, PathBuf, PathBuf) {
     session
         .clipboard_store(&ClipboardStore {
             op: ClipOp::Copy,
-            sources: vec![abs(&src.join("dup.txt"))],
+            sources: vec![fs_path(&src.join("dup.txt"))],
             scope: ClipScope::Selected,
         })
         .expect("the clipboard takes the copy");
@@ -586,7 +586,7 @@ fn a_paste_with_no_collision_runs_without_a_question() {
     session
         .clipboard_store(&ClipboardStore {
             op: ClipOp::Copy,
-            sources: vec![abs(&src.join("unique.txt"))],
+            sources: vec![fs_path(&src.join("unique.txt"))],
             scope: ClipScope::Selected,
         })
         .expect("the clipboard takes the copy");

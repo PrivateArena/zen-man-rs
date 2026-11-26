@@ -31,6 +31,7 @@ use std::time::Duration;
 use serde::Serialize;
 
 use crate::archive::extract::{ExtractReport, ExtractReq};
+use crate::archive::vfs::Manifest;
 use crate::entry::{DirPage, FileEntry};
 use crate::error::CoreError;
 use crate::events::{ChangeCause, EngineEvent};
@@ -46,10 +47,10 @@ use crate::ops::delete::{self, DeleteReport, DeleteReq};
 use crate::ops::mkdir::{self, MkdirReq};
 use crate::ops::r#move::{MoveFs, OsMoveFs};
 use crate::ops::open::{self, OpenReport};
-use crate::ops::paste::{self, PasteMode, PasteReport, PasteReq};
+use crate::ops::paste::{self, PasteMode, PasteOutcome, PasteReport, PasteReq};
 use crate::ops::rename::{self, RenameReport, RenameReq};
 use crate::ops::{ConflictPolicy, guard};
-use crate::path::{AbsPath, FsPath};
+use crate::path::{AbsPath, FsPath, VfsKind};
 use crate::platform::Env;
 use crate::platform::env_probe::ProbeReport;
 use crate::services::dirs::{
@@ -1081,11 +1082,16 @@ impl Session {
     ///
     /// Everything that can be answered without touching a byte runs **synchronously**, so the caller learns
     /// about a refused selection on its own call rather than through a job event five frames later: the
-    /// VFS write guard, the writability probe, and the containment guard ([`guard::guard_sources`] +
+    /// destination guards, the writability probe, and the containment guard ([`guard::guard_sources`] +
     /// [`guard::ensure_guarded`], which is what turns `cp dir dir/sub` into
     /// [`CoreError::DestInsideSource`] instead of Go's silent no-op). What follows is a
     /// [`JobKind::Paste`] job — the copy itself can be terabytes, and plan F1 is exactly this call blocking
     /// a window.
+    ///
+    /// A queue of archive **members** is a copy *out of* the VFS, which the host walk cannot read: it
+    /// routes to [`Self::paste_members`], the same job kind over the extractor. A queue that mixes
+    /// members and host files is refused outright — the UI can only queue one pane's selection, so
+    /// "mixed" is a bug, not a state to half-extract.
     ///
     /// The job appends the Go-parity undo-log record (`ActionPasteCopy`/`ActionPasteMove`/`ActionPasteLink`,
     /// `(placed sources, dest, "")`) **after** the walk, invalidates the destination and every affected
@@ -1094,26 +1100,42 @@ impl Session {
     /// outcomes as [`JobPayload::Paste`](crate::events::JobPayload::Paste).
     ///
     /// # Errors
-    /// [`CoreError::Empty`] for an empty selection, [`CoreError::VfsReadOnly`] for an archive source or
-    /// destination, [`CoreError::DestInsideSource`] when *every* source is refused, and the destination's
-    /// own [`CoreError::PermissionDenied`]/[`CoreError::NotFound`]. A partial paste is **not** an error: it
+    /// [`CoreError::Empty`] for an empty selection, [`CoreError::VfsReadOnly`] for an archive
+    /// **destination** or for a cut/link of members, [`CoreError::Unsupported`] for a mixed queue,
+    /// [`CoreError::DestInsideSource`] when *every* source is refused, and the destination's own
+    /// [`CoreError::PermissionDenied`]/[`CoreError::NotFound`]. A partial paste is **not** an error: it
     /// is a report.
     pub fn paste(&self, req: &PasteReq, origin: Origin) -> Result<Receipt<PasteReport>, CoreError> {
-        // 1. the archive read-only rule, on sources and destination alike (`api/ops.go:73,227`).
-        let src_paths: Vec<FsPath> = req
-            .sources
-            .iter()
-            .map(|p| FsPath::from_abs(p.clone()))
-            .collect();
-        let mut refs: Vec<&FsPath> = src_paths.iter().collect();
-        let dest_path = FsPath::from_abs(req.dest.clone());
-        refs.push(&dest_path);
-        guard::vfs_write_guard(&refs)?;
+        // 1. the archive read-only rule, on the **destination** (`api/ops.go:227`): an archive
+        //    *source* is a read (the queue may hold members), a write into a store stays refused.
+        //    The destination is therefore read *as a store*, which is what the archive half of these
+        //    two guards needed to stop being dead code: `from_abs` can never answer "archive", so
+        //    pasting into `/a/b.zip/inner` used to reach the walk. `guard::dest_store` splits the
+        //    text by store and lets a real directory named `fake.zip` through (ledger #13).
+        let dest_path = guard::dest_store(self.inner.dirs.source().as_ref(), &req.dest);
+        guard::vfs_write_guard(&[&dest_path])?;
         guard::dest_guard(&dest_path)?;
         // 2. "the OS agrees we may write here", before a worker has been born (`api/ops.go:227-229`).
         guard::ensure_writable(self.inner.env.as_ref(), &req.dest)?;
-        // 3. containment, once, so the executor and the report cannot disagree about the target names.
-        let guarded = guard::guard_sources(&req.sources, &req.dest)?;
+        // 3. route the queue. Members extract (see `Self::paste_members`); the host half below keeps
+        //    today's body, fed the host paths.
+        let (host, members) = req.split();
+        if !members.is_empty() {
+            if !host.is_empty() {
+                return Err(CoreError::Unsupported {
+                    what: "mixing archive members and local files in one paste",
+                });
+            }
+            if req.mode != PasteMode::Copy {
+                // A cut/link of a member is a write inside the store (`VfsReadOnly`, decision 3).
+                return Err(CoreError::VfsReadOnly {
+                    path: members[0].to_string(),
+                });
+            }
+            return self.paste_members(req, &members, origin);
+        }
+        // 4. containment, once, so the executor and the report cannot disagree about the target names.
+        let guarded = guard::guard_sources(&host, &req.dest)?;
         guard::ensure_guarded(&guarded, &req.dest)?;
 
         let label = format!(
@@ -1152,7 +1174,7 @@ impl Session {
                 ChangeCause::LocalJob,
                 origin,
             );
-            let mut parents: Vec<AbsPath> = Vec::new();
+            let mut parents: Vec<FsPath> = Vec::new();
             if req.mode != PasteMode::Copy {
                 for (source, _) in report.placed() {
                     if let Some(parent) = source.parent()
@@ -1163,7 +1185,7 @@ impl Session {
                 }
             }
             for parent in parents {
-                sess.invalidate_from(&FsPath::from_abs(parent), ChangeCause::LocalJob, origin);
+                sess.invalidate_from(&parent, ChangeCause::LocalJob, origin);
             }
             // The index hears about the same set the log did: a copy/link put rows somewhere new, a cut
             // relocated them (plan §5.3's no-connection rule — an op, never a `Connection`).
@@ -1171,10 +1193,17 @@ impl Session {
                 .placed()
                 .into_iter()
                 .map(|(source, target)| match req.mode {
-                    PasteMode::Cut => IndexOp::Moved {
-                        from: source.clone(),
-                        to: target.clone(),
-                    },
+                    // A cut queue is host-only (`clipboard_store` refuses a member cut), so the
+                    // `FsPath::host_abs` below is the identity of what the guard walked.
+                    PasteMode::Cut => source.host_abs().map_or(
+                        IndexOp::Created {
+                            path: target.clone(),
+                        },
+                        |from| IndexOp::Moved {
+                            from,
+                            to: target.clone(),
+                        },
+                    ),
                     PasteMode::Copy | PasteMode::Link => IndexOp::Created {
                         path: target.clone(),
                     },
@@ -1224,6 +1253,70 @@ impl Session {
             policy,
         };
         self.paste(&req, origin)
+    }
+
+    // --------------------------------------------------------------------------------- paste out of an archive
+
+    /// Paste a queue of archive **members** by extracting them into `req.dest` — the sibling of the
+    /// job in [`Self::paste`], not a second write path: same [`JobKind::Paste`], same
+    /// [`JobPayload::Paste`](crate::events::JobPayload::Paste) report, same log/invalidate/index
+    /// behaviour, so the jobs pane, the toasts and the history cannot tell the two apart.
+    ///
+    /// Each queued member becomes exactly one [`PasteOutcome`] (see [`run_member_paste`] — per-source
+    /// answers are the rule, see the `ops/paste.rs` docs). The queue is a copy (`paste` has refused
+    /// any other mode for members), so the clipboard is **not** cleared: Go's clear-after-a-clean-cut
+    /// condition (`api/ops.go:339-344`) has nothing that moved here.
+    ///
+    /// # Errors
+    /// Every refusal is synchronous and lives in [`Self::paste`] (destination guards, mixed queue,
+    /// cut/link of members); this only starts the job. Cancellation is the job's `Err`, everything
+    /// else — a vanished member, an unreadable container — is an outcome in the report.
+    fn paste_members(
+        &self,
+        req: &PasteReq,
+        members: &[FsPath],
+        origin: Origin,
+    ) -> Result<Receipt<PasteReport>, CoreError> {
+        let label = format!("Paste {} item(s)", members.len());
+        let spec = JobSpec::new(self.inner.jobs.next_id(), JobKind::Paste, label, origin);
+        let id = spec.id;
+        let sess = self.clone();
+        let req = req.clone();
+        let members = members.to_vec();
+        let archives = Arc::clone(&self.inner.archives);
+        self.inner.jobs.attach(spec, move |cancel, progress| {
+            let mut report = run_member_paste(&archives, &req, &members, cancel, progress)?;
+            if let Some(entry) = report.log_entry() {
+                match sess.append_log(&entry) {
+                    Ok(id) => report.log_id = Some(id),
+                    // As in the host walk: a paste the history pane does not know about cannot be
+                    // reverted, so the failure is said out loud (plan F4's sibling).
+                    Err(e) => sess.push(EngineEvent::Notice {
+                        level: crate::events::NoticeLevel::Warn,
+                        message: format!("paste log: {}", e.user_message()),
+                    }),
+                }
+            }
+            // The destination is the only directory the walk changed: the container was read, not
+            // written, and a member is not a host directory that could be invalidated.
+            sess.invalidate_from(
+                &FsPath::from_abs(report.dest.clone()),
+                ChangeCause::LocalJob,
+                origin,
+            );
+            // The written files are real filesystem paths, so they are indexable — the one case the
+            // "members are never indexed" rule of `services/archive.rs` carves out, same as extract.
+            let ops: Vec<IndexOp> = report
+                .placed()
+                .into_iter()
+                .map(|(_, target)| IndexOp::Created {
+                    path: target.clone(),
+                })
+                .collect();
+            sess.intent().note_all(&ops);
+            Ok(JobResult::done(report.clone(), report.summary()))
+        });
+        Ok(Receipt::Running { job: id, origin })
     }
 
     // ------------------------------------------------------------------------------------ delete
@@ -2083,32 +2176,47 @@ impl Session {
 
     /// Queue a copy/cut selection — Go's `handleClipboardSet` (`api/ops.go:144-186`), in Go's order:
     ///
-    /// 1. the VFS write guard (an archive selection is [`CoreError::VfsReadOnly`], `api/ops.go:73`);
+    /// 1. the cut rule: copying **out of** an archive is a read and is allowed (the queue then holds
+    ///    the *member*, not its container), but a `Cut` of a member would have to delete inside the
+    ///    store, which stays refused — [`CoreError::VfsReadOnly`]. Go's per-handler guard refused any
+    ///    archive path here; only the write half of that survives (a copy is not a write).
     /// 2. [`clipboard::store`], which expands a [`ClipScope::Inside`](clipboard::ClipScope) request into
-    ///    the directory's children and refuses an empty selection with [`CoreError::Empty`];
+    ///    the directory's children — host or archive — and refuses an empty selection with
+    ///    [`CoreError::Empty`];
     /// 3. the undo-log record Go appended — `Append(ActionCopy, sources, "", "")`, a *record of the
-    ///    copy*, not an undoable action (a log failure is a notice, never a failed copy);
+    ///    copy*, not an undoable action (a log failure is a notice, never a failed copy). A member
+    ///    queue logs the member strings (`/a/b.zip/inner`), which round-trip through `FsPath::resolve`;
     /// 4. [`EngineEvent::ClipboardChanged`] so every badge repaints;
     /// 5. best-effort [`clipboard::publish_system`] (Go's `writeToSystemClipboard`, whose spawn error Go
     ///    ignored and whose child exit status it never read — a clipboard manager that refuses the
     ///    payload must not turn a successful copy into a failed one; here the refusal is *reported* as a
-    ///    notice instead of vanishing).
+    ///    notice instead of vanishing). The system gets the **host items only**: an all-member queue
+    ///    publishes the empty uri-list, because no other application can open a member URI.
     ///
     /// # Errors
-    /// [`CoreError::VfsReadOnly`] for an archive source, [`CoreError::Empty`] for an empty selection,
-    /// [`CoreError::NotADir`] for a `Inside` request naming a file, and the source's own errors.
+    /// [`CoreError::VfsReadOnly`] for a **cut** of an archive member (a copy is legal),
+    /// [`CoreError::Empty`] for an empty selection, [`CoreError::NotADir`] for a `Inside` request naming
+    /// a file, and the source's own errors.
     pub fn clipboard_store(&self, req: &ClipboardStore) -> Result<Clipboard, CoreError> {
-        let paths: Vec<FsPath> = req.sources.iter().cloned().map(FsPath::from_abs).collect();
-        let refs: Vec<&FsPath> = paths.iter().collect();
-        crate::ops::guard::vfs_write_guard(&refs)?;
-        let clip = clipboard::store(self.inner.dirs.source().as_ref(), req)?;
+        if req.op == clipboard::ClipOp::Cut
+            && let Some(member) = req.sources.iter().find(|p| p.store.is_archive())
+        {
+            return Err(CoreError::VfsReadOnly {
+                path: member.to_string(),
+            });
+        }
+        let clip = clipboard::store(
+            self.inner.dirs.source().as_ref(),
+            self.inner.archives.store().as_ref(),
+            req,
+        )?;
         // The record carries the **resolved** sources: Go assigned `clipboard.Sources = paths` *after*
         // `resolveInsideSources` had widened an `Inside` request into the directory's children
         // (`api/ops.go:158-166`), so the log names what a paste will actually place.
         let sources: Vec<String> = clip
             .items
             .iter()
-            .map(|item| item.path.to_string_lossy())
+            .map(|item| item.path.to_string())
             .collect();
         if let Err(e) = self.append_log(&ActionEntry::new(ActionType::COPY, sources, "", "")) {
             self.push(EngineEvent::Notice {
@@ -2446,6 +2554,169 @@ impl Session {
         spec.budget = budget;
         self.inner.jobs.attach(spec, f)
     }
+}
+
+/// The name a member paste creates under `dest` — [`plan_paste`](crate::archive::extract::plan_paste)'s
+/// re-root rule (`/a/b.zip/inner/x.txt` pasted into `/d` names `/d/x.txt`), computable even when the
+/// plan itself failed, so a `Failed` outcome can still name the target the user asked for.
+fn member_target(member: &FsPath, dest: &AbsPath) -> AbsPath {
+    member
+        .last_segment()
+        .and_then(|base| dest.join(base).ok())
+        .unwrap_or_else(|| dest.clone())
+}
+
+/// Extract one member queue into `req.dest` — the executor behind [`Session::paste_members`], with
+/// `ops::paste::paste`'s answer shape: one [`PasteOutcome`] per queued member, per-source failures in
+/// the report, and cancellation the only `Err` (the job's).
+///
+/// Members are grouped by their store so each container is opened **once** (streaming N members out of
+/// one handle is the `archive/vfs.rs` reader rationale), the groups running in queue order. A
+/// container that cannot be opened fails the members it holds and the walk continues — "which member
+/// failed, and why" is the whole answer the report has to give.
+fn run_member_paste(
+    archives: &crate::services::archive::ArchiveService,
+    req: &PasteReq,
+    members: &[FsPath],
+    cancel: &CancelToken,
+    progress: &crate::jobs::Progress,
+) -> Result<PasteReport, CoreError> {
+    let mut report = PasteReport {
+        mode: req.mode,
+        dest: req.dest.clone(),
+        outcomes: Vec::with_capacity(members.len()),
+        rejected: Vec::new(),
+        conflicts: Vec::new(),
+        bytes: 0,
+        files: 0,
+        reload_required: members.len() > paste::TRACK_ENTRIES_CAP,
+        log_id: None,
+    };
+    let mut groups: Vec<(crate::path::ArchiveToken, Vec<&FsPath>)> = Vec::new();
+    for member in members {
+        let Some(token) = member.archive_token() else {
+            continue; // a host path: `paste` routes only members here
+        };
+        match groups.iter_mut().find(|(t, _)| *t == token) {
+            Some((_, list)) => list.push(member),
+            None => groups.push((token, vec![member])),
+        }
+    }
+    for (token, group) in groups {
+        let store = VfsKind::Archive {
+            host: token.host.clone(),
+            nested: token.nested.clone(),
+        };
+        // Both handles are per **store**: the reader because streaming N members out of one open file
+        // is the `archive/vfs.rs` rationale, the manifest because `manifest_of` re-checks the
+        // container's mtime, which a 10 000-member queue would otherwise ask 10 000 times.
+        let manifest = match archives.store().manifest_of(&store) {
+            Ok(manifest) => manifest,
+            Err(e) => {
+                let e = Arc::new(e);
+                for member in group {
+                    report.outcomes.push(PasteOutcome::Failed {
+                        source: member.clone(),
+                        target: member_target(member, &req.dest),
+                        error: Arc::clone(&e),
+                    });
+                }
+                continue;
+            }
+        };
+        let mut reader = match crate::archive::vfs::open_store(
+            &token.host,
+            token.nested.as_deref(),
+            archives.limits().nested_archive_max_bytes,
+        ) {
+            Ok(reader) => reader,
+            Err(e) => {
+                // One open per store, one failure per member of it: the queue is per-member, so
+                // the report is too.
+                let e = Arc::new(e);
+                for member in group {
+                    report.outcomes.push(PasteOutcome::Failed {
+                        source: member.clone(),
+                        target: member_target(member, &req.dest),
+                        error: Arc::clone(&e),
+                    });
+                }
+                continue;
+            }
+        };
+        for member in group {
+            cancel.check()?;
+            let (outcome, bytes, files) =
+                extract_one_member(&manifest, reader.as_mut(), req, member, cancel, progress)?;
+            report.bytes += bytes;
+            report.files += files;
+            report.outcomes.push(outcome);
+        }
+    }
+    Ok(report)
+}
+
+/// One queued member: plan it under `dest` re-rooted at its own name, stream it out, and answer with
+/// its outcome plus the two numbers the report accumulates. `Err` only for cancellation — every other
+/// failure is this member's [`PasteOutcome::Failed`], with the error the plan or the walk reported.
+fn extract_one_member(
+    manifest: &Manifest,
+    reader: &mut dyn crate::archive::reader::ArchiveReader,
+    req: &PasteReq,
+    member: &FsPath,
+    cancel: &CancelToken,
+    progress: &crate::jobs::Progress,
+) -> Result<(PasteOutcome, u64, u64), CoreError> {
+    let proposed = member_target(member, &req.dest);
+    // `FsPath` constructors already clean the relative path; `plan_paste` cleans again for its own
+    // callers, so the two agree on the spelling of the member key.
+    let source = member.rel();
+    let failed = |e: CoreError| PasteOutcome::Failed {
+        source: member.clone(),
+        target: proposed.clone(),
+        error: Arc::new(e),
+    };
+    let items = match crate::archive::extract::plan_paste(manifest, &req.dest, source) {
+        Ok(items) => items,
+        Err(e) => return Ok((failed(e), 0, 0)),
+    };
+    let extract = match crate::archive::extract::extract_all(
+        reader, &items, &req.dest, req.policy, cancel, progress,
+    ) {
+        Ok(extract) => extract,
+        Err(CoreError::Cancelled) => return Err(CoreError::Cancelled),
+        Err(e) => return Ok((failed(e), 0, 0)),
+    };
+    // The placed name: the top-level planned target — the member's own name under `dest` — unless the
+    // collision policy renamed *that* member (a renamed child stays the subtree's business).
+    let mut target = items
+        .first()
+        .map_or_else(|| proposed.clone(), |item| item.target.clone());
+    if let Some((_, fresh)) = extract.renamed.iter().find(|(m, _)| m == source) {
+        target = fresh.clone();
+    }
+    let outcome = if !extract.written.is_empty() || extract.dirs > 0 {
+        PasteOutcome::Placed {
+            source: member.clone(),
+            target,
+        }
+    } else if !extract.skipped.is_empty() {
+        // Every file of the member hit an occupied name (`SkipExisting`): nothing moved, say so.
+        PasteOutcome::Skipped {
+            source: member.clone(),
+            target: proposed,
+            reason: paste::SkipReason::Existing,
+        }
+    } else {
+        // A plan with no extractable node is `plan_paste`'s `NotFound` in practice; this arm only
+        // catches a container whose member vanished between plan and walk.
+        failed(CoreError::NotFound {
+            path: member.to_string(),
+            source_path: member.store.host().map(|h| h.to_string()),
+        })
+    };
+    let files = u64::try_from(extract.written.len()).unwrap_or(u64::MAX) + extract.dirs;
+    Ok((outcome, extract.bytes, files))
 }
 
 impl Drop for Inner {
@@ -3241,7 +3512,7 @@ mod tests {
 
     #[test]
     fn clipboard_store_queues_logs_and_clears() {
-        // Plan §5.3's `ops/clipboard.rs` façade on `Session`: guard → store → log record → event →
+        // Plan §5.3's `ops/clipboard.rs` façade on `Session`: cut rule → store → log record → event →
         // best-effort system sync (`api/ops.go:144-186`, `handleClipboardSet`).
         let dir = temp_dir("clipboard");
         fs::create_dir_all(dir.join("probe")).expect("probe dir");
@@ -3256,9 +3527,9 @@ mod tests {
             Limits::default(),
         )
         .expect("open");
-        let a = AbsPath::try_from(sel.join("a.txt").as_path()).expect("absolute");
-        let sub = AbsPath::try_from(sel.join("sub").as_path()).expect("absolute");
-        let root = AbsPath::try_from(sel.as_path()).expect("absolute");
+        let a = FsPath::from_abs(AbsPath::try_from(sel.join("a.txt").as_path()).expect("absolute"));
+        let sub = FsPath::from_abs(AbsPath::try_from(sel.join("sub").as_path()).expect("absolute"));
+        let root = FsPath::from_abs(AbsPath::try_from(sel.as_path()).expect("absolute"));
         assert!(
             session.clipboard().is_none(),
             "a fresh session has nothing queued"
@@ -3301,11 +3572,7 @@ mod tests {
         let records = session.log_recent(None).expect("the log reads");
         let rec = records.entries().last().expect("one record was appended");
         assert_eq!(rec.action, crate::history::codec::ActionType::COPY);
-        assert_eq!(
-            rec.sources,
-            vec![a.to_string_lossy()],
-            "the resolved sources"
-        );
+        assert_eq!(rec.sources, vec![a.to_string()], "the resolved sources");
         assert_eq!(rec.dest, "", "a copy has no destination yet");
         assert_eq!(rec.name, "");
 

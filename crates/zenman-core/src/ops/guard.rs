@@ -151,6 +151,37 @@ pub fn vfs_write_guard(paths: &[&FsPath]) -> Result<(), CoreError> {
     Ok(())
 }
 
+/// Read a **destination** as the store its text addresses, with the one answer [`FsPath::resolve`]
+/// cannot give from the name alone: an archive-named component that is a *directory* on disk is not a
+/// container.
+///
+/// The parse split is name-based (plan §5.2's case 6), so `/a/b.zip/inner` reads as an archive path
+/// whether `b.zip` is a container or the real directory of `docs/contracts.md` ledger #13. For a *read*
+/// that ambiguity is harmless — the reader opens the file and fails honestly — but a **write** guard
+/// must not refuse a folder for the shape of its name, which is the exact Go defect that ledger records.
+/// So the question goes to the filesystem: an existing host that is **not** a directory is a store, and
+/// [`vfs_write_guard`] refuses it; anything else — a directory, or nothing there yet — stays the plain
+/// path, so a missing destination is reported as missing ([`ensure_writable`] and the write itself) and
+/// not as a read-only archive.
+#[must_use]
+pub fn dest_store(source: &dyn crate::services::dirs::FsSource, dest: &AbsPath) -> FsPath {
+    let resolved = FsPath::resolve(&dest.to_string_lossy(), std::path::Path::new("/"), None)
+        .unwrap_or_else(|_| FsPath::from_abs(dest.clone()));
+    if !resolved.store.is_archive() {
+        return resolved;
+    }
+    let host_is_dir = resolved
+        .store
+        .host()
+        .and_then(|host| source.lstat(host.as_path()).ok())
+        .is_some_and(|info| info.kind.is_navigable_dir());
+    if host_is_dir {
+        FsPath::from_abs(dest.clone())
+    } else {
+        resolved
+    }
+}
+
 /// The raw-text half of the destination rule — what Go's `validateDest` was applied to, the JSON string
 /// before any parsing (`archive_extract.go:57-66`).
 ///

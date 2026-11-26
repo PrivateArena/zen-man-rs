@@ -219,7 +219,7 @@ fn a_copy_clipboard_makes_the_drop_a_copy_and_a_cut_clipboard_a_move() {
         .session
         .clipboard_store(&zenman_core::ops::clipboard::ClipboardStore {
             op: zenman_core::ops::clipboard::ClipOp::Copy,
-            sources: vec![source.clone()],
+            sources: vec![FsPath::from_abs(source.clone())],
             scope: zenman_core::ops::clipboard::ClipScope::Selected,
         })
         .expect("the clipboard takes the copy");
@@ -235,7 +235,7 @@ fn a_copy_clipboard_makes_the_drop_a_copy_and_a_cut_clipboard_a_move() {
         .session
         .clipboard_store(&zenman_core::ops::clipboard::ClipboardStore {
             op: zenman_core::ops::clipboard::ClipOp::Cut,
-            sources: vec![source],
+            sources: vec![FsPath::from_abs(source)],
             scope: zenman_core::ops::clipboard::ClipScope::Selected,
         })
         .expect("the clipboard takes the cut");
@@ -341,5 +341,170 @@ fn a_drag_released_on_nothing_pastes_nothing() {
             .count(),
         0,
         "and puts nothing in the folder"
+    );
+}
+
+// ---------------------------------------------------------------------- drags across a store
+//
+// The container writer is the one `tests/archives.rs` uses — the dev-dep `zip` crate, spelled here
+// so these tests know exactly which member they are dragging.
+
+/// The bytes of a stored (uncompressed) zip — `tests/archives.rs`'s helper, same writer.
+fn zip_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let opts =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    for (name, body) in entries {
+        if name.ends_with('/') {
+            writer
+                .add_directory(name.trim_end_matches('/'), opts)
+                .expect("add a directory member");
+        } else {
+            writer.start_file(*name, opts).expect("start a member");
+            std::io::Write::write_all(&mut writer, body).expect("write a member");
+        }
+    }
+    writer.finish().expect("finish the container").into_inner()
+}
+
+fn write_zip(path: &Path, entries: &[(&str, &[u8])]) {
+    std::fs::write(path, zip_bytes(entries)).expect("write the container");
+}
+
+fn toast_texts(harness: &Harness<'static, ZenApp>) -> Vec<String> {
+    harness
+        .state()
+        .notices
+        .queued()
+        .iter()
+        .map(|notice| notice.text.clone())
+        .collect()
+}
+
+/// Left pane inside `root/box.zip` (a store), right pane in `root/hostdir` (a host directory with
+/// an `out` folder and a `seed.txt` file).
+fn archive_and_host(tag: &str) -> (PathBuf, Harness<'static, ZenApp>) {
+    let root = scratch(tag);
+    std::fs::create_dir_all(root.join("hostdir/out")).expect("host directories");
+    write(&root.join("hostdir/seed.txt"), b"host bytes\n");
+    write_zip(&root.join("box.zip"), &[("member.txt", b"pulled out\n")]);
+    let session = common::session(tag);
+    let mut app = ZenApp::new(session, Vec::new());
+    app.set_layout(panes_for(LayoutMode::Split));
+    let store = FsPath::resolve(
+        root.join("box.zip").to_str().expect("utf-8"),
+        Path::new("/"),
+        None,
+    )
+    .expect("the container resolves to an archive store");
+    assert!(store.store.is_archive(), "the left tab is a store: {store}");
+    app.open_tab(PaneSlot::Left, store);
+    app.open_tab(
+        PaneSlot::Right,
+        FsPath::from_abs(absolute(&root.join("hostdir"))),
+    );
+    let harness = build_harness(app, egui::vec2(1600.0, 800.0));
+    (root, harness)
+}
+
+/// A member dragged out of an archive is a **copy** of the *member* (rule 1: the store is read-
+/// only, so a move is not even askable), and the drop extracts the member into the host folder.
+#[test]
+fn dragging_a_member_out_of_an_archive_copies_the_member_to_a_host_folder() {
+    let (root, mut harness) = archive_and_host("dnd-archive-out");
+    let from = centre(&harness, "member.txt");
+    let to = centre(&harness, "out");
+    let mods = Modifiers::default();
+    // Walk the drag halfway, then read the payload the grab produced *before* the release answers.
+    push_button(&mut harness, from, true, mods);
+    move_to(&mut harness, from);
+    for t in [0.125_f32, 0.25, 0.375, 0.5] {
+        move_to(&mut harness, from.lerp(to, t));
+    }
+    let payload = harness
+        .state()
+        .drag
+        .clone()
+        .expect("the grab carries a payload");
+    assert_eq!(
+        payload.mode,
+        DragMode::Copy,
+        "a drag out of a read-only store cannot mean a move"
+    );
+    assert_eq!(payload.paths.len(), 1, "exactly the grabbed row");
+    assert!(
+        payload.paths[0].store.is_archive() && payload.paths[0].ends_with("member.txt"),
+        "the payload is the member `FsPath`, not the container: {:?}",
+        payload.paths[0]
+    );
+    for t in [0.625_f32, 0.75, 0.875, 1.0] {
+        move_to(&mut harness, from.lerp(to, t));
+    }
+    push_button(&mut harness, to, false, mods);
+    settle(&mut harness);
+    common::settle_until(
+        &mut harness,
+        "the extracted member landing in the host folder",
+        |_| root.join("hostdir/out/member.txt").is_file(),
+    );
+    assert_eq!(
+        std::fs::read(root.join("hostdir/out/member.txt")).expect("extracted member"),
+        b"pulled out\n",
+        "the member's bytes came along"
+    );
+    assert!(
+        !root.join("hostdir/out/box.zip").exists(),
+        "the container itself was not copied"
+    );
+    assert!(
+        harness.state().drag.is_none(),
+        "the drag ended with the release"
+    );
+    // The source survives a copy — the archive tab is still listing its member.
+    let left = &harness.state().model.panes[&PaneSlot::Left];
+    assert!(
+        left.tabs[0]
+            .entries
+            .entries
+            .iter()
+            .any(|entry| entry.name == "member.txt"),
+        "the archive listing is intact after the copy"
+    );
+}
+
+/// An archive pane is not a writable destination: a drop onto it is refused with the keyboard
+/// ladder's words, and the container's bytes are untouched.
+#[test]
+fn dropping_onto_an_archive_pane_is_refused_with_the_read_only_reason() {
+    let (root, mut harness) = archive_and_host("dnd-archive-in");
+    let zip_len = std::fs::metadata(root.join("box.zip"))
+        .expect("the container")
+        .len();
+    let from = centre(&harness, "seed.txt");
+    // The left pane's body, under its single member row.
+    let to = below(&harness, "member.txt");
+    drag(&mut harness, from, to, Modifiers::default());
+    settle(&mut harness);
+    assert!(
+        toast_texts(&harness)
+            .iter()
+            .any(|t| t.contains("read-only") && t.contains("extract it first")),
+        "the refused drop said why: {:?}",
+        toast_texts(&harness)
+    );
+    assert!(
+        harness.state().drag.is_none(),
+        "the refused drop consumed the drag"
+    );
+    assert!(
+        root.join("hostdir/seed.txt").is_file(),
+        "the source stayed where it was"
+    );
+    assert_eq!(
+        std::fs::metadata(root.join("box.zip"))
+            .expect("the container")
+            .len(),
+        zip_len,
+        "the refused drop did not overwrite the container it would have addressed"
     );
 }

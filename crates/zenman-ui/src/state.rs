@@ -568,10 +568,12 @@ impl Tab {
         Some(path)
     }
 
-    /// The absolute path a row points at, `None` when the tab is on an archive (plan §4.2: only a
-    /// local path can have a `dir_size` answer).
+    /// The row's own path in the tab's store — a host path in a plain directory, the **member**
+    /// path in an archive listing (`/a/b.zip/inner/a.txt`). This is the currency clipboard and paste
+    /// traffic speak: anything that must be able to name a member — [`Tab::row_abs`] cannot — uses
+    /// this.
     #[must_use]
-    pub fn row_abs(&self, entry: &zenman_core::entry::FileEntry) -> Option<AbsPath> {
+    pub fn row_fs(&self, entry: &zenman_core::entry::FileEntry) -> Option<FsPath> {
         // `rel_path` is only filled by the flat listings; in a plain directory the row *is* its
         // name — joining the name is what makes the row point at the entry, not at the directory.
         let rel = if entry.rel_path.is_empty() {
@@ -579,7 +581,17 @@ impl Tab {
         } else {
             entry.rel_path.as_str()
         };
-        let path = self.path.join_rel(rel).ok()?;
+        self.path.join_rel(rel).ok()
+    }
+
+    /// The absolute **host** path a row points at. In an archive listing this is the *container* —
+    /// [`FsPath::host_abs`] answers the archive file, never the member — so it must only serve
+    /// genuinely-host callers: open / rename / delete / size lookups, all of which the UI refuses
+    /// outright while the pane shows an archive. Anything that queues, drags or pastes a row uses
+    /// [`Tab::row_fs`] instead.
+    #[must_use]
+    pub fn row_abs(&self, entry: &zenman_core::entry::FileEntry) -> Option<AbsPath> {
+        let path = self.row_fs(entry)?;
         path.host_abs()
     }
 

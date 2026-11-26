@@ -773,17 +773,22 @@ impl ZenApp {
             };
             let key = Tab::row_key(entry);
             if tab.sel.contains(key) {
-                self.selection_abs(slot)
+                self.selection_fs(slot)
             } else {
-                tab.row_abs(entry)
-                    .map(|path| vec![path])
-                    .unwrap_or_default()
+                tab.row_fs(entry).map(|path| vec![path]).unwrap_or_default()
             }
         };
         if paths.is_empty() {
             return;
         }
-        let mode = crate::drag_drop::grab_mode(self.session.clipboard().as_ref());
+        // A drag out of an archive is a read: the store is read-only, so a *move* would ask core
+        // for `PasteMode::Cut` of members, which `Session::paste` refuses with `VfsReadOnly`.
+        // Grab a copy instead — pasting members into a host directory extracts them.
+        let mode = if self.in_archive(slot) {
+            crate::drag_drop::DragMode::Copy
+        } else {
+            crate::drag_drop::grab_mode(self.session.clipboard().as_ref())
+        };
         self.drag = Some(crate::drag_drop::DragPayload {
             source: slot,
             paths,
@@ -802,6 +807,17 @@ impl ZenApp {
 
     /// A drop on a directory row: Go's `executeFileOp('paste', sources, path)` (`file-list.js:320-330`).
     fn drop_into_row(&mut self, slot: PaneSlot, ix: usize, copy: bool) {
+        // An archive pane is not a writable destination: its rows' `row_abs` answers the
+        // *container*, so without this gate a drop on a member row would paste next to the zip.
+        // Same refusal (and same words) as the keyboard ladder's [`Self::READ_ONLY_REFUSED`].
+        if self.in_archive(slot) {
+            self.drag = None;
+            self.notices.post(
+                toast::Level::Warning,
+                "drop: an archive listing is read-only — extract it first",
+            );
+            return;
+        }
         let Some(payload) = self.take_drag(copy) else {
             return;
         };
@@ -828,6 +844,17 @@ impl ZenApp {
 
     /// A drop on a pane's own background — `DropIntent::PasteInto{pane}`, into the directory it shows.
     fn drop_into_pane(&mut self, slot: PaneSlot, copy: bool) {
+        // The background of an archive listing is not a directory: `shown_dir_abs` would answer the
+        // *container* itself, so the drop would target `/a/b.zip`. Refused, like the keyboard
+        // `Paste` in the same pane.
+        if self.in_archive(slot) {
+            self.drag = None;
+            self.notices.post(
+                toast::Level::Warning,
+                "drop: an archive listing is read-only — extract it first",
+            );
+            return;
+        }
         let Some(payload) = self.take_drag(copy) else {
             return;
         };
@@ -857,8 +884,8 @@ impl ZenApp {
         let same_dir = payload
             .paths
             .first()
-            .and_then(|path| path.as_path().parent())
-            .is_some_and(|parent| parent == dest.as_path());
+            .and_then(|path| path.parent())
+            .is_some_and(|parent| parent == FsPath::from_abs(dest.clone()));
         if same_dir && conflicts.is_empty() {
             // Dropping rows back into their own directory: Go performed the no-op happily, core refuses
             // it (plan F11), and the refusal is worth hearing rather than watching nothing happen.
@@ -1295,7 +1322,7 @@ impl ZenApp {
     /// active tab shows: after a Cut Inside the rows are not even in the listing, and the indicator is
     /// the only trace left.
     #[must_use]
-    fn clip_status(&self) -> Option<panels::status_bar::ClipStatus> {
+    pub fn clip_status(&self) -> Option<panels::status_bar::ClipStatus> {
         self.clip.brief.clone()
     }
 
@@ -1356,9 +1383,17 @@ impl ZenApp {
                     .collect(),
             };
             // A copy is not a move: its rows keep their full colour because the source survives the
-            // paste, so only a cut builds the set.
-            let cut = (clip.op == ClipOp::Cut)
-                .then(|| Arc::new(clip.items.iter().map(|i| i.path.clone()).collect()));
+            // paste, so only a cut builds the set. A cut queue is host-only by rule (core refuses
+            // `Cut` of a member with `VfsReadOnly`), so mapping to host paths loses nothing; a
+            // hypothetical member is skipped rather than dimming its container's rows.
+            let cut = (clip.op == ClipOp::Cut).then(|| {
+                Arc::new(
+                    clip.items
+                        .iter()
+                        .filter_map(|i| i.path.host_abs())
+                        .collect(),
+                )
+            });
             ClipView {
                 source: Some(clip.clone()),
                 cut,
@@ -1873,10 +1908,13 @@ impl ZenApp {
             Command::CutInside => self.clipboard_store(slot, ClipOp::Cut, ClipScope::Inside),
             Command::CopyPath | Command::CopyName => {
                 let named = command == Command::CopyName;
+                // The row's own spelling, not the container's: the menu offers Copy path/Copy name
+                // inside an archive (menus read "reading is never refused"), and a member's text is
+                // `host.zip/member`, which is what a shell or a paste target can actually use.
                 let lines: Vec<String> = self
-                    .selection_abs(slot)
+                    .selection_fs(slot)
                     .iter()
-                    .map(|path| path_text(path.as_path(), named))
+                    .map(|path| folder_text(path, named))
                     .collect();
                 self.copy_lines(&lines, ctx);
             }
@@ -1887,8 +1925,10 @@ impl ZenApp {
             Command::OpenInNewTab => match self.single_selected_dir(slot) {
                 Some(dir) => {
                     // Go's `open-in-new-tab` (`keyboard.js:230-234`) demands one selected directory
-                    // — `getSelectedDir()` — and opens the *pane's* new tab there.
-                    self.open_tab(slot, FsPath::from_abs(dir));
+                    // — `getSelectedDir()` — and opens the *pane's* new tab there. The path is the
+                    // row's own, so inside an archive the new tab lands on the member directory
+                    // rather than back on the container.
+                    self.open_tab(slot, dir);
                 }
                 None => self.notices.post(
                     toast::Level::Warning,
@@ -1896,7 +1936,13 @@ impl ZenApp {
                 ),
             },
             Command::PasteInside => match self.single_selected_dir(slot) {
-                Some(dest) => self.run_paste(slot, dest, None),
+                // The destination of a paste is always a host directory (an archive listing is
+                // refused by `READ_ONLY_REFUSED` before this dispatch), so the member case cannot
+                // arrive here — a store-root path simply has no host answer.
+                Some(dir) => match dir.host_abs() {
+                    Some(dest) => self.run_paste(slot, dest, None),
+                    None => self.no_directory(command),
+                },
                 None => self.notices.post(
                     toast::Level::Warning,
                     "paste inside: select exactly one directory",
@@ -1973,8 +2019,10 @@ impl ZenApp {
         self.shown_tab(slot).map(|tab| tab.id)
     }
 
-    /// The shown directory as an absolute path — a paste destination. `None` on an archive path
-    /// (plan §4.2: only a local path can be written to).
+    /// The shown directory as an absolute path — a paste destination for **host** callers only.
+    /// In an archive listing this answers the *container* (`FsPath::host_abs`), so every write
+    /// ladder that takes this path is gated by [`Self::in_archive`] first; the drag/drop route is
+    /// gated the same way.
     pub(crate) fn shown_dir_abs(&self, slot: PaneSlot) -> Option<AbsPath> {
         self.shown_tab(slot)?.path.host_abs()
     }
@@ -2023,8 +2071,11 @@ impl ZenApp {
         crate::dialogs::extract::start(self, slot, &tab.path, sources, policy);
     }
 
-    /// The selection's absolute paths, in listing order (plan §5.8's display-order fix). Archive
-    /// rows have no host path, so they are simply not part of a selection the engine can act on.
+    /// The selection's absolute **host** paths, in listing order (plan §5.8's display-order fix).
+    /// In an archive listing [`Tab::row_abs`] answers the *container*, so this is only honest for
+    /// the genuinely-host callers left on it — open / rename / delete / chmod / copy-path text —
+    /// all of which the dispatch ladder refuses inside an archive. Clipboard queueing and dragging
+    /// use [`Self::selection_fs`], which keeps members.
     pub(crate) fn selection_abs(&self, slot: PaneSlot) -> Vec<AbsPath> {
         let Some(tab) = self.shown_tab(slot) else {
             return Vec::new();
@@ -2034,6 +2085,21 @@ impl ZenApp {
             .iter()
             .filter(|entry| tab.sel.contains(Tab::row_key(entry)))
             .filter_map(|entry| tab.row_abs(entry))
+            .collect()
+    }
+
+    /// The selection's paths in the pane's own store, in listing order — the clipboard/drag
+    /// currency: host rows give host paths, archive rows give the **member** path, never the
+    /// container.
+    pub(crate) fn selection_fs(&self, slot: PaneSlot) -> Vec<FsPath> {
+        let Some(tab) = self.shown_tab(slot) else {
+            return Vec::new();
+        };
+        tab.entries
+            .entries
+            .iter()
+            .filter(|entry| tab.sel.contains(Tab::row_key(entry)))
+            .filter_map(|entry| tab.row_fs(entry))
             .collect()
     }
 
@@ -2051,15 +2117,16 @@ impl ZenApp {
     }
 
     /// The one selected row when it is a directory — Go's `getSelectedDir()`
-    /// (`keyboard.js:139-150`), which demands *exactly one* selection for the `-inside` chords.
-    fn single_selected_dir(&self, slot: PaneSlot) -> Option<AbsPath> {
+    /// (`keyboard.js:139-150`), which demands *exactly one* selection for the `-inside` chords. The
+    /// row's own path, so a member directory answers the member and not its container.
+    fn single_selected_dir(&self, slot: PaneSlot) -> Option<FsPath> {
         let ix = self.single_selected_ix(slot)?;
         let tab = self.shown_tab(slot)?;
         let entry = tab.entries.entries.get(ix)?;
         if !entry.is_dir {
             return None;
         }
-        tab.row_abs(entry)
+        tab.row_fs(entry)
     }
 
     pub(crate) fn nothing_selected(&mut self, what: &str) {
@@ -2360,7 +2427,7 @@ impl ZenApp {
         slot: PaneSlot,
         dest: AbsPath,
         mode: Option<PasteMode>,
-        sources: Vec<AbsPath>,
+        sources: Vec<FsPath>,
         conflicts: Vec<String>,
     ) {
         let confirm = Confirm::new(
@@ -2826,16 +2893,15 @@ impl ZenApp {
     /// engine's guard is the authority, and `SkipExisting` — the policy the no-conflict path passes —
     /// cannot destroy anything.
     #[must_use]
-    pub fn paste_conflicts(&self, dest: &AbsPath, sources: &[AbsPath]) -> Vec<String> {
+    pub fn paste_conflicts(&self, dest: &AbsPath, sources: &[FsPath]) -> Vec<String> {
         let Some(existing) = self.listing_names_of(dest) else {
             return Vec::new();
         };
         let mut out: Vec<String> = Vec::new();
         for path in sources {
-            let name = path
-                .as_path()
-                .file_name()
-                .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+            // The name a paste answers at `dest`: the basename for a host path, the member's own
+            // name for an archive path — which is exactly where `Session::paste` re-roots it.
+            let name = path.last_segment().unwrap_or_default().to_string();
             if existing.contains(&name) && !out.contains(&name) {
                 out.push(name);
             }
@@ -2895,7 +2961,7 @@ impl ZenApp {
         slot: PaneSlot,
         dest: AbsPath,
         mode: Option<PasteMode>,
-        explicit: &[AbsPath],
+        explicit: &[FsPath],
         policy: ConflictPolicy,
     ) {
         let origin = self.session.next_origin();
@@ -3468,9 +3534,10 @@ impl ZenApp {
     /// runs) and a file is a launch, each failure named per path.
     ///
     /// Only ever reached with host paths: a single selected row goes through [`PaneCommand::Open`],
-    /// which knows stores, and a row *inside* a store is refused below — `Tab::row_abs` answers with
-    /// the **container** for any member path (`FsPath::host_abs`), so launching it would open a file
-    /// the user is not even looking at. Opening a member is extraction, which is [`Command::Extract`].
+    /// which knows stores, and a multi-selection inside an archive is refused below. Opening is a
+    /// host-only verb — the queueing verbs use [`Tab::row_fs`]; [`Tab::row_abs`], which the batch
+    /// was built with, still answers the **container** for a member path, which is exactly why the
+    /// refusal has to stay here. Opening a member is extraction, which is [`Command::Extract`].
     ///
     /// `navigate_to` is the multi-selection batch's fallback: with several rows there is no single
     /// joined path to move to, so the reported host directory is used.
@@ -3502,7 +3569,8 @@ impl ZenApp {
     /// The clipboard chords: `Copy`/`Cut` queue the selection, `CopyInside`/`CutInside` queue a
     /// directory's children (`ClipScope::Inside`, Go's `copy_inside`/`cut_inside`).
     fn clipboard_store(&mut self, slot: PaneSlot, op: ClipOp, scope: ClipScope) {
-        let sources = self.selection_abs(slot);
+        // The queue speaks `FsPath`: an archive row queues the *member*, not the container.
+        let sources = self.selection_fs(slot);
         if sources.is_empty() {
             self.nothing_selected(match op {
                 ClipOp::Copy => "copy",
@@ -3532,7 +3600,8 @@ impl ZenApp {
         }
         let req = ClipboardStore {
             op,
-            sources: paths.to_vec(),
+            // The found set is host paths; `from_abs` is the lossless injection into `FsPath`.
+            sources: paths.iter().cloned().map(FsPath::from_abs).collect(),
             scope: ClipScope::Selected,
         };
         match self.session.clipboard_store(&req) {

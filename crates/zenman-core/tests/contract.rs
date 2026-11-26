@@ -224,7 +224,7 @@ fn d03_copy_collision_is_reported_not_silent() {
     let origin = session.next_origin();
     let job = running(session.paste(
         &PasteReq {
-            sources: vec![src.clone()],
+            sources: vec![FsPath::from_abs(src.clone())],
             dest: abs(&root.join("dest")),
             mode: PasteMode::Copy,
             policy: ConflictPolicy::SkipExisting,
@@ -286,7 +286,7 @@ fn d05_paste_conflict_is_a_typed_field() {
     let origin = session.next_origin();
     let job = running(session.paste(
         &PasteReq {
-            sources: vec![abs(&root.join("tree/d1"))],
+            sources: vec![FsPath::from_abs(abs(&root.join("tree/d1")))],
             dest: abs(&root.join("dest")),
             mode: PasteMode::Copy,
             policy: ConflictPolicy::SkipExisting,
@@ -412,7 +412,7 @@ fn d09_revert_invalidates_the_pane() {
     let origin = session.next_origin();
     let job = running(session.paste(
         &PasteReq {
-            sources: vec![src],
+            sources: vec![FsPath::from_abs(src)],
             dest: abs(&root.join("dest")),
             mode: PasteMode::Copy,
             policy: ConflictPolicy::Rename,

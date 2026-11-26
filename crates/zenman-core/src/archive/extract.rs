@@ -245,6 +245,14 @@ pub struct PlanItem {
     pub size: u64,
 }
 
+/// Does the cleaned source `s` name this member, or an ancestor of it?
+///
+/// The one selection predicate both plan functions share: `m == s` (the member itself) or
+/// `m.starts_with("{s}/")` (a descendant — the `/` matters, so source `doc` does not select `docs/x`).
+fn member_matches(m: &str, s: &str) -> bool {
+    m == s || m.starts_with(&format!("{s}/"))
+}
+
 /// Resolve every member under `dest`, refusing the whole plan if any one of them escapes.
 ///
 /// This is the pass that makes "extracts to nothing" true: it writes nothing, so a refusal cannot leave
@@ -260,10 +268,9 @@ pub fn plan(
 ) -> Result<Vec<PlanItem>, CoreError> {
     let selected = |path: &str| {
         sources.is_empty()
-            || sources.iter().any(|s| {
-                let s = clean_internal_path(s);
-                path == s || path.starts_with(&format!("{s}/"))
-            })
+            || sources
+                .iter()
+                .any(|s| member_matches(path, &clean_internal_path(s)))
     };
     let mut out = Vec::new();
     for (path, node) in manifest.iter() {
@@ -276,6 +283,63 @@ pub fn plan(
             is_dir: node.is_dir,
             is_symlink: false,
             size: u64::try_from(node.size.max(0)).unwrap_or(0),
+        });
+    }
+    Ok(out)
+}
+
+/// Plan one member (or its whole subtree) into `dest`, **re-rooted at the member's own name** — the
+/// layout a *paste* out of an archive means: queue `box.zip/inner/a.txt`, paste into `/d`, get
+/// `/d/a.txt`; queue `box.zip/inner`, get `/d/inner/a.txt`. The container path is never reproduced
+/// (`KeepTree` keeps it, which is what "Extract here" shows).
+///
+/// This is [`plan`] with a different target rule, not a second reader: the `member` field still names
+/// the cleaned internal path (that is what `write_stream` reads), only `target` re-roots, so
+/// [`extract_all`] and its [`ConflictPolicy`](crate::ops::ConflictPolicy) handling (dir-onto-dir
+/// merges; file collisions skip/rename per policy) serve both layouts unchanged.
+///
+/// Unlike `plan`, an absent member is an **error**, not zero items: `plan`'s "no match ⇒ no items"
+/// is right for "extract here with a filter" and wrong for a paste, where a member that vanished
+/// since the queue was made must become this source's `Failed` outcome rather than a silent no-op.
+///
+/// # Errors
+/// [`CoreError::NotFound`] when the manifest has no node named `source` (or under it), and
+/// [`CoreError::InvalidPath`] with `EscapesRoot` for a member that resolves outside `dest` or
+/// through a symlink — the same zip-slip refusal [`plan`] makes.
+pub fn plan_paste(
+    manifest: &Manifest,
+    dest: &AbsPath,
+    source: &str,
+) -> Result<Vec<PlanItem>, CoreError> {
+    let s = clean_internal_path(source);
+    if s.is_empty() {
+        // The store root has no node and no name to re-root at; a queue should never hold it (the
+        // rows of a listing are its children), and `NotFound` says so without walking the manifest.
+        return Err(CoreError::NotFound {
+            path: source.to_string(),
+            source_path: None,
+        });
+    }
+    // Re-root at the member's own name: `inner/deep/a.txt` under source `inner/deep` becomes
+    // `a.txt`... with `base` = the last segment of `s` and the tail `m[s.len()..]` appended.
+    let base = s.rsplit('/').next().unwrap_or(&s);
+    let mut out = Vec::new();
+    for (path, node) in manifest.subtree(&s) {
+        let rel = format!("{base}{}", &path[s.len()..]);
+        out.push(PlanItem {
+            member: path.clone(),
+            target: crate::ops::guard::safe_join(dest, &rel)?,
+            is_dir: node.is_dir,
+            is_symlink: false,
+            size: u64::try_from(node.size.max(0)).unwrap_or(0),
+        });
+    }
+    if out.is_empty() {
+        // The manifest does not know its host (it is a tree of internal paths), so `source_path`
+        // stays `None`; the caller that opened the store names it in its own reporting.
+        return Err(CoreError::NotFound {
+            path: s,
+            source_path: None,
         });
     }
     Ok(out)
@@ -714,6 +778,44 @@ mod tests {
                 .all(|i| i.member == "docs" || i.member.starts_with("docs/"))
         );
         assert!(items.iter().any(|i| i.is_dir));
+    }
+
+    #[test]
+    fn plan_paste_re_roots_at_the_member_name() {
+        let dest = AbsPath::from_path("/tmp/dest").expect("abs");
+        let m = manifest_of(&[
+            "inner/a.txt",
+            "inner/deep/b.txt",
+            "inner-backup/x.txt",
+            "innertext.txt",
+            "top.txt",
+        ]);
+        let items = plan_paste(&m, &dest, "inner").expect("plans");
+        // The subtree, re-rooted at `inner`: no `inner/inner`, no `top.txt`, and — because the range
+        // read in `Manifest::subtree` cannot tell a sibling prefix from a child on its own — none of
+        // `inner-backup/…` or `innertext.txt`.
+        let targets: Vec<String> = items.iter().map(|i| i.target.to_string_lossy()).collect();
+        assert_eq!(
+            targets,
+            [
+                "/tmp/dest/inner",
+                "/tmp/dest/inner/a.txt",
+                "/tmp/dest/inner/deep",
+                "/tmp/dest/inner/deep/b.txt",
+            ],
+            "the synthesised directory nodes come along, re-rooted like the leaves"
+        );
+        // The `member` field keeps the internal path: that is what `write_stream` reads.
+        assert_eq!(items[1].member, "inner/a.txt");
+
+        // A file member plans to exactly one target under its own name.
+        let one = plan_paste(&m, &dest, "inner/a.txt").expect("plans one file");
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].target.to_string_lossy(), "/tmp/dest/a.txt");
+
+        // An absent member is `NotFound`, never an empty plan (a paste must name the failure).
+        let err = plan_paste(&m, &dest, "gone.txt").expect_err("absent member");
+        assert_eq!(err.kind(), "not_found");
     }
 
     #[test]

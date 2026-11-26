@@ -418,9 +418,9 @@ pub struct PaneModel<'a> {
 ///
 /// Pure so the pairing rule is testable without a session: the selection is the pane's own
 /// [`Selection`], the cut queue is the engine's clipboard projected onto absolute paths
-/// ([`ZenApp::cut_clip`](crate::app::ZenApp::cut_clip)). An archive row has no absolute path —
-/// [`Tab::row_abs`] answers `None` — and Go's class was path-keyed too, so a row that cannot name a
-/// path is never a cut row.
+/// ([`ZenApp::cut_clip`](crate::app::ZenApp::cut_clip)) — host paths only, since a cut queue is
+/// host-only (core refuses cutting a member). Go's class was path-keyed too, so the pairing stays
+/// a plain set test on the row's [`Tab::row_abs`].
 #[must_use]
 pub fn row_state(
     entry_abs: Option<&AbsPath>,

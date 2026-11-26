@@ -14,7 +14,22 @@
 //! The undo-log record is appended by the caller ([`crate::Session::paste`]), after the walk, and carries
 //! the sources that actually landed — plan F3's rule for a delete is used here too: the record describes
 //! the work that ran, so a revert never has to guess.
+//!
+//! # Sources are [`FsPath`]s; this module's `paste` runs on the host
+//!
+//! A selection may name archive members, so [`PasteReq::sources`] is the store-typed path and
+//! [`PasteReq::split`] is the read that separates it into (host, members). The `paste` below is the
+//! **host executor**: it resolves each source to its [`AbsPath`] host and copies real files; a member
+//! source that reaches it is a [`CoreError::VfsReadOnly`] outcome (unreachable through
+//! [`Session::paste`](crate::Session::paste), which routes a member queue to the extract path — the
+//! Failed answer exists for the caller that does not, and it is per-source because a queue that is
+//! half-refused must still say so per source). The destination is always a host directory: writing
+//! *into* an archive stays refused (`ops::guard::vfs_write_guard`).
+//!
+//! A member source is logged as its [`FsPath::Display`] string (`/a/b.zip/inner`), which is what lets
+//! `history::revert` recompute the placed name from the source's last segment under `dest`.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::error::CoreError;
@@ -25,7 +40,7 @@ use crate::ops::copy::{CopyStats, copy_item};
 use crate::ops::guard::{SourceGuard, SourceReject};
 use crate::ops::r#move::{MoveStats, move_item};
 use crate::ops::{ConflictPolicy, ProgressSink};
-use crate::path::AbsPath;
+use crate::path::{AbsPath, FsPath, VfsKind};
 use crate::platform::{Env, LinkItem};
 
 /// Go's `trackEntries` threshold (`api/ops.go:311`): past 100 sources it stopped describing the results and
@@ -60,8 +75,9 @@ impl PasteMode {
 /// One paste, already resolved to concrete sources.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PasteReq {
-    /// What the selection holds — the guard expands and checks these.
-    pub sources: Vec<AbsPath>,
+    /// What the selection holds — host paths and archive members alike; the containment guard expands
+    /// and checks the host half (see [`Self::split`]).
+    pub sources: Vec<FsPath>,
     /// The destination **directory**, already known writable.
     pub dest: AbsPath,
     /// Copy, cut or link.
@@ -70,20 +86,41 @@ pub struct PasteReq {
     pub policy: ConflictPolicy,
 }
 
+impl PasteReq {
+    /// Split the queue into `(host, members)` — the two executors' routing key.
+    ///
+    /// The host half keeps the queue's order, which is what the containment guard walks; a member
+    /// contributes nothing to it (its container is *not* a source — pasting the zip when the user
+    /// queued `box.zip/inner` is the bug this split exists to prevent).
+    #[must_use]
+    pub fn split(&self) -> (Vec<AbsPath>, Vec<FsPath>) {
+        let mut host = Vec::new();
+        let mut members = Vec::new();
+        for source in &self.sources {
+            if matches!(source.store, VfsKind::Fs) {
+                host.extend(source.host_abs());
+            } else {
+                members.push(source.clone());
+            }
+        }
+        (host, members)
+    }
+}
+
 /// One source's result.
 #[derive(Clone, Debug)]
 pub enum PasteOutcome {
     /// The bytes/link landed at `target`.
     Placed {
-        /// What was read.
-        source: AbsPath,
+        /// What was read — an archive member for an extract paste, a host path otherwise.
+        source: FsPath,
         /// Where it landed — [`ConflictPolicy::Rename`] can move it off the proposed name.
         target: AbsPath,
     },
     /// Nothing was written, for a reason the UI has to say out loud (plan F12).
     Skipped {
         /// The source that was left where it was.
-        source: AbsPath,
+        source: FsPath,
         /// The destination that was already occupied.
         target: AbsPath,
         /// Why.
@@ -92,7 +129,7 @@ pub enum PasteOutcome {
     /// The attempt failed; the other sources are unaffected.
     Failed {
         /// The source that could not be placed.
-        source: AbsPath,
+        source: FsPath,
         /// The destination it failed against.
         target: AbsPath,
         /// Why, shared so the report stays `Clone` (plan §9.1).
@@ -103,7 +140,7 @@ pub enum PasteOutcome {
 impl PasteOutcome {
     /// The source this outcome is about.
     #[must_use]
-    pub fn source(&self) -> &AbsPath {
+    pub fn source(&self) -> &FsPath {
         match self {
             Self::Placed { source, .. }
             | Self::Skipped { source, .. }
@@ -161,7 +198,7 @@ pub struct PasteReport {
     /// One entry per allowed source, in guard order.
     pub outcomes: Vec<PasteOutcome>,
     /// The sources the containment guard refused, with the reason (`api/ops.go:309`'s silent `continue`).
-    pub rejected: Vec<(AbsPath, SourceReject)>,
+    pub rejected: Vec<(FsPath, SourceReject)>,
     /// Names of the directory-onto-directory pairings that merged — the payload of Go's
     /// `status:"conflict"` answer (ledger #8), which the UI turns into the merge confirmation instead of
     /// a second round trip.
@@ -179,7 +216,7 @@ pub struct PasteReport {
 impl PasteReport {
     /// The sources that actually landed, in order — what the log record carries and what a revert reads.
     #[must_use]
-    pub fn placed(&self) -> Vec<(&AbsPath, &AbsPath)> {
+    pub fn placed(&self) -> Vec<(&FsPath, &AbsPath)> {
         self.outcomes
             .iter()
             .filter_map(|o| match o {
@@ -191,7 +228,7 @@ impl PasteReport {
 
     /// The skipped sources.
     #[must_use]
-    pub fn skipped(&self) -> Vec<&AbsPath> {
+    pub fn skipped(&self) -> Vec<&FsPath> {
         self.outcomes
             .iter()
             .filter_map(|o| match o {
@@ -203,7 +240,7 @@ impl PasteReport {
 
     /// The failed sources, each with its error.
     #[must_use]
-    pub fn failed(&self) -> Vec<(&AbsPath, &CoreError)> {
+    pub fn failed(&self) -> Vec<(&FsPath, &CoreError)> {
         self.outcomes
             .iter()
             .filter_map(|o| match o {
@@ -241,6 +278,11 @@ impl PasteReport {
     /// `GetLog().Append(logAction, paths, req.Dest, "")` (`api/ops.go:356`) and of the frozen
     /// `paste-copy`/`paste-move`/`paste-link` records in `tests/golden/log.json`.
     ///
+    /// A source is logged as its [`FsPath::Display`] string: byte-identical to the old [`AbsPath`] text
+    /// for a host path (the goldens do not move), and the member string (`/a/b.zip/inner`) for an
+    /// extract paste — which is what lets `history::revert` recompute the placed name from the source's
+    /// last segment under `dest` and delete exactly what was extracted.
+    ///
     /// `None` when nothing landed: Go appended a record for a paste that placed nothing (it appended
     /// *before* checking `lastErr` in the link handler, `api/ops.go:913`), which is an undo entry for work
     /// that never ran.
@@ -249,7 +291,7 @@ impl PasteReport {
         let sources: Vec<String> = self
             .placed()
             .into_iter()
-            .map(|(source, _)| source.to_string_lossy())
+            .map(|(source, _)| source.to_string())
             .collect();
         if sources.is_empty() {
             return None;
@@ -296,12 +338,19 @@ impl std::cmp::PartialEq for PasteReport {
 /// (a copied tree recreates them or follows them) and, in [`PasteMode::Link`], the link creation itself.
 /// `fs` is the [`MoveFs`] seam the cut path renames through.
 ///
+/// This is the **host** executor: each guard row names an [`AbsPath`] source (the host of the queue
+/// entry it came from — see [`PasteReq::split`], which is what `Session::paste` feeds the guard), and
+/// the outcome carries the [`FsPath`] it was queued as. A queue entry whose store is an archive cannot
+/// be read here; it gets a per-source [`CoreError::VfsReadOnly`] failure instead of a copy of its
+/// container. `Session::paste` never routes members this far — it sends them to the extract path.
+///
 /// `Err` means the paste did not start: an empty selection, a wholly refused one
 /// ([`CoreError::DestInsideSource`]), an unsupported link platform, or cancellation. Per-source failures
 /// are in the report.
 ///
 /// # Errors
-/// See above; every inner failure is a [`PasteOutcome::Failed`], never an `Err`.
+/// See above; every inner failure — including a member source, which is unreadable from this executor
+/// — is a [`PasteOutcome::Failed`], never an `Err`.
 pub fn paste(
     env: &dyn Env,
     fs: &dyn crate::ops::r#move::MoveFs,
@@ -315,7 +364,11 @@ pub fn paste(
         mode: req.mode,
         dest: req.dest.clone(),
         outcomes: Vec::with_capacity(guard.allowed.len()),
-        rejected: guard.rejected.to_vec(),
+        rejected: guard
+            .rejected
+            .iter()
+            .map(|(s, why)| (FsPath::from_abs(s.clone()), *why))
+            .collect(),
         conflicts: Vec::new(),
         bytes: 0,
         files: 0,
@@ -323,8 +376,10 @@ pub fn paste(
         log_id: None,
     };
 
+    let queue = queue_index(req);
+
     if req.mode == PasteMode::Link {
-        let items = link_items(guard, req.policy, &mut report)?;
+        let items = link_items(&queue, guard, req.policy, &mut report)?;
         if !items.is_empty() {
             block_on(env.paste_link(&items))??;
         }
@@ -333,6 +388,18 @@ pub fn paste(
 
     for allowed in &guard.allowed {
         cancel.check()?;
+        let source = queued_source(&queue, &allowed.source);
+        if source.store.is_archive() {
+            // The one case the type cannot prevent a direct caller from asking: refuse *this source*,
+            // do not read its container (`Session` routes members away; this is the belt).
+            let path = source.to_string();
+            report.outcomes.push(PasteOutcome::Failed {
+                source,
+                target: allowed.target.clone(),
+                error: Arc::new(CoreError::VfsReadOnly { path }),
+            });
+            continue;
+        }
         if dir_onto_dir(&allowed.source, &allowed.target) {
             report.conflicts.push(name_of(&allowed.source));
         }
@@ -360,7 +427,7 @@ pub fn paste(
         match outcome {
             Err(ref e) if matches!(e, CoreError::Cancelled) => return Err(CoreError::Cancelled),
             Err(e) => report.outcomes.push(PasteOutcome::Failed {
-                source: allowed.source.clone(),
+                source,
                 target: allowed.target.clone(),
                 error: Arc::new(e),
             }),
@@ -369,13 +436,13 @@ pub fn paste(
                 report.files += files + dirs;
                 if let Some(reason) = skipped {
                     report.outcomes.push(PasteOutcome::Skipped {
-                        source: allowed.source.clone(),
+                        source,
                         target: reason,
                         reason: SkipReason::Existing,
                     });
                 } else {
                     report.outcomes.push(PasteOutcome::Placed {
-                        source: allowed.source.clone(),
+                        source,
                         target: dest.unwrap_or_else(|| allowed.target.clone()),
                     });
                 }
@@ -384,6 +451,31 @@ pub fn paste(
     }
     progress.advance(0, 0, "");
     Ok(report)
+}
+
+/// The queue keyed by the host path a guard row names — [`FsPath::host_abs`] is that relation
+/// (the identity for a host entry, the container for a member). Keyed once per paste rather than
+/// scanned per source: a 10 000-item `Cut Inside` paste must not cost the walk 10⁸ path comparisons.
+/// Where two queue entries share one host (two members of one container) the first wins — this index
+/// exists to *name* a member that reached the host executor, and a refusal that says "an archive"
+/// rather than the exact member is still a refusal, not a wrong copy.
+fn queue_index(req: &PasteReq) -> HashMap<AbsPath, FsPath> {
+    let mut index = HashMap::with_capacity(req.sources.len());
+    for source in &req.sources {
+        if let Some(host) = source.host_abs() {
+            index.entry(host).or_insert_with(|| source.clone());
+        }
+    }
+    index
+}
+
+/// The queue entry a guard row came from: the guard speaks [`AbsPath`], the report speaks [`FsPath`].
+/// A guard built without the matching queue entry falls back to the host form of the row.
+fn queued_source(queue: &HashMap<AbsPath, FsPath>, host: &AbsPath) -> FsPath {
+    queue
+        .get(host)
+        .cloned()
+        .unwrap_or_else(|| FsPath::from_abs(host.clone()))
 }
 
 // -------------------------------------------------------------------------------------- internals
@@ -420,16 +512,29 @@ fn stats_into_copy(stats: &CopyStats) -> (u64, u64, u64, Option<AbsPath>) {
 }
 
 fn link_items(
+    queue: &HashMap<AbsPath, FsPath>,
     guard: &SourceGuard,
     policy: ConflictPolicy,
     report: &mut PasteReport,
 ) -> Result<Vec<LinkItem>, CoreError> {
     let mut items = Vec::new();
     for allowed in &guard.allowed {
+        let source = queued_source(queue, &allowed.source);
+        if source.store.is_archive() {
+            // A link to a member is not a thing another process could follow: same per-source refusal
+            // the copy/cut walk gives it (`Session` refuses a member queue before `Link` is reached).
+            let path = source.to_string();
+            report.outcomes.push(PasteOutcome::Failed {
+                source,
+                target: allowed.target.clone(),
+                error: Arc::new(CoreError::VfsReadOnly { path }),
+            });
+            continue;
+        }
         let target = match policy.decide(false, &allowed.target)? {
             crate::ops::ConflictDecision::Skip => {
                 report.outcomes.push(PasteOutcome::Skipped {
-                    source: allowed.source.clone(),
+                    source,
                     target: allowed.target.clone(),
                     reason: SkipReason::Existing,
                 });
@@ -450,7 +555,7 @@ fn link_items(
             .allowed
             .iter()
             .find(|a| a.target == item.link || a.source == item.target)
-            .map(|a| a.source.clone());
+            .map(|a| queued_source(queue, &a.source));
         if let Some(source) = source {
             report.outcomes.push(PasteOutcome::Placed {
                 source,

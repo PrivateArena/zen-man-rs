@@ -591,7 +591,7 @@ fn copy_from_the_menu_leaves_the_clipboard_set_after_it_closes() {
     assert!(
         clip.paths()
             .first()
-            .is_some_and(|path| path.as_path().to_string_lossy().ends_with("a.txt")),
+            .is_some_and(|path| path.to_string().ends_with("a.txt")),
         "the clipboard holds {:?}",
         clip.paths()
     );

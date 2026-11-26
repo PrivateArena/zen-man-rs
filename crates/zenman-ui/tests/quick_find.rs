@@ -284,7 +284,7 @@ fn clip(harness: &Harness<'static, ZenApp>) -> Option<(ClipOp, Vec<String>)> {
             clip.op,
             clip.items
                 .iter()
-                .map(|item| item.path.to_string_lossy())
+                .map(|item| item.path.to_string())
                 .collect(),
         )
     })

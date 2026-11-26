@@ -24,11 +24,14 @@ use std::time::{Duration, SystemTime};
 use zenman_core::archive::extract::{ExtractReport, ExtractReq};
 use zenman_core::archive::vfs::clean_internal_path;
 
-use zenman_core::events::EngineEvent;
+use zenman_core::events::{EngineEvent, JobPayload};
+use zenman_core::history::codec::ActionType;
 use zenman_core::index::intent::{IndexIntent, IndexOp, RecordingIntent};
 use zenman_core::jobs::JobId;
 use zenman_core::limits::Limits;
 use zenman_core::ops::ConflictPolicy;
+use zenman_core::ops::clipboard::{ClipOp, ClipScope, ClipboardStore};
+use zenman_core::ops::paste::{PasteMode, PasteOutcome, PasteReport, PasteReq, SkipReason};
 use zenman_core::path::{AbsPath, FsPath, VfsKind};
 use zenman_core::platform::default_env;
 use zenman_core::session::{Origin, Receipt, Session, SessionPaths};
@@ -617,12 +620,435 @@ fn archive_members_are_never_indexed() {
     );
 }
 
+// --------------------------------------------------------------------------- copy/paste of a member
+
+/// 1. Copying a member is a **read**: the queue holds the member itself, and its chip facts are the
+///    member's own — the name the pane showed, the manifest's `is_dir`, the *uncompressed* size (not the
+///    zip's).
+#[test]
+fn copying_a_member_queues_the_member_with_its_own_facts() {
+    let s = session();
+    let store = store_of(Path::new("/"), "plain.zip");
+    let docs = store.join("docs").expect("dir member");
+    let top = store.join("top.txt").expect("file member");
+    let clip = s
+        .clipboard_store(&ClipboardStore {
+            op: ClipOp::Copy,
+            sources: vec![docs.clone(), top.clone()],
+            scope: ClipScope::Selected,
+        })
+        .expect("copy out of an archive is a read");
+    assert_eq!(clip.items.len(), 2);
+    assert_eq!(
+        clip.items[0].display, "docs",
+        "the member's own name, not the container's"
+    );
+    assert!(
+        clip.items[0].is_dir,
+        "the manifest row says directory, the chip says directory"
+    );
+    assert_eq!(
+        clip.items[0].size,
+        Some(0),
+        "a directory node carries 0 uncompressed bytes"
+    );
+    assert_eq!(clip.items[1].display, "top.txt");
+    assert!(!clip.items[1].is_dir);
+    assert_eq!(
+        clip.items[1].size,
+        Some(15),
+        "the uncompressed member size (`zip_browse`'s props), not the container's on-disk length"
+    );
+    assert_eq!(
+        clip.items[0].path.to_string(),
+        format!("{}/docs", archive_path("plain.zip").display()),
+        "the queue addresses the member, and `Display` round-trips through `FsPath::resolve`"
+    );
+    assert!(clip.is_archive(), "and the caller can route on it");
+    assert_eq!(
+        clip.origin.as_ref(),
+        Some(&store),
+        "the parent of a top-level member is the store root"
+    );
+
+    // The log record names the member strings (decision 6), not the container.
+    let records = s.log_recent(None).expect("the log reads");
+    let rec = records.records.last().expect("one record was appended");
+    assert_eq!(rec.action, ActionType::COPY);
+    assert_eq!(rec.sources, vec![docs.to_string(), top.to_string()]);
+}
+
+/// 2. A **cut** of a member stays refused: pasting it would have to delete inside the store.
+#[test]
+fn cutting_a_member_is_refused() {
+    let s = session();
+    let store = store_of(Path::new("/"), "plain.zip");
+    let docs = store.join("docs").expect("member");
+    let err = s
+        .clipboard_store(&ClipboardStore {
+            op: ClipOp::Cut,
+            sources: vec![docs.clone()],
+            scope: ClipScope::Selected,
+        })
+        .expect_err("a cut of a member is a write inside the store");
+    assert_eq!(err.kind(), "vfs_readonly", "{err}");
+    assert!(
+        s.clipboard().is_none(),
+        "the refusal leaves the queue alone, it does not clear it"
+    );
+    // (The same selection as a *copy* is what test 1 queues — the refusal is about the op, not the
+    // path, and the two halves must not tangle.)
+}
+
+/// 3. Pasting a member **file** into a host directory extracts the file — and never copies the
+///    container next to it.
+#[test]
+fn pasting_a_member_file_extracts_it_not_the_container() {
+    let mut s = session();
+    let store = store_of(Path::new("/"), "plain.zip");
+    let top = store.join("top.txt").expect("member");
+    let dest = scratch::Scratch::new("contract-archive-paste-file");
+    let report = paste_and_wait(
+        &mut s,
+        vec![top.clone()],
+        dest.path(),
+        ConflictPolicy::SkipExisting,
+    );
+    assert_eq!(report.summary(), "1 placed, 0 skipped, 0 failed");
+    let placed = report.placed();
+    assert_eq!(
+        placed[0].0, &top,
+        "the outcome names the member, not the container"
+    );
+    let out = dest.join("top.txt");
+    assert_eq!(
+        placed[0].1,
+        &AbsPath::from_path(&out).expect("abs"),
+        "re-rooted at the member's own name"
+    );
+    let golden = fs::read(Path::new(REPO).join("tests/golden/archive-stream-plain.txt"))
+        .expect("the captured member body");
+    assert_eq!(
+        fs::read(&out).expect("the extracted file"),
+        golden,
+        "byte-identical to the stream"
+    );
+    assert!(
+        !dest.join("plain.zip").exists(),
+        "the bug this whole pass fixes: the zip itself must never be the copy"
+    );
+}
+
+/// 4. Pasting a member **directory** brings the subtree, re-rooted at the member's own name — not at
+///    the internal path, and not flattened into the destination.
+#[test]
+fn pasting_a_member_dir_re_roots_the_subtree() {
+    let mut s = session();
+    let store = store_of(Path::new("/"), "plain.zip");
+    let docs = store.join("docs").expect("member");
+    let dest = scratch::Scratch::new("contract-archive-paste-dir");
+    let report = paste_and_wait(
+        &mut s,
+        vec![docs.clone()],
+        dest.path(),
+        ConflictPolicy::SkipExisting,
+    );
+    assert_eq!(
+        report.summary(),
+        "1 placed, 0 skipped, 0 failed",
+        "one queued member, one outcome"
+    );
+    assert_eq!(
+        report.placed()[0].1,
+        &AbsPath::from_path(dest.join("docs")).expect("abs")
+    );
+    assert!(
+        dest.join("docs/readme.md").is_file(),
+        "the subtree comes along"
+    );
+    assert!(
+        dest.join("docs/nested/deep.txt").is_file(),
+        "re-rooted at `docs`, the synthesised `docs/nested` included"
+    );
+    assert!(
+        !dest.join("readme.md").exists() && !dest.join("docs/docs").exists(),
+        "neither the KeepTree-flattened nor the doubled layout"
+    );
+    let want = s
+        .archive_read(&docs.join("readme.md").expect("child member"))
+        .expect("read the member");
+    assert_eq!(
+        fs::read(dest.join("docs/readme.md")).expect("read the file"),
+        want,
+        "the extracted bytes are the member's own"
+    );
+}
+
+/// 5. The [`ConflictPolicy`] is honoured at the re-rooted name, per member: `SkipExisting` leaves the
+///    existing file and answers `Skipped`; `Rename` keeps both and names the placed path it used.
+#[test]
+fn a_member_paste_honours_the_conflict_policy() {
+    let mut s = session();
+    let store = store_of(Path::new("/"), "plain.zip");
+    let top = store.join("top.txt").expect("member");
+    let dest = scratch::Scratch::new("contract-archive-paste-collide");
+    fs::write(dest.join("top.txt"), b"already here\n").expect("seed the collision");
+
+    let report = paste_and_wait(
+        &mut s,
+        vec![top.clone()],
+        dest.path(),
+        ConflictPolicy::SkipExisting,
+    );
+    assert_eq!(report.summary(), "0 placed, 1 skipped, 0 failed");
+    assert_eq!(
+        report.outcomes[0],
+        PasteOutcome::Skipped {
+            source: top.clone(),
+            target: AbsPath::from_path(dest.join("top.txt")).expect("abs"),
+            reason: SkipReason::Existing,
+        },
+        "the skip is a value naming the member, not an absence"
+    );
+    assert_eq!(
+        fs::read(dest.join("top.txt")).expect("still there"),
+        b"already here\n",
+        "SkipExisting never clobbers"
+    );
+
+    let report = paste_and_wait(
+        &mut s,
+        vec![top.clone()],
+        dest.path(),
+        ConflictPolicy::Rename,
+    );
+    assert_eq!(report.summary(), "1 placed, 0 skipped, 0 failed");
+    let renamed = dest.join("top (1).txt");
+    assert!(
+        renamed.is_file(),
+        "the rename policy kept both: {:?}",
+        fs::read_dir(dest.path()).map(|d| d.count())
+    );
+    assert_eq!(
+        report.placed()[0].1,
+        &AbsPath::from_path(&renamed).expect("abs"),
+        "the Placed target is the post-rename path, not the proposed one"
+    );
+    assert_eq!(
+        fs::read(dest.join("top.txt")).expect("original"),
+        b"already here\n",
+        "and it did not touch the original"
+    );
+}
+
+/// 6. The destination guard is **live** now: a paste *into* an archive (the store itself, or a path
+///    below it) is `VfsReadOnly` — the write-inside-the-archive rule the types could not express before.
+#[test]
+fn pasting_into_an_archive_destination_is_refused() {
+    let s = session();
+    let src_dir = scratch::Scratch::new("contract-archive-paste-dest-src");
+    fs::write(src_dir.join("victim.txt"), b"x").expect("a host file");
+    let victim = FsPath::from_abs(AbsPath::from_path(src_dir.join("victim.txt")).expect("abs"));
+    for dest in [
+        archive_path("plain.zip"),
+        archive_path("plain.zip").join("docs"),
+    ] {
+        let err = s
+            .paste(
+                &PasteReq {
+                    sources: vec![victim.clone()],
+                    dest: AbsPath::from_path(&dest).expect("abs dest"),
+                    mode: PasteMode::Copy,
+                    policy: ConflictPolicy::SkipExisting,
+                },
+                Origin(61),
+            )
+            .expect_err("the destination addresses a store");
+        assert_eq!(err.kind(), "vfs_readonly", "{dest:?}: {err}");
+    }
+    assert!(s.jobs().is_empty(), "a refused paste spawns no job");
+}
+
+/// 6b. The other half of ledger #13: the name is only a *hint*. A real directory that happens to be
+///     called `fake.zip` (or sits under one) is a plain filesystem path and must stay a legal paste
+///     destination — a guard that read the text alone would refuse it, which is the Go defect the
+///     deviation ledger records.
+#[test]
+fn a_real_directory_named_like_an_archive_is_still_a_destination() {
+    let mut s = session();
+    let root = scratch::Scratch::new("contract-archive-paste-fake-zip");
+    fs::create_dir_all(root.join("fake.zip/inner")).expect("a directory, not a container");
+    fs::write(root.join("victim.txt"), b"payload\n").expect("a host file");
+    let victim = FsPath::from_abs(AbsPath::from_path(root.join("victim.txt")).expect("abs"));
+    for name in ["fake.zip", "fake.zip/inner"] {
+        let dest = AbsPath::from_path(root.join(name)).expect("abs dest");
+        let report = paste_and_wait(
+            &mut s,
+            vec![victim.clone()],
+            dest.as_path(),
+            ConflictPolicy::SkipExisting,
+        );
+        assert_eq!(
+            report.summary(),
+            "1 placed, 0 skipped, 0 failed",
+            "{name} is a directory: the paste runs"
+        );
+    }
+    assert!(root.join("fake.zip/victim.txt").is_file());
+    assert!(root.join("fake.zip/inner/victim.txt").is_file());
+}
+
+/// 7. Decision 6 end to end: the record a member paste appends carries the **member string**, and
+///    `history::revert` — unchanged — recomputes the placed name from it and deletes exactly the
+///    extracted file.
+#[test]
+fn a_member_paste_logs_the_member_string_and_reverts() {
+    let mut s = session();
+    let store = store_of(Path::new("/"), "plain.zip");
+    let top = store.join("top.txt").expect("member");
+    let dest = scratch::Scratch::new("contract-archive-paste-revert");
+    let report = paste_and_wait(
+        &mut s,
+        vec![top.clone()],
+        dest.path(),
+        ConflictPolicy::SkipExisting,
+    );
+    let log_id = report
+        .log_id
+        .expect("a paste that placed something logged a record");
+    let record = s.log_record(log_id).expect("the record reads back");
+    assert_eq!(record.action, ActionType::PASTE_COPY);
+    assert_eq!(
+        record.sources,
+        vec![top.to_string()],
+        "the member string (`/a/b.zip/top.txt`), which is what `revert`'s `dest/base(source)` needs"
+    );
+    assert_eq!(record.dest, dest.path().to_string_lossy());
+    let out = dest.join("top.txt");
+    assert!(out.is_file(), "the extraction placed it");
+
+    let receipt = s.revert(log_id, Origin(71)).expect("the revert starts");
+    let job = match receipt {
+        Receipt::Running { job, .. } => job,
+        Receipt::Done(_) => panic!("revert is a job"),
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut done = false;
+    while !done && std::time::Instant::now() < deadline {
+        for ev in s.poll() {
+            if let EngineEvent::JobFinished { id, error, .. } = ev
+                && id == job
+            {
+                if let Some(e) = error {
+                    panic!("the revert job {id} failed: {e}");
+                }
+                done = true;
+            }
+        }
+        if !done {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+    assert!(done, "the revert job reported a terminal event within 30 s");
+    assert!(
+        !out.exists(),
+        "reverting the member paste deletes the extracted file — the container was never touched"
+    );
+}
+
+/// 8. `CopyInside` (`ClipScope::Inside`) inside an archive queues the member's **children**, in the
+///    manifest's name order — the same expansion the pane's rows show.
+#[test]
+fn copy_inside_an_archive_queues_the_children() {
+    let s = session();
+    let store = store_of(Path::new("/"), "plain.zip");
+    let docs = store.join("docs").expect("member");
+    let clip = s
+        .clipboard_store(&ClipboardStore {
+            op: ClipOp::Copy,
+            sources: vec![docs.clone()],
+            scope: ClipScope::Inside,
+        })
+        .expect("copy_inside on an archive directory");
+    let names: Vec<&str> = clip.items.iter().map(|i| i.display.as_str()).collect();
+    assert_eq!(
+        names,
+        ["nested", "readme.md"],
+        "Go's lexical child order, from the same rows `zip_browse` asserts"
+    );
+    assert_eq!(
+        clip.paths(),
+        vec![
+            docs.join("nested").expect("child"),
+            docs.join("readme.md").expect("child"),
+        ],
+        "the children keep the store (and a nested store would keep *that* store)"
+    );
+    assert!(
+        clip.items.iter().all(|i| i.path.store.is_archive()),
+        "nothing collapsed back to the container"
+    );
+    assert!(
+        clip.items[0].is_dir,
+        "`nested` is the synthesised directory node"
+    );
+}
+
 // --------------------------------------------------------------------------- helpers
 
 fn job_of(receipt: Receipt<ExtractReport>) -> JobId {
     match receipt {
         Receipt::Running { job, .. } => job,
         Receipt::Done(_) => panic!("extraction is always a job (plan F1)"),
+    }
+}
+
+/// Paste through the session and drive the [`JobKind::Paste`](zenman_core::jobs::JobKind::Paste) job
+/// to its report — the member-paste sibling of `finish`, same wall-clock coalescing caveat.
+fn paste_and_wait(
+    s: &mut Session,
+    sources: Vec<FsPath>,
+    dest: &Path,
+    policy: ConflictPolicy,
+) -> PasteReport {
+    let origin = s.next_origin();
+    let receipt = s
+        .paste(
+            &PasteReq {
+                sources,
+                dest: AbsPath::from_path(dest).expect("the scratch dest is absolute"),
+                mode: PasteMode::Copy,
+                policy,
+            },
+            origin,
+        )
+        .expect("a member paste into a host directory is accepted");
+    let job = match receipt {
+        Receipt::Running { job, .. } => job,
+        Receipt::Done(_) => panic!("a paste is never synchronous (plan F1)"),
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        for ev in s.poll() {
+            if let EngineEvent::JobFinished {
+                id, payload, error, ..
+            } = ev
+                && id == job
+            {
+                if let Some(e) = error {
+                    panic!("the paste job {id} failed: {e}");
+                }
+                match payload {
+                    JobPayload::Paste(report) => return report,
+                    other => panic!("paste job {id} finished with a non-paste payload: {other:?}"),
+                }
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the paste job {job} never produced a terminal event"
+        );
+        std::thread::sleep(Duration::from_millis(25));
     }
 }
 

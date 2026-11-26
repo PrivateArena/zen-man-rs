@@ -248,7 +248,8 @@ fn dir_changed(events: &[EngineEvent]) -> Vec<(String, Option<Origin>)> {
 
 fn paste_req(sources: Vec<AbsPath>, dest: AbsPath, mode: PasteMode) -> PasteReq {
     PasteReq {
-        sources,
+        // The queue speaks `FsPath` now; these tests queue host paths, which is the `Fs` store.
+        sources: sources.into_iter().map(FsPath::from_abs).collect(),
         dest,
         mode,
         policy: ConflictPolicy::SkipExisting,
@@ -401,7 +402,7 @@ fn paste_appends_a_go_parity_log_record() {
         report
             .placed()
             .iter()
-            .map(|(s, _)| s.to_string_lossy())
+            .map(|(s, _)| s.to_string())
             .collect::<Vec<_>>(),
         vec![two.to_string_lossy(), one.to_string_lossy()],
         "the log's source order is the request order, as Go appended it"
@@ -489,7 +490,7 @@ fn paste_cut_moves_sources_and_clears_the_clipboard() {
     session
         .clipboard_store(&ClipboardStore {
             op: ClipOp::Cut,
-            sources: vec![a.clone(), b.clone()],
+            sources: vec![FsPath::from_abs(a.clone()), FsPath::from_abs(b.clone())],
             scope: ClipScope::Selected,
         })
         .expect("the selection is queued");
@@ -554,7 +555,7 @@ fn each_collision_policy_answers_a_taken_name() {
         let taken = root.join(format!("dest-{n}/f.txt"));
         write(&taken, b"ORIGINAL");
         let req = PasteReq {
-            sources: vec![source.clone()],
+            sources: vec![FsPath::from_abs(source.clone())],
             dest,
             mode: PasteMode::Copy,
             policy,
@@ -567,7 +568,7 @@ fn each_collision_policy_answers_a_taken_name() {
                 assert_eq!(
                     report.outcomes[0],
                     PasteOutcome::Skipped {
-                        source: source.clone(),
+                        source: FsPath::from_abs(source.clone()),
                         target: abs(&taken),
                         reason: SkipReason::Existing,
                     },
@@ -586,7 +587,7 @@ fn each_collision_policy_answers_a_taken_name() {
                 assert_eq!(
                     report.outcomes[0],
                     PasteOutcome::Placed {
-                        source: source.clone(),
+                        source: FsPath::from_abs(source.clone()),
                         target: abs(&renamed),
                     },
                     "the report names the path that was actually used"
@@ -631,7 +632,7 @@ fn the_guard_refuses_a_paste_into_itself_and_reports_a_partial() {
 
     // A mixed selection into `project/build`: `project` is refused, `loose.txt` still pastes.
     let req = PasteReq {
-        sources: vec![project.clone(), outside],
+        sources: vec![FsPath::from_abs(project.clone()), FsPath::from_abs(outside)],
         dest: build.clone(),
         mode: PasteMode::Copy,
         policy: ConflictPolicy::SkipExisting,
@@ -640,7 +641,10 @@ fn the_guard_refuses_a_paste_into_itself_and_reports_a_partial() {
     let (report, _ev) = wait_paste(&mut session, job);
     assert_eq!(
         report.rejected,
-        vec![(project.clone(), SourceReject::DestInsideSource)],
+        vec![(
+            FsPath::from_abs(project.clone()),
+            SourceReject::DestInsideSource
+        )],
         "the refused source is named, with its reason"
     );
     assert_eq!(
@@ -905,7 +909,7 @@ fn cancel_midway_leaves_a_prefix_and_no_log_record() {
     session
         .clipboard_store(&ClipboardStore {
             op: ClipOp::Cut,
-            sources: sources.clone(),
+            sources: sources.iter().cloned().map(FsPath::from_abs).collect(),
             scope: ClipScope::Selected,
         })
         .expect("queued");
@@ -2424,7 +2428,7 @@ fn exactly_the_five_action_types_go_admits_are_reversible() {
     session
         .clipboard_store(&ClipboardStore {
             op: ClipOp::Copy,
-            sources: vec![file.clone()],
+            sources: vec![FsPath::from_abs(file.clone())],
             scope: ClipScope::Selected,
         })
         .expect("a copy logs `copy` (type 1)");

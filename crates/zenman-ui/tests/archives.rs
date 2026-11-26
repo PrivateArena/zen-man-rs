@@ -446,7 +446,14 @@ fn a_corrupt_container_reports_the_typed_error_inline_and_as_a_toast() {
 #[test]
 fn write_commands_inside_an_archive_are_refused_with_a_reason_and_change_nothing() {
     let root = clean("readonly");
-    write_zip(&root.join("box.zip"), &[("a.txt", b"member bytes\n")]);
+    write_zip(
+        &root.join("box.zip"),
+        &[
+            ("a.txt", b"member bytes\n"),
+            ("docs/", b""),
+            ("docs/note.txt", b"child of the member dir\n"),
+        ],
+    );
 
     let mut harness = pane_harness("readonly", &root);
     let slot = PaneSlot::Left;
@@ -466,6 +473,7 @@ fn write_commands_inside_an_archive_are_refused_with_a_reason_and_change_nothing
         Command::Chmod,
         Command::Paste,
         Command::Cut,
+        Command::CutInside,
     ] {
         dispatch(&mut harness, slot, command);
         let texts = toast_texts(&harness);
@@ -474,6 +482,39 @@ fn write_commands_inside_an_archive_are_refused_with_a_reason_and_change_nothing
             "{command:?} did not say why it refused: {texts:?}"
         );
     }
+    // A cut that was refused queued nothing at all — the clipboard stays empty, not half-cut.
+    assert!(
+        harness.state().session.clipboard().is_none(),
+        "a refused cut must not queue"
+    );
+
+    // **Copy is the read**, so it is *not* on the refused ladder: it queues, without a toast and
+    // without touching the container (plan rules 1 and 3).
+    select(&mut harness, slot, "a.txt");
+    dispatch(&mut harness, slot, Command::Copy);
+    let clip = harness
+        .state()
+        .session
+        .clipboard()
+        .expect("Copy inside an archive must queue, not refuse");
+    assert_eq!(clip.items.len(), 1);
+    // `Copy Inside` on a directory member queues the member's children the same way.
+    select(&mut harness, slot, "docs");
+    dispatch(&mut harness, slot, Command::CopyInside);
+    let clip = harness
+        .state()
+        .session
+        .clipboard()
+        .expect("CopyInside inside an archive must queue, not refuse");
+    assert_eq!(clip.items.len(), 1, "the member dir's one child");
+    assert!(
+        clip.items[0]
+            .path
+            .to_string()
+            .ends_with("box.zip/docs/note.txt"),
+        "the queue is the child member: {:?}",
+        clip.items[0].path
+    );
 
     let after: Vec<String> = std::fs::read_dir(root.join("box.zip").parent().expect("parent"))
         .expect("read the host directory")
@@ -485,8 +526,178 @@ fn write_commands_inside_an_archive_are_refused_with_a_reason_and_change_nothing
         root.join("box.zip").is_file(),
         "the container itself is untouched"
     );
-    // The listing is still the container's, and the member is still there.
-    assert_eq!(names(shown(&harness, slot)), vec!["a.txt"]);
+    // The listing is still the container's, and the members are still there.
+    let mut listed = names(shown(&harness, slot));
+    listed.sort();
+    assert_eq!(listed, vec!["a.txt", "docs"]);
+}
+
+// --------------------------------------------------------------------------- copy/paste a member
+
+/// Rule 1: a copy inside an archive queues the **member**, and the status bar's chip names and
+/// sizes that member — not the container the old `row_abs` collapse used to answer with.
+#[test]
+fn copying_a_member_queues_the_member_and_the_chip_names_the_member() {
+    let root = clean("clip-member");
+    // The container is far larger than 13 bytes, so a chip size of 13 can only be the member's.
+    write_zip(&root.join("small.zip"), &[("a.txt", b"member bytes\n")]);
+
+    let mut harness = pane_harness("clip-member", &root);
+    let slot = PaneSlot::Left;
+    activate(&mut harness, slot, "small.zip");
+    select(&mut harness, slot, "a.txt");
+    dispatch(&mut harness, slot, Command::Copy);
+
+    let clip = harness
+        .state()
+        .session
+        .clipboard()
+        .expect("the menu-less Copy chord queued the row");
+    assert_eq!(clip.items.len(), 1, "exactly the selected member");
+    assert!(
+        clip.is_archive(),
+        "the queue lives in an archive store: {:?}",
+        clip.paths()
+    );
+    assert!(
+        clip.items[0].path.ends_with("a.txt") && clip.items[0].path.store.is_archive(),
+        "the queued path is the member, not the container: {:?}",
+        clip.items[0].path
+    );
+
+    // The status bar's chip: the member's own name and the member's own (uncompressed) size.
+    let status = harness
+        .state()
+        .clip_status()
+        .expect("the bar reports the queue");
+    assert_eq!(status.items[0].name, "a.txt", "the chip names the member");
+    assert_eq!(
+        status.items[0].size,
+        Some(13),
+        "the chip sizes the member, not the zip"
+    );
+    assert!(!status.items[0].is_dir);
+
+    // A *cut* in the same pane is still refused (rule 3) and leaves the copy queue as it was.
+    dispatch(&mut harness, slot, Command::Cut);
+    assert!(
+        toast_texts(&harness)
+            .iter()
+            .any(|t| t.contains("read-only")),
+        "the refused cut said why: {:?}",
+        toast_texts(&harness)
+    );
+    let clip = harness
+        .state()
+        .session
+        .clipboard()
+        .expect("the refused cut kept the copy queue");
+    assert_eq!(
+        clip.op,
+        zenman_core::ops::clipboard::ClipOp::Copy,
+        "and did not turn it into a cut"
+    );
+    assert_eq!(clip.items.len(), 1, "and queued nothing new");
+}
+
+/// Rule 2: pasting a queued member into a host directory **extracts the member** — the file lands
+/// under its own name, the container does not, and the archive tab survives the paste.
+#[test]
+fn pasting_a_member_into_a_host_directory_extracts_just_the_member() {
+    let root = clean("paste-member");
+    write_zip(&root.join("box.zip"), &[("a.txt", b"member bytes\n")]);
+    std::fs::create_dir_all(root.join("out")).expect("destination directory");
+
+    let mut harness = pane_harness("paste-member", &root);
+    let slot = PaneSlot::Left;
+    activate(&mut harness, slot, "box.zip");
+    select(&mut harness, slot, "a.txt");
+    dispatch(&mut harness, slot, Command::Copy);
+
+    // A second tab of the same pane points at a host directory; `Paste` runs against *it*.
+    harness
+        .state_mut()
+        .open_tab(slot, fs_path(&root.join("out")));
+    settle(&mut harness);
+    dispatch(&mut harness, slot, Command::Paste);
+
+    common::settle_until(
+        &mut harness,
+        "the extracted member landing in the host directory",
+        |_| root.join("out").join("a.txt").is_file(),
+    );
+    assert_eq!(
+        std::fs::read(root.join("out").join("a.txt")).expect("extracted member"),
+        b"member bytes\n",
+        "the member's bytes came along"
+    );
+    assert!(
+        !root.join("out").join("box.zip").exists(),
+        "the container itself was not copied — the old bug"
+    );
+
+    // The archive tab is still there, still listing its members, unharmed.
+    let archive_tab = &harness.state().model.panes[&slot].tabs[0];
+    assert!(
+        archive_tab.path.store.is_archive(),
+        "tab 0 is still the archive listing: {:?}",
+        archive_tab.path
+    );
+    assert_eq!(
+        names(archive_tab),
+        vec!["a.txt"],
+        "and still lists its member"
+    );
+    assert!(
+        archive_tab.error.is_none(),
+        "and says nothing wrong about it"
+    );
+}
+
+/// The text the shell put on the clipboard: `Context::copy_text` is an output *command*, so it is read
+/// from the frame that ran the command — `dispatch`'s settle loop would flush it away.
+fn copied(
+    harness: &mut Harness<'static, ZenApp>,
+    slot: PaneSlot,
+    command: Command,
+) -> Option<String> {
+    let ctx = harness.ctx.clone();
+    harness.state_mut().dispatch(slot, command, &ctx);
+    harness.step();
+    harness
+        .output()
+        .platform_output
+        .commands
+        .iter()
+        .find_map(|command| match command {
+            egui::OutputCommand::CopyText(text) => Some(text.clone()),
+            _ => None,
+        })
+}
+
+/// The menu offers Copy path / Copy name inside a container ("reading is never refused",
+/// `menus::mod`), so the text is the **member's own** spelling — the container's path would name a
+/// file the user never selected.
+#[test]
+fn copy_path_and_name_inside_an_archive_name_the_member() {
+    let root = clean("copy-path");
+    write_zip(&root.join("box.zip"), &[("a.txt", b"member bytes\n")]);
+    let mut harness = pane_harness("copy-path", &root);
+    let slot = PaneSlot::Left;
+    activate(&mut harness, slot, "box.zip");
+    select(&mut harness, slot, "a.txt");
+
+    let want = format!("{}/a.txt\n", root.join("box.zip").display());
+    assert_eq!(
+        copied(&mut harness, slot, Command::CopyPath).as_deref(),
+        Some(want.as_str()),
+        "the member path, not the container"
+    );
+    assert_eq!(
+        copied(&mut harness, slot, Command::CopyName).as_deref(),
+        Some("a.txt\n"),
+        "the member's own name"
+    );
 }
 
 // -------------------------------------------------------------------------------- properties

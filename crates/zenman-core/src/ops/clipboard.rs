@@ -16,6 +16,17 @@
 //! * `readFromSystemClipboard` (`api/ops.go:577`) is the fallback source when a paste request carries no
 //!   `sources` of its own: `wl-paste` → `xclip`, URI list first, plain text second.
 //!
+//! # Queued paths are [`FsPath`]s, not [`AbsPath`]s
+//!
+//! A selection can be an *archive member* — the pane browses `box.zip/inner` and Ctrl+C queues what it
+//! shows. Go queued the container's absolute path because its `ClipboardState` had nothing else to hold,
+//! which is the bug this type fixes: an `FsPath` names a member *and* its store, so the chip shows the
+//! member's own name and uncompressed size, and the paste extracts it ([`Clipboard::is_archive`] is how
+//! the caller routes it). The one thing an archive path cannot do is reach an external application —
+//! no other program can open `file:///a/b.zip/inner` — so [`uri_list`] and [`publish_system`] publish
+//! the host items only, and an all-member queue publishes the empty list (the same body a clear
+//! writes) rather than a stale container URI.
+//!
 //! # Why the system sync goes through [`Env`] and not a crate
 //!
 //! Plan §5.3 sketched `arboard`; the decision for step 9a is **no new dependency** (the Go app's behaviour
@@ -31,7 +42,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::CoreError;
 use crate::jobs;
-use crate::path::AbsPath;
+use crate::path::{AbsPath, FsPath, VfsKind};
 use crate::platform::{Env, ExecRequest};
 use crate::services::dirs::FsSource;
 
@@ -68,16 +79,19 @@ impl std::fmt::Display for ClipOp {
 /// (`api/ops.go:166-176`), kept as its own type so the UI does not re-`stat` a selection it just made.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClipItem {
-    /// The absolute path the paste will read.
-    pub path: AbsPath,
-    /// `filepath.Base(source)` — the name the chip shows.
+    /// The path the paste will read — a member of an archive store when the selection came from a
+    /// pane browsing one, a plain filesystem path otherwise.
+    pub path: FsPath,
+    /// `filepath.Base(source)` — the name the chip shows (for a member, the member's own last segment,
+    /// not the container's).
     pub display: String,
     /// `info.IsDir()` — Go answered it per item (`api/ops.go:166-176`), and the status bar's
     /// in-action popup needs it for the row glyph. `false` when the stat failed: a path nobody could
     /// read is not a directory, and the popup must not claim one.
     pub is_dir: bool,
-    /// `info.Size()`, or `None` when the stat failed. Go reported that case as `0`
-    /// (`api/ops.go:163-171`); plan §2.4 makes the difference visible.
+    /// `info.Size()` (for a member: the *uncompressed* size, the number the pane painted), or `None`
+    /// when the stat failed. Go reported that case as `0` (`api/ops.go:163-171`); plan §2.4 makes the
+    /// difference visible.
     pub size: Option<u64>,
 }
 
@@ -91,14 +105,15 @@ pub struct Clipboard {
     /// clipboard carries).
     pub items: Vec<ClipItem>,
     /// The parent of the first source — the directory the pane came from, which is what a paste back
-    /// into it must refuse (`ops::guard`).
-    pub origin: Option<AbsPath>,
+    /// into it must refuse (`ops::guard`). The parent is *in the store*: a member queue from
+    /// `box.zip/inner` origins at the `box.zip` store root, a host queue at its host directory.
+    pub origin: Option<FsPath>,
 }
 
 impl Clipboard {
     /// The queued paths, in order — what `writeToSystemClipboard` and the paste loop consume.
     #[must_use]
-    pub fn paths(&self) -> Vec<AbsPath> {
+    pub fn paths(&self) -> Vec<FsPath> {
         self.items.iter().map(|i| i.path.clone()).collect()
     }
 
@@ -106,6 +121,25 @@ impl Clipboard {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
+    }
+
+    /// `true` when any queued item lives in an archive store. A `cut` queue never is (the caller
+    /// refuses that before storing); a `copy` queue with any member pastes by *extracting* —
+    /// see `Session::paste`, which routes on this.
+    #[must_use]
+    pub fn is_archive(&self) -> bool {
+        self.items.iter().any(|i| i.path.store.is_archive())
+    }
+
+    /// The queued host paths (members contribute nothing) — the system uri-list payload, which an
+    /// external application can only be given paths its own filesystem has.
+    #[must_use]
+    pub fn host_paths(&self) -> Vec<AbsPath> {
+        self.items
+            .iter()
+            .filter(|i| matches!(i.path.store, VfsKind::Fs))
+            .filter_map(|i| i.path.host_abs())
+            .collect()
     }
 }
 
@@ -124,10 +158,32 @@ pub enum ClipScope {
 pub struct ClipboardStore {
     /// Copy or cut.
     pub op: ClipOp,
-    /// What the user selected (or, with [`ClipScope::Inside`], the directories to open up).
-    pub sources: Vec<AbsPath>,
+    /// What the user selected (or, with [`ClipScope::Inside`], the directories to open up) — host
+    /// paths and archive members alike, in the pane's order.
+    pub sources: Vec<FsPath>,
     /// Which of the two Go handlers this request answers.
     pub scope: ClipScope,
+}
+
+/// The read-only seam that makes an archive *member* statable, in the shape [`store`] and
+/// [`expand_inside`] need: the same rows the pane painted, addressed by [`FsPath`] and nothing else.
+///
+/// Implemented by [`crate::archive::vfs::ArchiveStore`] (its `stat`/`list` *are* these two methods);
+/// the trait exists so this module never names `Session` or the archive service. A `Fs`-store path
+/// never reaches it — [`FsSource`] answers those.
+pub trait MemberFacts: Send + Sync {
+    /// One member's row — `VirtualNode::to_entry`, the source of truth for `is_dir`/`size`.
+    ///
+    /// # Errors
+    /// [`CoreError::NotFound`] for an absent member, plus the store's own open/verify errors.
+    fn stat_member(&self, path: &FsPath) -> Result<crate::entry::FileEntry, CoreError>;
+
+    /// The rows of one archive directory, sorted by name.
+    ///
+    /// # Errors
+    /// The store's errors (a non-directory is a typed refusal there, matching what a pane listing it
+    /// would have shown).
+    fn list_members(&self, path: &FsPath) -> Result<Vec<crate::entry::FileEntry>, CoreError>;
 }
 
 /// What the system clipboard handed us: paths, and whether they came with a type.
@@ -168,7 +224,17 @@ const URI_LIST_MIME: &str = "text/uri-list";
 /// [`ClipScope::Inside`], an empty directory is refused too (see [`expand_inside`]). The returned
 /// [`Clipboard`] is the value the session stores; appending the log record, pushing the event and calling
 /// [`publish_system`] are the session's business (plan §5.3 keeps I/O ordering out of `ops`).
-pub fn store(source: &dyn FsSource, req: &ClipboardStore) -> Result<Clipboard, CoreError> {
+///
+/// Copying out of an archive is a **read**, so a member source is legal here and gets the member's own
+/// facts: `display` is the member's last segment, `is_dir`/`size` come from [`MemberFacts`] (the same
+/// [`crate::archive::vfs::VirtualNode::to_entry`] rows the pane painted, so the chip cannot disagree
+/// with the row). A `cut` of a member is *not* refused here — the caller knows the op
+/// (`Session::clipboard_store` refuses it); this function only answers "what is queued".
+pub fn store(
+    source: &dyn FsSource,
+    archives: &dyn MemberFacts,
+    req: &ClipboardStore,
+) -> Result<Clipboard, CoreError> {
     if req.sources.is_empty() {
         return Err(CoreError::Empty { what: "selection" });
     }
@@ -177,7 +243,7 @@ pub fn store(source: &dyn FsSource, req: &ClipboardStore) -> Result<Clipboard, C
         ClipScope::Inside => {
             let mut expanded = Vec::new();
             for dir in &req.sources {
-                expanded.extend(expand_inside(source, dir)?);
+                expanded.extend(expand_inside(source, archives, dir)?);
             }
             expanded
         }
@@ -187,28 +253,17 @@ pub fn store(source: &dyn FsSource, req: &ClipboardStore) -> Result<Clipboard, C
         // caller's, not the expander's: an empty queue is never a success.
         return Err(CoreError::Empty { what: "selection" });
     }
-    let origin = paths.first().and_then(AbsPath::parent);
+    let origin = paths.first().and_then(FsPath::parent);
     let items = paths
         .into_iter()
         .map(|path| {
-            let display = path.file_name().map_or_else(
-                || path.to_string_lossy(),
-                |n| n.to_string_lossy().into_owned(),
-            );
-            // Go statted with `os.Stat` and used `0` on failure (`api/ops.go:163-166`); the failure is
-            // kept as `None` here, and the stat is `lstat` because that is the seam this crate has.
-            // The one stat answers *both* the size and Go's `isDir` (`api/ops.go:166-176`), so it is
-            // read once — the same `is_navigable_dir` rule [`expand_inside`] uses two functions below.
-            let info = source.lstat(path.as_path()).ok();
-            let size = info.as_ref().and_then(|info| u64::try_from(info.size).ok());
-            let is_dir = info
-                .as_ref()
-                .is_some_and(|info| info.kind.is_navigable_dir());
+            // One stat answers *both* the size and Go's `isDir` (`api/ops.go:166-176`), as before.
+            let (is_dir, size) = facts(source, archives, &path);
             ClipItem {
-                path,
-                display,
+                display: display_name(&path),
                 is_dir,
                 size,
+                path,
             }
         })
         .collect();
@@ -217,6 +272,45 @@ pub fn store(source: &dyn FsSource, req: &ClipboardStore) -> Result<Clipboard, C
         items,
         origin,
     })
+}
+
+/// The name the chip shows: the last segment of the path in its own store (for a member, the member's
+/// basename — Go's `filepath.Base` of a host path is exactly `FsPath::last_segment` there). The store
+/// roots have no last segment, and keep Go's full-text fallback (`api/ops.go:166`).
+fn display_name(path: &FsPath) -> String {
+    if let Some(name) = path.last_segment() {
+        return name.to_string();
+    }
+    path.host_abs()
+        .map_or_else(|| path.to_string(), |p| p.to_string_lossy())
+}
+
+/// One path's `(is_dir, size)`, asked of whichever store owns it — **once**, so the two can never
+/// disagree about the same row.
+///
+/// `Fs`: Go statted with `os.Stat` and used `0` on failure (`api/ops.go:163-166`); the failure is kept
+/// as `None` here, and the stat is `lstat` because that is the seam this crate has.
+/// `Archive`: [`MemberFacts::stat_member`], whose `size` is the *uncompressed* member size and whose
+/// `is_dir` is the manifest's own bit — a failed stat is the same `false`/`None` pair (a member that
+/// vanished since the listing is not a directory the popup may claim).
+fn facts(source: &dyn FsSource, archives: &dyn MemberFacts, path: &FsPath) -> (bool, Option<u64>) {
+    if path.store.is_archive() {
+        return archives
+            .stat_member(path)
+            .map(|entry| (entry.is_dir, u64::try_from(entry.size.max(0)).ok()))
+            .unwrap_or((false, None));
+    }
+    // Go answered `isDir` per queued item (`api/ops.go:166-176`), and the status bar's in-action popup
+    // draws its glyph from it; the one stat answers both, the same `is_navigable_dir` rule
+    // [`expand_inside`] uses below.
+    let info = path
+        .host_abs()
+        .and_then(|host| source.lstat(host.as_path()).ok());
+    let size = info.as_ref().and_then(|info| u64::try_from(info.size).ok());
+    let is_dir = info
+        .as_ref()
+        .is_some_and(|info| info.kind.is_navigable_dir());
+    (is_dir, size)
 }
 
 /// Open up one directory into its children — `resolveInsideSources` (`api/ops.go:189-211`).
@@ -234,15 +328,42 @@ pub fn store(source: &dyn FsSource, req: &ClipboardStore) -> Result<Clipboard, C
 ///   listing seam does not offer.
 ///
 /// Children come back sorted by name, because Go's `os.ReadDir` is lexical (`api/ops.go:198`) and the
-/// paste order — and therefore the undo record — follows it.
-pub fn expand_inside(source: &dyn FsSource, dir: &AbsPath) -> Result<Vec<AbsPath>, CoreError> {
-    let info = source.lstat(dir.as_path())?;
+/// paste order — and therefore the undo record — follows it. The same rule answers an archive
+/// directory: [`MemberFacts::list_members`] is the manifest's name-sorted `children_of`, and the
+/// children keep the store (`FsPath::join` carries host *and* nested, so a nested store stays correct).
+pub fn expand_inside(
+    source: &dyn FsSource,
+    archives: &dyn MemberFacts,
+    dir: &FsPath,
+) -> Result<Vec<FsPath>, CoreError> {
+    if dir.store.is_archive() {
+        // The store root is a directory by construction (it is the open container); anything else has
+        // to be *proved* one, the way the `lstat` branch below does.
+        if !dir.is_store_root() {
+            let entry = archives.stat_member(dir)?;
+            if !entry.is_dir {
+                return Err(CoreError::NotADir {
+                    path: dir.to_string(),
+                });
+            }
+        }
+        let mut entries = archives.list_members(dir)?;
+        if entries.is_empty() {
+            return Err(CoreError::Empty { what: "folder" });
+        }
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        return entries.iter().map(|e| dir.join(&e.name)).collect();
+    }
+    let host = dir.host_abs().ok_or_else(|| CoreError::NotADir {
+        path: dir.to_string(),
+    })?;
+    let info = source.lstat(host.as_path())?;
     if !info.kind.is_navigable_dir() {
         return Err(CoreError::NotADir {
-            path: dir.to_string_lossy(),
+            path: dir.to_string(),
         });
     }
-    let mut entries = source.read_dir(dir)?;
+    let mut entries = source.read_dir(&host)?;
     if entries.is_empty() {
         return Err(CoreError::Empty { what: "folder" });
     }
@@ -256,12 +377,16 @@ pub fn expand_inside(source: &dyn FsSource, dir: &AbsPath) -> Result<Vec<AbsPath
 /// **no trailing newline** (`strings.Join`, not a per-line write — `wl-copy` is told where the list ends by
 /// stdin closing).
 ///
-/// An empty selection yields the empty string, which is what a clipboard *clear* publishes
-/// (`api/ops.go:216`).
+/// Only the **host** paths are spelled out: an external application cannot open `file:///a/b.zip/inner`,
+/// so a member contributes nothing (its container is *not* published either — that would offer the other
+/// app a paste of the whole zip, the exact bug this queue used to be). An all-member list is therefore
+/// empty, which is the same body a clipboard *clear* publishes (`api/ops.go:216`).
 #[must_use]
-pub fn uri_list(paths: &[AbsPath]) -> String {
+pub fn uri_list(paths: &[FsPath]) -> String {
     paths
         .iter()
+        .filter(|p| matches!(p.store, VfsKind::Fs))
+        .filter_map(FsPath::host_abs)
         .map(|p| format!("file://{}", percent_encode_path(&p.to_string_lossy())))
         .collect::<Vec<_>>()
         .join("\n")
@@ -410,16 +535,23 @@ fn has(env: &dyn Env, program: &str) -> bool {
 ///
 /// `None` (or an empty clipboard) publishes an empty uri-list, which is how Go cleared it
 /// (`api/ops.go:216`): another application's paste then yields nothing instead of the old selection.
+/// An **all-member** queue publishes that same empty body — an external app cannot read a member URI,
+/// and publishing the container instead would offer a paste of the whole archive.
 /// With neither `wl-copy` nor `xclip` installed this is a **silent no-op**, exactly as in Go
-/// (`api/ops.go:573` has no `else`), so a headless box does not fail every copy.
+/// (`api/ops.go:573` has no `else`), so a headless box does not fail every copy; the answer then is
+/// `Ok(None)`, and `Ok(Some(tool))` names the tool a publish actually went through.
 ///
 /// The child's exit status is ignored, as Go's `_ = cmd.Run()` ignored it: a clipboard manager that
 /// refuses the payload must not turn a successful copy into a failed one. An `Err` here therefore means
 /// only "the platform could not even spawn", which the session reports as a degraded sync.
-pub fn publish_system(env: &dyn Env, clip: Option<&Clipboard>) -> Result<(), CoreError> {
+pub fn publish_system(
+    env: &dyn Env,
+    clip: Option<&Clipboard>,
+) -> Result<Option<SystemClipTool>, CoreError> {
     let paths = clip.map_or_else(Vec::new, |c| c.paths());
     let body = uri_list(&paths);
-    let req = match detect_tool(env) {
+    let tool = detect_tool(env);
+    let req = match tool {
         SystemClipTool::Wayland => {
             ExecRequest::argv(WL_COPY, ["-t", URI_LIST_MIME])
                 .with_stdin(body)
@@ -434,12 +566,12 @@ pub fn publish_system(env: &dyn Env, clip: Option<&Clipboard>) -> Result<(), Cor
         .with_stdin(body)
         // As above: `xclip -i` forks the selection owner, which inherits the output pipes.
         .detached(),
-        SystemClipTool::None => return Ok(()),
+        SystemClipTool::None => return Ok(None),
     };
     // Output discarded on purpose — see the doc above. Both layers of the `Result` count: the outer is
     // the job runner's, the inner the platform's refusal to spawn.
     jobs::block_on(env.exec_program(req))??;
-    Ok(())
+    Ok(Some(tool))
 }
 
 /// Read the system clipboard — `readFromSystemClipboard` (`api/ops.go:577-610`), the fallback source of a
@@ -677,6 +809,27 @@ mod tests {
         AbsPath::from_path(text).expect("test path is absolute and clean")
     }
 
+    fn fs(text: &str) -> FsPath {
+        FsPath::from_abs(abs(text))
+    }
+
+    /// The [`MemberFacts`] of a test that never queues a member: an archive call here is a bug in the
+    /// test, so it answers the typed refusal rather than a panic.
+    struct NoMembers;
+
+    impl MemberFacts for NoMembers {
+        fn stat_member(&self, path: &FsPath) -> Result<crate::entry::FileEntry, CoreError> {
+            Err(CoreError::UnsupportedArchive {
+                archive: path.to_string(),
+            })
+        }
+        fn list_members(&self, path: &FsPath) -> Result<Vec<crate::entry::FileEntry>, CoreError> {
+            Err(CoreError::UnsupportedArchive {
+                archive: path.to_string(),
+            })
+        }
+    }
+
     // ------------------------------------------------------------------ parse/round-trip vectors
 
     #[test]
@@ -730,13 +883,32 @@ mod tests {
             "/tree/ünïcode-é.txt",
         ]
         .map(abs);
-        let body = uri_list(&originals);
+        let queued: Vec<FsPath> = originals.iter().cloned().map(FsPath::from_abs).collect();
+        let body = uri_list(&queued);
         assert_eq!(body.lines().count(), originals.len());
         assert!(
             !body.ends_with('\n'),
             "Go joined with \\n, no trailing newline"
         );
         assert_eq!(parse_uri_list(&body), originals.to_vec());
+    }
+
+    #[test]
+    fn uri_list_publishes_host_paths_only() {
+        // Decision 5: an external app cannot read `file:///a/b.zip/inner`, and it must not be handed
+        // the container either — only plain host items reach the wire.
+        let member = FsPath::archive(abs("/a/b.zip"), None, "inner").expect("member path");
+        assert_eq!(
+            uri_list(std::slice::from_ref(&member)),
+            "",
+            "an all-member list is empty"
+        );
+        let host = fs("/a/host.txt");
+        assert_eq!(
+            uri_list(&[member, host.clone()]),
+            uri_list(&[host]),
+            "a mixed list carries the host item and nothing else"
+        );
     }
 
     // ------------------------------------------------------------------ system-clipboard commands
@@ -747,24 +919,28 @@ mod tests {
             op: ClipOp::Copy,
             items: vec![
                 ClipItem {
-                    path: abs("/tree/a b.txt"),
+                    path: fs("/tree/a b.txt"),
                     display: "a b.txt".into(),
                     is_dir: false,
                     size: None,
                 },
                 ClipItem {
-                    path: abs("/tree/c"),
+                    path: fs("/tree/c"),
                     display: "c".into(),
                     is_dir: true,
                     size: Some(7),
                 },
             ],
-            origin: Some(abs("/tree")),
+            origin: Some(fs("/tree")),
         };
         let want = uri_list(&clip.paths());
 
         let wayland = ClipEnv::new(&["wl-copy", "wl-paste"], vec![ClipEnv::out(0, "")]);
-        publish_system(&wayland, Some(&clip)).expect("wayland publish");
+        assert_eq!(
+            publish_system(&wayland, Some(&clip)).expect("wayland publish"),
+            Some(SystemClipTool::Wayland),
+            "the answer names the tool the publish went through"
+        );
         let calls = wayland.calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].program, "wl-copy");
@@ -786,9 +962,12 @@ mod tests {
         let calls = x11.calls();
         assert_eq!(calls[1].stdin.as_deref(), Some(""));
 
-        // No tool at all: the Go no-op — Ok, and nothing spawned.
+        // No tool at all: the Go no-op — Ok, nothing spawned, and the answer says so.
         let none = ClipEnv::new(&[], Vec::new());
-        publish_system(&none, Some(&clip)).expect("headless publish is a no-op");
+        assert_eq!(
+            publish_system(&none, Some(&clip)).expect("headless publish is a no-op"),
+            None
+        );
         assert!(none.calls().is_empty());
     }
 
@@ -863,10 +1042,11 @@ mod tests {
         scratch.empty_dir("payload/gamma");
         scratch.file("payload/beta.txt", b"123");
         scratch.file("payload/alpha.txt", b"x");
-        let dir = scratch.path().join("payload").expect("join");
+        let dir = FsPath::from_abs(scratch.path().join("payload").expect("join"));
 
         let clip = store(
             &OsDirRead,
+            &NoMembers,
             &ClipboardStore {
                 op: ClipOp::Cut,
                 sources: vec![dir.clone()],
@@ -883,8 +1063,11 @@ mod tests {
             ["alpha.txt", "beta.txt", "gamma"]
         );
         assert_eq!(clip.op, ClipOp::Cut);
-        let children = ["alpha.txt", "beta.txt", "gamma"].map(|n| dir.join(n).expect("join"));
-        assert_eq!(clip.paths(), children.to_vec());
+        let children: Vec<FsPath> = ["alpha.txt", "beta.txt", "gamma"]
+            .iter()
+            .map(|n| dir.join(n).expect("join"))
+            .collect();
+        assert_eq!(clip.paths(), children);
         // `origin` is the parent of the first *queued* item — here the opened directory itself.
         assert_eq!(clip.origin.as_ref(), Some(&dir));
         let sizes = clip.items.iter().map(|i| i.size).collect::<Vec<_>>();
@@ -908,6 +1091,7 @@ mod tests {
         // "No files selected").
         let selected = store(
             &OsDirRead,
+            &NoMembers,
             &ClipboardStore {
                 op: ClipOp::Copy,
                 sources: vec![dir.clone()],
@@ -918,6 +1102,7 @@ mod tests {
         assert_eq!(selected.paths(), vec![dir]);
         let empty = store(
             &OsDirRead,
+            &NoMembers,
             &ClipboardStore {
                 op: ClipOp::Copy,
                 sources: Vec::new(),
@@ -932,11 +1117,12 @@ mod tests {
         let scratch = Scratch::new("reject");
         let file = scratch.path().join("f.txt").expect("join");
         std::fs::write(scratch.0.join("f.txt"), b"x").expect("write");
-        let err = expand_inside(&OsDirRead, &file).expect_err("a file is not inside-able");
+        let err = expand_inside(&OsDirRead, &NoMembers, &FsPath::from_abs(file))
+            .expect_err("a file is not inside-able");
         assert_eq!(err.kind(), "not_a_directory");
 
         let empty_dir = AbsPath::from_path(scratch.empty_dir("empty")).expect("abs");
-        let empty = expand_inside(&OsDirRead, &empty_dir)
+        let empty = expand_inside(&OsDirRead, &NoMembers, &FsPath::from_abs(empty_dir))
             .expect_err("an empty folder is Go's 'folder is empty, nothing to copy/cut'");
         assert_eq!(empty.kind(), "empty");
     }

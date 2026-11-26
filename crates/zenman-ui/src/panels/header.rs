@@ -452,8 +452,8 @@ impl ZenApp {
                 .map(|tab| zenman_core::store::config::TabSession {
                     id: format!("tab-{}", tab.id.0),
                     // The **store** string, not the host path: `Display`/`FsPath::resolve` round-trip
-                    // an archive member (`/a/b.zip/inner`), while `host_abs()` answers `None` for one
-                    // and would have written an empty path — a tab that reloads as nothing.
+                    // an archive member (`/a/b.zip/inner`), while `host_abs()` answers its *container*,
+                    // so a tab opened on a member directory would reload as a tab on the zip root.
                     path: tab.path.to_string(),
                     name: tab.title.clone(),
                     // Both halves of the membership: `group_id` is this app's group, `group` is Go's

@@ -140,6 +140,22 @@ impl Manifest {
         self.nodes.iter()
     }
 
+    /// One member's subtree — the node itself, then everything under it, in path order.
+    ///
+    /// A range read rather than a scan of [`Self::iter`], because the caller that wants one folder out
+    /// of a 200 000-node container must not pay for the container: a paste of N members costs N
+    /// subtree walks, not N full ones. Keys are cleaned and `/`-separated, so `source` and each of its
+    /// descendants sort between `source` and `source` + the highest scalar value; a sibling named
+    /// `source-x` falls inside that range and the exact prefix test is what turns it away. An empty
+    /// `source` (the store root, which has no node) walks nothing.
+    pub fn subtree(&self, source: &str) -> impl Iterator<Item = (&String, &VirtualNode)> {
+        let want = clean_internal_path(source);
+        let prefix = format!("{want}/");
+        self.nodes
+            .range(want.clone()..=format!("{want}\u{10ffff}"))
+            .filter(move |(key, _)| key.as_str() == want || key.starts_with(&prefix))
+    }
+
     /// Node count (files and directories).
     #[must_use]
     pub fn len(&self) -> usize {
@@ -585,6 +601,22 @@ impl ArchiveStore {
     }
 }
 
+/// The clipboard's read-only view of this store: [`stat`] and [`list`] are exactly the two facts
+/// [`store`](crate::ops::clipboard::store) needs to name, size and expand a member queue without
+/// ever naming `Session` (the seam lives next to its user, the impl next to its subject).
+///
+/// [`stat`]: ArchiveStore::stat
+/// [`list`]: ArchiveStore::list
+impl crate::ops::clipboard::MemberFacts for ArchiveStore {
+    fn stat_member(&self, path: &FsPath) -> Result<FileEntry, CoreError> {
+        self.stat(path)
+    }
+
+    fn list_members(&self, path: &FsPath) -> Result<Vec<FileEntry>, CoreError> {
+        self.list(path)
+    }
+}
+
 /// The `FsPath` of one member of a store — the constructor the pane uses after a row activation.
 #[must_use]
 pub fn member_path(host: &AbsPath, nested: Option<&str>, inner: &str) -> FsPath {
@@ -616,6 +648,43 @@ mod tests {
         assert_eq!(clean_internal_path("a//b"), "a/b");
         // The zip-slip member keeps its `..`: a listing must not lie about what the container holds.
         assert_eq!(clean_internal_path("../escape.txt"), "../escape.txt");
+    }
+
+    /// The range read `Manifest::subtree` is for: a member's own subtree, and *only* it — the
+    /// lexicographic range also contains the sibling prefixes, which the exact test must turn away.
+    #[test]
+    fn subtree_walks_the_member_and_its_children_only() {
+        let mut r = FakeReader::new(vec![
+            entry("inner/a.txt", false, 3),
+            entry("inner/deep/b.txt", false, 4),
+            entry("inner-backup/x.txt", false, 1),
+            entry("innertext.txt", false, 1),
+            entry("top.txt", false, 1),
+        ]);
+        let m = build_manifest(&mut r, &Limits::default()).expect("manifest");
+        let keys: Vec<String> = m.subtree("inner").map(|(k, _)| k.clone()).collect();
+        assert_eq!(
+            keys,
+            ["inner", "inner/a.txt", "inner/deep", "inner/deep/b.txt"],
+            "the synthesised directory nodes are part of the subtree"
+        );
+        assert_eq!(
+            m.subtree("top.txt")
+                .map(|(k, _)| k.as_str())
+                .collect::<Vec<_>>(),
+            ["top.txt"],
+            "a file is its own subtree"
+        );
+        assert_eq!(
+            m.subtree("").count(),
+            0,
+            "the store root has no node, so it walks nothing rather than everything"
+        );
+        assert_eq!(
+            m.subtree("gone").count(),
+            0,
+            "an absent member walks nothing"
+        );
     }
 
     #[test]

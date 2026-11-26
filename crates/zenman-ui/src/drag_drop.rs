@@ -44,7 +44,7 @@ use egui::{Area, Color32, CornerRadius, Frame, Margin, Modifiers, Order, Pos2, R
 
 use zenman_core::ops::clipboard::{ClipOp, Clipboard};
 use zenman_core::ops::paste::PasteMode;
-use zenman_core::path::AbsPath;
+use zenman_core::path::FsPath;
 use zenman_core::store::config::PaneSlot;
 
 use crate::theme::Tokens;
@@ -84,8 +84,9 @@ impl DragMode {
 pub struct DragPayload {
     /// The pane the drag started in.
     pub source: PaneSlot,
-    /// Go's `dataTransfer` payload, in listing order.
-    pub paths: Vec<AbsPath>,
+    /// Go's `dataTransfer` payload, in listing order. A `FsPath` so a grab out of an archive
+    /// carries the **member**, not the container; destinations stay host `AbsPath`s.
+    pub paths: Vec<FsPath>,
     /// The mode decided at grab time from the clipboard; [`drop_mode`] refines it at release.
     pub mode: DragMode,
 }

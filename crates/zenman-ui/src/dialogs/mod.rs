@@ -52,7 +52,7 @@ pub use search_manager::{IndexOutcome, SearchManager};
 use egui::{Align2, Area, CornerRadius, Id, Order, Ui, Vec2};
 
 use zenman_core::ops::paste::PasteMode;
-use zenman_core::path::AbsPath;
+use zenman_core::path::{AbsPath, FsPath};
 use zenman_core::store::config::PaneSlot;
 
 use crate::state::GroupId;
@@ -110,8 +110,9 @@ pub enum DialogKind {
         dest: AbsPath,
         /// `None` = follow the clipboard's own op (Go's `paste`), `Some` = an explicit mode.
         mode: Option<PasteMode>,
-        /// A drag's sources; empty for a clipboard paste, which reads the live clipboard.
-        sources: Vec<AbsPath>,
+        /// A drag's sources (a member `FsPath` when the drag started in an archive); empty for a
+        /// clipboard paste, which reads the live clipboard.
+        sources: Vec<FsPath>,
     },
     /// Batch rename (step 14b) — the subject is the pane whose selection the rows came from.
     BatchRename {
