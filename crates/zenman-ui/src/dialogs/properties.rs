@@ -388,18 +388,13 @@ pub fn open(app: &mut ZenApp, slot: PaneSlot) {
         .iter()
         .find(|e| tab.sel.keys().contains(crate::state::Tab::row_key(e)))
         .cloned();
-    let path = match (&selected, in_archive) {
-        (Some(entry), true) => tab
-            .path
-            .join_rel(&entry.rel_path)
-            .ok()
+    // The selected row's own path, store-correct in both stores (`Tab::row_fs`): the two cases used
+    // to spell the same `join_rel` here, which is right for a host listing and wrong for a member.
+    let path = match &selected {
+        Some(entry) => tab
+            .row_fs(entry)
             .or_else(|| tab.path.join(&entry.name).ok()),
-        (Some(entry), false) => tab
-            .path
-            .join_rel(&entry.rel_path)
-            .ok()
-            .or_else(|| tab.path.join(&entry.name).ok()),
-        (None, _) => Some(tab.path.clone()),
+        None => Some(tab.path.clone()),
     };
     let Some(path) = path else {
         app.notices

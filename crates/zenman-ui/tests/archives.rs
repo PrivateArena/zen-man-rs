@@ -352,6 +352,106 @@ fn enter_on_a_directory_member_navigates_the_store() {
     assert_eq!(names(tab), vec!["readme.md"]);
 }
 
+/// The second step down is the one that used to break. A member's `rel_path` is its whole path
+/// *inside the store* (`docs/nested`), so joining it on the listed member (`…/box.zip/docs`) doubled
+/// the segment and the pane landed on `…/box.zip/docs/docs/nested` — "Path not found", which is what
+/// a user sees the first time they browse two levels into a container.
+#[test]
+fn stepping_two_levels_deep_keeps_the_member_path_undoubled() {
+    let root = clean("deep-member");
+    write_zip(
+        &root.join("box.zip"),
+        &[
+            ("docs/", b""),
+            ("docs/nested/", b""),
+            ("docs/nested/deep.txt", b"two levels down\n"),
+        ],
+    );
+    let mut harness = pane_harness("deep-member", &root);
+    let slot = PaneSlot::Left;
+    activate(&mut harness, slot, "box.zip");
+    select(&mut harness, slot, "docs");
+    dispatch(&mut harness, slot, Command::Open);
+    select(&mut harness, slot, "nested");
+    dispatch(&mut harness, slot, Command::Open);
+
+    let tab = shown(&harness, slot);
+    assert_eq!(
+        tab.path.relative_to(&tab.path.store_root()),
+        Some("docs/nested".into()),
+        "no doubled segment: {:?}",
+        tab.path
+    );
+    assert_eq!(names(tab), vec!["deep.txt"]);
+    assert!(
+        tab.error.is_none(),
+        "and nothing claimed an error: {:?}",
+        tab.error
+    );
+}
+
+/// The same depth through the clipboard: the queued path was the doubled one, so `plan_paste` found
+/// no member and the paste answered `0 placed, 0 skipped, 1 failed`.
+#[test]
+fn copying_and_pasting_a_deep_member_extracts_it() {
+    let root = clean("deep-paste");
+    write_zip(
+        &root.join("box.zip"),
+        &[
+            ("docs/", b""),
+            ("docs/nested/", b""),
+            ("docs/nested/deep.txt", b"two levels down\n"),
+        ],
+    );
+    std::fs::create_dir_all(root.join("out")).expect("destination directory");
+    let mut harness = pane_harness("deep-paste", &root);
+    let slot = PaneSlot::Left;
+    activate(&mut harness, slot, "box.zip");
+    select(&mut harness, slot, "docs");
+    dispatch(&mut harness, slot, Command::Open);
+    select(&mut harness, slot, "nested");
+    dispatch(&mut harness, slot, Command::Copy);
+
+    let clip = harness
+        .state()
+        .session
+        .clipboard()
+        .expect("the deep member queued");
+    assert_eq!(clip.items[0].display, "nested");
+    assert!(
+        clip.items[0]
+            .path
+            .to_string()
+            .ends_with("box.zip/docs/nested"),
+        "the queue names the member once: {:?}",
+        clip.items[0].path
+    );
+    assert!(
+        clip.items[0].is_dir,
+        "and knows it is a directory (the manifest row says so)"
+    );
+
+    harness
+        .state_mut()
+        .open_tab(slot, fs_path(&root.join("out")));
+    settle(&mut harness);
+    dispatch(&mut harness, slot, Command::Paste);
+    common::settle_until(
+        &mut harness,
+        "the deep member landing in the host directory",
+        |_| root.join("out").join("nested").is_dir(),
+    );
+    assert_eq!(
+        std::fs::read(root.join("out").join("nested").join("deep.txt")).expect("extracted"),
+        b"two levels down\n",
+        "re-rooted at the member's own name, subtree intact"
+    );
+    assert!(
+        !root.join("out").join("box.zip").exists(),
+        "and the container stayed where it was"
+    );
+}
+
 #[test]
 fn a_nested_archive_browses_to_depth_two_and_a_third_level_does_not_open() {
     let root = clean("nested");

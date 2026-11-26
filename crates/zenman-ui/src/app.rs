@@ -568,7 +568,11 @@ impl ZenApp {
                     let joined = if entry.rel_path.is_empty() {
                         tab.path.enter(&entry.name).ok()
                     } else {
-                        tab.path.join_rel(&entry.rel_path).ok()
+                        // The row's own path — which for an archive row means "resolved against the
+                        // store root", because a member's `rel_path` is its whole internal path
+                        // (`Tab::row_fs`). Joining that on the listed directory would double it and
+                        // open a path that does not exist.
+                        tab.row_fs(&entry)
                     };
                     let joined = joined.or_else(|| tab.path.enter(&entry.name).ok());
                     joined.map(|joined| {

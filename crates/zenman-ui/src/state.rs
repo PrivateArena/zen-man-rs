@@ -569,18 +569,31 @@ impl Tab {
     }
 
     /// The row's own path in the tab's store — a host path in a plain directory, the **member**
-    /// path in an archive listing (`/a/b.zip/inner/a.txt`). This is the currency clipboard and paste
-    /// traffic speak: anything that must be able to name a member — [`Tab::row_abs`] cannot — uses
-    /// this.
+    /// path in an archive listing (`/a/b.zip/inner/a.txt`). This is the currency clipboard, drag,
+    /// paste and navigation speak: anything that must be able to name a member — [`Tab::row_abs`]
+    /// cannot — uses this.
+    ///
+    /// The two stores spell `rel_path` differently and the join has to know which one it has:
+    ///
+    /// * host: `rel_path` is **listing**-relative (`EntryBuilder::build`,
+    ///   `path.relative_to(&self.rel_base)`), and the listing root is the tab's directory, so the row
+    ///   resolves against `self.path`; a plain (non-flat) listing leaves it empty and the name is the
+    ///   whole relative path.
+    /// * archive: `rel_path` is the member's path **inside the store** (`VirtualNode::to_entry`,
+    ///   `api/archive_vfs.go:31`), which is already complete — resolving it against the listed
+    ///   directory would double it (`/a/b.zip/inner` listing `a.txt`, joined, gives
+    ///   `/a/b.zip/inner/inner/a.txt`), a path that exists nowhere. So it resolves against the store
+    ///   root.
     #[must_use]
     pub fn row_fs(&self, entry: &zenman_core::entry::FileEntry) -> Option<FsPath> {
-        // `rel_path` is only filled by the flat listings; in a plain directory the row *is* its
-        // name — joining the name is what makes the row point at the entry, not at the directory.
         let rel = if entry.rel_path.is_empty() {
             entry.name.as_str()
         } else {
             entry.rel_path.as_str()
         };
+        if self.path.store.is_archive() {
+            return FsPath::new(self.path.store.clone(), rel).ok();
+        }
         self.path.join_rel(rel).ok()
     }
 
@@ -1617,6 +1630,69 @@ pub fn quad_slots() -> Vec<PaneSlot> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A row of a listing, in whichever coordinates its store spells `rel_path`.
+    fn entry(name: &str, rel_path: &str, is_dir: bool) -> zenman_core::entry::FileEntry {
+        zenman_core::entry::FileEntry {
+            name: name.into(),
+            is_dir,
+            is_symlink: false,
+            size: 0,
+            mod_time: None,
+            mode: String::new(),
+            rel_path: rel_path.into(),
+            depth: 0,
+            files_count: None,
+        }
+    }
+
+    /// `rel_path` means two different things — listing-relative for a host row
+    /// (`EntryBuilder::build`), *store*-relative for a member (`VirtualNode::to_entry`) — and
+    /// [`Tab::row_fs`] is the one place that has to know which row it is holding. Resolving the
+    /// archive spelling against the listed directory is the `…/box.zip/docs/docs/nested` path that
+    /// answers "Path not found" one level into a container.
+    #[test]
+    fn a_row_resolves_against_the_root_its_store_spells_rel_path_in() {
+        let host = Tab::new(
+            TabId(1),
+            FsPath::fs("/data/tree").expect("host dir"),
+            "host",
+        );
+        assert_eq!(
+            host.row_fs(&entry("a.txt", "", false))
+                .map(|p| p.to_string()),
+            Some("/data/tree/a.txt".into()),
+            "a plain listing's row is its own name"
+        );
+        assert_eq!(
+            host.row_fs(&entry("b.txt", "sub/b.txt", false))
+                .map(|p| p.to_string()),
+            Some("/data/tree/sub/b.txt".into()),
+            "a flat listing's row is relative to the listed directory"
+        );
+
+        let store = FsPath::new(
+            zenman_core::path::VfsKind::Archive {
+                host: AbsPath::from_path("/data/box.zip").expect("abs"),
+                nested: None,
+            },
+            "docs",
+        )
+        .expect("member directory");
+        let deep = Tab::new(TabId(2), store, "archive");
+        assert_eq!(
+            deep.row_fs(&entry("nested", "docs/nested", true))
+                .map(|p| p.to_string()),
+            Some("/data/box.zip/docs/nested".into()),
+            "the member's internal path resolves from the store root, not from `docs`"
+        );
+        assert_eq!(
+            deep.row_abs(&entry("nested", "docs/nested", true))
+                .map(|p| p.to_string_lossy()),
+            Some("/data/box.zip".into()),
+            "and the host answer is still the container, which is why queueing must not use it"
+        );
+    }
 
     #[test]
     fn every_mode_is_consistent_and_quad_reduces_to_split_then_single() {
