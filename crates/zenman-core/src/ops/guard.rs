@@ -517,29 +517,6 @@ pub fn safe_join(dest: &AbsPath, member: &str) -> Result<AbsPath, CoreError> {
 mod safe_join_tests {
     use super::*;
 
-    /// The banned-method-free recursive delete the tests need (see `clippy.toml`).
-    fn rm_rf(path: &std::path::Path) {
-        if path.symlink_metadata().is_err() {
-            return;
-        }
-        if let Ok(entries) = std::fs::read_dir(path) {
-            for entry in entries.flatten() {
-                let child = entry.path();
-                let is_dir = child
-                    .symlink_metadata()
-                    .map(|m| m.is_dir())
-                    .unwrap_or(false)
-                    && !child.is_symlink();
-                if is_dir {
-                    rm_rf(&child);
-                } else {
-                    let _ = std::fs::remove_file(&child);
-                }
-            }
-        }
-        let _ = std::fs::remove_dir(path);
-    }
-
     #[test]
     fn traversal_is_refused_and_legal_names_are_not() {
         let dest = AbsPath::from_path("/tmp/dest").expect("abs");
@@ -560,8 +537,7 @@ mod safe_join_tests {
     #[cfg(unix)]
     #[test]
     fn an_existing_symlink_intermediate_is_refused() {
-        let base = std::env::temp_dir().join(format!("zenman-safe-join-{}", std::process::id()));
-        std::fs::create_dir_all(&base).expect("tmp");
+        let base = crate::scratch::create("safe-join");
         let outside = base.join("outside");
         std::fs::create_dir_all(&outside).expect("outside");
         let dest = base.join("dest");
@@ -571,6 +547,6 @@ mod safe_join_tests {
         std::os::unix::fs::symlink(&outside, &link).expect("symlink");
         let e = safe_join(&abs_dest, "link/escape.txt").expect_err("must not follow the link");
         assert_eq!(e.kind(), "invalid_path");
-        rm_rf(&base);
+        let _ = crate::scratch::remove_tree(&base);
     }
 }

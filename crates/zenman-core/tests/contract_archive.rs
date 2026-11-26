@@ -34,16 +34,18 @@ use zenman_core::platform::default_env;
 use zenman_core::session::{Origin, Receipt, Session, SessionPaths};
 use zenman_core::store::config::ZenConfig;
 
+// Scratch naming, recursive delete and stale-tree reaping: the shared test-support module.
+#[path = "../src/scratch.rs"]
+mod scratch;
+
 const REPO: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
 
 /// The archives directory, built once per process by the repository's own generator.
 fn archives() -> PathBuf {
     static DIR: OnceLock<PathBuf> = OnceLock::new();
     DIR.get_or_init(|| {
-        let root =
-            std::env::temp_dir().join(format!("zenman-contract-archive-{}", std::process::id()));
-        wipe(&root);
-        fs::create_dir_all(&root).expect("scratch root");
+        // Fresh, pid+seq-unique, reapable by the shared sweep; the generator below is its only writer.
+        let root = scratch::create("contract-archive");
         let out = root.join("archives");
         let generator = Path::new(REPO).join("scripts/make-fixtures.py");
         assert!(
@@ -76,11 +78,7 @@ fn archives() -> PathBuf {
 
 /// A session whose scratch tree lives beside the archives.
 fn session() -> Session {
-    let dir = std::env::temp_dir().join(format!(
-        "zenman-contract-archive-session-{}",
-        std::process::id()
-    ));
-    fs::create_dir_all(&dir).expect("scratch dir");
+    let dir = scratch::create("contract-archive-session");
     let (session, notes) = Session::open(
         SessionPaths::new(
             dir.join("config.json"),
@@ -123,11 +121,7 @@ fn archive_path(name: &str) -> PathBuf {
 
 /// A copy of a captured archive, so a test can damage it without touching the golden fixtures.
 fn copy_archive(name: &str, tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "zenman-contract-archive-copy-{}-{tag}",
-        std::process::id()
-    ));
-    fs::create_dir_all(&dir).expect("copy dir");
+    let dir = scratch::create(&format!("contract-archive-copy-{tag}"));
     let to = dir.join(name);
     fs::copy(archive_path(name), &to).expect("copy the captured archive");
     to
@@ -265,12 +259,15 @@ fn stream_file() {
 
     // The capped read of the same member agrees, and a member over the cap is refused.
     assert_eq!(s.archive_read(&member).expect("read"), golden);
+    // The capped session gets its own tree — the loose `/tmp/zenman-tight-*` files it used to write
+    // left debris behind when the run died, so they live under a guarded scratch directory now.
+    let tight_dir = scratch::Scratch::new("contract-archive-tight");
     let tight = Session::open(
         SessionPaths::new(
-            std::env::temp_dir().join("zenman-tight-config.json"),
-            std::env::temp_dir().join("zenman-tight-log"),
+            tight_dir.join("config.json"),
+            tight_dir.join("log"),
             None,
-            std::env::temp_dir().join("zenman-tight-probe"),
+            tight_dir.join("probe"),
         ),
         ZenConfig::default(),
         default_env(),
@@ -309,9 +306,7 @@ fn extract_zip_slip_refused() {
         "the `..` node is visible: {names:?}"
     );
 
-    let dest = scratch("zipslip-dest");
-    wipe(&dest);
-    fs::create_dir_all(&dest).expect("dest");
+    let dest = scratch::create("contract-archive-zipslip-dest");
     let req = ExtractReq::all(
         AbsPath::from_path(archive_path("zipslip.zip")).expect("host"),
         None,
@@ -445,9 +440,7 @@ fn corrupt_container_is_a_typed_error() {
 #[test]
 fn extract_symlink_member_is_a_plain_file() {
     let mut s = session();
-    let dest = scratch("symlink-dest");
-    wipe(&dest);
-    fs::create_dir_all(&dest).expect("dest");
+    let dest = scratch::create("contract-archive-symlink-dest");
     let out = dest.join("out");
     let req = ExtractReq::all(
         AbsPath::from_path(archive_path("symlink.zip")).expect("host"),
@@ -491,9 +484,7 @@ fn extract_symlink_member_is_a_plain_file() {
 #[test]
 fn extract_collision_follows_the_policy() {
     let mut s = session();
-    let dest = scratch("collision-dest");
-    wipe(&dest);
-    fs::create_dir_all(&dest).expect("dest");
+    let dest = scratch::create("contract-archive-collision-dest");
     let out = dest.join("out");
     fs::create_dir_all(&out).expect("out");
     fs::write(out.join("top.txt"), b"already here\n").expect("seed the collision");
@@ -593,9 +584,7 @@ fn archive_members_are_never_indexed() {
     );
 
     // Extraction, by contrast, must report the files it really wrote.
-    let dest = scratch("index-dest");
-    wipe(&dest);
-    fs::create_dir_all(&dest).expect("dest");
+    let dest = scratch::create("contract-archive-index-dest");
     let out = dest.join("out");
     let req = ExtractReq::all(
         AbsPath::from_path(archive_path("plain.zip")).expect("host"),
@@ -629,13 +618,6 @@ fn archive_members_are_never_indexed() {
 }
 
 // --------------------------------------------------------------------------- helpers
-
-fn scratch(tag: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "zenman-contract-archive-{}-{tag}",
-        std::process::id()
-    ))
-}
 
 fn job_of(receipt: Receipt<ExtractReport>) -> JobId {
     match receipt {
@@ -685,24 +667,4 @@ fn finish(s: &mut Session, id: JobId, expect_dir_changed: bool) -> ExtractReport
         );
     }
     report
-}
-
-/// `std::fs::remove_dir_all` is banned workspace-wide
-fn wipe(dir: &Path) {
-    if dir.symlink_metadata().is_err() {
-        return;
-    }
-    if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let is_dir =
-                path.symlink_metadata().map(|m| m.is_dir()).unwrap_or(false) && !path.is_symlink();
-            if is_dir {
-                wipe(&path);
-            } else {
-                let _ = fs::remove_file(&path);
-            }
-        }
-    }
-    let _ = fs::remove_dir(dir);
 }

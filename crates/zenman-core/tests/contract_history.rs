@@ -29,6 +29,10 @@ use zenman_core::index::schema;
 use zenman_core::store::config::StoreMode;
 use zenman_core::store::sql::{self, DbOpenError};
 
+// Scratch naming, recursive delete and stale-tree reaping: the shared test-support module.
+#[path = "../src/scratch.rs"]
+mod scratch;
+
 const GOLDEN: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/golden");
 
 fn golden(name: &str) -> PathBuf {
@@ -53,24 +57,18 @@ fn fixture_paths() -> serde_json::Map<String, serde_json::Value> {
         .clone()
 }
 
-/// Remove a temp dir's files and the directory itself. `std::fs::remove_dir_all` is banned workspace-wide
-/// (`clippy.toml`: deletion goes through `ops::delete`), and a `tests/golden/**` copy must never be the
-/// thing a recursive delete reaches, so the test helper is deliberately one level deep.
+/// Remove a temp dir's files and the directory itself — the shared scratch-tree delete
+/// (`scratch::remove_tree`, included via `#[path]` below), which is `remove_dir_all`-free
+/// (`clippy.toml`: deletion goes through `ops::delete`) and relaxes file modes on the way down, so a
+/// `-wal`/`-shm` sidecar or a hostile mode cannot make the delete fail and leak the tree.
 fn cleanup(dir: &Path) {
-    for entry in fs::read_dir(dir).expect("temp dir is readable") {
-        fs::remove_file(entry.expect("dir entry").path()).ok();
-    }
-    fs::remove_dir(dir).ok();
+    let _ = scratch::remove_tree(dir);
 }
 
+/// A fresh, uniquely-named scratch tree (`zenman-contract-<tag>-<pid>-<seq>`); the shared module
+/// also reaps stale trees from dead processes before handing it back.
 fn temp_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "zenman-contract-{tag}-{}-{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    fs::create_dir_all(&dir).expect("temp dir");
-    dir
+    scratch::create(&format!("contract-{tag}"))
 }
 
 /// Decode every frame of `log`, in order. Panics with the byte offset on any framing error, so a

@@ -1176,30 +1176,10 @@ mod tests {
             session
         }
 
+        /// A fresh, uniquely-named scratch tree (`zenman-watcher-<tag>-<pid>-<seq>`); the naming and
+        /// the stale-tree reap come from `crate::scratch`.
         fn scratch(tag: &str) -> PathBuf {
-            let root =
-                std::env::temp_dir().join(format!("zenman-watcher-{tag}-{}", std::process::id()));
-            cleanup(&root);
-            fs::create_dir_all(&root).expect("scratch dir");
-            root
-        }
-
-        /// Remove a scratch tree. `std::fs::remove_dir_all` is banned workspace-wide (`clippy.toml`:
-        /// deletion goes through `ops::delete`), so the walk is spelled out here — these trees are the
-        /// test's own, a level or two deep, and a leftover is cleared by the next run.
-        fn cleanup(dir: &Path) {
-            let Ok(entries) = fs::read_dir(dir) else {
-                return;
-            };
-            for entry in entries.filter_map(Result::ok) {
-                let path = entry.path();
-                if path.is_dir() {
-                    cleanup(&path);
-                } else {
-                    let _ = fs::remove_file(path);
-                }
-            }
-            let _ = fs::remove_dir(dir);
+            crate::scratch::create(&format!("watcher-{tag}"))
         }
 
         #[test]

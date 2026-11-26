@@ -57,29 +57,20 @@ fn golden_json(name: &str) -> serde_json::Value {
 
 // -------------------------------------------------------------------------------------- scratch trees
 
+// Scratch naming, recursive delete and stale-tree reaping: the shared test-support module.
+#[path = "../src/scratch.rs"]
+mod scratch;
+
+/// A fresh, uniquely-named scratch tree (`zenman-contract-ops-<tag>-<pid>-<seq>`).
 fn temp_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "zenman-contract-ops-{tag}-{}-{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    let _ = remove_tree(&dir);
-    fs::create_dir_all(&dir).expect("temp dir");
-    dir
+    scratch::create(&format!("contract-ops-{tag}"))
 }
 
-/// Recursive delete for a *test scratch tree*. `std::fs::remove_dir_all` is banned workspace-wide because
-/// product deletion must go through `ops::delete` (step 9c) — which does not exist yet, and which must
-/// never be what cleans a temp directory anyway.
+/// Recursive delete for a *test scratch tree* — delegated to the shared module
+/// (`scratch::remove_tree`), which is `remove_dir_all`-free (`clippy.toml` says product deletion
+/// must go through `ops::delete` — which must never be what cleans a temp directory anyway).
 fn remove_tree(path: &Path) -> std::io::Result<()> {
-    let meta = fs::symlink_metadata(path)?;
-    if meta.file_type().is_symlink() || meta.is_file() {
-        return fs::remove_file(path);
-    }
-    for entry in fs::read_dir(path)?.flatten() {
-        remove_tree(&entry.path())?;
-    }
-    fs::remove_dir(path)
+    scratch::remove_tree(path)
 }
 
 fn write(path: &Path, bytes: &[u8]) -> AbsPath {

@@ -52,6 +52,10 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+// Scratch naming, recursive delete and stale-tree reaping: the shared test-support module.
+#[path = "../src/scratch.rs"]
+mod scratch;
+
 use zenman_core::error::CoreError;
 use zenman_core::events::{EngineEvent, JobPayload};
 use zenman_core::jobs::JobId;
@@ -84,9 +88,9 @@ fn fixtures() -> &'static Fixtures {
 }
 
 fn build_fixtures() -> Fixtures {
-    let root = std::env::temp_dir().join(format!("zenman-contract-search-{}", std::process::id()));
-    wipe(&root);
-    std::fs::create_dir_all(&root).expect("scratch root");
+    // Fresh, pid+seq-unique, and reapable by the shared sweep — see `contract_dirs.rs`'s copy of
+    // this fixture-building dance for the full rationale (same eleven-thousand-file problem).
+    let root = scratch::create("contract-search");
     let tree = root.join("tree");
     let generator = Path::new(REPO).join("scripts/make-fixtures.py");
     assert!(
@@ -127,61 +131,9 @@ fn directory_sizes_are_go_like(dir: &Path) -> bool {
         return false;
     }
     let sized = std::fs::metadata(&one).map(|m| m.len()).unwrap_or(u64::MAX);
-    let _ = one.remove_dir_all_guarded();
+    let _ = scratch::remove_tree(&one);
     let _ = std::fs::remove_dir(dir.join("size-probe"));
     sized == 40
-}
-
-fn relax(dir: &Path) {
-    use std::os::unix::fs::PermissionsExt as _;
-    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755));
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.symlink_metadata().map(|m| m.is_dir()).unwrap_or(false) && !path.is_symlink() {
-                relax(&path);
-            }
-        }
-    }
-}
-
-/// Remove a tree, relaxing the hostile modes first (`0444`/`000` directories cannot be traversed).
-fn wipe(dir: &Path) {
-    if dir.symlink_metadata().is_err() {
-        return;
-    }
-    relax(dir);
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let is_dir =
-                path.symlink_metadata().map(|m| m.is_dir()).unwrap_or(false) && !path.is_symlink();
-            if is_dir {
-                wipe(&path);
-            } else {
-                let _ = std::fs::remove_file(&path);
-            }
-        }
-    }
-    let _ = std::fs::remove_dir(dir);
-}
-
-trait RemoveDirTree {
-    fn remove_dir_all_guarded(&self) -> std::io::Result<()>;
-}
-
-impl RemoveDirTree for Path {
-    fn remove_dir_all_guarded(&self) -> std::io::Result<()> {
-        let meta = self.symlink_metadata()?;
-        if !meta.is_dir() {
-            return std::fs::remove_file(self);
-        }
-        for entry in std::fs::read_dir(self)? {
-            let path = entry?.path();
-            let _ = path.remove_dir_all_guarded();
-        }
-        std::fs::remove_dir(self)
-    }
 }
 
 // --------------------------------------------------------------------------------------- the harness
@@ -466,7 +418,7 @@ fn live_walk_limits() {
 
     // 4. The depth budget, on a tree this test owns (the fixture tree is 20 deep in `deep/`).
     let deep = fixtures().root.join("depth-probe");
-    let _ = deep.remove_dir_all_guarded();
+    let _ = scratch::remove_tree(&deep);
     let mut leaf = deep.clone();
     for d in 0..10 {
         leaf = leaf.join(format!("l{d}"));
@@ -611,7 +563,7 @@ fn live_search_hidden_file_policy() {
     // fixture tree's own dot-entry is inside `tree/.dot/`, which the goldens never reach — so this test
     // builds the case it needs, next to the tree it shares with the goldens.
     let dir = fixtures().root.join("hidden-probe");
-    let _ = dir.remove_dir_all_guarded();
+    let _ = scratch::remove_tree(&dir);
     std::fs::create_dir_all(&dir).expect("hidden probe dir");
     std::fs::write(dir.join(".secret.txt"), b"h").expect("hidden file");
     std::fs::write(dir.join("visible.txt"), b"v").expect("visible file");
@@ -990,10 +942,7 @@ struct IdxFixtures {
 fn idx_fixtures() -> &'static IdxFixtures {
     static TREE: OnceLock<IdxFixtures> = OnceLock::new();
     TREE.get_or_init(|| {
-        let root =
-            std::env::temp_dir().join(format!("zenman-contract-index-{}", std::process::id()));
-        wipe(&root);
-        std::fs::create_dir_all(&root).expect("index scratch root");
+        let root = scratch::create("contract-index");
         let tree = root.join("tree");
         let output = Command::new("python3")
             .current_dir(REPO)
@@ -1015,8 +964,8 @@ fn idx_fixtures() -> &'static IdxFixtures {
             "make-fixtures.py failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        // NOTE: deliberately NOT `relax`ed — the hostile permissions (noexec-dir, noread-dir) are what make the
-        // count 1 260; `wipe` relaxes on the way out. eprintln for the location:
+        // NOTE: deliberately NOT `relax`ed at rest — the hostile permissions (noexec-dir, noread-dir) are what make the
+        // count 1 260; the shared `remove_tree` relaxes on the way out. eprintln for the location:
         eprintln!("contract_search: index fixture tree at {}", tree.display());
         IdxFixtures { root }
     })
@@ -1346,7 +1295,7 @@ fn rebuild_is_atomic() {
 fn incremental_update() {
     // A small tree of our own: the shared fixture trees are read-only for the other tests here.
     let root = idx_fixtures().root.join("idx-incr-tree");
-    wipe(&root);
+    let _ = scratch::remove_tree(&root);
     std::fs::create_dir_all(root.join("sub")).expect("sub");
     std::fs::write(root.join("a.txt"), b"one").expect("a");
     std::fs::write(root.join("keep.txt"), b"keep").expect("keep");
@@ -1459,7 +1408,7 @@ fn incremental_update() {
     assert_eq!(total("keep"), 0);
 
     // Pruned: the bounded `LIKE 'x/%' ESCAPE '\'` subtree delete, FTS rowids gathered first.
-    wipe(&root.join("moved"));
+    let _ = scratch::remove_tree(&root.join("moved"));
     updater::apply_op(
         &conn,
         &IndexOp::Pruned {

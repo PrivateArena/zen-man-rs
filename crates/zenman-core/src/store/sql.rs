@@ -354,14 +354,10 @@ fn render_issues(issues: &[SchemaIssue]) -> String {
 mod tests {
     use super::*;
 
+    /// A fresh, uniquely-named temp tree (`zenman-sql-<tag>-<pid>-<seq>`); naming and stale-tree
+    /// reaping come from `crate::scratch`.
     fn tmp_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "zenman-sql-{tag}-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        dir
+        crate::scratch::create(&format!("sql-{tag}"))
     }
 
     #[test]

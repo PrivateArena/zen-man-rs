@@ -340,8 +340,9 @@ mod tests {
 
     #[test]
     fn a_truncated_icns_is_caught() {
-        let dir = std::env::temp_dir().join(format!("xtask-app-icon-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("scratch");
+        // A guarded scratch tree (`zenman-xtask-app-icon-<pid>-<seq>`): the guard's `Drop` does what
+        // the hand-rolled file/dir removals used to, via the shared `remove_tree`.
+        let dir = crate::scratch::Scratch::new("xtask-app-icon");
         let path = dir.join("zenman.icns");
         // Right magic, wrong total length, no icon entries.
         std::fs::write(&path, [b'i', b'c', b'n', b's', 0, 0, 0, 40]).expect("fixture");
@@ -350,8 +351,6 @@ mod tests {
             problems.iter().any(|p| p.contains("icon types")),
             "{problems:?}"
         );
-        std::fs::remove_file(&path).ok();
-        std::fs::remove_dir(&dir).ok();
     }
 
     #[test]
@@ -360,8 +359,7 @@ mod tests {
         let mut bytes = vec![0u8, 0, 1, 0, 1, 0];
         bytes.extend_from_slice(&[16, 16, 0, 0, 1, 0, 32, 0, 40, 0, 0, 0, 22, 0, 0, 0]);
         bytes.extend_from_slice(&[0u8; 40]);
-        let dir = std::env::temp_dir().join(format!("xtask-app-icon-ico-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("scratch");
+        let dir = crate::scratch::Scratch::new("xtask-app-icon-ico");
         let path = dir.join("zenman.ico");
         std::fs::write(&path, &bytes).expect("fixture");
         let problems = ico_problems(&path);
@@ -369,7 +367,5 @@ mod tests {
             problems.iter().any(|p| p.contains("entries")),
             "{problems:?}"
         );
-        std::fs::remove_file(&path).ok();
-        std::fs::remove_dir(&dir).ok();
     }
 }

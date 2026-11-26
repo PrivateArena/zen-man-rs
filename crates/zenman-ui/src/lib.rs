@@ -52,6 +52,12 @@ pub mod keymap;
 pub mod menus;
 pub mod panels;
 pub mod persist;
+/// Test-only scratch-dir support (`create`, the `Scratch` guard, `remove_tree`, the stale-tree sweep).
+/// Included textually from `zenman-core` — the same file core uses — so no crate has to depend on a
+/// test-support crate just for temp-directory hygiene.
+#[cfg(test)]
+#[path = "../../zenman-core/src/scratch.rs"]
+pub(crate) mod scratch;
 pub mod state;
 pub mod theme;
 pub mod widgets;

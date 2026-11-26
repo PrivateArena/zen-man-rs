@@ -35,6 +35,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, OnceLock};
 
+// Scratch naming, recursive delete and stale-tree reaping: the shared test-support module.
+#[path = "../src/scratch.rs"]
+mod scratch;
+
 use serde_json::Value;
 
 use zenman_core::cursor::Cursor;
@@ -72,12 +76,11 @@ fn fixtures() -> &'static Fixtures {
 }
 
 fn build_fixtures() -> Fixtures {
-    let root = std::env::temp_dir().join(format!("zenman-contract-dirs-{}", std::process::id()));
-    // A stable path per process: eleven thousand files must not pile up across runs, so an old tree is
-    // wiped before the new one is generated. `std::fs::remove_dir_all` is banned workspace-wide
-    // (`clippy.toml`), hence the explicit walk below.
-    wipe(&root);
-    std::fs::create_dir_all(&root).expect("scratch root");
+    // A fresh, pid+seq-unique tree from the shared module: eleven thousand files must not pile up
+    // across runs, so the name carries the owner pid and the sweep reaps the tree (or a crashed
+    // run's leftovers) once its owner is gone. The shared delete relaxes the hostile modes on the
+    // way down, which is what makes a leftover `000`/`0444` tree deletable at all.
+    let root = scratch::create("contract-dirs");
     let tree = root.join("tree");
     let generator = Path::new(REPO).join("scripts/make-fixtures.py");
     assert!(
@@ -130,63 +133,9 @@ fn directory_sizes_are_go_like(dir: &Path) -> bool {
         return false;
     }
     let sized = std::fs::metadata(&one).map(|m| m.len()).unwrap_or(u64::MAX);
-    let _ = one.remove_dir_all_in();
+    let _ = scratch::remove_tree(&one);
     let _ = std::fs::remove_dir(dir.join("size-probe"));
     sized == 40
-}
-
-/// Remove a tree, relaxing the hostile modes first: a `0444` directory cannot be traversed in order to
-/// delete what is inside it, and a `000` one cannot even be read.
-fn wipe(dir: &Path) {
-    if dir.symlink_metadata().is_err() {
-        return;
-    }
-    relax(dir);
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let is_dir =
-                path.symlink_metadata().map(|m| m.is_dir()).unwrap_or(false) && !path.is_symlink();
-            if is_dir {
-                wipe(&path);
-            } else {
-                let _ = std::fs::remove_file(&path);
-            }
-        }
-    }
-    let _ = std::fs::remove_dir(dir);
-}
-
-fn relax(dir: &Path) {
-    use std::os::unix::fs::PermissionsExt as _;
-    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755));
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.symlink_metadata().map(|m| m.is_dir()).unwrap_or(false) && !path.is_symlink() {
-                relax(&path);
-            }
-        }
-    }
-}
-
-/// The recursive-delete helper `clippy.toml` forbids, restricted to the scratch tree this file created.
-trait RemoveDirTreeAll {
-    fn remove_dir_all_in(&self) -> std::io::Result<()>;
-}
-
-impl RemoveDirTreeAll for Path {
-    fn remove_dir_all_in(&self) -> std::io::Result<()> {
-        let meta = self.symlink_metadata()?;
-        if !meta.is_dir() {
-            return std::fs::remove_file(self);
-        }
-        for entry in std::fs::read_dir(self)? {
-            let path = entry?.path();
-            let _ = path.remove_dir_all_in();
-        }
-        std::fs::remove_dir(self)
-    }
 }
 
 fn golden(name: &str) -> Value {

@@ -505,9 +505,10 @@ mod tests {
     }
 
     /// A copy of the committed references, baselines and `snapshots.rs` under
-    /// `<temp>/xtask-parity-<pid>-<tag>`, so the gate can be seen failing without touching the tree.
+    /// `<temp>/zenman-xtask-parity-<tag>-<pid>-<seq>`, so the gate can be seen failing without
+    /// touching the tree. The shared scratch module makes the tree fresh and its name reapable.
     fn tree(tag: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!("xtask-parity-{}-{tag}", std::process::id()));
+        let root = crate::scratch::create(&format!("xtask-parity-{tag}"));
         for dir in ["docs/parity", "crates/zenman-ui/tests/snapshots"] {
             let target = root.join(dir);
             std::fs::create_dir_all(&target).expect("the copy directory is creatable");
@@ -635,8 +636,7 @@ mod tests {
     /// silently shortening the report.
     #[test]
     fn a_malformed_map_is_an_error_not_a_shrug() {
-        let root =
-            std::env::temp_dir().join(format!("xtask-parity-{}-malformed", std::process::id()));
+        let root = crate::scratch::create("xtask-parity-malformed");
         std::fs::create_dir_all(root.join("crates/zenman-ui/tests/snapshots"))
             .expect("the scratch tree is creatable");
         std::fs::create_dir_all(root.join("docs/parity")).expect("the scratch refs are creatable");

@@ -521,7 +521,6 @@ mod tests {
     use std::collections::VecDeque;
     use std::path::PathBuf;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
     use crate::mode::ModeBits;
@@ -640,19 +639,14 @@ mod tests {
 
     // ------------------------------------------------------------------ the scratch directory
 
-    static SCRATCH_SEQ: AtomicU64 = AtomicU64::new(0);
-
     /// A unique temp dir, removed on drop — the `linux.rs` probe-test pattern (`OsDirRead` needs a real
-    /// filesystem, and the suite runs in parallel, so the name carries a counter *and* the pid).
+    /// filesystem, and the suite runs in parallel, so the name carries a counter *and* the pid, via
+    /// `crate::scratch`).
     struct Scratch(PathBuf);
 
     impl Scratch {
         fn new(tag: &str) -> Self {
-            let seq = SCRATCH_SEQ.fetch_add(1, Ordering::AcqRel);
-            let dir = std::env::temp_dir()
-                .join(format!("zenman-clip-{tag}-{}-{seq}", std::process::id()));
-            std::fs::create_dir_all(&dir).expect("create the scratch dir");
-            Self(dir)
+            Self(crate::scratch::create(&format!("clip-{tag}")))
         }
 
         fn file(&self, name: &str, bytes: &[u8]) -> PathBuf {
@@ -675,26 +669,8 @@ mod tests {
 
     impl Drop for Scratch {
         fn drop(&mut self) {
-            remove_scratch(&self.0);
+            let _ = crate::scratch::remove_tree(&self.0);
         }
-    }
-
-    /// The scratch tree is ours, so it is deleted by hand: `std::fs::remove_dir_all` is banned
-    /// workspace-wide (clippy.toml, plan §6.1) — the same helper shape `linux.rs` tests use.
-    fn remove_scratch(root: &std::path::Path) {
-        let Ok(entries) = std::fs::read_dir(root) else {
-            let _ = std::fs::remove_dir(root);
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() && !path.is_symlink() {
-                remove_scratch(&path);
-            } else {
-                let _ = std::fs::remove_file(&path);
-            }
-        }
-        let _ = std::fs::remove_dir(root);
     }
 
     fn abs(text: &str) -> AbsPath {

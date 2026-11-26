@@ -100,6 +100,7 @@ crates/zenman-core/
 | src/platform/windows.rs | Windows implementation: Win32 junctions/shortcuts/attributes, no rustix | ~1250 | `struct Windows` (same `Env` surface), shortcut + `attributes_to_mode` paths |
 | src/platform/stub.rs | Named "unsupported" bodies for targets with no platform backend | ~290 | `struct Unsupported`, `Unsupported::new()`, `labelled(what)`, `no_mounts_for(path) -> MountTable` |
 | src/platform/env_probe.rs | Capability probing in a scratch dir: overlayfs, symlink support, userns | ~388 | `probe(env) -> Result<ProbeReport, CoreError>`, `overlayfs_works(scratch_root)`, `probe_symlink_support(root, flags)` |
+| src/scratch.rs | **test-only** (`#[cfg(test)]`, `#[path]`-included by the other crates): scratch-tree naming, one mode-relaxing recursive delete, and the reaper for trees whose owner process exited | ~250 | `create(name) -> PathBuf`, `struct Scratch` (guard), `remove_tree(&Path)`, `sweep_once()`, `sweep_stale() -> usize`, `survivors()`, `reapable(name, &Path)` |
 | tests/contract.rs | Golden contracts for the generic engine surface (paths, errors, entries) | ~554 | no exports |
 | tests/contract_dirs.rs | Directory listing/paging/cache contracts | ~1292 | no exports |
 | tests/contract_ops.rs | Largest contract suite: copy/move/paste/delete/rename/chmod incl. cancellation | ~2692 | no exports |

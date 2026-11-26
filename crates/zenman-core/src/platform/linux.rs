@@ -1053,9 +1053,7 @@ mod tests {
     fn trash_predicates_answer_without_side_effects() {
         assert!(!can_trash(Path::new("/")), "trash refuses a root folder");
         assert!(!can_trash(Path::new("/definitely/not/here")));
-        let tmp = std::env::temp_dir();
-        let dir = tmp.join(format!("zenman-trash-pred-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("create the private probe dir");
+        let dir = crate::scratch::create("trash-pred");
         // The predicates must not create or delete anything. Counted in a directory of our own, because
         // `/tmp` is a shared neighbourhood — other tests are writing there at the same moment.
         let before = entries_in(&dir);
@@ -1088,9 +1086,7 @@ mod tests {
             linux.supports_symlink().expect("caps"),
             linux.caps().contains(PlatformCaps::SYMLINK)
         );
-        let scratch =
-            std::env::temp_dir().join(format!("zenman-linux-probe-{}", std::process::id()));
-        std::fs::create_dir_all(&scratch).expect("create the scratch root");
+        let scratch = crate::scratch::create("linux-probe");
         let measured = linux.probe_symlinks(&scratch).expect("the probe answers");
         assert_eq!(linux.cached_symlink_support(), Some(measured));
         assert_eq!(linux.supports_symlink().expect("cached"), measured);
@@ -1196,8 +1192,7 @@ mod tests {
 
     #[test]
     fn is_writable_answers_the_real_permission() {
-        let dir = std::env::temp_dir().join(format!("zenman-writable-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let dir = crate::scratch::create("writable");
         let abs = AbsPath::from_path(&dir).expect("absolute");
         assert!(is_writable(&abs).expect("a fresh temp dir is writable"));
         // `access(2)` knows what the mode bits do not: a 0o444 file is not writable by us.
@@ -1217,8 +1212,7 @@ mod tests {
 
     #[test]
     fn copy_paths_reports_per_item_failures() {
-        let root = std::env::temp_dir().join(format!("zenman-copy-{}", std::process::id()));
-        let _ = std::fs::remove_dir(&root);
+        let root = crate::scratch::create("copy");
         std::fs::create_dir_all(root.join("src/inner")).expect("create the source tree");
         std::fs::write(root.join("src/a.txt"), b"hello").expect("write a file");
         std::fs::write(root.join("src/inner/b.txt"), b"world!").expect("write a nested file");
@@ -1255,18 +1249,10 @@ mod tests {
         remove_probe_root(&root);
     }
 
-    /// The test tree is ours, so it is deleted by hand: `std::fs::remove_dir_all` is banned
-    /// (`clippy.toml`, plan §5.1) and `ops::delete` does not exist yet.
+    /// The test tree is ours, so it goes by hand — via the shared scratch-tree delete, which is
+    /// `remove_dir_all`-free (`clippy.toml`, plan §5.1; `ops::delete` does not exist yet) and relaxes
+    /// the hostile modes the fixtures set.
     fn remove_probe_root(root: &Path) {
-        if let Ok(entries) = std::fs::read_dir(root) {
-            for entry in entries.flatten() {
-                if entry.path().is_dir() {
-                    remove_probe_root(&entry.path());
-                } else {
-                    let _ = std::fs::remove_file(entry.path());
-                }
-            }
-        }
-        let _ = std::fs::remove_dir(root);
+        let _ = crate::scratch::remove_tree(root);
     }
 }

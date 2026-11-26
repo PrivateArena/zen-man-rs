@@ -746,6 +746,7 @@ impl AbsPath {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scratch::Scratch;
 
     fn strings(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| (*s).to_string()).collect()
@@ -763,14 +764,11 @@ mod tests {
         AbsPath::from_path(p.display().to_string()).expect("the scratch root is absolute")
     }
 
-    fn scratch(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "zenman-walker-{tag}-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::create_dir_all(&dir).expect("scratch dir");
-        dir
+    /// A fresh scratch tree, deleted when the returned guard drops (so a panicking assert still cleans
+    /// up). The name keeps the `zenman-walker-<tag>-` recognisability; the pid+seq suffix comes from
+    /// `crate::scratch`.
+    fn scratch(tag: &str) -> Scratch {
+        crate::scratch::Scratch::new(&format!("walker-{tag}"))
     }
 
     fn touch(root: &Path, rel: &str) {
@@ -783,7 +781,7 @@ mod tests {
 
     /// The fixed tree the walk tests share: nested directories, a 21-level chain, a backslash name, a
     /// quoted directory name, a dotfile, and an uppercase name (the `name` column is lowercased).
-    fn tree(tag: &str) -> PathBuf {
+    fn tree(tag: &str) -> Scratch {
         let root = scratch(tag);
         for rel in [
             "a.txt",

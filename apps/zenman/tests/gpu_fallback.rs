@@ -13,6 +13,10 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+// Scratch naming and stale-tree reaping: the shared test-support module (same file as `zenman-core`'s).
+#[path = "../../../crates/zenman-core/src/scratch.rs"]
+mod scratch;
+
 /// The boot report line `main::run` prints (also matched by `docs/crash-reports.md`).
 const BOOT_REPORT: &str = "gpu: profile=";
 /// Plan §5.9: the code for "every rung of the ladder had no adapter".
@@ -38,6 +42,10 @@ fn zenman(args: &[&str], env: &[(&str, &str)]) -> Run {
     }
     // Never inherit the caller's `WGPU_BACKEND`: it would silently retarget the ladder under test.
     cmd.env_remove("WGPU_BACKEND");
+    // This suite overrides the data and config directories but not `HOME` (the ladder's own answer
+    // must come from the host), so without this Mesa would cache the shaders of every case into the
+    // developer's real `~/.cache`.
+    cmd.env("MESA_SHADER_CACHE_DISABLE", "1");
     // `Command::output` is on this workspace's ban list (`clippy.toml`, plan F10: every spawn goes
     // through one audited executor); piped `spawn` + `wait_with_output` is the same thing explicitly.
     let spawned = cmd
@@ -55,17 +63,10 @@ fn zenman(args: &[&str], env: &[(&str, &str)]) -> Run {
     }
 }
 
-/// A data directory per test, so the two cases cannot see each other's sentinel.
+/// A data directory per test, so the two cases cannot see each other's sentinel — named and
+/// reaped by the shared scratch module (`zenman-gpu-fallback-<tag>-<pid>-<seq>`).
 fn scratch(tag: &str) -> PathBuf {
-    let dir =
-        std::env::temp_dir().join(format!("zenman-gpu-fallback-{tag}-{}", std::process::id()));
-    if dir.exists() {
-        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
-            let _ = std::fs::remove_file(entry.path());
-        }
-    }
-    std::fs::create_dir_all(&dir).expect("the temp directory is creatable");
-    dir
+    scratch::create(&format!("gpu-fallback-{tag}"))
 }
 
 /// What `wgpu` can see on this machine, as `--print-adapters` reports it.

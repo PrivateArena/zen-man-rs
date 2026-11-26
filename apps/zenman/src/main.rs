@@ -40,6 +40,13 @@ mod gpu_startup;
 mod i18n;
 mod single_instance;
 
+/// Test-only scratch-dir support (`create`, the `Scratch` guard, `remove_tree`, the stale-tree
+/// sweep), included textually from `zenman-core` — the same file every other test target uses —
+/// so scratch trees are named, deleted and reaped by one implementation.
+#[cfg(test)]
+#[path = "../../../crates/zenman-core/src/scratch.rs"]
+mod scratch;
+
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
@@ -701,8 +708,9 @@ mod tests {
     /// for too and still deserves to open.
     #[test]
     fn a_file_target_opens_the_folder_that_holds_it_and_a_foreign_one_is_dropped() {
-        let dir = std::env::temp_dir().join(format!("zenman-cli-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("temp fixture directory");
+        // A guarded `zenman-cli-<pid>-<seq>` tree: the three-entry fixture is a plain local, so the
+        // guard's `Drop` tidies it (the shared delete is `remove_dir_all`-free, `clippy.toml`).
+        let dir = crate::scratch::Scratch::new("cli");
         let file = dir.join("notes.txt");
         std::fs::write(&file, b"x").expect("temp fixture file");
         let lossy = file.to_string_lossy().into_owned();
@@ -727,11 +735,5 @@ mod tests {
             1,
             "a web address is not a folder, and the real target still opens"
         );
-        // Named, explicit removals: `remove_dir_all` is banned workspace-wide (product deletion goes
-        // through `ops::delete`, trash-first and logged), and a three-entry fixture tree does not need a
-        // recursive walk to be tidied.
-        let _ = std::fs::remove_file(&file);
-        let _ = std::fs::remove_dir(dir.join("My Docs"));
-        let _ = std::fs::remove_dir(&dir);
     }
 }

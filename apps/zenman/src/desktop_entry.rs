@@ -308,7 +308,6 @@ mod tests {
             ),
             "a second run rewrites nothing"
         );
-        remove_tree(&dir);
     }
 
     #[test]
@@ -327,30 +326,13 @@ mod tests {
             write_exact(&path, b"other png").expect("writable"),
             Written::Updated
         ));
-        remove_tree(&dir);
     }
 
-    /// Test-only recursive delete. `std::fs::remove_dir_all` is banned workspace-wide (`clippy.toml`,
-    /// deletion is a `trash` operation in the product), and the ban does not lift for tests — same
-    /// helper, same reason, as `app_dirs`' test module.
-    fn remove_tree(path: &Path) {
-        let Ok(read) = std::fs::read_dir(path) else {
-            return;
-        };
-        for entry in read.flatten() {
-            let child = entry.path();
-            if child.is_dir() {
-                remove_tree(&child);
-            } else {
-                let _ = std::fs::remove_file(&child);
-            }
-        }
-        let _ = std::fs::remove_dir(path);
-    }
-
-    fn scratch(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("zenman-desktop-{tag}-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("scratch directory");
-        dir
+    /// A fresh guarded tree (`zenman-desktop-<tag>-<pid>-<seq>`) from the shared scratch module:
+    /// both callers keep it as a plain local, so `Drop` removes it — the same job the hand-rolled
+    /// `remove_tree` used to do, from the one shared implementation (`clippy.toml` bans
+    /// `remove_dir_all`; the ban does not lift for tests).
+    fn scratch(tag: &str) -> crate::scratch::Scratch {
+        crate::scratch::Scratch::new(&format!("desktop-{tag}"))
     }
 }

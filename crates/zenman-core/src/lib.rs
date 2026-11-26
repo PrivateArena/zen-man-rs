@@ -53,6 +53,10 @@ pub mod mode;
 pub mod ops;
 pub mod path;
 pub mod platform;
+/// Test-only scratch-dir support; see the module docs. The other workspace members include the same
+/// file with `#[path]` rather than adding a dependency on this crate's test surface.
+#[cfg(test)]
+pub(crate) mod scratch;
 pub mod services;
 pub mod session;
 pub mod store;

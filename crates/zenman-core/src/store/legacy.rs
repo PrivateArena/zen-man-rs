@@ -598,14 +598,10 @@ mod tests {
         Path::new(GOLDEN).join(name)
     }
 
-    fn scratch(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "zenman-legacy-{tag}-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::create_dir_all(&dir).expect("scratch dir");
-        dir
+    /// A fresh scratch tree in a guard that deletes it on drop (so a panicking assert still cleans
+    /// up); the naming and the reap come from `crate::scratch`.
+    fn scratch(tag: &str) -> crate::scratch::Scratch {
+        crate::scratch::Scratch::new(&format!("legacy-{tag}"))
     }
 
     /// The expectation table, `docs/contracts.md` → *config.json → ZenConfig migration table*, applied

@@ -15,6 +15,10 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+// Scratch naming and stale-tree reaping: the shared test-support module (same file as `zenman-core`'s).
+#[path = "../../../crates/zenman-core/src/scratch.rs"]
+mod scratch;
+
 /// The boot report the reload assertions read (`apps/zenman/src/app.rs` prints it).
 const SESSION_NOTE: &str = "boot note: session";
 /// The layout report, which is what makes portable mode checkable from stdout.
@@ -79,30 +83,39 @@ fn zenman(args: &[&str]) -> Run {
     run(Path::new(env!("CARGO_BIN_EXE_zenman")), args, &[])
 }
 
-/// A tree per case, so two cases never share a settings file.
+/// A tree per case, so two cases never share a settings file. The shared module makes each name
+/// `zenman-session-boot-<tag>-<pid>-<seq>`: fresh, and reapable by the sweep if the run dies.
 fn scratch(tag: &str) -> PathBuf {
-    let dir =
-        std::env::temp_dir().join(format!("zenman-session-boot-{tag}-{}", std::process::id()));
-    remove_tree(&dir);
-    std::fs::create_dir_all(&dir).expect("the scratch directory is creatable");
+    scratch::create(&format!("session-boot-{tag}"))
+}
+
+/// A tree beside the built binary, for the one case that needs *the executable's own directory* to
+/// be somewhere else: portable layout is detected from `current_exe()`, so the marker has to sit
+/// next to the file that runs.
+///
+/// `target/tmp` rather than the temp dir for one reason: it is the filesystem the binary is on, so
+/// [`exe_beside_marker`] can hard-link it. A copy of a debug binary is ~76 MB, which on a
+/// `tmpfs`-backed `/tmp` is 76 MB of RAM per run of this case.
+fn exe_tree(tag: &str) -> PathBuf {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("zenman-session-boot-{tag}-{}", std::process::id()));
+    // Creation-time pre-clean: the tree outlives a green run (the hard link costs nothing and
+    // `cargo clean` takes the rest), so this is what stops the previous run's data files being read
+    // as this run's report.
+    let _ = scratch::remove_tree(&dir);
+    std::fs::create_dir_all(&dir).expect("the exe tree is creatable");
     dir
 }
 
-/// Test-only recursive delete; `std::fs::remove_dir_all` is banned workspace-wide (`clippy.toml`:
-/// deletion in the product goes through `trash`), and the ban does not lift for tests.
-fn remove_tree(path: &Path) {
-    let Ok(read) = std::fs::read_dir(path) else {
-        return;
-    };
-    for entry in read.flatten() {
-        let child = entry.path();
-        if child.is_dir() {
-            remove_tree(&child);
-        } else {
-            let _ = std::fs::remove_file(&child);
-        }
-    }
-    let _ = std::fs::remove_dir(path);
+/// Put a runnable `zenman` at `exe` without copying the bytes.
+fn exe_beside_marker(exe: &Path) {
+    let built = Path::new(env!("CARGO_BIN_EXE_zenman"));
+    // A hard link is a second name for the same inode, so `current_exe()` reports *this* path — a
+    // symlink would resolve back to the build directory and the marker would not be found. Linking
+    // fails across filesystems (`EXDEV`), which is the only case that pays for a copy.
+    std::fs::hard_link(built, exe)
+        .or_else(|_| std::fs::copy(built, exe).map(|_| ()))
+        .expect("the binary is beside its marker");
 }
 
 /// Every file under `root`, as paths (an empty answer is what "nothing was written" looks like).
@@ -331,11 +344,11 @@ fn a_marker_beside_the_binary_keeps_the_session_beside_the_binary() {
     if !skip_if_no_window() {
         return;
     }
-    let tree = scratch("portable");
-    // A copy, not the build's own path: a `portable.dat` beside `target/debug/zenman` would silently
-    // switch every later run of that binary — including this suite's other cases — to portable mode.
+    // Not the build's own path: a `portable.dat` beside `target/debug/zenman` would silently switch
+    // every later run of that binary — including this suite's other cases — to portable mode.
+    let tree = exe_tree("portable");
     let exe = tree.join("zenman");
-    std::fs::copy(env!("CARGO_BIN_EXE_zenman"), &exe).expect("copy the binary beside its marker");
+    exe_beside_marker(&exe);
     std::fs::write(tree.join("portable.dat"), b"").expect("the marker is an empty file");
     // A home that stays free of this app's files is the whole claim of portable mode: the platform
     // layout would have written all three of these (`directories::ProjectDirs` for `io.storytold.zenman`).
@@ -351,6 +364,10 @@ fn a_marker_beside_the_binary_keeps_the_session_beside_the_binary() {
         ("XDG_CONFIG_HOME", config.as_str()),
         ("XDG_DATA_HOME", data.as_str()),
         ("XDG_CACHE_HOME", cache.as_str()),
+        // The software/legacy GL ladder compiles shaders through Mesa, which caches 2 MB of them
+        // under `XDG_CACHE_HOME` — inside the tree whose emptiness this case is asserting about.
+        // The cache is the driver's, not the app's, so switch it off rather than move it out.
+        ("MESA_SHADER_CACHE_DISABLE", "1"),
     ];
     let env: Vec<(&str, &str)> = env.to_vec();
 

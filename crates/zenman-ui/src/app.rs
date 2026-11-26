@@ -3411,10 +3411,12 @@ pub(crate) mod tests {
     use zenman_core::store::config::ZenConfig;
 
     /// A session whose files live in memory-equivalent temp paths (tests only — the *crate* still
-    /// never touches `std::fs`; `Session::open` is core's IO seam).
+    /// never touches `std::fs`; `Session::open` is core's IO seam). The tree comes from the shared
+    /// scratch module: `zenman-ui-test-<pid>-<seq>`, fresh per call, and reaped by the sweep once
+    /// this process is gone (the tree must outlive the call — a `Session` holds its paths — so this
+    /// hands back a plain `Session`, not a guard).
     pub(crate) fn memory_session() -> Session {
-        let dir = std::env::temp_dir().join(format!("zenman-ui-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("temp dir");
+        let dir = crate::scratch::create("ui-test");
         let paths = SessionPaths::new(
             dir.join("config.json"),
             dir.join("action.log"),

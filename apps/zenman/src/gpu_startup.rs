@@ -472,11 +472,10 @@ mod tests {
 
     #[test]
     fn a_corrupt_or_absent_sentinel_reads_as_none() {
-        let dir = std::env::temp_dir().join(format!("zenman-sentinel-{}", std::process::id()));
-        let sentinel = Sentinel::new(&dir);
+        let dir = crate::scratch::Scratch::new("sentinel");
+        let sentinel = Sentinel::new(dir.path());
         assert_eq!(sentinel.path(), dir.join(LAST_GOOD_FILE).as_path());
         assert_eq!(sentinel.read_blessed().map(|b| b.profile), None);
-        let _ = std::fs::create_dir_all(&dir);
         let _ = std::fs::write(sentinel.path(), "not a record at all\n");
         assert_eq!(sentinel.read_blessed().map(|b| b.profile), None);
         let _ = std::fs::remove_file(sentinel.path());
@@ -484,10 +483,8 @@ mod tests {
 
     #[test]
     fn create_then_bless_clears_the_marker() {
-        let dir =
-            std::env::temp_dir().join(format!("zenman-sentinel-cycle-{}", std::process::id()));
-        let _ = std::fs::remove_dir(dir.join(MARKER_FILE));
-        let sentinel = Sentinel::new(&dir);
+        let dir = crate::scratch::Scratch::new("sentinel-cycle");
+        let sentinel = Sentinel::new(dir.path());
         let profile = GpuProfile {
             name: "gpu",
             kind: GpuKind::Gpu,

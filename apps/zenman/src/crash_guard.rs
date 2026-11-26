@@ -135,20 +135,23 @@ mod tests {
 
     #[test]
     fn a_panic_writes_a_report_when_a_directory_is_installed() {
-        let dir = std::env::temp_dir().join(format!("zenman-crash-{}", std::process::id()));
-        let before = std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0);
-        install_hook(&dir);
+        // A guarded `zenman-crash-<pid>-<seq>` tree: the report directory is a plain local, so the
+        // guard removes it on the unwind path too.
+        let dir = crate::scratch::Scratch::new("crash");
+        let before = std::fs::read_dir(dir.path())
+            .map(|d| d.count())
+            .unwrap_or(0);
+        install_hook(dir.path());
         let report: Result<Result<(), &str>, String> =
             guard("Report", || panic!("deliberate panic from a test"));
         assert!(report.is_err(), "the panic must surface as the outer Err");
-        let after = std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0);
+        let after = std::fs::read_dir(dir.path())
+            .map(|d| d.count())
+            .unwrap_or(0);
         assert!(
             after > before,
             "a report file should have appeared in {}",
             dir.display()
         );
-        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
-            let _ = std::fs::remove_file(entry.path());
-        }
     }
 }

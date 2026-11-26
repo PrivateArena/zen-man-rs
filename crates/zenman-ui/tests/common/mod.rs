@@ -23,6 +23,12 @@ use zenman_core::session::{Session, SessionPaths};
 use zenman_core::store::config::ZenConfig;
 use zenman_ui::app::ZenApp;
 
+// The shared scratch-tree delete (`remove_tree`), included textually from `zenman-core` — the same
+// file every other test target uses. The fixture *names* here stay deterministic on purpose (see
+// `fixture_base`), so only the delete is shared, not the naming.
+#[path = "../../../zenman-core/src/scratch.rs"]
+mod scratch;
+
 /// Where every fixture of this test binary lives: cargo's own per-integration-test scratch
 /// directory (`CARGO_TARGET_TMPDIR`, i.e. `<workspace>/target/tmp`) under `zenman-ui-fixtures`.
 ///
@@ -476,22 +482,10 @@ fn set_mtime(path: &Path, unix_secs: u64) {
     }
 }
 
-/// Remove a fixture tree, entry by entry.
-///
-/// `std::fs::remove_dir_all` is banned workspace-wide (plan §5.1: deletion goes through `trash`, with a
-/// log) — and a fixture reset is deliberately *not* a product delete, so it does the unlogged removal
-/// by hand instead of pretending to be one.
+/// Remove a fixture tree, entry by entry — delegated to the shared scratch-module delete
+/// (`std::fs::remove_dir_all` is banned workspace-wide, plan §5.1: product deletion goes through
+/// `trash`, with a log) — and a fixture reset is deliberately *not* a product delete, so the
+/// shared helper does the unlogged removal instead of pretending to be one.
 pub fn remove_tree(path: &Path) {
-    let Ok(read) = std::fs::read_dir(path) else {
-        return;
-    };
-    for entry in read.flatten() {
-        let child = entry.path();
-        if child.is_dir() {
-            remove_tree(&child);
-        } else {
-            let _ = std::fs::remove_file(&child);
-        }
-    }
-    let _ = std::fs::remove_dir(path);
+    let _ = scratch::remove_tree(path);
 }

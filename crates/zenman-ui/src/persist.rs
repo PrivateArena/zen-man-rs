@@ -197,15 +197,10 @@ mod tests {
     fn autosave_respects_the_debounce() {
         // A real folder (tests may do IO; the crate may not), so the debounced write is observable
         // as bytes — `Location::Memory` never reports `Saved` because it has no path.
-        // A fresh subdirectory per process *and* per counter tick — the clippy ban on
-        // `remove_dir_all` applies to tests too, so the test never deletes anything.
-        static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "zenman-ui-persist-{}-{}",
-            std::process::id(),
-            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&dir).expect("temp dir");
+        // A fresh `zenman-ui-persist-<pid>-<seq>` tree from the shared scratch module: the clippy
+        // ban on `remove_dir_all` applies to tests too, so the test itself never deletes anything —
+        // the tree carries its owner pid and the sweep reaps it once that process is gone.
+        let dir = crate::scratch::create("ui-persist");
         let (mut persisted, report) = open(Location::Dir(dir.join("autosave")));
         assert!(
             report.dir.is_some(),

@@ -41,6 +41,14 @@ mod parity;
 mod png;
 mod source_guards;
 
+/// Scratch-dir support (`create`, the `Scratch` guard, `remove_tree`, the stale-tree sweep),
+/// included textually from `zenman-core` — the same file every other test target uses, so the
+/// workspace's scratch trees are named, deleted and reaped by one implementation.
+///
+/// Not `#[cfg(test)]`: `cargo xtask scratch` and the `ci` hygiene gate run the reaper itself.
+#[path = "../../crates/zenman-core/src/scratch.rs"]
+mod scratch;
+
 fn main() {
     if let Err(e) = run() {
         eprintln!("xtask: {e}");
@@ -64,11 +72,15 @@ fn run() -> Result<(), Box<dyn Error>> {
             parity::run(&root, &harness_snapshot_names(&root)?)
         }
         "contracts" => contracts::contracts(),
+        "scratch" => scratch_guard(),
         "fixture-tree" => fixture_tree::fixture_tree(),
         "golden-index" => contracts::golden_index(&workspace_root()?.join("tests/golden")),
         "help" | "-h" | "--help" => {
             println!(
-                "usage: cargo xtask <ci|deps|licenses|assets|app-icon|snapshots|parity|contracts|fixture-tree|golden-index>"
+                "usage: cargo xtask <ci|deps|licenses|assets|app-icon|snapshots|parity|contracts|scratch|fixture-tree|golden-index>"
+            );
+            println!(
+                "  scratch reaps the test scratch trees in the temp dir whose owner process has exited"
             );
             println!(
                 "  parity is plan §7 step 15's human gate: it pairs docs/parity/*.png with the snapshots/ baselines"
@@ -92,6 +104,9 @@ fn ci() -> Result<(), Box<dyn Error>> {
     io_guard()?;
     step("cargo clippy --workspace --all-targets -- -D warnings")?;
     step("cargo test --workspace")?;
+    // The suite above writes its scratch trees into the system temp dir, which is a `tmpfs` on some
+    // developer machines: reap what the run left and answer for the rest (see `scratch_guard`).
+    scratch_guard()?;
     // Step 12b: the `watch` feature is off by default, so nothing above compiles `index/watcher.rs`'s
     // inotify half at all. Plan §7 step 12's "watcher feature compiles on and off" is only an acceptance
     // criterion if the gate runs it — a feature nothing builds rots silently (§9.2 step-12a).
@@ -113,7 +128,53 @@ fn ci() -> Result<(), Box<dyn Error>> {
     app_icon::app_icon()?;
     snapshot_artefact_gate()?;
     parity_gate()?;
+    // After the `--features watch` suite too, so nothing escapes the last test binary.
+    scratch_guard()?;
     println!("xtask ci: all gates green");
+    Ok(())
+}
+
+/// The temp-dir hygiene gate.
+///
+/// Every test scratch tree is made by `crate::scratch`, which names it after the process that made
+/// it and reaps, on the next run, the trees whose owner has exited — so a `panic` that skips an
+/// end-of-body delete, or a `SIGKILL` that skips every delete, costs RAM for minutes instead of
+/// forever (unmanaged, this workspace's tests left 14,038 directories and 23 GB on one machine).
+///
+/// What is left for a gate is the reaper's own failure: a reapable tree still on disk is one the
+/// sweep could not delete — a mode or an owner `relax` does not cover, and it will still be there
+/// tomorrow. That, and only that, is red.
+fn scratch_guard() -> Result<(), Box<dyn Error>> {
+    let reaped = scratch::sweep_stale();
+    let left = scratch::survivors();
+    let mut stuck = Vec::new();
+    for (path, age) in &left {
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        if scratch::reapable(name, path) {
+            stuck.push(format!(
+                "{} ({} minutes old)",
+                path.display(),
+                age.as_secs() / 60
+            ));
+        }
+    }
+    if !stuck.is_empty() {
+        return Err(format!(
+            "xtask ci: scratch hygiene — {} scratch tree(s) in the temp dir belong to a run that has \
+             ended and the reaper could not delete them (a mode or an owner `relax` does not cover):\n  {}",
+            stuck.len(),
+            stuck.join("\n  ")
+        )
+        .into());
+    }
+    println!(
+        "xtask ci: scratch hygiene — reaped {reaped} leaked scratch tree(s); {} still held by a live \
+         run or younger than the abandonment window",
+        left.len()
+    );
     Ok(())
 }
 
@@ -964,16 +1025,16 @@ mod tests {
         snapshot_name_is_recognised,
     };
 
-    /// A copy of the committed artefacts under `<temp>/xtask-snap-<pid>-<tag>`, so the gate can be
-    /// seen failing without touching the tree. `size_override` rewrites the copied `SIZE`, which is
-    /// how a test can make every artefact "the wrong dimensions" the way a real size change does.
-    /// (The copy is what the gate reads; the committed tree is never touched.)
+    /// A copy of the committed artefacts under `<temp>/zenman-xtask-snap-<tag>-<pid>-<seq>`, so the
+    /// gate can be seen failing without touching the tree. `size_override` rewrites the copied `SIZE`,
+    /// which is how a test can make every artefact "the wrong dimensions" the way a real size change
+    /// does. (The copy is what the gate reads; the committed tree is never touched.)
     fn artefact_tree(tag: &str, size_override: Option<(u32, u32)>) -> std::path::PathBuf {
         let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("xtask is a workspace member")
             .to_path_buf();
-        let root = std::env::temp_dir().join(format!("xtask-snap-{}-{tag}", std::process::id()));
+        let root = crate::scratch::create(&format!("xtask-snap-{tag}"));
         let dir = root.join("crates/zenman-ui/tests/snapshots");
         std::fs::create_dir_all(&dir).expect("the copy directory is creatable");
         let mut source = harness_snapshot_names(&repo).expect("the test names its baselines");

@@ -2662,31 +2662,16 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
+    /// A fresh, uniquely-named temp tree (`zenman-session-<tag>-<pid>-<seq>`); naming and stale-tree
+    /// reaping come from `crate::scratch`.
     fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "zenman-session-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.subsec_nanos())
-                .unwrap_or(0)
-        ));
-        fs::create_dir_all(&dir).expect("temp dir");
-        dir
+        crate::scratch::create(&format!("session-{tag}"))
     }
 
-    /// Remove the files a session created, then the directory. `std::fs::remove_dir_all` is banned
-    /// workspace-wide (`clippy.toml`), and the tree here is two levels at most.
+    /// Remove the files a session created, then the directory — the shared scratch-tree delete
+    /// (`crate::scratch::remove_tree`), which is `remove_dir_all`-free (`clippy.toml`).
     fn cleanup(dir: &Path) {
-        for entry in fs::read_dir(dir).expect("temp dir reads") {
-            let entry = entry.expect("entry");
-            if entry.path().is_dir() {
-                let _ = fs::remove_dir(entry.path());
-            } else {
-                let _ = fs::remove_file(entry.path());
-            }
-        }
-        let _ = fs::remove_dir(dir);
+        let _ = crate::scratch::remove_tree(dir);
     }
 
     /// A copy of the frozen undo log with one body byte of its second frame flipped, which is the state

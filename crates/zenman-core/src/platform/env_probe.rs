@@ -264,12 +264,10 @@ pub fn scratch_dir(scratch_root: &Path, prefix: &str) -> PathBuf {
 mod tests {
     use super::*;
 
-    /// A per-test directory under the harness' temp dir; never `~`, never shared.
+    /// A per-test directory under the harness' temp dir; never `~`, never shared. Naming and
+    /// stale-tree reaping come from `crate::scratch`.
     fn scratch(tag: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("zenman-probe-test-{}-{tag}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("create the test scratch root");
-        dir
+        crate::scratch::create(&format!("probe-test-{tag}"))
     }
 
     fn leftovers(dir: &Path) -> Vec<String> {

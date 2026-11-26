@@ -628,30 +628,6 @@ mod tests {
     use crate::archive::reader::RawEntry;
     use crate::archive::vfs::{VirtualNode, build_manifest};
 
-    /// `std::fs::remove_dir_all` is banned workspace-wide (`clippy.toml`), so the test cleans up with the
-    /// same explicit walk the contract tests use.
-    fn rm_rf(path: &std::path::Path) {
-        if path.symlink_metadata().is_err() {
-            return;
-        }
-        if let Ok(entries) = std::fs::read_dir(path) {
-            for entry in entries.flatten() {
-                let child = entry.path();
-                let is_dir = child
-                    .symlink_metadata()
-                    .map(|m| m.is_dir())
-                    .unwrap_or(false)
-                    && !child.is_symlink();
-                if is_dir {
-                    rm_rf(&child);
-                } else {
-                    let _ = std::fs::remove_file(&child);
-                }
-            }
-        }
-        let _ = std::fs::remove_dir(path);
-    }
-
     struct FakeReader;
 
     impl crate::archive::reader::ArchiveReader for FakeReader {
@@ -742,8 +718,7 @@ mod tests {
 
     #[test]
     fn extract_writes_only_under_the_destination() {
-        let dir = std::env::temp_dir().join(format!("zenman-extract-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("tmpdir");
+        let dir = crate::scratch::create("extract");
         let dest = AbsPath::from_path(dir.join("out")).expect("abs");
         std::fs::create_dir_all(dest.as_path()).expect("dest");
         let m = manifest_of(&["docs/", "docs/a.txt"]);
@@ -759,7 +734,7 @@ mod tests {
         .expect("extracts");
         assert_eq!(report.written.len(), 1);
         assert!(dest.as_path().join("docs/a.txt").exists());
-        rm_rf(&dir);
+        let _ = crate::scratch::remove_tree(&dir);
     }
 
     #[test]

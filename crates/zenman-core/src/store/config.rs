@@ -988,14 +988,10 @@ pub const UNMAPPED_GO_KEYS: &[(&str, &str)] = &[
 mod tests {
     use super::*;
 
+    /// A fresh, uniquely-named temp tree (`zenman-config-<tag>-<pid>-<seq>`); naming and stale-tree
+    /// reaping come from `crate::scratch`.
     fn tmp_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "zenman-config-{tag}-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        dir
+        crate::scratch::create(&format!("config-{tag}"))
     }
 
     fn sample() -> ZenConfig {

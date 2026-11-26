@@ -54,6 +54,7 @@ assets/app-icon/                generated application icon set (master PNG, runt
 | `cargo xtask ci` | xtask/src/main.rs | Aggregate gate runner (fmt/clippy/test/licences/parity/snapshots/artefact gates) |
 | `cargo xtask parity` | xtask/src/parity.rs | Reports which Go reference files/screens are ported, from `docs/parity` baselines |
 | `cargo xtask contracts` / `golden-index` | xtask/src/contracts.rs | Validates engine output against `tests/golden` (incl. `action.log` walk + CRC32) |
+| `cargo xtask scratch` | xtask/src/main.rs (`scratch_guard`) + `crates/zenman-core/src/scratch.rs` | Reaps the test scratch trees left in the temp dir by a run whose process is gone, and fails while a reapable one survives (a `tmpfs` `/tmp` makes a leak cost RAM); runs twice inside `cargo xtask ci` |
 | `cargo xtask deps` / `licenses` | xtask/src/main.rs | Reads `cargo metadata`: rev-pinning, licence allowlist, `zenman-core` UI-free boundary |
 | `cargo xtask snapshots` | xtask/src/main.rs + crates/zenman-ui/tests/snapshots.rs | Rasterised kittest/wgpu snapshot rendering |
 | `cargo xtask fixture-tree` | xtask/src/fixture_tree.rs | Regenerates `tests/fixtures` and its manifest via scripts/make-fixtures.py |
@@ -187,6 +188,7 @@ persist: craft-settings (dock/tabs) + store::config (ZenConfig: workspaces.defau
 | Change what the session saves or restores | `crates/zenman-ui/src/panels/header.rs` (`workspace_session`, `apply_workspace`, `restore_last_session`, `flush_session`), `crates/zenman-core/src/services/workspaces.rs` (`Autosave`, `RESERVED`), `crates/zenman-core/src/store/config.rs` (`Workspace`/`TabSession`), `crates/zenman-ui/tests/workspaces.rs`, `docs/contracts.md` → "Session save and restore" |
 | Change where the app's files live | `apps/zenman/src/app_dirs.rs` (`Layout`, `PORTABLE_MARKERS`, `resolve_in`), `docs/contracts.md` → "Where the files live", `apps/zenman/src/config_boot.rs` |
 | Add or change a CI gate | `xtask/src/main.rs` (`run` dispatch + `ci`), the relevant gate module (`source_guards.rs`, `parity.rs`, `contracts.rs`), `.cargo/config.toml` alias |
+| Add a test that needs a directory on disk | `crates/zenman-core/src/scratch.rs` (`create` for a plain path, `Scratch` for one that must be deleted on unwind — never a hand-rolled `env::temp_dir().join(..)`), then the nearest existing helper for the naming (`src/index/walker.rs` → `zenman-walker-<case>`) |
 | Regenerate fixtures, goldens or snapshots | `scripts/make-fixtures.py`, `xtask/src/fixture_tree.rs`, `xtask/src/contracts.rs`, `crates/zenman-ui/tests/snapshots.rs`, `docs/fixtures.md` |
 | Add an engine feature and surface it | `crates/zenman-core/src/session.rs` (facade method), `crates/zenman-ui/src/app.rs` (command), see `PROJECT_OVERVIEW.crates-zenman-core.md` |
 

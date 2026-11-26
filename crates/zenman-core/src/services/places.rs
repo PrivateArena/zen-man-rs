@@ -281,10 +281,10 @@ mod tests {
     use super::*;
     use std::fs;
 
+    /// A fresh, uniquely-named scratch tree (`zenman-core-places-<name>-<pid>-<seq>`); naming and
+    /// stale-tree reaping come from `crate::scratch`.
     fn scratch(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join("zenman-core-places").join(name);
-        fs::create_dir_all(&dir).expect("scratch dir");
-        dir
+        crate::scratch::create(&format!("core-places-{name}"))
     }
 
     fn bookmark(path: &str) -> Bookmark {

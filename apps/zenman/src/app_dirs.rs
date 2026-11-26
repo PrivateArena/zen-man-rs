@@ -381,35 +381,18 @@ pub(crate) fn xdg_base(name: &str) -> Option<PathBuf> {
 mod tests {
     use super::*;
 
+    /// A fresh, uniquely-named scratch tree (`zenman-appdirs-<tag>-<pid>-<seq>`) from the shared
+    /// scratch module: it carries the owner pid, so the sweep reaps whatever a crashed run leaves.
     fn tmp(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("zenman-appdirs-{tag}-{}", std::process::id()))
+        crate::scratch::create(&format!("appdirs-{tag}"))
     }
 
     /// A scratch "binary directory" holding a portable marker, the way `target/release/` does the
     /// moment someone drops `portable.dat` beside the executable.
     fn exe_dir_with(tag: &str, marker: &str) -> PathBuf {
         let dir = tmp(tag);
-        remove_tree(&dir);
-        std::fs::create_dir_all(&dir).expect("exe dir");
         std::fs::write(dir.join(marker), b"").expect("marker file");
         dir
-    }
-
-    /// Test-only recursive delete. `std::fs::remove_dir_all` is banned workspace-wide (`clippy.toml`,
-    /// deletion is a `trash` operation in the product), and the ban does not lift for tests.
-    fn remove_tree(path: &std::path::Path) {
-        let Ok(read) = std::fs::read_dir(path) else {
-            return;
-        };
-        for entry in read.flatten() {
-            let child = entry.path();
-            if child.is_dir() {
-                remove_tree(&child);
-            } else {
-                let _ = std::fs::remove_file(&child);
-            }
-        }
-        let _ = std::fs::remove_dir(path);
     }
 
     /// Names left behind in `dir` by a writability probe that forgot to tidy up.
@@ -426,18 +409,22 @@ mod tests {
 
     #[test]
     fn cli_overrides_win() {
+        // Each `tmp` call makes a *fresh* tree, so every path is named once and cloned from there.
+        let data = tmp("data");
+        let config = tmp("config");
+        let session = tmp("session.ron");
         let o = Overrides {
-            data_dir: Some(tmp("data")),
-            config: Some(tmp("config")),
-            session: Some(tmp("session.ron")),
+            data_dir: Some(data.clone()),
+            config: Some(config.clone()),
+            session: Some(session.clone()),
         };
         let paths = AppPaths::resolve(&o).expect("explicit overrides always resolve");
-        assert_eq!(paths.data, tmp("data"));
-        assert_eq!(paths.config, tmp("config"));
-        assert_eq!(paths.session.as_deref(), Some(tmp("session.ron").as_path()));
+        assert_eq!(paths.data, data);
+        assert_eq!(paths.config, config);
+        assert_eq!(paths.session.as_deref(), Some(session.as_path()));
         assert_eq!(paths.layout, Layout::Override);
         // The cache follows the *data* override — the one that says "keep this run inside one tree".
-        assert_eq!(paths.cache, tmp("data").join("cache"));
+        assert_eq!(paths.cache, data.join("cache"));
     }
 
     #[test]
@@ -593,7 +580,6 @@ mod tests {
     #[test]
     fn no_marker_leaves_the_platform_layout_alone() {
         let dir = tmp("portable-absent");
-        std::fs::create_dir_all(&dir).expect("exe dir");
         let paths = AppPaths::resolve_in(&Overrides::default(), Some(&dir)).expect("resolvable");
         assert_eq!(paths.layout, Layout::Platform);
         assert!(
@@ -639,7 +625,6 @@ mod tests {
         // and its data goes there too — beside the `.app`, never inside it, because writing into a
         // signed bundle breaks the signature (craft-libs' rule, `crates/settings/src/paths.rs:141-158`).
         let outer = tmp("portable-bundle");
-        remove_tree(&outer);
         let app = outer.join("ZenMan.app");
         let macos = app.join("Contents").join("MacOS");
         std::fs::create_dir_all(&macos).expect("bundle layout");
@@ -663,7 +648,6 @@ mod tests {
         // The same rule read the other way: a `portable.dat` that someone dropped inside the bundle (or
         // a stray file at that name) must not switch an installed app into portable mode.
         let outer = tmp("portable-bundle-inside");
-        remove_tree(&outer);
         let app = outer.join("ZenMan.app");
         let macos = app.join("Contents").join("MacOS");
         std::fs::create_dir_all(&macos).expect("bundle layout");

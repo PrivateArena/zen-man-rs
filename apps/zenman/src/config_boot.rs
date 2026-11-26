@@ -314,13 +314,11 @@ fn preserve_corrupt(path: &Path) -> Result<PathBuf, std::io::Error> {
 mod tests {
     use super::*;
 
+    /// A fresh `zenman-boot-<tag>-<pid>-<seq>` tree from the shared scratch module (reapable by
+    /// the sweep); the tree outlives the call — `AppPaths` holds its paths — so this hands back
+    /// plain paths, not a guard.
     fn paths(tag: &str) -> AppPaths {
-        let dir = std::env::temp_dir().join(format!(
-            "zenman-boot-{tag}-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::create_dir_all(&dir).expect("temp dir");
+        let dir = crate::scratch::create(&format!("boot-{tag}"));
         AppPaths::resolve(&crate::app_dirs::Overrides {
             data_dir: Some(dir.clone()),
             config: Some(dir.join("config")),

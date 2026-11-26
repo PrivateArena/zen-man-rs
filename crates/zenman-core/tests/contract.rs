@@ -13,7 +13,7 @@
 #![cfg(unix)]
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use zenman_core::entry::FileEntry;
 use zenman_core::error::CoreError;
@@ -28,30 +28,18 @@ use zenman_core::platform::default_env;
 use zenman_core::session::{Receipt, Session, SessionPaths};
 use zenman_core::store::config::ZenConfig;
 
+// Naming, recursive delete and stale-tree reaping for the scratch directories come from the shared
+// test-support module (`zenman-core`'s `scratch.rs`, included here with `#[path]`).
+#[path = "../src/scratch.rs"]
+mod scratch;
+
 // ------------------------------------------------------------------ scratch trees and session boots
 
-fn temp_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "zenman-contract-sweep-{tag}-{}-{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    let _ = remove_tree(&dir);
-    fs::create_dir_all(&dir).expect("temp dir");
-    dir
-}
-
-/// Recursive delete for a *test scratch tree* (`std::fs::remove_dir_all` is banned workspace-wide:
-/// product deletion must go through `ops::delete` — which must never be what cleans a temp dir).
-fn remove_tree(path: &Path) -> std::io::Result<()> {
-    let meta = fs::symlink_metadata(path)?;
-    if meta.file_type().is_symlink() || meta.is_file() {
-        return fs::remove_file(path);
-    }
-    for entry in fs::read_dir(path)?.flatten() {
-        remove_tree(&entry.path())?;
-    }
-    fs::remove_dir(path)
+/// A fresh, uniquely-named scratch tree (`zenman-contract-sweep-<tag>-<pid>-<seq>`), deleted when
+/// the test body ends — the guard's `Drop` runs on the unwind path, so a failing `assert!` still
+/// cleans up, and a `SIGKILL` leaves a pid-named tree the next run's sweep reaps.
+fn temp_dir(tag: &str) -> scratch::Scratch {
+    scratch::Scratch::new(&format!("contract-sweep-{tag}"))
 }
 
 fn abs(path: &Path) -> AbsPath {

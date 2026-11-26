@@ -1051,10 +1051,8 @@ mod tests {
 
     #[test]
     fn is_writable_answers_from_the_read_only_attribute() {
-        let dir = std::env::temp_dir().join(format!("zenman-win-writable-{}", std::process::id()));
-        let _ = std::fs::remove_dir(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir");
-        let abs = AbsPath::from_path(&dir).expect("absolute");
+        let dir = crate::scratch::Scratch::new("win-writable");
+        let abs = AbsPath::from_path(dir.path()).expect("absolute");
         assert!(is_writable(&abs).expect("a fresh temp dir is writable"));
         let file = dir.join("ro.txt");
         std::fs::write(&file, b"x").expect("write");
@@ -1072,9 +1070,8 @@ mod tests {
             !is_writable(&AbsPath::from_path(dir.join("nope")).expect("abs"))
                 .expect("a missing path is `false`, not an error")
         );
-        // The tree is ours, so it goes by hand (`std::fs::remove_dir_all` is banned, `clippy.toml`).
-        let _ = std::fs::remove_file(&file);
-        let _ = std::fs::remove_dir(&dir);
+        // The guard deletes the tree, mode-relaxing on the way down (`std::fs::remove_dir_all` is
+        // banned, `clippy.toml`).
     }
 
     // -- the trait audit ----------------------------------------------------------------------------

@@ -357,7 +357,7 @@ mod tests {
     use super::*;
     use crate::index::schema;
     use crate::path::AbsPath;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
 
     fn db() -> Connection {
         let conn = Connection::open_in_memory().expect("in-memory database");
@@ -452,14 +452,10 @@ mod tests {
         }
     }
 
-    fn scratch(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "zenman-updater-{tag}-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::create_dir_all(&dir).expect("scratch dir");
-        dir
+    /// A fresh scratch tree in a guard that deletes it on drop (so a panicking assert still cleans
+    /// up); the naming and the reap come from `crate::scratch`.
+    fn scratch(tag: &str) -> crate::scratch::Scratch {
+        crate::scratch::Scratch::new(&format!("updater-{tag}"))
     }
 
     #[test]

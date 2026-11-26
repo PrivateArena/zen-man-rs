@@ -24,7 +24,7 @@
 
 use std::collections::HashSet;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use zenman_core::error::CoreError;
@@ -58,15 +58,14 @@ fn golden(name: &str) -> serde_json::Value {
 
 // ------------------------------------------------------------------------------------- scratch trees
 
-fn scratch(tag: &str) -> PathBuf {
-    static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    let dir = std::env::temp_dir().join(format!(
-        "zenman-contract-ws-{tag}-{}-{}",
-        std::process::id(),
-        COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
-    fs::create_dir_all(&dir).expect("temp dir");
-    dir
+// Scratch naming, recursive delete and stale-tree reaping: the shared test-support module.
+#[path = "../src/scratch.rs"]
+mod scratch;
+
+/// A fresh scratch tree (`zenman-contract-ws-<tag>-<pid>-<seq>`) owned by a guard: the tree is a
+/// plain local in every caller, so `Drop` removes it even when an `assert!` unwinds.
+fn scratch_dir(tag: &str) -> scratch::Scratch {
+    scratch::Scratch::new(&format!("contract-ws-{tag}"))
 }
 
 // --------------------------------------------------------------------------------------- the session
@@ -140,7 +139,7 @@ fn the_workspace_model_matches_the_frozen_go_session_shape() {
     let ws = workspace("${FIXTURE_ROOT}/tree");
     let mut config = ZenConfig::default();
     config.workspaces.insert("fixture".to_string(), ws.clone());
-    let dir = scratch("golden-shape");
+    let dir = scratch_dir("golden-shape");
     let file = dir.join("config.json");
     config.save(&file).expect("the config writes");
     let back = ZenConfig::load(&file).expect("and reads back");
@@ -156,7 +155,7 @@ fn the_workspace_model_matches_the_frozen_go_session_shape() {
 
 #[test]
 fn workspace_verbs_are_idempotent_and_missing_names_are_typed() {
-    let dir = scratch("verbs");
+    let dir = scratch_dir("verbs");
     let session = plain(&dir);
     let ws = workspace("/x");
     session
@@ -211,7 +210,7 @@ fn an_autosave_survives_a_kill_minus_nine() {
     // The whole point of the criterion: nothing below calls `Session::close`, `Persisted::flush`, or any
     // other clean-exit path. The `Session` is simply dropped, and the state is read back by a *different*
     // code path (`WorkspaceService::reload`) that has no access to memory.
-    let dir = scratch("kill9");
+    let dir = scratch_dir("kill9");
     let saved_bytes;
     {
         let session = plain(&dir);
@@ -571,7 +570,7 @@ fn substitution_quotes_every_value_and_never_re_reads_a_substituted_one() {
 
 #[test]
 fn the_executor_builds_the_argv_the_plan_demands_and_never_concatenates() {
-    let dir = scratch("exec");
+    let dir = scratch_dir("exec");
     let recorder = Arc::new(Recorder::default());
     let action = CustomAction {
         command: "printf %s {name}".to_string(),
@@ -698,7 +697,7 @@ fn pump_exec(session: &mut Session, job: zenman_core::jobs::JobId) -> ExecOutcom
 
 #[test]
 fn action_crud_matches_gots_four_verbs() {
-    let dir = scratch("crud");
+    let dir = scratch_dir("crud");
     let session = plain(&dir);
     let list = session
         .action_create(act("one", "files", "*.txt"))
@@ -793,7 +792,7 @@ fn names_of(preview: &batch_rename::PreviewSet) -> Vec<&str> {
 
 #[test]
 fn the_preview_engine_reproduces_every_rule_batch_rename_js_has() {
-    let dir = scratch("preview");
+    let dir = scratch_dir("preview");
     // ── literal find/replace, stem only (the default: `ext` unchecked)
     let rows = rows_in(
         &dir,
@@ -1028,7 +1027,7 @@ fn the_preview_engine_reproduces_every_rule_batch_rename_js_has() {
 
 #[test]
 fn applying_a_batch_goes_through_the_rename_op_with_a_parent_rewrite_and_a_log_record() {
-    let dir = scratch("apply");
+    let dir = scratch_dir("apply");
     fs::create_dir_all(dir.join("sub")).expect("dir");
     let file = |name: &str| AbsPath::from_path(dir.join(name)).expect("abs");
     fs::write(dir.join("a1.txt"), b"x").expect("written");
@@ -1198,7 +1197,7 @@ fn applying_a_batch_goes_through_the_rename_op_with_a_parent_rewrite_and_a_log_r
 
 #[test]
 fn the_log_page_carries_the_flags_the_panel_cannot_derive() {
-    let dir = scratch("log");
+    let dir = scratch_dir("log");
     fs::write(dir.join("f.txt"), b"x").expect("written");
     let session = plain(&dir);
     session

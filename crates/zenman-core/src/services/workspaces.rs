@@ -598,13 +598,7 @@ mod tests {
     fn a_session_file_is_one_workspaces_entry_and_reads_back() {
         // The documented way to make a session file: take `workspaces.default` out of `config.json`.
         // So the round trip that matters is `save` → `restore` → write those bytes out → `read_session`.
-        static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "zenman-session-file-{}-{}",
-            std::process::id(),
-            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&dir).expect("temp dir");
+        let dir = crate::scratch::create("session-file");
         let service = WorkspaceService::new(dir.join("config.json"));
         let config = service
             .save(&ZenConfig::default(), RESERVED, &workspace("/a"))
@@ -642,13 +636,7 @@ mod tests {
     fn rename_moves_the_entry_its_contents_and_refuses_a_collision() {
         // The verb Go never had: its Save-As was a save plus a delete, which loses the stored
         // session if the second write never happens. A rename is one write, or none.
-        static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "zenman-ws-rename-{}-{}",
-            std::process::id(),
-            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&dir).expect("temp dir");
+        let dir = crate::scratch::create("ws-rename");
         let service = WorkspaceService::new(dir.join("config.json"));
         let config = service
             .save(&ZenConfig::default(), "alpha", &workspace("/a"))

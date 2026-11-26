@@ -503,13 +503,10 @@ mod tests {
     use super::*;
     use crate::app_dirs::{AppPaths, Overrides};
 
+    /// A fresh `zenman-single-<tag>-<pid>-<seq>` tree from the shared scratch module (reapable by
+    /// the sweep); `AppPaths` outlives the call, so this is a plain path, not a guard.
     fn paths(tag: &str) -> AppPaths {
-        let dir = std::env::temp_dir().join(format!(
-            "zenman-single-{tag}-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::create_dir_all(&dir).expect("temp data dir");
+        let dir = crate::scratch::create(&format!("single-{tag}"));
         AppPaths::resolve(&Overrides {
             data_dir: Some(dir),
             ..Default::default()

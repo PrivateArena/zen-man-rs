@@ -283,7 +283,7 @@ mod tests {
     use super::*;
     use crate::index::schema;
     use crate::path::AbsPath;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
 
     /// Go's `runRebuild` statement order (`api/search_index_walker.go:74-286`).
     const ALL_STAGES: [Stage; 5] = [
@@ -302,13 +302,10 @@ mod tests {
         conn
     }
 
-    fn scratch(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "zenman-rebuild-{tag}-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::create_dir_all(&dir).expect("scratch dir");
+    /// The walked tree, in a guard that deletes it on drop (so a panicking assert still cleans up);
+    /// the pid+seq suffix and the reap come from `crate::scratch`.
+    fn scratch(tag: &str) -> crate::scratch::Scratch {
+        let dir = crate::scratch::Scratch::new(&format!("rebuild-{tag}"));
         for rel in [
             "one.txt",
             "two.md",

@@ -1064,14 +1064,10 @@ impl Iterator for FrameIter {
 mod tests {
     use super::*;
 
+    /// A fresh, uniquely-named temp tree (`zenman-log-<tag>-<pid>-<seq>`); naming and stale-tree
+    /// reaping come from `crate::scratch`.
     fn tmp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "zenman-log-{tag}-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        dir
+        crate::scratch::create(&format!("log-{tag}"))
     }
 
     fn entries(n: usize) -> Vec<ActionEntry> {
