@@ -932,10 +932,12 @@ mod tests {
             Some(Command::Paste),
             "a paste arrives with the clipboard text attached, which the file manager ignores"
         );
-        // A file manager's clipboard is the engine's, so an image clipboard is the same command.
+        // A file manager's clipboard is the engine's, so an image clipboard is the same command. The
+        // pixels are irrelevant to a chord, so the image is egui's own placeholder rather than a
+        // palette colour: `theme.rs` owns every colour this crate paints, and this one paints none.
         assert_eq!(
             map.lookup_event(&Event::PasteImage(std::sync::Arc::new(
-                egui::ColorImage::filled([1, 1], egui::Color32::TRANSPARENT)
+                egui::ColorImage::example()
             ))),
             Some(Command::Paste),
             "a Ctrl+V over an image clipboard is still the paste chord"

@@ -2072,6 +2072,15 @@ impl Session {
         lock(&self.inner.clipboard).clone()
     }
 
+    /// Look at the queue without copying it. [`Self::clipboard`] answers by value, which costs one
+    /// allocation per queued path plus its display name — fine for a menu that asks on a click, wrong
+    /// for the frame loop, which asks every frame to paint the dimmed rows and the status bar's
+    /// indicator. The frame-path callers in the shell take this seam and copy only what they show.
+    #[must_use]
+    pub fn clipboard_with<T>(&self, read: impl FnOnce(&Clipboard) -> T) -> Option<T> {
+        lock(&self.inner.clipboard).as_ref().map(read)
+    }
+
     /// Queue a copy/cut selection — Go's `handleClipboardSet` (`api/ops.go:144-186`), in Go's order:
     ///
     /// 1. the VFS write guard (an archive selection is [`CoreError::VfsReadOnly`], `api/ops.go:73`);

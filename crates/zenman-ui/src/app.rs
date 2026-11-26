@@ -10,6 +10,7 @@
 //! `Arc::get_mut` gymnastics for no shared-ownership benefit (the UI is the only holder). Recorded
 //! as a plan correction.
 
+use std::collections::HashSet;
 use std::time::Instant;
 
 use egui::{CentralPanel, Panel, Ui};
@@ -205,6 +206,28 @@ pub struct ZenApp {
     pub persist_at: Option<Instant>,
     /// The last frame's start, for the step-8 `perf_frame` budget check.
     pub last_frame: Instant,
+    /// What the session's queue means for this frame: the rows a **cut** moves (the panes dim them)
+    /// and what the status bar says about it. Refreshed at the top of [`Self::ui`]
+    /// ([`Self::refresh_clip`]), so the four panes share one build and a cleared clipboard dims
+    /// nothing the very next frame.
+    clip: ClipView,
+}
+
+/// What one frame knows about the session's copy/cut queue, derived once for the four panes and the
+/// status bar ([`ZenApp::refresh_clip`]).
+///
+/// The two halves answer the same question from two ends — *which rows did the user put in a queue*
+/// and *what should the bar say about it* — so they are built together and cached together. The
+/// queue itself is kept only to notice a change: comparing whole `Clipboard`s is exact where a
+/// `(op, len)` fingerprint would not be, since a same-sized re-selection must still repaint.
+#[derive(Clone, Default)]
+struct ClipView {
+    /// The queue the two projections came from.
+    source: Option<zenman_core::ops::clipboard::Clipboard>,
+    /// The paths a **cut** queues, which the panes dim; `None` for a copy or nothing queued.
+    cut: Option<Arc<HashSet<AbsPath>>>,
+    /// The status bar's `N items in action` indicator; `None` when nothing is queued.
+    brief: Option<panels::status_bar::ClipStatus>,
 }
 
 impl ZenApp {
@@ -242,6 +265,7 @@ impl ZenApp {
             log: crate::panels::action_log::LogPanel::default(),
             persist_at: None,
             last_frame: Instant::now(),
+            clip: ClipView::default(),
         }
     }
 
@@ -277,6 +301,7 @@ impl ZenApp {
             log: crate::panels::action_log::LogPanel::default(),
             persist_at: None,
             last_frame: Instant::now(),
+            clip: ClipView::default(),
         };
         // `restore` needs the store and the app apart (the store lives *in* the app), so lift it
         // out, restore, and put it back.
@@ -1153,6 +1178,9 @@ impl ZenApp {
 
     /// Per-frame drawing: the panes and their chrome, the drawers, the dock, the toasts.
     pub fn ui(&mut self, ui: &mut Ui) {
+        // The frame's two views of the queue, built **once**: the four panes and the status bar read
+        // one projection each rather than asking the engine every row and every frame (`ClipView`).
+        self.refresh_clip();
         let tokens = self.tokens;
         self.open_requested_menu();
         if self.model.log_panel {
@@ -1226,21 +1254,110 @@ impl ZenApp {
         }
     }
 
+    /// The rows the **cut** clipboard queues, as the shared set the panes dim from (see
+    /// [`Self::cut_clip`] and [`PaneModel::cut`](panels::file_pane::PaneModel::cut)). `None` when
+    /// nothing is queued, or when the queue is a *copy* — a copy dims nothing.
+    #[must_use]
+    pub fn cut_clip(&self) -> Option<Arc<HashSet<AbsPath>>> {
+        self.clip.cut.clone()
+    }
+
+    /// The session clipboard as the status bar's second indicator (Go's amber `✂ N items in action`),
+    /// or `None` when nothing is queued. The queue is the *session's*, so it is reported whatever the
+    /// active tab shows: after a Cut Inside the rows are not even in the listing, and the indicator is
+    /// the only trace left.
+    #[must_use]
+    fn clip_status(&self) -> Option<panels::status_bar::ClipStatus> {
+        self.clip.brief.clone()
+    }
+
+    /// This frame's two views of the engine's queue: the set of paths a **cut** moves, and the
+    /// status bar's indicator. Go keyed its `.cut-state` class by path (`file-list.js:437-449`) and so
+    /// does the set; the queue is the session's, so it names rows the active pane may not even show.
+    ///
+    /// Rebuilt only when the queue *changed*, compared field by field against the queue last seen (not
+    /// guessed from its length, which a same-sized re-selection would fool), because a frame asks this
+    /// question four times over: an unchanged frame then reads the engine through
+    /// [`Session::clipboard_with`](zenman_core::session::Session::clipboard_with) and allocates
+    /// nothing, where a 500-row queue would otherwise cost 500 path and 500 name clones, per frame.
+    fn refresh_clip(&mut self) {
+        let unchanged = self
+            .session
+            .clipboard_with(|clip| self.clip.source.as_ref() == Some(clip))
+            .unwrap_or(self.clip.source.is_none());
+        if unchanged {
+            return;
+        }
+        // Rebuilt from a borrow: whatever the queue's size, a frame needs a set of paths and ten rows.
+        let next = self.session.clipboard_with(|clip| {
+            if clip.is_empty() {
+                // Remembered, and projected as nothing: an empty queue still *exists*, and forgetting
+                // it would ask this question again on every following frame.
+                return ClipView {
+                    source: Some(clip.clone()),
+                    cut: None,
+                    brief: None,
+                };
+            }
+            let brief = panels::status_bar::ClipStatus {
+                op: clip.op.as_str(),
+                // The glyph says which of the two it is: Go swapped the scissors for the clipboard
+                // (`file-list.js:437-449`) and so here.
+                icon: match clip.op {
+                    ClipOp::Copy => "copy",
+                    ClipOp::Cut => "cut",
+                },
+                total: clip.items.len(),
+                items: clip
+                    .items
+                    .iter()
+                    .take(panels::status_bar::DISPLAY_CAP)
+                    .map(|item| panels::status_bar::StatusItem {
+                        name: item.display.clone(),
+                        is_dir: item.is_dir,
+                        // The same rule the listing row's size cell keeps (`entry_row::size_cell`,
+                        // [`RowOrder::selected_items`]): a folder's `st_size` is its inode's record, not
+                        // its content, so the queue's list shows the placeholder rather than a number
+                        // the row two inches above it refuses to print.
+                        size: if item.is_dir {
+                            None
+                        } else {
+                            Some(item.size).flatten()
+                        },
+                    })
+                    .collect(),
+            };
+            // A copy is not a move: its rows keep their full colour because the source survives the
+            // paste, so only a cut builds the set.
+            let cut = (clip.op == ClipOp::Cut)
+                .then(|| Arc::new(clip.items.iter().map(|i| i.path.clone()).collect()));
+            ClipView {
+                source: Some(clip.clone()),
+                cut,
+                brief: Some(brief),
+            }
+        });
+        self.clip = next.unwrap_or_default();
+    }
+
     /// The 30 px status bar (plan §5.8 `status_bar.rs`), fed by the active pane's tab.
     fn status_bar(&mut self, ui: &mut Ui) {
         let tokens = self.tokens;
         let slot = self.model.active_pane;
-        let names = self
+        let items = self
             .model
             .panes
             .get(&slot)
             .and_then(|p| p.active_tab())
             .map(|tab| {
                 let order = panels::file_pane::RowOrder::build(tab);
-                order.selected_names(&tab.sel)
+                // Only the head of the list, and only up to the popup's own cap: the bar prints a
+                // count from the selection and ten names from the rows, never one name per selected
+                // row (`Ctrl+A` on a 450-row listing would otherwise clone 450 names a frame).
+                order.selected_items(&tab.sel, panels::status_bar::DISPLAY_CAP)
             })
             .unwrap_or_default();
-        let (selection, rows, error) = self
+        let (selected, rows, error) = self
             .model
             .panes
             .get(&slot)
@@ -1271,8 +1388,11 @@ impl ZenApp {
             },
         };
         let model = panels::status_bar::StatusModel {
-            selection: &selection,
-            names,
+            // The count comes from the selection, not from `items`: the bar's list is a head, and the
+            // number it prints and the number its popup titles are the whole of it.
+            selected: selected.len(),
+            items,
+            clip: self.clip_status(),
             info,
             jobs: &self.jobs.foreground,
             panes: self.model.panes.len(),

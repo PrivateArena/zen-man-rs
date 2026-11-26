@@ -95,6 +95,29 @@ impl SelectionState {
         }
     }
 
+    /// The row's glyph colour — the whole row dims, not just its name. CSS's `opacity` covered the
+    /// icon too (`file-list.css:41-43`), so the class's own tint ([`icon_tint`]) goes through the
+    /// same [`Tokens::dimmed`] mix the label does.
+    #[must_use]
+    pub fn icon(self, entry: &FileEntry, tokens: &Tokens) -> Color32 {
+        let base = icon_tint(entry, tokens);
+        match self {
+            Self::Cut | Self::SelectedCut => tokens.dimmed(base),
+            _ => base,
+        }
+    }
+
+    /// The muted cell colour (the size, the date, a flat row's rel path): `--text-muted`, dimmed on a
+    /// cut row exactly as [`Self::text`] dims the name. The list row's three right-hand cells used to
+    /// read `tokens.text_muted` straight, which left a cut row's size and date at full strength.
+    #[must_use]
+    pub fn muted(self, tokens: &Tokens) -> Color32 {
+        match self {
+            Self::Cut | Self::SelectedCut => tokens.dimmed(tokens.text_muted),
+            _ => tokens.text_muted,
+        }
+    }
+
     /// `true` when the row is part of the selection.
     #[must_use]
     pub const fn is_selected(self) -> bool {
@@ -130,6 +153,11 @@ impl SizeLookup<'_> {
     pub const UNKNOWN: SizeLookup<'static> = SizeLookup(&|_| None);
 }
 
+/// The placeholder a size cell shows when nobody has read a size: the `--` of [`size_cell`]'s unknown
+/// cases, and the same two characters the status bar's popup prints for a directory it has not walked
+/// (plan §2.4: an unreadable size is not a size of zero, and it is not nothing to say either).
+pub const UNKNOWN_SIZE: &str = "--";
+
 /// The size cell's text — see the module docs for the bug this is the fix of.
 ///
 /// * a file: its `st_size`, formatted;
@@ -154,7 +182,7 @@ pub fn size_cell(entry: &FileEntry, sizes: Option<FileSizes>) -> String {
         }
         (Some(bytes), None) => format!("{} (-- files)", format_size(bytes)),
         (None, Some(files)) => format!("-- ({} file{})", files, plural(&files)),
-        (None, None) => "--".to_string(),
+        (None, None) => UNKNOWN_SIZE.to_string(),
     }
 }
 
@@ -253,7 +281,7 @@ pub fn paint_list_row(
         icon_rect,
         icons::icon_for(entry),
         icon_side,
-        icon_tint(entry, tokens),
+        sel.icon(entry, tokens),
     );
     let text_x = icon_rect.max.x + tokens.row_icon_gap;
     cell(
@@ -272,7 +300,7 @@ pub fn paint_list_row(
             ui,
             rel,
             &entry.rel_path,
-            tokens.text_muted,
+            sel.muted(tokens),
             Align::LEFT,
             tokens,
         );
@@ -281,7 +309,7 @@ pub fn paint_list_row(
         ui,
         pad_left(size, tokens.cell_padding),
         &size_cell(entry, path.and_then(|p| sizes.get(p))),
-        tokens.text_muted,
+        sel.muted(tokens),
         Align::RIGHT,
         tokens,
     );
@@ -289,7 +317,7 @@ pub fn paint_list_row(
         ui,
         pad_left(date, tokens.cell_padding),
         &date_cell(entry),
-        tokens.text_muted,
+        sel.muted(tokens),
         Align::RIGHT,
         tokens,
     );
@@ -339,7 +367,7 @@ pub fn paint_grid_tile(
         icon_rect,
         icons::icon_for(entry),
         glyph_side,
-        icon_tint(entry, tokens),
+        sel.icon(entry, tokens),
     );
     let label_rect = egui::Rect::from_min_size(
         egui::pos2(
@@ -643,6 +671,41 @@ mod tests {
         assert_eq!(SelectionState::of(true, false), SelectionState::Selected);
         assert_eq!(SelectionState::of(true, true), SelectionState::SelectedCut);
         assert_eq!(SelectionState::of(false, false), SelectionState::Normal);
+    }
+
+    #[test]
+    fn a_cut_row_dims_every_colour_the_row_paints() {
+        // The CSS `opacity: .5` covered the glyph and the muted cells as much as the name
+        // (`file-list.css:41-43`), so no cell may read a token straight while the row is queued.
+        let tokens = Tokens::dark();
+        let file = entry("a", false, 1, None);
+        let dir = entry("docs", true, 0, None);
+        assert_eq!(SelectionState::Normal.icon(&dir, &tokens), tokens.warning);
+        assert_eq!(SelectionState::Normal.muted(&tokens), tokens.text_muted);
+        assert_ne!(
+            SelectionState::Cut.icon(&dir, &tokens),
+            tokens.warning,
+            "a cut row's folder glyph dims"
+        );
+        assert_ne!(
+            SelectionState::SelectedCut.icon(&dir, &tokens),
+            tokens.warning,
+            "and so does a cut row that is selected as well"
+        );
+        assert_eq!(
+            SelectionState::Cut.icon(&file, &tokens),
+            tokens.dimmed(tokens.text_muted),
+            "a file's glyph is the muted tint, dimmed"
+        );
+        assert_eq!(
+            SelectionState::Cut.muted(&tokens),
+            tokens.dimmed(tokens.text_muted)
+        );
+        assert_ne!(
+            SelectionState::Selected.muted(&tokens),
+            tokens.dimmed(tokens.text_muted),
+            "a plain selection dims nothing"
+        );
     }
 
     #[test]

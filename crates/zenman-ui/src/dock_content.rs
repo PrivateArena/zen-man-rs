@@ -9,6 +9,10 @@
 use craft_ui::docking::{DockArea, DockContent, DockOutput, DockStyle, Permissions};
 use egui::{Align, Color32, Layout, Rect, Stroke, Ui, Window, pos2, vec2};
 
+use std::collections::HashSet;
+use std::sync::Arc;
+
+use zenman_core::path::AbsPath;
 use zenman_core::session::Session;
 use zenman_core::store::config::PaneSlot;
 
@@ -67,6 +71,9 @@ pub struct PaneDock<'a> {
     pub disk: Option<(u64, u64)>,
     /// What the chrome asked the shell to do, drained by [`show`].
     pub header: Vec<HeaderCommand>,
+    /// The rows the cut clipboard queues, shared with every pane this frame (the shell built it once,
+    /// [`ZenApp::cut_clip`]). Owned by the handle so a pane can borrow it while the model is borrowed.
+    pub cut: Option<Arc<HashSet<AbsPath>>>,
 }
 
 impl<'a> DockContent<DockId> for PaneDock<'a> {
@@ -213,6 +220,8 @@ impl PaneDock<'_> {
         let Some(tab) = tabs.get_mut(active) else {
             return;
         };
+        // The cut queue is borrowed, never rebuilt per row: the shell made the set once this frame.
+        let cut = self.cut.clone();
         let mut model = PaneModel {
             slot,
             tab,
@@ -221,6 +230,7 @@ impl PaneDock<'_> {
             sizes: &sizes,
             visible_rows: 0,
             drag: self.drag.clone(),
+            cut: cut.as_deref(),
         };
         let panel = DockId::FilePane(slot);
         let commands = file_pane::show(ui, &panel, &mut model, &tokens);
@@ -449,6 +459,9 @@ pub fn show(app: &mut ZenApp, ui: &mut Ui) {
             .ok()
             .and_then(|root| app.session.env().disk_space(&root).ok())
             .map(|space| (space.free, space.total));
+        // The frame's cut queue, shared by all four panes rather than rebuilt per pane. Read *before*
+        // the handle borrows the model, because `cut_clip` is a method on the whole app.
+        let cut = app.cut_clip();
         let mut content = PaneDock {
             model: &mut app.model,
             session: &app.session,
@@ -464,6 +477,7 @@ pub fn show(app: &mut ZenApp, ui: &mut Ui) {
             zoom: app.zoom.status(),
             disk,
             header: Vec::new(),
+            cut,
         };
         let output: DockOutput<DockId> = DockArea::new(dock::dock_area_id()).show_content(
             ui,
@@ -620,6 +634,7 @@ mod tests {
             zoom: crate::zoom::ZoomStatus::default(),
             disk: None,
             header: Vec::new(),
+            cut: None,
         };
         assert_eq!(
             content.logical_label(&DockId::FilePane(PaneSlot::Left)),

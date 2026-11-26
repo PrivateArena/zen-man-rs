@@ -431,6 +431,12 @@ pub fn nested_flat_file_rows() -> Vec<(String, bool)> {
 /// real worker-thread job. kittest's fake time advances neither the coalesce gate nor the worker,
 /// so a `harness.run()`-only loop spins against a clock that never moves. Sleeping is the only
 /// way past both — and the deadline turns a missing event into a named failure, not a hang.
+///
+/// Why [`Harness::run_ok`] and not [`Harness::run`]: `run` panics when a frame cannot settle inside
+/// the harness's step budget (4 by default), and a **live job asks for the next repaint on purpose**
+/// (`jobs_ui::keep_polling`) — so the budget says nothing about the thing being waited for, only
+/// about how busy the machine is. Under load it blew roughly a run in four, on a suite whose logic
+/// had not changed. The deadline is the assertion here; a step budget is not.
 pub fn settle_until(
     harness: &mut Harness<'static, ZenApp>,
     what: &str,
@@ -438,7 +444,9 @@ pub fn settle_until(
 ) {
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
     loop {
-        harness.run();
+        // Stepped, not settled: see the module note. `None` means "still repainting", which is what
+        // the loop is for.
+        let _settled = harness.run_ok();
         if pred(harness) {
             return;
         }

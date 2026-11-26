@@ -72,6 +72,10 @@ pub struct ClipItem {
     pub path: AbsPath,
     /// `filepath.Base(source)` — the name the chip shows.
     pub display: String,
+    /// `info.IsDir()` — Go answered it per item (`api/ops.go:166-176`), and the status bar's
+    /// in-action popup needs it for the row glyph. `false` when the stat failed: a path nobody could
+    /// read is not a directory, and the popup must not claim one.
+    pub is_dir: bool,
     /// `info.Size()`, or `None` when the stat failed. Go reported that case as `0`
     /// (`api/ops.go:163-171`); plan §2.4 makes the difference visible.
     pub size: Option<u64>,
@@ -193,13 +197,17 @@ pub fn store(source: &dyn FsSource, req: &ClipboardStore) -> Result<Clipboard, C
             );
             // Go statted with `os.Stat` and used `0` on failure (`api/ops.go:163-166`); the failure is
             // kept as `None` here, and the stat is `lstat` because that is the seam this crate has.
-            let size = source
-                .lstat(path.as_path())
-                .ok()
-                .and_then(|info| u64::try_from(info.size).ok());
+            // The one stat answers *both* the size and Go's `isDir` (`api/ops.go:166-176`), so it is
+            // read once — the same `is_navigable_dir` rule [`expand_inside`] uses two functions below.
+            let info = source.lstat(path.as_path()).ok();
+            let size = info.as_ref().and_then(|info| u64::try_from(info.size).ok());
+            let is_dir = info
+                .as_ref()
+                .is_some_and(|info| info.kind.is_navigable_dir());
             ClipItem {
                 path,
                 display,
+                is_dir,
                 size,
             }
         })
@@ -765,11 +773,13 @@ mod tests {
                 ClipItem {
                     path: abs("/tree/a b.txt"),
                     display: "a b.txt".into(),
+                    is_dir: false,
                     size: None,
                 },
                 ClipItem {
                     path: abs("/tree/c"),
                     display: "c".into(),
+                    is_dir: true,
                     size: Some(7),
                 },
             ],
@@ -907,6 +917,15 @@ mod tests {
         assert!(
             sizes[2].is_some(),
             "a directory stat has a size on this host; None would mean the stat failed"
+        );
+        // Go answered `isDir` per queued item (`api/ops.go:166-176`), and the status bar's in-action
+        // popup draws its glyph from it. One `lstat` serves the size and this, so the two can never
+        // disagree about the same row.
+        let dirs = clip.items.iter().map(|i| i.is_dir).collect::<Vec<_>>();
+        assert_eq!(
+            dirs,
+            vec![false, false, true],
+            "alpha.txt/beta.txt are files, gamma is the directory"
         );
 
         // The Selected scope queues the selection itself, and an empty selection is `Empty` (Go's

@@ -21,7 +21,7 @@
 //! | Groups | `grouped` flat view with `▶`/`▼` and counts (`:71-96`) | the same, live since step 9d |
 //! | Empty | `Directory is empty` (`:104`) | the same |
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 
 use egui::{Id, Pos2, Rect, Sense, Ui};
@@ -292,6 +292,36 @@ impl RowOrder {
             .collect()
     }
 
+    /// The selected rows as the status bar's hover list wants them — the name, the class the glyph
+    /// shows, the size — in the same display order [`Self::selected_names`] keeps, stopped at `limit`
+    /// because the bar shows a counted head rather than a scrolled list.
+    ///
+    /// A directory's `size` is `None`, not its `st_size`: the content size is the `dir_size` walk's
+    /// answer, which lives in the pane's [`SizeLookup`] and is not worth threading through the bar for
+    /// one popup row — and the inode number is exactly what [`entry_row::size_cell`] refuses to print
+    /// as a size (the `(undefined files)` bug's other half).
+    #[must_use]
+    pub fn selected_items(
+        &self,
+        sel: &Selection,
+        limit: usize,
+    ) -> Vec<crate::panels::status_bar::StatusItem> {
+        (0..self.len())
+            .filter_map(|ix| self.entry_at(ix))
+            .filter(|entry| sel.contains(Tab::row_key(entry)))
+            .take(limit)
+            .map(|entry| crate::panels::status_bar::StatusItem {
+                name: entry.name.clone(),
+                is_dir: entry.is_dir,
+                size: if entry.is_dir {
+                    None
+                } else {
+                    u64::try_from(entry.size).ok()
+                },
+            })
+            .collect()
+    }
+
     /// The keys of every selectable row, in display order.
     #[must_use]
     pub fn keys(&self) -> Vec<String> {
@@ -377,6 +407,32 @@ pub struct PaneModel<'a> {
     /// The drag in flight, if any (step 10c): every directory row and the pane background may claim
     /// its release. Cloned in, because the pane must not hold the app's field across the draw.
     pub drag: Option<crate::drag_drop::DragPayload>,
+    /// The rows the *cut* clipboard queues — Go's `.cut-state` class (`file-list.css:41-43`), which
+    /// the pane now actually applies: a queued row paints dimmed until the clipboard goes away.
+    /// `None` when nothing is queued **or** the queue is a *copy*, which dims nothing. The set is
+    /// built once per frame by the shell and shared by every pane, so a pane only ever borrows it.
+    pub cut: Option<&'a HashSet<AbsPath>>,
+}
+
+/// The visual state of one row: selected, queued in a cut clipboard, both, or neither.
+///
+/// Pure so the pairing rule is testable without a session: the selection is the pane's own
+/// [`Selection`], the cut queue is the engine's clipboard projected onto absolute paths
+/// ([`ZenApp::cut_clip`](crate::app::ZenApp::cut_clip)). An archive row has no absolute path —
+/// [`Tab::row_abs`] answers `None` — and Go's class was path-keyed too, so a row that cannot name a
+/// path is never a cut row.
+#[must_use]
+pub fn row_state(
+    entry_abs: Option<&AbsPath>,
+    selected: bool,
+    cut: Option<&HashSet<AbsPath>>,
+) -> SelectionState {
+    let queued = match (entry_abs, cut) {
+        (Some(path), Some(paths)) => paths.contains(path),
+        // No path, or no cut clipboard (a copy clipboard is `None` here): nothing to dim.
+        _ => false,
+    };
+    SelectionState::of(selected, queued)
 }
 
 /// Draw one pane body, returning the commands the shell must carry out.
@@ -646,6 +702,10 @@ fn list(ui: &mut Ui, model: &mut PaneModel<'_>, tokens: &Tokens) -> ListOut {
     let tab: &Tab = model.tab;
     let sizes = model.sizes;
     let slot = model.slot;
+    let facts = RowFacts {
+        sizes,
+        cut: model.cut,
+    };
     let events = virtual_list::show_list(
         ui,
         ListSpec {
@@ -656,7 +716,7 @@ fn list(ui: &mut Ui, model: &mut PaneModel<'_>, tokens: &Tokens) -> ListOut {
         },
         |ix| row_id(slot, ix),
         |ui, ix, hit| {
-            let event = paint_row(ui, hit, ix, &order, tab, sizes, tokens);
+            let event = paint_row(ui, hit, ix, &order, tab, &facts, tokens);
             paint_row_overlay(
                 ui,
                 hit,
@@ -687,6 +747,10 @@ fn grid(ui: &mut Ui, model: &mut PaneModel<'_>, tokens: &Tokens) -> ListOut {
     let tab: &Tab = model.tab;
     let sizes = model.sizes;
     let slot = model.slot;
+    let facts = RowFacts {
+        sizes,
+        cut: model.cut,
+    };
     let drag = model.drag.clone();
     let events = virtual_list::show_grid(
         ui,
@@ -702,7 +766,7 @@ fn grid(ui: &mut Ui, model: &mut PaneModel<'_>, tokens: &Tokens) -> ListOut {
         },
         |ix| row_id(slot, ix),
         |ui, ix, hit| {
-            let event = paint_row(ui, hit, ix, &order, tab, sizes, tokens);
+            let event = paint_row(ui, hit, ix, &order, tab, &facts, tokens);
             // A grid tile is a drop target too; the in-cell editor is a list-view thing (a tile has
             // no name cell to sit in, and Go had no grid view at all).
             if drag.is_some() {
@@ -716,6 +780,17 @@ fn grid(ui: &mut Ui, model: &mut PaneModel<'_>, tokens: &Tokens) -> ListOut {
     ListOut { events, commands }
 }
 
+/// What a row asks about the frame, once the tab and the visual order are settled: the directory-size
+/// answers and the cut queue. A struct rather than two arguments because the crate denies
+/// `too_many_arguments` and the row painter was already at the limit — and because the two *are*
+/// one thing: the facts the engine holds that a drawn row needs.
+struct RowFacts<'a> {
+    /// The `DirService` size cache, as [`PaneModel::sizes`].
+    sizes: &'a dyn Fn(&AbsPath) -> Option<FileSizes>,
+    /// The frame's cut queue, as [`PaneModel::cut`]: the rows that paint dimmed.
+    cut: Option<&'a HashSet<AbsPath>>,
+}
+
 /// Draw one visual row and read its click.
 fn paint_row(
     ui: &mut Ui,
@@ -723,7 +798,7 @@ fn paint_row(
     ix: usize,
     order: &RowOrder,
     tab: &Tab,
-    sizes: &dyn Fn(&AbsPath) -> Option<FileSizes>,
+    facts: &RowFacts<'_>,
     tokens: &Tokens,
 ) -> Option<RowEvent> {
     let Some(entry) = order.entry_at(ix) else {
@@ -746,8 +821,8 @@ fn paint_row(
     };
     let entry_ix = order.entry_ix(ix)?;
     let key = Tab::row_key(entry);
-    let sel = SelectionState::of(tab.sel.contains(key), false);
     let path = tab.row_abs(entry);
+    let sel = row_state(path.as_ref(), tab.sel.contains(key), facts.cut);
     if tab.view == ViewMode::Grid {
         entry_row::paint_grid_tile(ui, hit, entry, sel, tokens);
     } else {
@@ -760,7 +835,7 @@ fn paint_row(
                 sel,
             },
             &hit.metrics.columns,
-            &SizeLookup(sizes),
+            &SizeLookup(facts.sizes),
             tokens,
         );
     }
@@ -1128,5 +1203,86 @@ fn select_prefix(ctx: &egui::Context, id: egui::Id, len: usize) {
                 egui::text::CCursor::new(len),
             )));
         state.store(ctx, id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An absolute path, spelled the way [`Tab::row_abs`] spells a row's.
+    fn abs(text: &str) -> AbsPath {
+        AbsPath::from_path(text).expect("an absolute path")
+    }
+
+    /// The queue a cut put on the clipboard.
+    fn queue(paths: &[&str]) -> HashSet<AbsPath> {
+        paths.iter().map(|p| abs(p)).collect()
+    }
+
+    #[test]
+    fn a_selected_row_outside_the_queue_is_selected_and_not_dimmed() {
+        let rows = queue(&["/tree/queued.txt"]);
+        let state = row_state(Some(&abs("/tree/a.txt")), true, Some(&rows));
+        assert_eq!(state, SelectionState::Selected);
+        assert!(state.is_selected(), "the selection still owns the row");
+    }
+
+    #[test]
+    fn a_queued_row_is_dimmed_even_when_it_is_not_selected() {
+        // The queue outlives the selection: Ctrl+C, click elsewhere, and the row is still a move
+        // waiting to happen — which is what `.cut-state` said and what the pane now paints.
+        let rows = queue(&["/tree/queued.txt"]);
+        let state = row_state(Some(&abs("/tree/queued.txt")), false, Some(&rows));
+        assert_eq!(state, SelectionState::Cut);
+        assert!(!state.is_selected());
+    }
+
+    #[test]
+    fn a_queued_and_selected_row_is_both() {
+        let rows = queue(&["/tree/queued.txt"]);
+        assert_eq!(
+            row_state(Some(&abs("/tree/queued.txt")), true, Some(&rows)),
+            SelectionState::SelectedCut,
+            "the row keeps its selection fill and still dims"
+        );
+    }
+
+    #[test]
+    fn no_queue_and_a_copy_queue_both_dim_nothing() {
+        // A *copy* clipboard never reaches this function as a set (`ZenApp::cut_paths` answers
+        // `None` for it), so the two cases are the same argument — which is the point: a copy must
+        // not dim, because its source survives the paste.
+        let path = abs("/tree/a.txt");
+        assert_eq!(row_state(Some(&path), false, None), SelectionState::Normal);
+        assert_eq!(row_state(Some(&path), true, None), SelectionState::Selected);
+        assert_eq!(
+            row_state(Some(&path), false, Some(&HashSet::new())),
+            SelectionState::Normal,
+            "an empty queue dims nothing either"
+        );
+    }
+
+    #[test]
+    fn a_row_the_queue_does_not_name_is_not_dimmed() {
+        // The pane shows a directory; the queue may hold rows of another pane entirely.
+        let rows = queue(&["/other/b.txt", "/other/c.txt"]);
+        assert_eq!(
+            row_state(Some(&abs("/tree/a.txt")), false, Some(&rows)),
+            SelectionState::Normal
+        );
+    }
+
+    #[test]
+    fn an_archive_row_is_never_cut() {
+        // [`Tab::row_abs`] answers `None` inside an archive, and Go's class was path-keyed
+        // (`file-list.js:437-449`): a row with no path cannot be in a queue of paths.
+        let rows = queue(&["/tree/a.txt"]);
+        assert_eq!(
+            row_state(None, true, Some(&rows)),
+            SelectionState::Selected,
+            "an archive row keeps the selection colour and no dimming"
+        );
+        assert_eq!(row_state(None, false, Some(&rows)), SelectionState::Normal);
     }
 }
