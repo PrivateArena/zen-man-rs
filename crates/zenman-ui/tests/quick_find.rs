@@ -13,7 +13,13 @@
 //!   branch — where the platform decides the outcome, the test asserts the branch and prints);
 //! * <kbd>Escape</kbd> closes, cancels and resets the lane so the *next* opening walks at once;
 //! * a `SearchReady` whose origin is not the dialog's current one is dropped (the stale-answer
-//!   rule of steps 9a/11a).
+//!   rule of steps 9a/11a);
+//! * **the walk is uncapped**, so the count line is a number and not a `500+ (capped)` shrug, and
+//!   the footer's batch verbs act on *every* match (`Copy Found` on 600 files queues 600 paths);
+//! * **the footer** (`quick-find.js:499-841`): `Copy Found`/`Cut Found` queue the match set on the
+//!   file clipboard, `Copy Path`/`Copy Name` write it to the *text* clipboard, both without closing
+//!   the dialog; `Delete Found` closes it and asks the same three-button question the context menu's
+//!   destructive rows ask, and nothing is deleted until that question is answered.
 
 mod common;
 
@@ -21,10 +27,13 @@ use std::path::{Path, PathBuf};
 
 use egui::Key;
 use egui_kittest::Harness;
+use egui_kittest::kittest::Queryable;
 
 use zenman_core::entry::{DirEntryLike, EntryBuilder, EntryKind, EntryStat, InfoEntry};
 use zenman_core::jobs::JobId;
+use zenman_core::ops::clipboard::ClipOp;
 use zenman_core::path::{AbsPath, FsPath};
+use zenman_core::platform;
 use zenman_core::services::search_live::{SearchResults, SearchStatus};
 use zenman_core::session::Origin;
 use zenman_core::store::config::{LayoutMode, PaneSlot};
@@ -59,6 +68,27 @@ fn scratch(tag: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join("zenman-ui-fixtures")
         .join(format!("zenman-ui-fixture-{tag}"))
+}
+
+/// A flat root of exactly these files — the fixture the footer's batch verbs need, where which
+/// rows survive the walk is the assertion.
+fn flat_tree(tag: &str, names: &[&str]) -> PathBuf {
+    let root = scratch(tag);
+    common::remove_tree(&root);
+    std::fs::create_dir_all(&root).expect("fixture root");
+    for name in names {
+        std::fs::write(root.join(name), "x\n").expect("fixture file");
+    }
+    root
+}
+
+/// A root of `count` files that one query matches, plus one it never does: Go's 500-row cap in the
+/// way of a number that is not `500+`.
+fn many_tree(tag: &str, count: usize) -> PathBuf {
+    let mut names: Vec<String> = (0..count).map(|ix| format!("batch-{ix:03}.txt")).collect();
+    names.push("keeper.zzz".to_string());
+    let borrowed: Vec<&str> = names.iter().map(String::as_str).collect();
+    flat_tree(tag, &borrowed)
 }
 
 fn abs(path: &Path) -> AbsPath {
@@ -192,6 +222,71 @@ fn shown<'h>(harness: &'h Harness<'static, ZenApp>) -> &'h Tab {
 
 fn names(hits: &[zenman_core::services::search_live::SearchHit]) -> Vec<String> {
     hits.iter().map(|h| h.rel_path.clone()).collect()
+}
+
+/// The test's stand-in for a footer click: kittest queues hover+press+release, and `run` walks them
+/// (and any repaint the verb asked for) to settled.
+fn click_footer(harness: &mut Harness<'static, ZenApp>, label: &str) {
+    harness.get_by_label(label).click();
+    harness.run();
+}
+
+/// …and the same click, one frame per queued event, so that `output()` is still the frame that
+/// answered: [`Harness::output`] is the **last** frame only, and `run` keeps stepping past the click.
+fn click_one_frame(harness: &mut Harness<'static, ZenApp>, label: &str) {
+    harness.get_by_label(label).click();
+    harness.step();
+}
+
+/// What the shell put on the **text** clipboard this frame (`Context::copy_text` is an output
+/// command, and `Harness::output` is the last frame only — so this is read between the click and
+/// any further frame).
+fn copied_text(harness: &Harness<'static, ZenApp>) -> Option<String> {
+    harness
+        .output()
+        .platform_output
+        .commands
+        .iter()
+        .find_map(|command| match command {
+            egui::OutputCommand::CopyText(text) => Some(text.clone()),
+            _ => None,
+        })
+}
+
+fn notices(harness: &Harness<'static, ZenApp>) -> Vec<String> {
+    harness
+        .state()
+        .notices
+        .queued()
+        .iter()
+        .map(|n| n.text.clone())
+        .collect()
+}
+
+fn any_notice(harness: &Harness<'static, ZenApp>, needle: &str) -> bool {
+    notices(harness).iter().any(|text| text.contains(needle))
+}
+
+/// Type a query and wait for its rows, returning the match set's rel paths.
+fn find_rows(harness: &mut Harness<'static, ZenApp>, word: &str) -> Vec<String> {
+    type_word(harness, word);
+    common::settle_until(harness, "the rows of a query", |h| {
+        quick_find(h).total.is_some()
+    });
+    names(&quick_find(harness).results)
+}
+
+/// The queue the engine is holding, as `(op, paths)`.
+fn clip(harness: &Harness<'static, ZenApp>) -> Option<(ClipOp, Vec<String>)> {
+    harness.state().session.clipboard().map(|clip| {
+        (
+            clip.op,
+            clip.items
+                .iter()
+                .map(|item| item.path.to_string_lossy())
+                .collect(),
+        )
+    })
 }
 
 /// A hand-built row for the stale-answer test (the only test-side search construction; the
@@ -532,5 +627,290 @@ fn a_stale_answer_is_dropped_and_the_current_origin_is_displayed() {
         rows,
         vec!["STALE-ROW".to_string()],
         "the current origin is displayed"
+    );
+}
+
+// --------------------------------------------------------------------------- the uncapped walk
+
+/// Go capped the live walk at 500 rows (`api/search.go:66`) and paid for it by re-fetching the whole
+/// set with `limit=0` before every footer verb (`quick-find.js:499-534`). The port lifts the cap at
+/// the request instead, which is the difference between a filter that lies and one that does not.
+#[test]
+fn the_walk_is_uncapped_so_six_hundred_matches_are_six_hundred_rows() {
+    const MATCHES: usize = 600;
+    let root = many_tree("qf-uncapped", MATCHES);
+    let mut harness = pane_harness("qf-uncapped", &root);
+    open_find(&mut harness);
+    let rows = find_rows(&mut harness, "batch");
+    let find = quick_find(&harness);
+    assert_eq!(
+        find.requested().map(|q| q.limit),
+        Some(0),
+        "the request asks for Go's `limit <= 0` (unlimited), not for 500"
+    );
+    assert_eq!(rows.len(), MATCHES, "every match is a row");
+    assert_eq!(find.total, Some(MATCHES), "and the count says so");
+    assert!(
+        !find.status.limited(),
+        "no budget cut this walk short: {:?}",
+        find.status
+    );
+    drop(find);
+    // The count line is the user-visible half of the contract: a number, and no `(capped)` hedge.
+    assert_eq!(
+        harness.query_all_by_label("600 matches").count(),
+        1,
+        "the count line prints the real total"
+    );
+    assert_eq!(
+        harness.query_all_by_label_contains("(capped)").count(),
+        0,
+        "the cap wording is gone: {:?}",
+        notices(&harness)
+    );
+}
+
+// ------------------------------------------------------------------- the footer's clipboard verbs
+
+#[test]
+fn copy_found_queues_every_match_and_leaves_the_dialog_up() {
+    let root = flat_tree("qf-copy-found", &["f1.txt", "f2.txt", "keeper.zzz"]);
+    let mut harness = pane_harness("qf-copy-found", &root);
+    open_find(&mut harness);
+    assert!(
+        !quick_find(&harness).actions_enabled(),
+        "with no rows there is nothing to queue, so the footer is greyed (Go's `:437-451`)"
+    );
+    assert_eq!(
+        harness.query_all_by_label("Copy Found").count(),
+        1,
+        "the button is drawn even while it is greyed"
+    );
+    let rows = find_rows(&mut harness, ".txt");
+    assert_eq!(rows, vec!["f1.txt", "f2.txt"]);
+    assert!(quick_find(&harness).actions_enabled());
+    click_footer(&mut harness, "Copy Found");
+    common::settle_until(&mut harness, "the copy toast", |h| {
+        any_notice(h, "copied 2 found item(s)")
+    });
+    let (op, paths) = clip(&harness).expect("the queue is not empty");
+    assert_eq!(op, ClipOp::Copy);
+    assert_eq!(
+        paths,
+        vec![
+            root.join("f1.txt").to_string_lossy(),
+            root.join("f2.txt").to_string_lossy()
+        ],
+        "the whole match set, in list order, as absolute paths"
+    );
+    assert!(
+        matches!(harness.state().dialogs.active(), Some(Dialog::QuickFind(_))),
+        "Go closed its overlay (`:785`); the port keeps it open so one opening can chain verbs"
+    );
+}
+
+#[test]
+fn cut_found_queues_the_match_set_as_a_move() {
+    let root = flat_tree("qf-cut-found", &["f1.txt", "keeper.zzz"]);
+    let mut harness = pane_harness("qf-cut-found", &root);
+    open_find(&mut harness);
+    find_rows(&mut harness, ".txt");
+    click_footer(&mut harness, "Cut Found");
+    common::settle_until(&mut harness, "the cut toast", |h| {
+        any_notice(h, "cut 1 found item(s)")
+    });
+    let (op, paths) = clip(&harness).expect("the queue is not empty");
+    assert_eq!(op, ClipOp::Cut, "`Cut Found` is a move, not a copy");
+    assert_eq!(paths, vec![root.join("f1.txt").to_string_lossy()]);
+}
+
+#[test]
+fn a_greyed_footer_button_queues_nothing() {
+    let root = flat_tree("qf-greyed", &["f1.txt"]);
+    let mut harness = pane_harness("qf-greyed", &root);
+    open_find(&mut harness);
+    // No query typed: the list is empty, so the buttons must not answer a click.
+    click_footer(&mut harness, "Copy Found");
+    harness.run();
+    assert!(
+        clip(&harness).is_none(),
+        "a click on a greyed button reached the engine: {:?}",
+        notices(&harness)
+    );
+}
+
+#[test]
+fn copy_path_and_copy_name_write_the_text_clipboard() {
+    let root = flat_tree("qf-copy-path", &["f1.txt", "f2.txt"]);
+    let mut harness = pane_harness("qf-copy-path", &root);
+    open_find(&mut harness);
+    find_rows(&mut harness, ".txt");
+    // Go's format (`context-menu.js:582-591`): one line per path, plus a trailing newline — and,
+    // unlike `Copy Found`, plain text only: the file queue is untouched.
+    let want_paths = format!(
+        "{}\n{}\n",
+        root.join("f1.txt").to_string_lossy(),
+        root.join("f2.txt").to_string_lossy()
+    );
+    click_one_frame(&mut harness, "Copy Path");
+    assert_eq!(copied_text(&harness).as_deref(), Some(want_paths.as_str()));
+    assert_eq!(
+        harness
+            .output()
+            .platform_output
+            .commands
+            .iter()
+            .filter(|command| matches!(command, egui::OutputCommand::CopyText(_)))
+            .count(),
+        1,
+        "one click, one clipboard write (a footer verb runs once per frame, in `drain`)"
+    );
+    assert!(clip(&harness).is_none(), "Copy Path is not Copy Found");
+    click_one_frame(&mut harness, "Copy Name");
+    assert_eq!(copied_text(&harness).as_deref(), Some("f1.txt\nf2.txt\n"));
+    // The dialog is still up for the verb that follows.
+    harness.run();
+    assert!(matches!(
+        harness.state().dialogs.active(),
+        Some(Dialog::QuickFind(_))
+    ));
+}
+
+// ---------------------------------------------------------------------- the footer's delete verb
+
+#[test]
+fn delete_found_closes_the_find_and_asks_the_three_way_question() {
+    let root = flat_tree(
+        "qf-delete-ask",
+        &["f1.txt", "f2.txt", "f3.txt", "keeper.zzz"],
+    );
+    let mut harness = pane_harness("qf-delete-ask", &root);
+    open_find(&mut harness);
+    find_rows(&mut harness, ".txt");
+    click_footer(&mut harness, "Delete Found");
+    common::settle_until(&mut harness, "the confirm card", |h| {
+        matches!(h.state().dialogs.active(), Some(Dialog::Confirm(_)))
+    });
+    assert_eq!(
+        harness
+            .query_all_by_label_contains("delete these 3 matched item(s)")
+            .count(),
+        1,
+        "the card counts the whole match set"
+    );
+    for label in ["Cancel", "Move to trash", "Delete permanently"] {
+        assert_eq!(
+            harness.query_all_by_label(label).count(),
+            1,
+            "`{label}` is one of the card's answers"
+        );
+    }
+    click_footer(&mut harness, "Cancel");
+    common::settle_until(&mut harness, "the cancellation toast", |h| {
+        any_notice(h, "delete found: cancelled")
+    });
+    assert!(
+        harness.state().dialogs.active().is_none(),
+        "a cancelled card closes"
+    );
+    for name in ["f1.txt", "f2.txt", "f3.txt", "keeper.zzz"] {
+        assert!(
+            root.join(name).exists(),
+            "the safe answer touched `{name}`: {:?}",
+            notices(&harness)
+        );
+    }
+}
+
+#[test]
+fn delete_found_permanently_removes_every_match_and_nothing_else() {
+    let root = flat_tree("qf-delete-perm", &["f1.txt", "f2.txt", "keeper.zzz"]);
+    let mut harness = pane_harness("qf-delete-perm", &root);
+    open_find(&mut harness);
+    find_rows(&mut harness, ".txt");
+    click_footer(&mut harness, "Delete Found");
+    common::settle_until(&mut harness, "the confirm card", |h| {
+        matches!(h.state().dialogs.active(), Some(Dialog::Confirm(_)))
+    });
+    click_footer(&mut harness, "Delete permanently");
+    common::settle_until(&mut harness, "the matched files to go", |h| {
+        let _ = h;
+        !root.join("f1.txt").exists()
+    });
+    assert!(!root.join("f2.txt").exists(), "the whole match set went");
+    assert!(
+        root.join("keeper.zzz").exists(),
+        "a non-match is not part of the answer"
+    );
+}
+
+/// The same branch probe `keymap.rs`'s D6 test runs: the fixture volume may have no trash root, in
+/// which case `to_trash` (`permanent_fallback: false`) must refuse rather than quietly delete.
+#[test]
+fn delete_found_to_the_trash_answers_the_d6_ladder() {
+    let root = flat_tree("qf-delete-trash", &["f1.txt", "keeper.zzz"]);
+    let one = root.join("f1.txt");
+    let can_trash = platform::default_env().can_trash(&abs(&one));
+    println!(
+        "can_trash({}) = {can_trash} — {}",
+        one.display(),
+        if can_trash {
+            "TRASHED branch: this volume has a trash location"
+        } else {
+            "REFUSED branch: foreign fsid, no trash root, permanent_fallback == false"
+        }
+    );
+    let mut harness = pane_harness("qf-delete-trash", &root);
+    open_find(&mut harness);
+    find_rows(&mut harness, ".txt");
+    click_footer(&mut harness, "Delete Found");
+    common::settle_until(&mut harness, "the confirm card", |h| {
+        matches!(h.state().dialogs.active(), Some(Dialog::Confirm(_)))
+    });
+    click_footer(&mut harness, "Move to trash");
+    common::settle_until(&mut harness, "the delete job's summary", |h| {
+        any_notice(h, "trashed") || any_notice(h, "failed")
+    });
+    if can_trash {
+        assert!(!one.exists(), "the trash branch moved the match away");
+    } else {
+        assert!(one.exists(), "a refused trash must not destroy the bytes");
+    }
+    assert!(
+        root.join("keeper.zzz").exists(),
+        "the trash rung never touches a non-match"
+    );
+}
+
+#[test]
+fn the_found_paths_are_the_matches_under_the_search_root() {
+    // The footer acts on paths, so the rel_path → absolute step is the whole feature: a nested
+    // match must resolve inside the root the dialog is searching, recursively.
+    let root = scratch("qf-nested");
+    common::remove_tree(&root);
+    std::fs::create_dir_all(root.join("deep/deeper")).expect("fixture dirs");
+    for name in ["top.log", "deep/mid.log", "deep/deeper/low.log"] {
+        std::fs::write(root.join(name), "x\n").expect("fixture file");
+    }
+    let mut harness = pane_harness("qf-nested", &root);
+    open_find(&mut harness);
+    edit_quick_find(&mut harness, |find| find.recursive = true);
+    find_rows(&mut harness, ".log");
+    let find = quick_find(&harness);
+    assert_eq!(find.results.len(), 3, "the recursive walk found the run");
+    let paths = find.found_paths();
+    assert_eq!(
+        paths
+            .iter()
+            .map(|p| p.to_string_lossy())
+            .collect::<Vec<_>>(),
+        vec![
+            // `WalkDir`'s pre-order over name-sorted siblings: `deep` sorts before `top.log`, and
+            // inside it `deeper` before `mid.log` (`search_live`'s own ordering).
+            root.join("deep/deeper/low.log").to_string_lossy(),
+            root.join("deep/mid.log").to_string_lossy(),
+            root.join("top.log").to_string_lossy(),
+        ],
+        "each rel_path resolves against the search root"
     );
 }

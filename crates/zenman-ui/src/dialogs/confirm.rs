@@ -33,6 +33,11 @@ pub enum Choice {
     Skip,
     /// Paste conflict: keep both (`ConflictPolicy::Rename`).
     Rename,
+    /// Delete Found's *second* yes: destroy the bytes instead of trashing them
+    /// ([`DeleteMode::Permanent`](zenman_core::ops::delete::DeleteMode::Permanent)). Its own variant
+    /// rather than a re-used `Ok`, because a card with two affirmative answers must never have to
+    /// guess which one the pointer landed on.
+    Permanent,
 }
 
 /// One button of a confirm.

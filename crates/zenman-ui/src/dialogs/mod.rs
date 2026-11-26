@@ -35,7 +35,7 @@ pub use confirm::{Choice, Confirm, ConfirmButton};
 pub use extract::ExtractProgress;
 pub use prompt::{Prompt, Validation};
 pub use properties::{PropertiesDialog, Subject as PropertiesSubject};
-pub use quick_find::{QuickFind, QuickOutcome};
+pub use quick_find::{QuickFind, QuickOutcome, QuickRequest};
 pub use search_manager::{IndexOutcome, SearchManager};
 
 use egui::{Align2, Area, CornerRadius, Id, Order, Ui, Vec2};
@@ -68,6 +68,15 @@ pub enum DialogKind {
         /// The pane whose selection is the target.
         slot: PaneSlot,
         /// The paths that would go — frozen when the dialog opened, and printed in it (plan D6).
+        paths: Vec<AbsPath>,
+    },
+    /// Quick find's `Delete Found` → the same `Session::delete`, aimed at every match of the live
+    /// search instead of at a selection. Its own kind, because it has two destructive answers and the
+    /// safe one (the trash) has to be nameable in the answer.
+    DeleteFound {
+        /// The pane the delete job is reported to.
+        slot: PaneSlot,
+        /// Every match, resolved when the footer button was clicked.
         paths: Vec<AbsPath>,
     },
     /// The quick-find dialog (step 11b) — the subject is the *pane*, and the answer is a row.
@@ -200,7 +209,10 @@ impl Answer {
         match self {
             Self::Text { choice, .. } | Self::Button { choice, .. } => *choice,
             Self::Quick {
-                outcome: QuickOutcome::Activate { .. } | QuickOutcome::Closed { .. },
+                outcome:
+                    QuickOutcome::Activate { .. }
+                    | QuickOutcome::Closed { .. }
+                    | QuickOutcome::DeleteFound { .. },
                 ..
             } => Choice::Ok,
             Self::Index { .. } | Self::Batch { .. } | Self::Action { .. } => Choice::Ok,

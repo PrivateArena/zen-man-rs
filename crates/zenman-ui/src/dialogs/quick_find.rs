@@ -23,12 +23,23 @@
 //!   had run; core refuses the pattern before spending a job slot, and the message paints under
 //!   the field in the error colour, never as a toast ([`CoreError::BadRegex`] is not
 //!   `is_expected`).
-//! * **The footer's clipboard buttons are not here yet** (Copy/Cut/Copy Path/Copy Name/Delete/
-//!   Paste Inside, `index.html:592-612`): they act on *all* results with a capped-result refetch
-//!   (`quick-find.js:501-537`), which is step 12+ territory, and the plan's field list does not
-//!   name them. There is also **no hidden-files toggle**, because Go has none (its live search
-//!   never filtered dot-files — plan §2.3), so the query keeps core's Go-parity
-//!   [`HiddenPolicy::Include`].
+//! * **The footer is here** (`index.html:593-616`): `Copy Found`, `Cut Found`, `Copy Path`,
+//!   `Copy Name` and `Delete Found` act on the *whole* match set, which is why the walk is
+//!   uncapped (below) — Go capped at 500 and answered that by re-fetching with `limit=0` before
+//!   every verb (`quick-find.js:499-534`); the port lifts the cap instead, so the rows on screen
+//!   are the rows the verb uses. The four clipboard verbs are *requests* kept for [`drain`], so
+//!   the dialog survives them (Go closed it, `:719`/`:785`) and one opening can chain
+//!   `Copy Found` → `Delete Found`. `Delete Found` alone is a closing [`QuickOutcome`], because the
+//!   answer it needs next is a modal of its own and the stack holds one ([`Dialogs::open`]).
+//!   **Its two `Paste … Inside` rows are still missing**: they paste the live clipboard into every
+//!   found folder, which is a *loop of paste jobs* each able to answer a conflict, and the
+//!   conflict confirm cannot be raised while this dialog owns the modal slot. Plan §7 row 11b's
+//!   other criterion — "URI list written to the system clipboard, X11/Wayland only" — was already
+//!   met underneath: `Copy`/`Cut Found` go through [`Session::clipboard_store`], which publishes
+//!   `file://` URIs through `ops::clipboard::publish_system` exactly as Go's `writeToSystemClipboard`
+//!   did (`api/ops.go:549-575`), so no new clipboard dependency is involved.
+//! * There is **no hidden-files toggle**, because Go has none (its live search never filtered
+//!   dot-files — plan §2.3), so the query keeps core's Go-parity [`HiddenPolicy::Include`].
 //! * Go persists the three toggles in `localStorage`; the port keeps them per-opening (plan D-list:
 //!   settings are step 12's `store/config` round-trip, not a dialog's business).
 //!
@@ -38,6 +49,9 @@
 //! when its origin is the dialog's current one. Core already suppresses superseded walks, so this
 //! is the second half of the contract: the dialog cannot be repainted by a keystroke it no longer
 //! has.
+//!
+//! [`Dialogs::open`]: crate::dialogs::Dialogs::open
+//! [`Session::clipboard_store`]: zenman_core::session::Session::clipboard_store
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -48,6 +62,7 @@ use egui::{
 
 use zenman_core::error::CoreError;
 use zenman_core::jobs::JobId;
+use zenman_core::ops::clipboard::ClipOp;
 use zenman_core::path::AbsPath;
 use zenman_core::services::search_live::{
     HiddenPolicy, NameMode, ScopeFilter, SearchAdmission, SearchHit, SearchQuery, SearchResults,
@@ -81,6 +96,54 @@ const FIELD_INSET_PADDINGS: f32 = 4.0;
 /// What the field is for: Go's `placeholder="Type to find files..."` (`index.html:575`).
 const PLACEHOLDER: &str = "Type to find files...";
 
+/// One footer button. The five are Go's, in Go's DOM order (`index.html:593-616`), minus its two
+/// `Paste … Inside` rows (module doc).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Footer {
+    /// The label, in Go's copy.
+    label: &'static str,
+    /// What the button does, for the pointer that paused on it.
+    tooltip: &'static str,
+    /// Red text: the same `tokens.danger` the confirm card's destructive answer wears.
+    danger: bool,
+    /// The verb, or `None` for the one that answers the dialog instead of asking the shell.
+    request: Option<QuickRequest>,
+}
+
+/// The footer, left to right as Go drew it.
+const FOOTER: [Footer; 5] = [
+    Footer {
+        label: "Copy Found",
+        tooltip: "Queue every match on the clipboard, for a paste into any pane",
+        danger: false,
+        request: Some(QuickRequest::CopyFound),
+    },
+    Footer {
+        label: "Cut Found",
+        tooltip: "Queue every match as a move (paste takes the bytes away from here)",
+        danger: false,
+        request: Some(QuickRequest::CutFound),
+    },
+    Footer {
+        label: "Copy Path",
+        tooltip: "Put every match's full path on the system clipboard, one per line",
+        danger: false,
+        request: Some(QuickRequest::CopyPaths),
+    },
+    Footer {
+        label: "Copy Name",
+        tooltip: "Put every match's name on the system clipboard, one per line",
+        danger: false,
+        request: Some(QuickRequest::CopyNames),
+    },
+    Footer {
+        label: "Delete Found",
+        tooltip: "Delete every match — asks first, and offers the trash",
+        danger: true,
+        request: None,
+    },
+];
+
 /// How the dialog's answer reaches the engine (the `Answer::Quick` payload; dialogs never call
 /// the engine themselves — plan §4.1's one-way door).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -103,6 +166,30 @@ pub enum QuickOutcome {
         /// The job whose rows, if any, were still coming.
         job: Option<JobId>,
     },
+    /// `Delete Found`: every match, handed to the shell, which must ask before touching a byte
+    /// (Go's `confirm()` of `quick-find.js:799` did the same, and offered only the permanent
+    /// answer). The paths are already resolved, because the rows that named them are gone the
+    /// moment this dialog closes.
+    DeleteFound {
+        /// The pane to report the job to.
+        slot: PaneSlot,
+        /// Every match, in list order.
+        paths: Vec<AbsPath>,
+    },
+}
+
+/// What a footer button asked the shell to do to the match set. Not an [`Answer`]: `Dialogs::show`
+/// closes the dialog on any answer, and these four verbs leave the list up for the next one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuickRequest {
+    /// `Copy Found` — Go's `performClipboardFound('copy')` (`:695`, `:747`).
+    CopyFound,
+    /// `Cut Found` — Go's `performClipboardFound('cut')` (`:699`).
+    CutFound,
+    /// `Copy Path` — Go's `onCopyPathFoundClick` (`:703`), via its `copyPaths` (`:582`).
+    CopyPaths,
+    /// `Copy Name` — Go's `onCopyNameFoundClick` (`:725`), via its `copyNames` (`:588`).
+    CopyNames,
 }
 
 /// The dialog's state — the plan's `QuickFind { query, regex, scope, recursive, results, total,
@@ -157,6 +244,8 @@ pub struct QuickFind {
     /// The last request handed to the engine — what makes "did the keystroke change anything?"
     /// a comparison instead of a guess.
     requested: Option<SearchQuery>,
+    /// The footer's verbs, waiting for [`drain`] (which runs them as the shell, not as the dialog).
+    pub requests: Vec<QuickRequest>,
 }
 
 impl QuickFind {
@@ -183,6 +272,7 @@ impl QuickFind {
             started: 0,
             deferred: 0,
             requested: None,
+            requests: Vec::new(),
         }
     }
 
@@ -199,6 +289,40 @@ impl QuickFind {
         let hit = self.cursor.and_then(|ix| self.results.get(ix))?;
         let path = self.root.join_rel(&hit.rel_path).ok()?;
         Some((path, hit.is_dir()))
+    }
+
+    /// Are the footer's verbs live? Go's `updateActionButtonsState`: no rows, no verbs
+    /// (`:437-451`). A walk in flight has already dropped its rows (`clear_rows`), so this answers
+    /// `false` for it too, and the buttons cannot act on a set that is being replaced.
+    #[must_use]
+    pub fn actions_enabled(&self) -> bool {
+        !self.results.is_empty()
+    }
+
+    /// Every match as an absolute path, in list order — Go's `resolvePathsForAction` (`:499-534`)
+    /// without its refetch, because this dialog does not cap the walk: what the list shows *is* the
+    /// whole match set. A `rel_path` the root cannot answer is skipped rather than fatal, the same
+    /// rule [`Self::activate_target`] applies to the single row it was given.
+    #[must_use]
+    pub fn found_paths(&self) -> Vec<AbsPath> {
+        self.results
+            .iter()
+            .filter_map(|hit| self.root.join_rel(&hit.rel_path).ok())
+            .collect()
+    }
+
+    /// Lift the footer's pending verbs out of the dialog, resolved to the paths they act on.
+    /// Called by [`drain`] once per frame, and *only* there: the rows belong to the dialog, the
+    /// engine does not.
+    fn take_batch(&mut self) -> Option<QuickBatch> {
+        let requests = std::mem::take(&mut self.requests);
+        if requests.is_empty() {
+            return None;
+        }
+        Some(QuickBatch {
+            requests,
+            paths: self.found_paths(),
+        })
     }
 
     /// The request the current state describes, or `None` when it is the one already handed
@@ -224,6 +348,12 @@ impl QuickFind {
         req.scope_filter = self.scope;
         req.recursive = self.recursive;
         req.hidden = HiddenPolicy::Include;
+        // **No row cap.** Go capped the walk at 500 (`api/search.go:66`) and made the footer pay for
+        // it with a re-fetch of the whole set before every verb (`quick-find.js:499-534`); the port
+        // lifts the cap here, so the filter is the truth and the verbs need no second pass. `0` is
+        // Go's own spelling of unlimited ([`SearchQuery::result_cap`]), and the walk still stops at
+        // the node/depth budgets, which [`Self::status_text`] reports instead of hiding.
+        req.limit = 0;
         req
     }
 
@@ -274,8 +404,34 @@ impl QuickFind {
         }
         match self.total {
             Some(total) if self.status.truncated => format!("{total}+ matches (capped)"),
-            Some(total) => format!("{total} match{}", if total == 1 { "" } else { "es" }),
+            Some(total) => {
+                let noun = if total == 1 { "match" } else { "matches" };
+                match self.stop_note() {
+                    Some(note) => format!("{total} {noun} ({note})"),
+                    None => format!("{total} {noun}"),
+                }
+            }
             None => String::new(),
+        }
+    }
+
+    /// Why the walk stopped short of the whole tree when it was *not* the row cap — with the cap
+    /// gone ([`Self::build_request`]) these budgets are the only thing standing between a query and
+    /// an answer, so the count line owns up to them rather than printing a number that reads
+    /// complete. `None` when the walk ran to the end, which is the normal case.
+    fn stop_note(&self) -> Option<String> {
+        let status = &self.status;
+        if status.node_budget_hit {
+            Some(format!(
+                "stopped after {} names examined",
+                status.nodes_visited
+            ))
+        } else if status.timed_out {
+            Some("stopped at the time budget".to_string())
+        } else if status.depth_truncated {
+            Some("stopped at the depth limit".to_string())
+        } else {
+            None
         }
     }
 
@@ -314,6 +470,7 @@ impl QuickFind {
         let title = format!("Finding in: {}", self.root.as_path().display());
         let mut clicked: Option<usize> = None;
         let mut activated: Option<usize> = None;
+        let mut delete_found = false;
         let mut fresh = self.fresh;
         let status = self.status_text();
         let error = self.error.clone();
@@ -515,6 +672,42 @@ impl QuickFind {
                                 .color(tokens.text_muted),
                         );
                     }
+                    // The footer (Go's `index.html:593-616`): the batch verbs over the *whole* match
+                    // set, right-aligned like its `justify-content: flex-end`, and greyed exactly when
+                    // Go greyed them (`updateActionButtonsState`, `:437-451`). The four clipboard verbs
+                    // are kept as requests for [`drain`] — an [`Answer`] would close the dialog, and
+                    // `Copy Found` then `Delete Found` is the point of having them. `Delete Found` is
+                    // the closing one, because the question it must ask next wants the modal slot this
+                    // dialog is standing in (`Dialogs::open` refuses a second dialog).
+                    let enabled = self.actions_enabled();
+                    ui.add_space(tokens.dialog_gap);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        for footer in FOOTER.iter().rev() {
+                            let colour = if footer.danger {
+                                tokens.danger
+                            } else if enabled {
+                                tokens.text_main
+                            } else {
+                                tokens.text_muted
+                            };
+                            let response = ui
+                                .add_enabled(
+                                    enabled,
+                                    egui::Button::new(
+                                        egui::RichText::new(footer.label)
+                                            .color(colour)
+                                            .size(tokens.font_size),
+                                    ),
+                                )
+                                .on_hover_text(footer.tooltip);
+                            if response.clicked() {
+                                match footer.request {
+                                    Some(request) => self.requests.push(request),
+                                    None => delete_found = true,
+                                }
+                            }
+                        }
+                    });
                 });
             });
         let _ = area;
@@ -529,6 +722,17 @@ impl QuickFind {
                 });
         } else if let Some(ix) = clicked {
             self.cursor = Some(ix);
+        }
+        // <kbd>Escape</kbd> already answered the dialog above; a footer click in the same frame as a
+        // dismissal is not a second answer, so the key wins.
+        if delete_found && outcome.is_none() {
+            let paths = self.found_paths();
+            if !paths.is_empty() {
+                outcome = Some(QuickOutcome::DeleteFound {
+                    slot: self.slot,
+                    paths,
+                });
+            }
         }
         self.fresh = fresh;
         outcome.map(|outcome| Answer::Quick {
@@ -581,6 +785,36 @@ fn fit_text(text: &str, max: f32) -> String {
 
 fn estimate_name_advance(chars: usize) -> f32 {
     2.0 * chars as f32
+}
+
+/// The footer's verbs, lifted out of the dialog with the paths they act on: one batch per frame,
+/// resolved while the dialog still owns the rows (`drain` runs after the draw, when the rows are
+/// still the ones the user clicked on).
+struct QuickBatch {
+    /// What was asked, in click order.
+    requests: Vec<QuickRequest>,
+    /// Every match, in list order — the whole set, because the walk is uncapped.
+    paths: Vec<AbsPath>,
+}
+
+/// Run the footer's non-closing verbs (plan §4.1's one-way door: the dialog asks, the shell acts).
+/// Called from `ZenApp::ui` beside [`search_manager::drain`](super::search_manager::drain), for the
+/// same reason — a config panel
+/// and a find footer both have work to do that must not cost them their window.
+pub fn drain(app: &mut ZenApp, ctx: &egui::Context) {
+    let batch = match app.dialogs.active_mut() {
+        Some(Dialog::QuickFind(find)) => find.take_batch(),
+        _ => None,
+    };
+    let Some(batch) = batch else { return };
+    for request in &batch.requests {
+        match request {
+            QuickRequest::CopyFound => app.found_clipboard(&batch.paths, ClipOp::Copy),
+            QuickRequest::CutFound => app.found_clipboard(&batch.paths, ClipOp::Cut),
+            QuickRequest::CopyPaths => app.found_copy_text(&batch.paths, false, ctx),
+            QuickRequest::CopyNames => app.found_copy_text(&batch.paths, true, ctx),
+        }
+    }
 }
 
 /// Open the dialog (plan §5.8's `open`): a *new* search session, so the throttle's window from a

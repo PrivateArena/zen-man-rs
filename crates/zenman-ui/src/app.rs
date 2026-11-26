@@ -1240,6 +1240,9 @@ impl ZenApp {
         // The manager's non-closing requests (Rebuild / Apply / the watch toggle) run here, after the
         // draw, exactly like the answers — a dialog still never calls the engine itself.
         crate::dialogs::search_manager::drain(self);
+        // …and the quick-find footer's (`Copy Found`, `Cut Found`, `Copy Path`, `Copy Name`), which
+        // need `ctx` for the *text* clipboard and a dialog that must stay open.
+        crate::dialogs::quick_find::drain(self, ui.ctx());
         // The drag ghost, on the foreground layer, paint-only: it must never claim a click from the row
         // under the pointer (`drag_drop::paint_ghost`).
         if let Some(payload) = self.drag.clone()
@@ -2037,7 +2040,7 @@ impl ZenApp {
     /// Put `lines` on the clipboard as one block — Go's `navigator.clipboard.writeText`
     /// (`context-menu.js:582-591`); egui's way out is the `CopyText` output command, which the
     /// shell's backend answers. An empty block is the loud no-op, never silence.
-    fn copy_lines(&mut self, lines: &[String], ctx: &egui::Context) {
+    pub(crate) fn copy_lines(&mut self, lines: &[String], ctx: &egui::Context) {
         let text = lines.join("\n");
         if text.is_empty() {
             self.nothing_selected("copy");
@@ -2268,19 +2271,7 @@ impl ZenApp {
             return;
         }
         let count = paths.len();
-        let mut named: Vec<String> = paths
-            .iter()
-            .take(3)
-            .map(|path| {
-                path.as_path().file_name().map_or_else(
-                    || path.as_path().display().to_string(),
-                    |name| name.to_string_lossy().into_owned(),
-                )
-            })
-            .collect();
-        if count > named.len() {
-            named.push(format!("and {} more", count - named.len()));
-        }
+        let named = named_summary(&paths);
         let confirm = Confirm::new(
             DialogKind::PermanentDelete { slot, paths },
             // The heading is not the button's wording: two nodes with one label is a menu the mouse
@@ -2288,7 +2279,7 @@ impl ZenApp {
             "Permanent delete",
             format!("Are you sure you want to permanently delete these {count} item(s)?"),
             vec![
-                named.join(", "),
+                named,
                 "The data is not recoverable. Nothing goes to the trash.".to_string(),
             ],
             // Safe answer first: `fresh` focuses the first button, so <kbd>Enter</kbd> and
@@ -2297,6 +2288,35 @@ impl ZenApp {
             vec![
                 ConfirmButton::new("Cancel", Choice::Cancel),
                 ConfirmButton::danger("Delete permanently", Choice::Ok),
+            ],
+        );
+        self.open_dialog(dialogs::Dialog::Confirm(confirm));
+    }
+
+    /// Quick find's `Delete Found` question. Go asked it once, with one answer, in a browser
+    /// `confirm` that could only say OK or Cancel (`quick-find.js:799`) — and its OK was
+    /// `os.RemoveAll`. The port keeps the count and the names Go showed and adds the answer Go could
+    /// not carry: the trash. Safe button first, so <kbd>Enter</kbd> and <kbd>Escape</kbd> both leave
+    /// the bytes alone (`Confirm`'s rule, and the reason the card exists).
+    fn open_found_delete_confirm(&mut self, slot: PaneSlot, paths: Vec<AbsPath>) {
+        if paths.is_empty() {
+            self.nothing_selected("delete");
+            return;
+        }
+        let count = paths.len();
+        let named = named_summary(&paths);
+        let confirm = Confirm::new(
+            DialogKind::DeleteFound { slot, paths },
+            "Delete found",
+            format!("Are you sure you want to delete these {count} matched item(s)?"),
+            vec![
+                named,
+                "The list is every match of the current query, not the rows on screen.".to_string(),
+            ],
+            vec![
+                ConfirmButton::new("Cancel", Choice::Cancel),
+                ConfirmButton::new("Move to trash", Choice::Ok),
+                ConfirmButton::danger("Delete permanently", Choice::Permanent),
             ],
         );
         self.open_dialog(dialogs::Dialog::Confirm(confirm));
@@ -2444,6 +2464,13 @@ impl ZenApp {
                     self.session.drop_pending_search();
                     self.session.reset_search_throttle();
                 }
+                crate::dialogs::QuickOutcome::DeleteFound { slot, paths } => {
+                    // Go deleted on one browser `confirm` whose only yes was the permanent one
+                    // (`quick-find.js:799`); the port hands the question to the same card the context
+                    // menu's two destructive rows use, which is why this dialog had to close first —
+                    // the stack holds one modal, and the *bytes* wait for the answer.
+                    self.open_found_delete_confirm(slot, paths);
+                }
             }
             return;
         }
@@ -2562,6 +2589,33 @@ impl ZenApp {
                         format!("delete: {}", report.summary()),
                     ),
                     Err(e) => self.toast_error("delete permanently", e),
+                }
+            }
+            DialogKind::DeleteFound { slot, paths } => {
+                // Two destructive answers, both named: Go's `confirm` had one, and it was the worse
+                // one. Anything else (Cancel, `Escape`) leaves every byte where it is.
+                let req = match choice {
+                    Choice::Ok => DeleteReq::to_trash(paths),
+                    Choice::Permanent => DeleteReq::permanent(paths),
+                    _ => {
+                        self.notices.post(
+                            toast::Level::Info,
+                            format!(
+                                "delete found: cancelled: {} item(s) left alone",
+                                paths.len()
+                            ),
+                        );
+                        return;
+                    }
+                };
+                let origin = self.session.next_origin();
+                match self.session.delete(&req, origin) {
+                    Ok(Receipt::Running { job, origin }) => self.note_running(slot, job, origin),
+                    Ok(Receipt::Done(report)) => self.notices.post(
+                        toast::Level::Success,
+                        format!("delete found: {}", report.summary()),
+                    ),
+                    Err(e) => self.toast_error("delete found", e),
                 }
             }
             DialogKind::PasteConflict {
@@ -3286,6 +3340,64 @@ impl ZenApp {
         }
     }
 
+    /// `Copy Found` / `Cut Found` (`quick-find.js:747-789`): the queue is the *whole match set* of the
+    /// live search, not the pane's selection — hence its own front end, with the paths handed in by
+    /// the dialog. Go closed its overlay and wrote to the pane's status line; the dialog stays up so
+    /// one opening can chain verbs, so the confirmation is a toast.
+    pub(crate) fn found_clipboard(&mut self, paths: &[AbsPath], op: ClipOp) {
+        let what = match op {
+            ClipOp::Copy => "copy found",
+            ClipOp::Cut => "cut found",
+        };
+        if paths.is_empty() {
+            self.notices
+                .post(toast::Level::Warning, format!("{what}: nothing to queue"));
+            return;
+        }
+        let req = ClipboardStore {
+            op,
+            sources: paths.to_vec(),
+            scope: ClipScope::Selected,
+        };
+        match self.session.clipboard_store(&req) {
+            Ok(clip) => self.notices.post(
+                toast::Level::Success,
+                format!(
+                    "{} {} found item(s) to the clipboard",
+                    match op {
+                        ClipOp::Copy => "copied",
+                        ClipOp::Cut => "cut",
+                    },
+                    clip.items.len()
+                ),
+            ),
+            Err(e) => self.toast_error(what, e),
+        };
+    }
+
+    /// `Copy Path` / `Copy Name` over the match set (`quick-find.js:703-745`): the *text* clipboard,
+    /// which is what makes the result usable outside the app — Go wrote
+    /// `paths.join('\n') + '\n'` (`context-menu.js:582-591`), and so does [`Self::copy_lines`].
+    pub(crate) fn found_copy_text(&mut self, paths: &[AbsPath], named: bool, ctx: &egui::Context) {
+        if paths.is_empty() {
+            self.nothing_selected(if named { "copy name" } else { "copy path" });
+            return;
+        }
+        let lines: Vec<String> = paths
+            .iter()
+            .map(|path| path_text(path.as_path(), named))
+            .collect();
+        self.copy_lines(&lines, ctx);
+        self.notices.post(
+            toast::Level::Success,
+            format!(
+                "copied {}s of {} found item(s) to the system clipboard",
+                if named { "name" } else { "path" },
+                paths.len()
+            ),
+        );
+    }
+
     /// <kbd>Delete</kbd> — **the trash path** (plan **D6**): `DeleteReq::to_trash`, which never
     /// escalates to destroying bytes without the user's answer. The tab reloads itself through the
     /// `DirChanged` the job emits.
@@ -3370,6 +3482,26 @@ pub fn tab_title(path: &FsPath) -> String {
         Some(name) if !name.is_empty() => name.to_string(),
         _ => "/".to_string(),
     }
+}
+
+/// The first three names of a doomed set, plus Go's `and N more` tail — the line both destructive
+/// confirms print, because a bare count does not tell the user *which* items they are answering for.
+fn named_summary(paths: &[AbsPath]) -> String {
+    let count = paths.len();
+    let mut named: Vec<String> = paths
+        .iter()
+        .take(3)
+        .map(|path| {
+            path.as_path().file_name().map_or_else(
+                || path.as_path().display().to_string(),
+                |name| name.to_string_lossy().into_owned(),
+            )
+        })
+        .collect();
+    if count > named.len() {
+        named.push(format!("and {} more", count - named.len()));
+    }
+    named.join(", ")
 }
 
 /// One line of `Copy path` / `Copy name` for a listing row.
