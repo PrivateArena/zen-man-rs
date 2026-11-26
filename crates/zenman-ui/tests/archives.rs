@@ -303,6 +303,56 @@ fn activating_an_archive_row_lists_its_members_read_only() {
 }
 
 #[test]
+fn enter_on_an_archive_row_opens_the_store_rather_than_the_desktop() {
+    let root = clean("enter-container");
+    write_zip(&root.join("plain.zip"), &[("a.txt", b"first member\n")]);
+    let mut harness = pane_harness("enter-container", &root);
+    let slot = PaneSlot::Left;
+
+    select(&mut harness, slot, "plain.zip");
+    dispatch(&mut harness, slot, Command::Open);
+
+    let tab = shown(&harness, slot);
+    assert_eq!(
+        tab.path.store_depth(),
+        1,
+        "the row was entered as a store, exactly as a double-click enters it: {:?}",
+        tab.path
+    );
+    assert_eq!(names(tab), vec!["a.txt"]);
+}
+
+/// Enter (and the menu's `Open` row) on one selected row is the pane's own activation rule, so a
+/// directory *member* navigates the store instead of asking the desktop to open it — the mistake the
+/// flat path made, since a row inside a container has no host path of its own.
+#[test]
+fn enter_on_a_directory_member_navigates_the_store() {
+    let root = clean("enter-member");
+    write_zip(
+        &root.join("plain.zip"),
+        &[
+            ("docs/", b""),
+            ("docs/readme.md", b"# inside the container\n"),
+        ],
+    );
+    let mut harness = pane_harness("enter-member", &root);
+    let slot = PaneSlot::Left;
+    activate(&mut harness, slot, "plain.zip");
+
+    select(&mut harness, slot, "docs");
+    dispatch(&mut harness, slot, Command::Open);
+
+    let tab = shown(&harness, slot);
+    assert_eq!(
+        tab.path.relative_to(&tab.path.store_root()),
+        Some("docs".into()),
+        "the pane stepped into the member: {:?}",
+        tab.path
+    );
+    assert_eq!(names(tab), vec!["readme.md"]);
+}
+
+#[test]
 fn a_nested_archive_browses_to_depth_two_and_a_third_level_does_not_open() {
     let root = clean("nested");
     // outer.zip / inner.zip / deep.zip — three containers, but only two stores.
@@ -337,6 +387,13 @@ fn a_nested_archive_browses_to_depth_two_and_a_third_level_does_not_open() {
     assert!(
         after.entries.entries.iter().any(|e| e.name == "deep.zip"),
         "the depth-3 container is still just a member row"
+    );
+    assert!(
+        toast_texts(&harness)
+            .iter()
+            .any(|text| text.contains("extract it first")),
+        "and activating it says what to do instead of launching the container: {:?}",
+        toast_texts(&harness)
     );
 
     // Back/forward step across the store switch like any other navigation (the history is the

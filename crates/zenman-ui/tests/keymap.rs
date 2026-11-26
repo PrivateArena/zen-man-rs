@@ -403,6 +403,101 @@ fn ctrl_c_then_ctrl_v_copies_into_the_other_pane() {
     );
 }
 
+/// The strip a Linux or Windows window reports for a `Ctrl`+… chord: egui-winit mirrors `ctrl` into
+/// `command` there (`egui-winit/src/lib.rs:2383`), which is what a chord's own event carries.
+const CTRL: egui::Modifiers = egui::Modifiers {
+    alt: false,
+    ctrl: true,
+    shift: false,
+    mac_cmd: false,
+    command: true,
+};
+
+/// Push a whole **frame's worth** of raw events and run — the shape a real window delivers, which
+/// `press` above cannot express. For a clipboard chord `egui-winit` pushes the modifier strip, then
+/// the `Event::Cut`/`Copy`/`Paste` that *stands in for* the key press, and never emits the press at
+/// all (`keymap.rs` module docs), so the strip ahead of the event is the half that matters.
+fn push(harness: &mut Harness<'static, ZenApp>, events: impl IntoIterator<Item = egui::Event>) {
+    harness.input_mut().events.extend(events);
+    harness.run();
+    harness.run();
+}
+
+/// One frame of a clipboard chord as egui delivers it: the strip the chord is held under, then the
+/// event that answers for the swallowed press.
+fn clipboard_chord(strip: egui::Modifiers, event: egui::Event) -> Vec<egui::Event> {
+    vec![egui::Event::ModifiersChanged(strip), event]
+}
+
+/// The row under the pointer becomes the selection — a click is a click whichever chord follows it.
+fn select(harness: &mut Harness<'static, ZenApp>, label: &str) {
+    harness.get_by_label(label).click();
+    settle(harness);
+}
+
+#[test]
+fn the_clipboard_events_copy_and_paste_across_the_panes() {
+    let src = tree("keymap-clipboard-copy-src", &["keep.txt"]);
+    let dst = tree("keymap-clipboard-copy-dst", &[]);
+    let mut harness = split_harness("keymap-clipboard-copy", &src, &dst);
+
+    select(&mut harness, "keep.txt");
+    push(&mut harness, clipboard_chord(CTRL, egui::Event::Copy));
+    // Route the paste to the *other* pane, the way a click on it would.
+    harness.state_mut().model.active_pane = PaneSlot::Right;
+    // The payload is egui's own clipboard text; the shell's clipboard is the engine's, so the string
+    // is ignored — which is exactly what makes this the file manager's Paste and not a text field's.
+    push(
+        &mut harness,
+        clipboard_chord(CTRL, egui::Event::Paste("keep.txt".to_string())),
+    );
+
+    let landed = dst.join("keep.txt");
+    common::settle_until(&mut harness, "keep.txt to land in the right pane", |_| {
+        landed.is_file()
+    });
+    assert!(
+        src.join("keep.txt").is_file(),
+        "a copy leaves the source alone"
+    );
+}
+
+#[test]
+fn the_clipboard_events_cut_and_paste_move_the_file() {
+    let src = tree("keymap-clipboard-cut-src", &["move.txt"]);
+    let dst = tree("keymap-clipboard-cut-dst", &[]);
+    let mut harness = split_harness("keymap-clipboard-cut", &src, &dst);
+
+    select(&mut harness, "move.txt");
+    push(&mut harness, clipboard_chord(CTRL, egui::Event::Cut));
+    harness.state_mut().model.active_pane = PaneSlot::Right;
+    push(
+        &mut harness,
+        clipboard_chord(CTRL, egui::Event::Paste(String::new())),
+    );
+
+    let landed = dst.join("move.txt");
+    common::settle_until(&mut harness, "move.txt to reach the right pane", |_| {
+        landed.is_file()
+    });
+    common::settle_until(&mut harness, "move.txt to leave the left pane", |_| {
+        !src.join("move.txt").exists()
+    });
+}
+
+#[test]
+fn a_clipboard_event_with_no_selection_says_so() {
+    let dir = common::listing_tree("keymap-clipboard-empty");
+    let mut harness = pane_harness("keymap-clipboard-empty", &dir);
+    push(&mut harness, clipboard_chord(CTRL, egui::Event::Cut));
+    settle(&mut harness);
+    assert!(
+        any_notice(&harness, "nothing selected"),
+        "the event lands on the same no-op-with-a-reason the chord does: {:?}",
+        notices(&harness)
+    );
+}
+
 #[test]
 fn enter_on_a_directory_navigates() {
     let dir = common::listing_tree("keymap-enter");

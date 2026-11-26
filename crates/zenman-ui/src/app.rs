@@ -542,12 +542,19 @@ impl ZenApp {
                     }
                     self.list(slot, false, false);
                 } else {
-                    // Plan §4.1's `Session::open` is step 9's write path; until then the shell says
-                    // so instead of pretending the row was opened.
-                    self.notices.post(
-                        crate::widgets::toast::Level::Info,
-                        format!("open: {}", entry.name),
-                    );
+                    // A file row (or a member past the store cap): hand it to the desktop. This is
+                    // the same behaviour the menu's `Open` row runs — `Command::Open` and this arm
+                    // are two front ends on one action (plan **D7**) — and until now this arm only
+                    // *said* the row was opened. The path is the row's own `row_abs`, because a
+                    // double-click owes nothing to what the first click of the pair selected.
+                    let Some(abs) = self.shown_tab(slot).and_then(|tab| tab.row_abs(&entry)) else {
+                        self.notices.post(
+                            crate::widgets::toast::Level::Warning,
+                            format!("open {}: this tab lists no local path", entry.name),
+                        );
+                        return;
+                    };
+                    self.run_open(slot, vec![abs], Some(child));
                 }
             }
             PaneCommand::FolderContext { path, at } => {
@@ -1630,6 +1637,8 @@ impl ZenApp {
             // rename) owns the keys, a dock float owns its own, and a modal owns everything.
             return;
         }
+        // The modifier strip is read out of the events themselves, so the real frame shape is what
+        // gets tested: a chord press, then the clipboard event egui-winit pushes in its place.
         let commands = ctx.input(|input| self.keys.lookup_events(&input.events));
         let slot = self.model.active_pane;
         for command in commands {
@@ -1875,18 +1884,25 @@ impl ZenApp {
             .collect()
     }
 
-    /// The one selected row when it is a directory — Go's `getSelectedDir()`
-    /// (`keyboard.js:139-150`), which demands *exactly one* selection for the `-inside` chords.
-    fn single_selected_dir(&self, slot: PaneSlot) -> Option<AbsPath> {
+    /// The index of the only selected row — `None` when none or several are selected. The one
+    /// question the selection answers for single-row activation and for Go's `-inside` chords.
+    fn single_selected_ix(&self, slot: PaneSlot) -> Option<usize> {
         let tab = self.shown_tab(slot)?;
         if tab.sel.len() != 1 {
             return None;
         }
-        let entry = tab
-            .entries
+        tab.entries
             .entries
             .iter()
-            .find(|entry| tab.sel.contains(Tab::row_key(entry)))?;
+            .position(|entry| tab.sel.contains(Tab::row_key(entry)))
+    }
+
+    /// The one selected row when it is a directory — Go's `getSelectedDir()`
+    /// (`keyboard.js:139-150`), which demands *exactly one* selection for the `-inside` chords.
+    fn single_selected_dir(&self, slot: PaneSlot) -> Option<AbsPath> {
+        let ix = self.single_selected_ix(slot)?;
+        let tab = self.shown_tab(slot)?;
+        let entry = tab.entries.entries.get(ix)?;
         if !entry.is_dir {
             return None;
         }
@@ -3076,19 +3092,51 @@ impl ZenApp {
         }
     }
 
-    /// <kbd>Enter</kbd> — Go's `triggerOpen`, with core's routing: a directory is *reported* in
-    /// `navigated` and the pane goes there, a file is handed to the desktop, and each failure is
-    /// toasted on its own (Go's single `lastErr`, made per-path).
+    /// <kbd>Enter</kbd> — Go's `triggerOpen`. One row is the pane's own activation rule (see
+    /// [`PaneCommand::Open`]); a multi-selection is the batch, which core routes: a directory is
+    /// *reported* in `navigated` and the pane goes there, a file goes to the desktop, and each
+    /// failure is toasted on its own (Go's single `lastErr`, made per-path).
     fn open_selection(&mut self, slot: PaneSlot) {
+        // One row goes through the pane's own activation rule (`PaneCommand::Open`), which owns the
+        // store ladder — so Enter, the menu row and a double-click cannot disagree (plan **D7**: one
+        // behaviour, several front ends). A multi-selection has no single row to enter, so it stays
+        // the batch of desktop launches Go's `handleOpen` ran.
+        if let Some(ix) = self.single_selected_ix(slot) {
+            self.run_command(slot, PaneCommand::Open { ix });
+            return;
+        }
         let paths = self.selection_abs(slot);
         if paths.is_empty() {
             self.nothing_selected("open");
             return;
         }
+        self.run_open(slot, paths, None);
+    }
+
+    /// Hand `paths` to the desktop and act on the engine's own routing: a directory is **navigation**
+    /// (`ops::open`'s `OpenRoute::Navigate`, reported rather than waiting for a launcher that never
+    /// runs) and a file is a launch, each failure named per path.
+    ///
+    /// Only ever reached with host paths: a single selected row goes through [`PaneCommand::Open`],
+    /// which knows stores, and a row *inside* a store is refused below — `Tab::row_abs` answers with
+    /// the **container** for any member path (`FsPath::host_abs`), so launching it would open a file
+    /// the user is not even looking at. Opening a member is extraction, which is [`Command::Extract`].
+    ///
+    /// `navigate_to` is the multi-selection batch's fallback: with several rows there is no single
+    /// joined path to move to, so the reported host directory is used.
+    fn run_open(&mut self, slot: PaneSlot, paths: Vec<AbsPath>, navigate_to: Option<FsPath>) {
+        if self.in_archive(slot) {
+            self.notices.post(
+                toast::Level::Warning,
+                "open: an archive member is not a local file — extract it first",
+            );
+            return;
+        }
         match self.session.open_paths(&paths) {
             Ok(report) => {
                 if let Some(dir) = report.navigated.first() {
-                    self.navigate_shown(slot, FsPath::from_abs(dir.clone()));
+                    let target = navigate_to.unwrap_or_else(|| FsPath::from_abs(dir.clone()));
+                    self.navigate_shown(slot, target);
                 }
                 for (path, e) in &report.failed {
                     self.notices.post(

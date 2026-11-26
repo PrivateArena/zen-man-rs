@@ -59,14 +59,28 @@ fn pane_harness(tag: &str) -> Harness<'static, ZenApp> {
     pane_harness_at(tag, &common::listing_tree(tag), egui::vec2(1200.0, 800.0))
 }
 
-/// [`pane_harness`] with the tab's directory and the window size under test — the breadcrumb
-/// tests need a deep start directory and a strip too narrow for it.
-fn pane_harness_at(tag: &str, dir: &std::path::Path, size: egui::Vec2) -> Harness<'static, ZenApp> {
-    let session = common::session(tag);
+/// [`pane_harness`] that also **hands back** the recording launcher, for the tests that need to see
+/// what was asked of the desktop. Every harness in this file already runs on `common::NoDesktopEnv`
+/// (`common::session` is [`common::session_with_launcher`] with the recorder dropped), so the
+/// difference here is observability, not safety: nothing ever spawns an editor mid-run.
+fn pane_harness_logging(
+    tag: &str,
+) -> (
+    Harness<'static, ZenApp>,
+    std::sync::Arc<common::NoDesktopEnv>,
+) {
+    let (session, env) = common::session_with_launcher(tag);
+    let dir = common::listing_tree(tag);
     let mut app = ZenApp::new(session, Vec::new());
     app.set_layout(panes_for(LayoutMode::Single));
-    let path = fixture_path(dir);
+    let path = fixture_path(&dir);
     app.open_tab(PaneSlot::Left, path);
+    (build(app, egui::vec2(1200.0, 800.0)), env)
+}
+
+/// The one harness builder the two entry points above share: the shell's real draw path, driven
+/// through the fork's `logic`/`ui` pair exactly as `apps/zenman` does.
+fn build(app: ZenApp, size: egui::Vec2) -> Harness<'static, ZenApp> {
     let mut harness = Harness::builder()
         .with_accessibility_check(true)
         .with_size(size)
@@ -84,6 +98,17 @@ fn pane_harness_at(tag: &str, dir: &std::path::Path, size: egui::Vec2) -> Harnes
         );
     settle(&mut harness);
     harness
+}
+
+/// [`pane_harness`] with the tab's directory and the window size under test — the breadcrumb
+/// tests need a deep start directory and a strip too narrow for it.
+fn pane_harness_at(tag: &str, dir: &std::path::Path, size: egui::Vec2) -> Harness<'static, ZenApp> {
+    let session = common::session(tag);
+    let mut app = ZenApp::new(session, Vec::new());
+    app.set_layout(panes_for(LayoutMode::Single));
+    let path = fixture_path(dir);
+    app.open_tab(PaneSlot::Left, path);
+    build(app, size)
 }
 
 fn settle(harness: &mut Harness<'static, ZenApp>) {
@@ -1055,5 +1080,66 @@ fn clicking_the_middle_of_a_tab_title_shows_that_tab() {
         harness.state().model.panes[&PaneSlot::Left].active,
         0,
         "a click on the title's centre showed the tab behind it"
+    );
+}
+
+// ------------------------------------------------------------------------------- activation
+
+/// The index a row sits at in the shown tab's listing.
+fn row_of(tab: &Tab, name: &str) -> usize {
+    tab.entries
+        .entries
+        .iter()
+        .position(|entry| entry.name == name)
+        .unwrap_or_else(|| panic!("no row {name:?} in {:?}", names(tab)))
+}
+
+/// Activate a row the way a double-click does. `RowEvent::Activate` *is* this command —
+/// [`zenman_ui::panels::file_pane::row_event`] answers `double_clicked()` with
+/// [`PaneCommand::Open`], and the shell's half is what is under test here.
+fn activate(harness: &mut Harness<'static, ZenApp>, name: &str) {
+    let ix = row_of(shown(harness), name);
+    harness
+        .state_mut()
+        .run_command(PaneSlot::Left, PaneCommand::Open { ix });
+    settle(harness);
+}
+
+#[test]
+fn a_double_click_on_a_file_hands_it_to_the_desktop() {
+    let dir = common::listing_tree("open-file");
+    let (mut harness, env) = pane_harness_logging("open-file");
+    let before = shown(&harness).path.clone();
+
+    activate(&mut harness, "a.txt");
+
+    assert_eq!(
+        env.opened(),
+        vec![dir.join("a.txt").to_string_lossy().to_string()],
+        "the row is handed to the desktop — the same route the context menu's `Open` row takes, \
+         and not the toast that only *said* it was opened"
+    );
+    assert_eq!(
+        shown(&harness).path,
+        before,
+        "opening a file never moves the pane"
+    );
+}
+
+#[test]
+fn a_double_click_on_a_directory_navigates_and_never_launches() {
+    let dir = common::listing_tree("open-dir");
+    let (mut harness, env) = pane_harness_logging("open-dir");
+
+    activate(&mut harness, "docs");
+
+    assert!(
+        env.opened().is_empty(),
+        "a directory is navigation, not a launch (`ops::open`'s `OpenRoute::Navigate`)"
+    );
+    assert_eq!(
+        shown(&harness).path,
+        fixture_path(&dir.join("docs")),
+        "and the pane shows it"
     );
 }

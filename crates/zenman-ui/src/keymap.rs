@@ -39,6 +39,36 @@
 //! Printable-character chords: Go has exactly one, bare <kbd>H</kbd> (see above); it is bound, and
 //! [`crate::app::ZenApp::handle_keys`] drops the whole pass whenever a text field owns the keyboard
 //! (plan F15), which is what makes a bare letter safe.
+//!
+//! # The clipboard chords arrive as *events*, not as keys
+//!
+//! <kbd>Ctrl</kbd>+<kbd>X</kbd>/<kbd>C</kbd>/<kbd>V</kbd> are **not** deliverable as
+//! [`Event::Key`] on any real backend: the pinned `egui-winit` translates the platform clipboard
+//! chords — <kbd>Cmd/Ctrl</kbd>+<kbd>X</kbd>/<kbd>C</kbd>/<kbd>V</kbd>, the dedicated Cut/Copy/Paste
+//! keys, and on Windows also <kbd>Shift</kbd>+<kbd>Del</kbd>, <kbd>Ctrl</kbd>+<kbd>Ins</kbd> and
+//! <kbd>Shift</kbd>+<kbd>Ins</kbd> — into [`Event::Cut`], [`Event::Copy`] and [`Event::Paste`],
+//! pushes that event and **returns without emitting the key press at all**
+//! (`egui-winit/src/lib.rs:3112-3140,3213-3218`, whose `set_clipboard_shortcuts` switch is off only
+//! at the cost of `TextEdit`'s own copy/paste). The key *release* is silenced too: the eaten press
+//! leaves a `None` marker in `HeldKeys`, so lifting the key emits nothing either
+//! (`egui-winit/src/held_keys.rs:26-33,83-93`). So the table keeps the chords — they are what the
+//! menus *print*, and what a synthetic press answers — and [`KeyMap::lookup_events`] answers the
+//! clipboard events in their place.
+//!
+//! Two consequences, both handled there:
+//!
+//! * **A clipboard event names no chord**, so its modifier strip is read out of the events that
+//!   *precede it* ([`strips`]) — never from the frame's end-of-queue `InputState::modifiers`, which a
+//!   quick tap has already cleared, turning Windows' <kbd>Shift</kbd>+<kbd>Del</kbd> into a plain cut.
+//! * **The strip is the only evidence**, so an eaten chord that is not this shell's clipboard is
+//!   answered by *nothing* ([`cut_command`]) rather than guessed, and Windows' <kbd>Shift</kbd>+
+//!   <kbd>Del</kbd> — eaten as [`Event::Cut`] — keeps its own answer, [`Command::PermanentDelete`].
+//!
+//! The one keystroke nothing can see: [`Event::Paste`] is pushed only when the system clipboard
+//! yielded text and [`Event::PasteImage`] only when it yielded an image, so a <kbd>Ctrl</kbd>+
+//! <kbd>V</kbd> over an *empty* system clipboard arrives as no event at all, and `eframe` exposes no
+//! raw-event hook to catch it upstream. Cut and Copy are therefore the reliable half of the trio —
+//! their events are pushed before the clipboard is ever read.
 
 use egui::{Event, Key, Modifiers};
 
@@ -421,7 +451,11 @@ impl Chord {
         if key != self.key {
             return false;
         }
-        let ctrl = self.ctrl == modifiers.ctrl || (self.ctrl && modifiers.command && !is_mac());
+        // `command` mirrors `ctrl` on Windows and Linux and carries ⌘ on macOS, where `ctrl` stays
+        // false for what the label calls Ctrl — so accepting it (and `mac_cmd`) is what makes a
+        // `Ctrl+T` chord reachable on a Mac at all (`egui::Modifiers`, `data/input/modifiers.rs:33-37`).
+        let ctrl =
+            self.ctrl == modifiers.ctrl || (self.ctrl && (modifiers.command || modifiers.mac_cmd));
         let alt = self.alt == modifiers.alt;
         let shift = self.shift == modifiers.shift;
         ctrl && alt && shift
@@ -447,10 +481,54 @@ impl Chord {
     }
 }
 
-/// The one platform question the matcher asks, answered without a `cfg` in an expression.
+/// Which chord an [`Event::Cut`] was.
+///
+/// `on_windows` is a parameter rather than a `cfg` so both arms are testable from any host; the one
+/// call site passes [`cfg!`]'s answer.
+///
+/// * Windows eats <kbd>Shift</kbd>+<kbd>Del</kbd> into this very event (`is_cut_command`,
+///   `egui-winit/src/lib.rs:3753-3757`), and that chord is this shell's [`Command::PermanentDelete`].
+/// * The same clause eats <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Del</kbd>, which no chord of ours
+///   binds — answered by nothing, because guessing here would queue a move the user never asked for.
+/// * Everything else — <kbd>Cmd/Ctrl</kbd>+<kbd>X</kbd>, the dedicated Cut key, or a Cut whose strip
+///   was never reported (an accessibility-driven one, or a harness injecting one bare event) — is the
+///   cut chord's own spelling.
 #[must_use]
-fn is_mac() -> bool {
-    cfg!(target_os = "macos")
+fn cut_command(modifiers: &Modifiers, on_windows: bool) -> Option<Command> {
+    if on_windows && modifiers.shift && !modifiers.ctrl && !modifiers.alt {
+        return Some(Command::PermanentDelete);
+    }
+    if modifiers.ctrl && modifiers.shift {
+        return None;
+    }
+    Some(Command::Cut)
+}
+
+/// `true` for the events `egui-winit` synthesises *instead of* a key press.
+#[must_use]
+fn synthesised(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Cut | Event::Copy | Event::Paste(_) | Event::PasteImage(_)
+    )
+}
+
+/// The modifier strip in force at each event of a frame. `egui-winit` reports a modifier press as its
+/// own [`Event::ModifiersChanged`] (`egui-winit/src/lib.rs:2367-2387`), and a clipboard event belongs
+/// to the strip held when it was pushed — see the module docs.
+fn strips(events: &[Event]) -> Vec<Modifiers> {
+    let mut current = Modifiers::NONE;
+    events
+        .iter()
+        .map(|event| {
+            match event {
+                Event::ModifiersChanged(held) => current = *held,
+                Event::Key { modifiers, .. } => current = *modifiers,
+                _ => {}
+            }
+            current
+        })
+        .collect()
 }
 
 /// The key part of a chord: egui's own name table plus the spellings Go's registry uses.
@@ -518,27 +596,61 @@ impl KeyMap {
         })
     }
 
-    /// [`Self::lookup`] for one raw event: only a *press* answers, and only a key press.
+    /// [`Self::lookup`] for one raw event: only a key *press* answers, and a clipboard event answers
+    /// with an empty modifier set — see [`Self::lookup_event_with`] for what a live frame supplies.
     #[must_use]
     pub fn lookup_event(&self, event: &Event) -> Option<Command> {
+        self.lookup_event_with(event, &Modifiers::NONE)
+    }
+
+    /// [`Self::lookup_event`] with the modifier strip that was held when the event was pushed — the
+    /// only evidence a synthesised clipboard event carries about which chord it was (module docs,
+    /// "the clipboard chords arrive as events").
+    #[must_use]
+    pub fn lookup_event_with(&self, event: &Event, modifiers: &Modifiers) -> Option<Command> {
         match event {
             Event::Key {
                 key,
                 pressed: true,
-                modifiers,
+                modifiers: pressed_with,
                 ..
-            } => self.lookup(*key, modifiers),
+            } => self.lookup(*key, pressed_with),
+            Event::Cut => cut_command(modifiers, cfg!(target_os = "windows")),
+            Event::Copy => Some(Command::Copy),
+            // Both Paste forms are the paste chord: the fork reads the clipboard first and pushes the
+            // text form for a text clipboard, the image form for an image one. The payload is egui's
+            // own, and the file manager's clipboard is the engine's, so neither string matters here.
+            Event::Paste(_) | Event::PasteImage(_) => Some(Command::Paste),
             _ => None,
         }
     }
 
-    /// Every command this frame's events ask for, in event order (plan F15's guard lives at the
-    /// call site, [`crate::app::ZenApp::handle_keys`]).
+    /// Every command this frame's events ask for, in event order (plan F15's guard lives at the call
+    /// site, [`crate::app::ZenApp::handle_keys`]). Each event is read against the modifier strip it
+    /// was pushed under ([`strips`]).
     #[must_use]
     pub fn lookup_events(&self, events: &[Event]) -> Vec<Command> {
-        events
+        let strips = strips(events);
+        let hits: Vec<(Command, bool)> = events
             .iter()
-            .filter_map(|event| self.lookup_event(event))
+            .zip(&strips)
+            .filter_map(|(event, modifiers)| {
+                let command = self.lookup_event_with(event, modifiers)?;
+                Some((command, synthesised(event)))
+            })
+            .collect();
+        // A clipboard event is an *echo* of a chord press whenever that press is also in the frame —
+        // and a doubled Paste is a duplicated file batch, not a no-op. This fork emits one or the
+        // other, so the rule costs a comparison and never fires today; it fires the day egui's
+        // clipboard translation is turned off.
+        hits.iter()
+            .filter(|(command, is_synthesised)| {
+                !is_synthesised
+                    || !hits
+                        .iter()
+                        .any(|(other, pressed)| !pressed && other == command)
+            })
+            .map(|(command, _)| *command)
             .collect()
     }
 
@@ -805,6 +917,107 @@ mod tests {
         assert_eq!(
             map.lookup_events(&[chord.event(), release]),
             vec![Command::Copy]
+        );
+    }
+
+    #[test]
+    fn the_clipboard_events_answer_the_clipboard_commands() {
+        let map = KeyMap::default();
+        // What a real window gets for Ctrl+X / Ctrl+C / Ctrl+V — the key press is retired by
+        // `egui-winit`, so these events are the only route the three commands have.
+        assert_eq!(map.lookup_event(&Event::Cut), Some(Command::Cut));
+        assert_eq!(map.lookup_event(&Event::Copy), Some(Command::Copy));
+        assert_eq!(
+            map.lookup_event(&Event::Paste("a\nb".to_string())),
+            Some(Command::Paste),
+            "a paste arrives with the clipboard text attached, which the file manager ignores"
+        );
+        // A file manager's clipboard is the engine's, so an image clipboard is the same command.
+        assert_eq!(
+            map.lookup_event(&Event::PasteImage(std::sync::Arc::new(
+                egui::ColorImage::filled([1, 1], egui::Color32::TRANSPARENT)
+            ))),
+            Some(Command::Paste),
+            "a Ctrl+V over an image clipboard is still the paste chord"
+        );
+    }
+
+    #[test]
+    fn the_clipboard_events_are_read_against_the_strip_held_when_they_were_pushed() {
+        let shift = Modifiers::SHIFT;
+        // The frame a Windows Shift+Del tap really produces: the modifier press, the Cut that ate the
+        // Del press, then the strip clearing again. End-of-queue modifiers are NONE here — reading
+        // them is what turned a permanent delete into a cut.
+        let frame = [
+            Event::Key {
+                key: Key::ShiftLeft,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: shift,
+            },
+            Event::ModifiersChanged(shift),
+            Event::Cut,
+            Event::ModifiersChanged(Modifiers::NONE),
+        ];
+        let held = strips(&frame);
+        assert_eq!(
+            held[2], shift,
+            "the Cut is read under the strip it was pushed with"
+        );
+        assert_eq!(
+            cut_command(&held[2], true),
+            Some(Command::PermanentDelete),
+            "and on Windows that strip is the permanent-delete chord"
+        );
+        assert_eq!(
+            cut_command(&held[2], false),
+            Some(Command::Cut),
+            "off Windows Shift+Del is never eaten, so a Cut stays a Cut"
+        );
+    }
+
+    #[test]
+    fn an_eaten_chord_that_is_not_a_clipboard_command_answers_nothing() {
+        let both = Modifiers {
+            ctrl: true,
+            shift: true,
+            command: true,
+            ..Modifiers::NONE
+        };
+        // Windows' `is_cut_command` checks Shift alone, so it eats Ctrl+Shift+Del too. Nothing is
+        // bound to that chord, so it must not become a cut.
+        assert_eq!(cut_command(&both, true), None);
+        assert_eq!(
+            cut_command(&both, false),
+            None,
+            "and the same strip is unbound wherever it comes from"
+        );
+        let cut_mods = Modifiers {
+            ctrl: true,
+            command: true,
+            ..Modifiers::NONE
+        };
+        assert_eq!(
+            cut_command(&cut_mods, true),
+            Some(Command::Cut),
+            "the cut chord itself is the one strip that must survive"
+        );
+    }
+
+    #[test]
+    fn a_chord_and_its_clipboard_event_in_one_frame_answer_once() {
+        let map = KeyMap::default();
+        let chord = Chord::ctrl(Key::V).event();
+        assert_eq!(
+            map.lookup_events(&[chord.clone(), Event::Paste("x".into())]),
+            vec![Command::Paste],
+            "a doubled Paste is a duplicated file batch, not a no-op"
+        );
+        assert_eq!(
+            map.lookup_events(&[Event::Paste("x".into()), chord]),
+            vec![Command::Paste],
+            "and the guard does not depend on which of the two arrives first"
         );
     }
 
