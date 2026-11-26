@@ -86,10 +86,9 @@ use zenman_core::store::config::PaneSlot;
 
 use crate::app::ZenApp;
 use crate::dialogs::confirm::modal_frame;
-use crate::dialogs::prompt::consume_key;
 use crate::dialogs::result_menu::{MenuShot, ResultMenu, dismiss_by_click, pointer_at};
 use crate::dialogs::{Answer, Dialog, DialogKind, close_button};
-use crate::keymap::KeyMap;
+use crate::keymap::{KeyMap, consume_key};
 use crate::menus::ResultVerb;
 use crate::theme::Tokens;
 use crate::widgets::disk_meter::format_size;

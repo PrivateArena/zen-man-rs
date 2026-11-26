@@ -5,14 +5,16 @@
 //! `main.js`). The same, with the two history steps and `..` made reachable by mouse — plan §2.3
 //! lists all three among the keys the JS app never had.
 //!
-//! A typed path resolves through [`FsPath::resolve`] (plan §4.2), which is what rejects `..` before
-//! anything is listed: the address bar is the one place a traversal string could enter the app, and
-//! in the port it enters a *type* that cannot hold one.
+//! A typed path resolves through [`FsPath::resolve`] (plan §4.2), which is what settles a traversal
+//! string before anything is listed: the address bar is the one place one could enter the app, and
+//! in the port it enters a *type* that cannot hold an escaping `..` — the same clamp Go's
+//! `filepath.Clean` applied (`AbsPath::clean`, so `/../../x` is `/x`, never a step out of the root).
 
 use egui::{Ui, vec2};
 
 use zenman_core::path::FsPath;
 
+use crate::keymap::consume_key;
 use crate::theme::Tokens;
 
 use super::file_pane::PaneCommand;
@@ -502,7 +504,8 @@ fn edit_button(ui: &mut Ui, tokens: &Tokens) -> egui::Response {
 
 /// Open the address field. It opens **holding the path it stands for** — Go's bar was a span of
 /// text that became an `<input value="…">`, so the field is never the empty black strip it used to
-/// look like, and every entry point (the free space, the pencil button, `Ctrl+F`) says the same.
+/// look like, and every entry point (the free space, the pencil button, `Command::FocusSearch`
+/// once it has a chord) says the same.
 fn open(m: &mut BreadcrumbModel<'_>) {
     *m.buffer = m.path.to_string();
     *m.editing = true;
@@ -516,6 +519,13 @@ fn edit_field(
     tokens: &Tokens,
     out: &mut Vec<PaneCommand>,
 ) {
+    // The two decisive keys are read and *taken* before the field is allocated, the way the prompt
+    // field does it (`dialogs::prompt::show`). Reading them afterwards was the defect: egui's
+    // single-line `TextEdit` answers <kbd>Enter</kbd> by surrendering its own focus, so
+    // `has_focus()` was already false on the very frame the key arrived, the commit fell through to
+    // the click-away branch, and the typed path was cleared without ever being listed.
+    let enter = consume_key(ui, egui::Key::Enter);
+    let escape = consume_key(ui, egui::Key::Escape);
     let field = egui::TextEdit::singleline(m.buffer)
         .font(egui::TextStyle::Monospace)
         .hint_text("type a path, Enter to list it")
@@ -532,11 +542,10 @@ fn edit_field(
             egui::TextEdit::store_state(ui.ctx(), response.id, state);
         }
     }
-    let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
-    let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
-    if enter && response.has_focus() {
+    if enter {
         // Plan §4.2: the address bar is the one entry point for a user-typed path, and
-        // `FsPath::resolve` is the guard — a `..` in it is rejected here, never listed.
+        // `FsPath::resolve` is the guard — the string becomes the path *type* here, so nothing
+        // reaches the listing that the type cannot hold (an escaping `..` included).
         let raw = m.buffer.clone();
         match resolve_address(&raw, m.path) {
             Ok(path) => out.push(PaneCommand::Navigate(path)),

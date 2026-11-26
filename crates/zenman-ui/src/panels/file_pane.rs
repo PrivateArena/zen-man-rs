@@ -33,6 +33,7 @@ use zenman_core::store::config::{PaneSlot, SortColumn, ViewMode};
 
 use crate::dock::DockId;
 use crate::jobs_ui::JobSlot;
+use crate::keymap::consume_key;
 use egui::widgets::text_edit::TextEditState;
 
 use crate::state::{
@@ -1180,17 +1181,6 @@ fn finish_editor(tab: &mut Tab, editor: &mut Option<RenameEditor>) {
     let mut fresh = RenameEditor::new(key, &name);
     fresh.taken = taken;
     *editor = Some(fresh);
-}
-
-/// Take a key out of the event queue and report whether it was there.
-fn consume_key(ui: &mut Ui, key: egui::Key) -> bool {
-    ui.input_mut(|input| {
-        let pressed = input.key_pressed(key);
-        if pressed {
-            input.consume_key(egui::Modifiers::NONE, key);
-        }
-        pressed
-    })
 }
 
 /// Select `[0, len)` in a field that has just been shown (the base name, extension excluded).

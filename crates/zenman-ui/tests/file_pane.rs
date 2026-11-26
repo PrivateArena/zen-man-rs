@@ -938,6 +938,152 @@ fn clicking_an_ancestor_chip_navigates_that_pane() {
     assert!(tab.can_go_back(), "and the deepened trail is walkable back");
 }
 
+// ---------------------------------------------------------------------- the address *field*
+
+/// Click the pencil at the end of the address strip, which opens the field holding the path the
+/// strip stands for. Two nodes carry the tooltip's words — the button, and the free space that
+/// opens the same field — so the button is picked by role (the rule `a_trail_too_narrow_…` uses).
+fn open_address_field(harness: &mut Harness<'static, ZenApp>) {
+    {
+        let pencil = harness
+            .query_all_by(|node: &AccessKitNode<'_>| {
+                node.label().as_deref() == Some("Edit the path")
+                    && node.role() == egui::Role::Button
+            })
+            .next()
+            .expect("the address-field button is in the tree");
+        pencil.click();
+    }
+    settle(harness);
+    assert!(
+        editing(harness),
+        "the strip is the field now, and it opened focused"
+    );
+}
+
+/// One real paste of a whole string — what the clipboard chord delivers (`Event::Paste`,
+/// `egui::widgets::text_edit::builder`), the way a user moves a path out of a terminal.
+fn paste_text(harness: &mut Harness<'static, ZenApp>, text: &str) {
+    harness
+        .input_mut()
+        .events
+        .push(egui::Event::Paste(text.to_string()));
+    harness.run();
+}
+
+/// Real keystrokes, one frame apart; the first one replaces the path the field opened selected.
+fn type_text(harness: &mut Harness<'static, ZenApp>, text: &str) {
+    for c in text.chars() {
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::Text(c.to_string()));
+        harness.run();
+    }
+}
+
+/// <kbd>Enter</kbd>, then the frames the committed command needs to reach the engine and come back.
+fn press_enter(harness: &mut Harness<'static, ZenApp>) {
+    harness.input_mut().events.push(egui::Event::Key {
+        modifiers: Default::default(),
+        physical_key: None,
+        key: egui::Key::Enter,
+        pressed: true,
+        repeat: false,
+    });
+    harness.run();
+    settle(harness);
+}
+
+/// The active pane's address-field flag and buffer, which the pane owns (`state::Pane`).
+fn editing(harness: &Harness<'static, ZenApp>) -> bool {
+    harness.state().model.panes[&PaneSlot::Left].address_editing
+}
+
+fn address_buffer(harness: &Harness<'static, ZenApp>) -> String {
+    harness.state().model.panes[&PaneSlot::Left]
+        .address_buffer
+        .clone()
+}
+
+#[test]
+fn pasting_an_absolute_path_into_the_address_field_lists_it() {
+    // The reported defect: with the pane on `…/listing/docs`, clicking the strip, pasting the
+    // absolute path of `…/listing/reports` and pressing <kbd>Enter</kbd> left the pane where it
+    // was — while clicking the `listing` chip beside it worked fine. The two decisive keys were
+    // read *after* `ui.add`: egui's single-line `TextEdit` answers <kbd>Enter</kbd> by surrendering
+    // its own focus, so `has_focus()` was already false on the frame the key arrived, the commit
+    // fell through to the click-away branch, and the pasted path was cleared unlisted.
+    let tree = common::listing_tree("addr-abs");
+    let mut harness = pane_harness_at("addr-abs", &tree.join("docs"), egui::vec2(1200.0, 800.0));
+    open_address_field(&mut harness);
+    let target = tree.join("reports");
+    paste_text(&mut harness, &target.to_string_lossy());
+    assert_eq!(
+        address_buffer(&harness),
+        target.to_string_lossy(),
+        "the paste replaced the path the field opened selected, as it does in any bar"
+    );
+    press_enter(&mut harness);
+    let tab = shown(&harness);
+    assert_eq!(
+        tab.path,
+        fixture_path(&target),
+        "Enter listed the pasted path"
+    );
+    assert!(
+        names(tab).contains(&"empty".to_string()),
+        "and it listed the directory that was named, not the one the pane was on: {:?}",
+        names(tab)
+    );
+    assert!(!editing(&harness), "the strip is chips again");
+    assert!(
+        tab.can_go_back(),
+        "the walk is history, so it is walkable back"
+    );
+}
+
+#[test]
+fn typing_a_relative_path_in_the_address_field_lists_it_under_the_pane() {
+    // Relative input means "under here" (`resolve_address` hands the tab's own path to
+    // `FsPath::resolve`), which is the other half of what the field is for.
+    let tree = common::listing_tree("addr-rel");
+    let mut harness = pane_harness("addr-rel");
+    open_address_field(&mut harness);
+    type_text(&mut harness, "docs");
+    press_enter(&mut harness);
+    assert_eq!(
+        shown(&harness).path,
+        fixture_path(&tree.join("docs")),
+        "`docs` was resolved against the pane's directory"
+    );
+}
+
+#[test]
+fn enter_in_the_address_field_re_lists_the_path_it_opened_with() {
+    // The other half of "nothing happens": the field opens *holding* the current path, so Enter
+    // with nothing changed is a re-list of the same directory — and it must still commit, the way
+    // entering an unchanged value into Go's bar did. The strip closes either way; it is never left
+    // holding a path the pane is not showing.
+    let tree = common::listing_tree("addr-same");
+    let mut harness = pane_harness_at("addr-same", &tree.join("docs"), egui::vec2(1200.0, 800.0));
+    let before = shown(&harness).path.clone();
+    open_address_field(&mut harness);
+    press_enter(&mut harness);
+    assert_eq!(shown(&harness).path, before, "the same path, listed again");
+    assert_eq!(
+        shown(&harness).total,
+        3,
+        "and the listing is there, not an empty pane: {:?}",
+        names(shown(&harness))
+    );
+    assert!(!editing(&harness), "the strip is chips again");
+    assert!(
+        address_buffer(&harness).is_empty(),
+        "`close` forgets what the field was holding"
+    );
+}
+
 #[test]
 fn a_trail_too_narrow_for_the_pane_collapses_and_keeps_the_edit_button() {
     // The collapse (`plan()` in `breadcrumb.rs`): root, `…`, and the deepest segments that fit.

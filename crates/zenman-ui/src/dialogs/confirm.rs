@@ -18,6 +18,7 @@
 use egui::{Align2, Area, CornerRadius, Frame, Key, Margin, Order, RichText, Stroke, Ui, Vec2};
 
 use crate::dialogs::{Answer, DialogKind};
+use crate::keymap::consume_key;
 use crate::theme::Tokens;
 
 /// The answer a confirm button carries (plan §4.1: a dialog result is a command, not a side effect).
@@ -184,17 +185,6 @@ impl Confirm {
             choice,
         })
     }
-}
-
-/// Take a key out of the event queue and report whether it was there.
-fn consume_key(ui: &mut Ui, key: Key) -> bool {
-    ui.input_mut(|input| {
-        let pressed = input.key_pressed(key);
-        if pressed {
-            input.consume_key(egui::Modifiers::NONE, key);
-        }
-        pressed
-    })
 }
 
 /// The card every dialog is drawn inside (the plan's `modal_frame`; `dock_content::modal_frame` is a

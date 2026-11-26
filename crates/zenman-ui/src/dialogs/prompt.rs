@@ -17,6 +17,7 @@ use egui::{
 
 use crate::dialogs::confirm::{Choice, modal_frame};
 use crate::dialogs::{Answer, DialogKind, Dialogs};
+use crate::keymap::consume_key;
 use crate::theme::Tokens;
 
 /// Which rule an answer is checked against. An enum rather than the plan's
@@ -209,17 +210,6 @@ impl Dialogs {
     pub fn open_prompt(&mut self, prompt: Prompt) -> bool {
         self.open(crate::dialogs::Dialog::Prompt(prompt))
     }
-}
-
-/// Take a key out of the event list and report whether it was there.
-pub(crate) fn consume_key(ui: &mut Ui, key: Key) -> bool {
-    ui.input_mut(|input| {
-        let pressed = input.key_pressed(key);
-        if pressed {
-            input.consume_key(egui::Modifiers::NONE, key);
-        }
-        pressed
-    })
 }
 
 /// Select `[0, len)` in a field that has just been shown.

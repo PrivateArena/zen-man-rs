@@ -70,7 +70,7 @@
 //! raw-event hook to catch it upstream. Cut and Copy are therefore the reliable half of the trio —
 //! their events are pushed before the clipboard is ever read.
 
-use egui::{Event, Key, Modifiers};
+use egui::{Event, Key, Modifiers, Ui};
 
 /// Every action the shell can take, by the name of the `Session` / model call that performs it
 /// (plan §5.8's `CommandId`). Dispatch and menus both speak this enum; nothing else names an action.
@@ -479,6 +479,28 @@ impl Chord {
             },
         }
     }
+}
+
+/// Take a key out of the event queue and report whether it was there.
+///
+/// A widget that owns the keyboard must *take* its keys, not just look for them, and it must look
+/// **before** it is allocated:
+///
+/// * the events survive until the end of the frame, so a plain `key_pressed` test lets one
+///   <kbd>Enter</kbd> answer a commit *and* open the selected row *and* reach a sibling pane;
+/// * egui's single-line `TextEdit` ends its own edit on <kbd>Enter</kbd> by surrendering focus
+///   (`text_edit/builder.rs`), so a check placed after `ui.add` reads a widget that has already
+///   given the keyboard up — which is how the address bar came to throw away the path it was
+///   given ([`crate::panels::breadcrumb`]).
+#[must_use]
+pub fn consume_key(ui: &mut Ui, key: Key) -> bool {
+    ui.input_mut(|input| {
+        let pressed = input.key_pressed(key);
+        if pressed {
+            input.consume_key(Modifiers::NONE, key);
+        }
+        pressed
+    })
 }
 
 /// Which chord an [`Event::Cut`] was.

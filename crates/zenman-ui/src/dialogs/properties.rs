@@ -30,9 +30,9 @@ use zenman_core::services::dirs::DirSizeStat;
 use zenman_core::session::{Origin, Receipt};
 use zenman_core::store::config::PaneSlot;
 
-use super::prompt::consume_key;
 use super::{Answer, Choice, Dialog, DialogKind};
 use crate::app::ZenApp;
+use crate::keymap::consume_key;
 use crate::theme::Tokens;
 use crate::widgets::disk_meter::format_size;
 
