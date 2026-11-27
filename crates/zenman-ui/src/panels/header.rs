@@ -772,9 +772,10 @@ impl ZenApp {
                 pane.tabs = tabs;
                 pane.groups = groups;
                 pane.mru.clear();
-                // The MRU ring (`Alt+Z`, step 10) is part of the pane's state: an empty one makes that
-                // chord do nothing on a pane that plainly has tabs in it. Touched in strip order, the
-                // shown tab last so it lands at the front.
+                // The MRU ring (`Ctrl+Tab`, `docs/tab-switcher-design.md` §3) is part of the pane's
+                // state: the switcher panel lists it, so an empty one would leave a pane that plainly
+                // has tabs in it with nothing to list. Touched in strip order, the shown tab last so it
+                // lands at the front.
                 for id in &order {
                     pane.touch_mru(*id);
                 }
@@ -790,6 +791,9 @@ impl ZenApp {
                     .unwrap_or(0);
                 pane.tab_sel = wanted.into_iter().collect();
                 pane.tab_sel_anchor = wanted;
+                // The group ring has to be rebuilt **after** the tabs and the shown one, so it names the
+                // groups this file just described rather than the ones `prune_groups` threw away.
+                pane.rebuild_group_mru();
                 pane.debug_assert_invariants();
             }
             let shown = self

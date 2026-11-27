@@ -74,6 +74,11 @@ pub struct PaneDock<'a> {
     /// The rows the cut clipboard queues, shared with every pane this frame (the shell built it once,
     /// [`ZenApp::cut_clip`]). Owned by the handle so a pane can borrow it while the model is borrowed.
     pub cut: Option<Arc<HashSet<AbsPath>>>,
+    /// The rect the switcher panel owns this frame, if one is open
+    /// (`docs/tab-switcher-design.md` §4.1: its geometry is arithmetic, so it is known here before it
+    /// is painted). A press inside the panel belongs to the panel — the centred panel floats over
+    /// *several* panes, and a click that lands on it must not move the keyboard to the one underneath.
+    pub overlay: Option<Rect>,
 }
 
 impl<'a> DockContent<DockId> for PaneDock<'a> {
@@ -180,11 +185,15 @@ impl PaneDock<'_> {
                         );
                     });
                 }
-                // The pane takes focus on click (DockOutput::focused also reports it; both agree).
+                // The pane takes focus on click (DockOutput::focused also reports it; both agree) —
+                // unless the press belongs to the floating panel, whose rows name a pane themselves.
+                let overlay = self.overlay;
+                let press = ui.input(|i| i.pointer.interact_pos());
+                let inside_panel =
+                    overlay.is_some_and(|rect| press.is_some_and(|p| rect.contains(p)));
                 if ui.input(|i| i.pointer.any_pressed())
-                    && ui
-                        .input(|i| i.pointer.interact_pos())
-                        .is_some_and(|p| ui.max_rect().contains(p))
+                    && press.is_some_and(|p| ui.max_rect().contains(p))
+                    && !inside_panel
                 {
                     self.model.active_pane = slot;
                 }
@@ -462,6 +471,12 @@ pub fn show(app: &mut ZenApp, ui: &mut Ui) {
         // The frame's cut queue, shared by all four panes rather than rebuilt per pane. Read *before*
         // the handle borrows the model, because `cut_clip` is a method on the whole app.
         let cut = app.cut_clip();
+        // The panel's own rect, from the frame it was laid out in (or nothing, before that).
+        let overlay = app
+            .switcher
+            .as_ref()
+            .map(|switcher| switcher.frame())
+            .filter(|rect| !rect.is_negative());
         let mut content = PaneDock {
             model: &mut app.model,
             session: &app.session,
@@ -478,6 +493,7 @@ pub fn show(app: &mut ZenApp, ui: &mut Ui) {
             disk,
             header: Vec::new(),
             cut,
+            overlay,
         };
         let output: DockOutput<DockId> = DockArea::new(dock::dock_area_id()).show_content(
             ui,
@@ -635,6 +651,7 @@ mod tests {
             disk: None,
             header: Vec::new(),
             cut: None,
+            overlay: None,
         };
         assert_eq!(
             content.logical_label(&DockId::FilePane(PaneSlot::Left)),

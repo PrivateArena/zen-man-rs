@@ -167,8 +167,10 @@ Activation rule: the strip edges every selected tab that is **not** the shown on
 the tab the pane stopped showing reads as "still focused". A tab the shell opens (`Ctrl+T`, the `+`, a
 duplicate) therefore goes through `Pane::show_clearing_residue`, which empties a selection that was nothing
 but the tab being replaced and leaves a run the user built alone: `Pane::activate` would drop that run, and
-`Pane::show` alone is what left the stale edge behind. The keyboard cycles (`Ctrl+Tab`, `Alt+Z`) own the
-selection outright and go through `Pane::activate`.
+`Pane::show` alone is what left the stale edge behind. The keyboard walk (`Ctrl+PageDown`,
+`Ctrl+PageUp`) owns the selection outright and goes through `Pane::activate`; the two panels that used to
+answer those chords — `Ctrl+Tab` and `Alt+Z` — commit through `PaneCommand::SelectTab { Replace }`, which
+lands in the same `activate` (`docs/tab-switcher-design.md` §5).
 
 `MenuTarget::Tab { ix }` gains `group: Option<GroupId>, count: usize`; `MenuContext` gains `in_group` and
 `tab_count`, and they are **not** in `bits()` — that array is the listing's seven plan booleans, which the

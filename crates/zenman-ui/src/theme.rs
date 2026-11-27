@@ -195,6 +195,40 @@ pub struct Tokens {
     pub group_hover_bridge: f32,
     /// Tallest the flyout gets before it scrolls — nine tabs is a list, forty is a pane.
     pub group_hover_max_height: f32,
+    // ---- the recent tab / group switcher panel (`docs/tab-switcher-design.md` §7) ----------------
+    /// The panel's fixed width: `width: 420px` (`tabs.css:251`). Fixed, because the geometry of the
+    /// rows must be arithmetic — a content-sized panel could not answer the pointer before painting.
+    pub switcher_width: f32,
+    /// The panel's own padding: `padding: 16px` (`tabs.css:250`).
+    pub switcher_pad: f32,
+    /// Gap between the heading and the row list (`tabs.css:255`, `gap: 8px`). Rows themselves are
+    /// butt-stacked: the design's height formula (`§4.1`) prices a row at `switcher_row_height` and
+    /// nothing between them.
+    pub switcher_gap: f32,
+    /// Horizontal padding inside a row: the `14px` of `padding: 10px 14px` (`tabs.css:278`).
+    pub switcher_row_pad_x: f32,
+    /// Vertical padding inside a row: the `10px` of the same rule (`tabs.css:278`).
+    pub switcher_row_pad_y: f32,
+    /// One row's height: 46 — the two text lines (`12px` name, `10px` path) plus the row's own
+    /// `10px × 2` padding, rounded to the 4 px grid (`tabs.css:277-278,314,323`).
+    pub switcher_row_height: f32,
+    /// The row's folder glyph: `width: 24px` (`tabs.css:301`).
+    pub switcher_icon_size: f32,
+    /// The group colour dot: `width: 8px` (`tabs.css:331`).
+    pub switcher_dot_size: f32,
+    /// The panel's heading (`RECENT TABS (N)`): `font-size: 11px` (`tabs.css:265`).
+    pub switcher_title_size: f32,
+    /// A row's first line: `font-size: 12px` (`tabs.css:314`).
+    pub switcher_name_size: f32,
+    /// A row's second, muted line: `font-size: 10px` (`tabs.css:323`).
+    pub switcher_path_size: f32,
+    /// `border-radius: 12px` (`tabs.css:249`).
+    pub switcher_corner_radius: u8,
+    /// Tallest the panel gets before the list becomes a window (§4.1): four 420-px-ish rows is a pane,
+    /// and the screen owns the rest. Go had no cap; the window does.
+    pub switcher_max_height: f32,
+    /// The wash behind the panel: Go's `rgba(0,0,0,0.4)` (`tabs.css:230`) — 0.4 · 255 = 102.
+    pub switcher_backdrop: Color32,
     /// Widest single breadcrumb segment.
     pub crumb_max_width: f32,
     /// Horizontal padding inside a crumb chip (`toolbar.css:85`, `padding: 2px 6px`).
@@ -445,6 +479,20 @@ impl Tokens {
             group_hover_grace: 0.12,
             group_hover_bridge: 4.0,
             group_hover_max_height: 240.0,
+            switcher_width: 420.0,
+            switcher_pad: 16.0,
+            switcher_gap: 8.0,
+            switcher_row_pad_x: 14.0,
+            switcher_row_pad_y: 10.0,
+            switcher_row_height: 46.0,
+            switcher_icon_size: 24.0,
+            switcher_dot_size: 8.0,
+            switcher_title_size: 11.0,
+            switcher_name_size: 12.0,
+            switcher_path_size: 10.0,
+            switcher_corner_radius: 12,
+            switcher_max_height: 420.0,
+            switcher_backdrop: Color32::from_rgba_unmultiplied(0, 0, 0, 102),
             crumb_max_width: 220.0,
             crumb_chip_padding: 6.0,
             crumb_separator_gap: 4.0,
@@ -558,6 +606,9 @@ impl Tokens {
             group_cyan: Color32::from_rgb(0x0e, 0x74, 0x90),
             group_pink: Color32::from_rgb(0xbe, 0x18, 0x5d),
             group_teal: Color32::from_rgb(0x0f, 0x76, 0x6e),
+            // The same grey-black wash at a lower alpha (§7): the light shell is bright, and 40 %
+            // black over it buries the panel's own border rather than the page behind it.
+            switcher_backdrop: Color32::from_rgba_unmultiplied(0, 0, 0, 64),
             ..Self::dark()
         }
     }
@@ -818,6 +869,10 @@ mod tests {
             50.0
         );
         assert_eq!(t.drawer_row_corner, 6);
+        // `tabs.css:251,278` and `docs/tab-switcher-design.md` §7: the switcher panel is 420 px wide
+        // and its rows are 46 px tall, so the arithmetic of §4.1 is nailed to Go's CSS numbers.
+        assert_eq!(t.switcher_width, 420.0);
+        assert_eq!(t.switcher_row_height, 46.0);
     }
 
     /// `Color32` is not `Ord`, so the palette's distinctness is a pairwise walk.

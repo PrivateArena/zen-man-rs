@@ -477,8 +477,13 @@ pub struct Pane {
     pub tabs: Vec<Tab>,
     /// Index into `tabs` (clamped by every mutation; `Pane::active_tab` never panics on it).
     pub active: usize,
-    /// Most-recently-used tab ring, cap 5 (`Alt+Z` in step 10).
+    /// Most-recently-used **tab** ring, head = the tab on screen. What the <kbd>Ctrl+Tab</kbd> panel
+    /// lists, in [`Pane::recent_tabs`] (`docs/tab-switcher-design.md` §3).
     pub mru: std::collections::VecDeque<TabId>,
+    /// Most-recently-used **group** ring, head = the group of the shown tab. What the <kbd>Alt+Z</kbd>
+    /// panel lists ([`Pane::recent_groups`], `docs/tab-switcher-design.md` §3): a group is recent when a
+    /// tab inside it was shown, and a tab with **no** group never touches this ring.
+    pub group_mru: std::collections::VecDeque<GroupId>,
     /// This pane's tab groups, in creation order. An entry exists **iff** at least one tab names it
     /// ([`Pane::prune_groups`]) — see the invariants at the head of the group algebra.
     pub groups: Vec<TabGroup>,
@@ -696,6 +701,85 @@ impl Pane {
         while self.mru.len() > MRU_CAP {
             self.mru.pop_back();
         }
+    }
+
+    /// Push a group to the recent-group ring — the twin of [`Pane::touch_mru`], same shape and the same
+    /// cap, because <kbd>Alt+Z</kbd> lists this ring the same way <kbd>Ctrl+Tab</kbd> lists that one
+    /// (`docs/tab-switcher-design.md` §3).
+    pub fn touch_group_mru(&mut self, id: GroupId) {
+        self.group_mru.retain(|existing| *existing != id);
+        self.group_mru.push_front(id);
+        while self.group_mru.len() > MRU_CAP {
+            self.group_mru.pop_back();
+        }
+    }
+
+    /// Re-touch **both** rings for whoever is on screen now.
+    ///
+    /// [`Pane::show`] is the ordinary writer, but three mutations move the screen *without* a `show`:
+    /// [`Pane::close_tabs`] clamps onto the neighbour of the tab that died, and [`Pane::create_group`] /
+    /// [`Pane::join_group`] / [`Pane::leave_group`] change which group the shown tab belongs to. Without
+    /// this the rings would be a lie the panel then repeats — row 0 not the tab on screen
+    /// (`docs/tab-switcher-design.md` §1.1), and the head of the group ring not its group (§3).
+    fn sync_recency(&mut self) {
+        let Some(tab) = self.active_tab() else {
+            return;
+        };
+        let (id, group) = (tab.id, tab.group);
+        self.touch_mru(id);
+        if let Some(group) = group {
+            self.touch_group_mru(group);
+        }
+    }
+
+    /// The tabs in recently-used order: the ring first, then every tab that never earned a touch (a
+    /// restored session, a tab whose ring entry was capped away) in strip order. Go's `getRecentTabs`
+    /// (`frontend/js/state.js:73-92`) answers the same two-part question, and this is what both
+    /// switcher panels list (`docs/tab-switcher-design.md` §3).
+    #[must_use]
+    pub fn recent_tabs(&self) -> Vec<TabId> {
+        let mut recent: Vec<TabId> = self.mru.iter().copied().collect();
+        let rest: Vec<TabId> = self
+            .tabs
+            .iter()
+            .map(|tab| tab.id)
+            .filter(|id| !recent.contains(id))
+            .collect();
+        recent.extend(rest);
+        recent
+    }
+
+    /// Rebuild the group ring from the strip: every tab's group touched in strip order, the shown tab's
+    /// group last so it lands at the head. A session restore replaces `tabs`/`groups` wholesale, which
+    /// leaves the ring naming the *old* session's ids (`prune_groups` then empties it), and an empty
+    /// ring would leave <kbd>Alt+Z</kbd> with a pane full of groups and nothing recent to say about them
+    /// (`docs/tab-switcher-design.md` §3).
+    pub fn rebuild_group_mru(&mut self) {
+        let order: Vec<GroupId> = self
+            .tabs
+            .iter()
+            .filter_map(|tab| tab.group)
+            .chain(self.active_tab().and_then(|tab| tab.group))
+            .collect();
+        self.group_mru.clear();
+        for group in order {
+            self.touch_group_mru(group);
+        }
+    }
+
+    /// The groups in recently-used order: the ring first, then the groups it does not name in creation
+    /// order (`Pane::groups`) — the same two-part answer as [`Pane::recent_tabs`].
+    #[must_use]
+    pub fn recent_groups(&self) -> Vec<GroupId> {
+        let mut recent: Vec<GroupId> = self.group_mru.iter().copied().collect();
+        let rest: Vec<GroupId> = self
+            .groups
+            .iter()
+            .map(|group| group.id)
+            .filter(|id| !recent.contains(id))
+            .collect();
+        recent.extend(rest);
+        recent
     }
 }
 
@@ -974,6 +1058,9 @@ impl Pane {
         self.groups.push(TabGroup::new(id, color));
         self.prune_groups();
         self.compact();
+        // Grouping the shown tab (or grouping it *with* others) makes this the recent group: a tab menu
+        // "New group" on the tab you are looking at must lead the `Alt+Z` list, not bury itself (§3).
+        self.sync_recency();
         Some(id)
     }
 
@@ -993,6 +1080,7 @@ impl Pane {
         }
         self.prune_groups();
         self.compact();
+        self.sync_recency();
         true
     }
 
@@ -1007,6 +1095,7 @@ impl Pane {
         }
         self.prune_groups();
         self.compact();
+        self.sync_recency();
         left
     }
 
@@ -1098,10 +1187,12 @@ impl Pane {
         {
             self.tab_sel_anchor = self.tab_sel.iter().next().copied();
         }
-        // Clamp only. Which tab takes the focus after a close is the MRU ring's question, and the caller
-        // answers it (`ZenApp::close_shown_tab`); this just never leaves `active` off the end.
+        // Clamp only to where the screen goes — `ZenApp::close_shown_tab` has its own say — but the tab
+        // that ends up on screen is by definition the most recent thing the pane has, and `recent_tabs`'
+        // row 0 has to be it (§1.1), so the rings follow the clamp.
         self.active = self.active.min(self.tabs.len().saturating_sub(1));
         self.prune_groups();
+        self.sync_recency();
         hit
     }
 
@@ -1111,15 +1202,19 @@ impl Pane {
         self.active_tab().map(|tab| tab.id)
     }
 
-    /// Show `id` and nothing else: the pane's index, the MRU ring. No selection change, no group is
+    /// Show `id` and nothing else: the pane's index, the MRU rings. No selection change, no group is
     /// unfolded — a <kbd>Ctrl</kbd>-click has to move the focus without throwing the multi-selection
     /// away, and invariant 4 already keeps the shown tab visible.
+    ///
+    /// A tab becoming the shown one also makes its group the recent one, which is why this stays the
+    /// **single writer**: nothing else has to remember to touch the group ring
+    /// (`docs/tab-switcher-design.md` §3).
     pub fn show(&mut self, id: TabId) -> bool {
         let Some(ix) = self.tabs.iter().position(|tab| tab.id == id) else {
             return false;
         };
         self.active = ix;
-        self.touch_mru(id);
+        self.sync_recency();
         true
     }
 
@@ -1282,10 +1377,13 @@ impl Pane {
     }
 
     /// Drop the rows no tab names any more (invariant 2). Idempotent, and called by every mutation that
-    /// can empty a group.
+    /// can empty a group. The recent-group ring is pruned against the survivors too, so the panel
+    /// <kbd>Alt+Z</kbd> opens can never offer a buried group (`docs/tab-switcher-design.md` §3).
     pub fn prune_groups(&mut self) {
         self.groups
             .retain(|group| self.tabs.iter().any(|tab| tab.group == Some(group.id)));
+        self.group_mru
+            .retain(|id| self.groups.iter().any(|group| group.id == *id));
     }
 
     /// Restore contiguity (invariant 1): walking the strip, the first member of a group brings all of
@@ -1376,6 +1474,75 @@ impl Pane {
             self.active,
             self.tabs.len()
         );
+        self.debug_assert_rings();
+
+        for id in &self.mru {
+            debug_assert!(
+                self.tabs.iter().any(|tab| tab.id == *id),
+                "mru holds the dead tab {id:?} (design §3)"
+            );
+            debug_assert!(
+                self.mru.iter().filter(|other| *other == id).count() == 1,
+                "mru names {id:?} twice (design §3)"
+            );
+        }
+        for id in &self.group_mru {
+            debug_assert!(
+                self.group(*id).is_some(),
+                "group_mru holds the dead group {id:?} (design §3)"
+            );
+            debug_assert!(
+                self.group_mru.iter().filter(|other| *other == id).count() == 1,
+                "group_mru names {id:?} twice (design §3)"
+            );
+        }
+        // The rings answer "what is on screen, and what was before that", so their heads *are* the
+        // shown tab and its group — `Pane::sync_recency` is the upkeep that makes that a fact rather than
+        // a hope. An empty ring is the one legal exception: a restored session that has never shown a
+        // tab (design §8).
+    }
+
+    /// The recency rings' own half of [`Pane::debug_assert_invariants`]
+    /// (`docs/tab-switcher-design.md` §3): a doubled or a dead id in either is a bug and not a state,
+    /// and the heads are the tab on screen and its group — the upkeep [`Pane::sync_recency`] exists to
+    /// guarantee.
+    fn debug_assert_rings(&self) {
+        for id in &self.mru {
+            debug_assert!(
+                self.tabs.iter().any(|tab| tab.id == *id),
+                "mru holds the dead tab {id:?} (design §3)"
+            );
+            debug_assert!(
+                self.mru.iter().filter(|other| *other == id).count() == 1,
+                "mru names {id:?} twice (design §3)"
+            );
+        }
+        for id in &self.group_mru {
+            debug_assert!(
+                self.group(*id).is_some(),
+                "group_mru holds the dead group {id:?} (design §3)"
+            );
+            debug_assert!(
+                self.group_mru.iter().filter(|other| *other == id).count() == 1,
+                "group_mru names {id:?} twice (design §3)"
+            );
+        }
+        if let Some(shown) = self.active_id()
+            && let Some(head) = self.mru.front()
+        {
+            debug_assert_eq!(
+                *head, shown,
+                "the tab ring heads {head:?} while the shown tab is {shown:?} (design §3)"
+            );
+        }
+        if let Some(shown) = self.active_tab().and_then(|tab| tab.group)
+            && let Some(head) = self.group_mru.front()
+        {
+            debug_assert_eq!(
+                *head, shown,
+                "the group ring heads {head:?} while the shown tab belongs to {shown:?} (design §3)"
+            );
+        }
     }
 
     /// Keep only the ids of tabs this pane actually has, in strip order — the resolution every
@@ -1395,8 +1562,10 @@ impl Pane {
 /// (`Limits::dir_page_default` is the same 200 Go used; the value is passed in by the caller).
 pub const DEFAULT_PAGE_SIZE: usize = 200;
 
-/// [`Pane::mru`] capacity, plan §4.3's "cap 5".
-pub const MRU_CAP: usize = 5;
+/// [`Pane::mru`] capacity. The switcher panel lists the ring, so the cap is "every tab a pane will
+/// realistically have", not a memory bound: it sat at plan §4.3's 5 for as long as nothing drew the
+/// ring, and Go's five (`state.js:91` slices to 5) is the number the panel replaced.
+pub const MRU_CAP: usize = 32;
 
 /// An off-canvas drawer (the Go app's two sidebars).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1776,14 +1945,54 @@ mod tests {
     }
 
     #[test]
-    fn mru_caps_at_five() {
+    fn the_mru_ring_caps_at_the_full_strip_of_a_pane() {
+        // `MRU_CAP` is the switcher panel's row budget, not a memory bound (design §3): past it the
+        // oldest touch falls off the back, newest first.
         let mut pane = Pane::default();
-        for i in 1..=8 {
+        for i in 1..=(MRU_CAP as u64) + 8 {
             pane.touch_mru(TabId(i));
         }
         assert_eq!(pane.mru.len(), MRU_CAP);
-        assert_eq!(pane.mru.front(), Some(&TabId(8)), "most recent first");
-        assert!(pane.mru.iter().all(|id| id.0 >= 4));
+        assert_eq!(
+            pane.mru.front(),
+            Some(&TabId(MRU_CAP as u64 + 8)),
+            "most recent first"
+        );
+        assert!(
+            pane.mru.iter().all(|id| id.0 > 8),
+            "the eight oldest touches are gone"
+        );
+    }
+
+    #[test]
+    fn the_recent_tab_list_is_the_ring_and_then_the_tabs_that_never_earned_a_touch() {
+        // Go's `getRecentTabs` (`state.js:73-92`) answers both halves, and the panel needs both: a
+        // restored session has an empty ring over a full strip (design §8).
+        let mut pane = Pane::default();
+        for i in 1..=4 {
+            pane.tabs
+                .push(Tab::new(TabId(i), FsPath::ROOT, format!("t{i}")));
+        }
+        pane.touch_mru(TabId(3));
+        pane.touch_mru(TabId(1));
+        assert_eq!(
+            pane.recent_tabs(),
+            vec![TabId(1), TabId(3), TabId(2), TabId(4)],
+            "the ring in its own order, then the untouched tabs in strip order"
+        );
+        // An empty ring is the whole strip, in strip order; a full one adds nothing to it.
+        let mut blank = Pane::default();
+        blank
+            .tabs
+            .push(Tab::new(TabId(7), FsPath::ROOT, "only".to_string()));
+        assert_eq!(blank.recent_tabs(), vec![TabId(7)]);
+        let mut ring_only = Pane::default();
+        ring_only.touch_mru(TabId(9));
+        assert_eq!(
+            ring_only.recent_tabs(),
+            vec![TabId(9)],
+            "a ring entry is listed even while its tab is between frames (the caller prunes it)"
+        );
     }
 
     #[test]
@@ -2157,6 +2366,151 @@ mod groups {
         assert_eq!(pane.active, 0);
         assert_eq!(pane.active_id(), None);
         assert!(pane.tab_sel_anchor.is_none() || pane.tab_sel.is_empty());
+        pane.debug_assert_invariants();
+    }
+
+    #[test]
+    fn the_group_ring_walks_the_same_way_as_the_tab_ring() {
+        // `Alt+Z` lists this ring, so a re-touch has to *move* a group, not name it twice, and the
+        // oldest one falls off the back just past `MRU_CAP` (design §3).
+        let (mut pane, ids) = strip(&["a", "b", "c"]);
+        let (red, blue) = (GroupId(1), GroupId(2));
+        pane.create_group(red, &[ids[0]], GroupColor::A)
+            .expect("one tab");
+        pane.create_group(blue, &[ids[1], ids[2]], GroupColor::B)
+            .expect("two tabs");
+        pane.touch_group_mru(red);
+        pane.touch_group_mru(blue);
+        assert_eq!(pane.group_mru.front(), Some(&blue), "most recent first");
+        pane.touch_group_mru(red);
+        assert_eq!(
+            pane.group_mru.len(),
+            2,
+            "a re-touch moves, it does not double"
+        );
+        assert_eq!(
+            pane.recent_groups(),
+            vec![red, blue],
+            "the panel's list is the ring, then the groups the ring does not name"
+        );
+        pane.debug_assert_invariants();
+    }
+
+    #[test]
+    fn showing_a_tab_makes_its_group_the_recent_one() {
+        // The one rule that keeps the two panels telling the same story: `show` writes both rings, so
+        // no caller has to remember the group half (design §3).
+        let (mut pane, ids) = strip(&["a", "b", "c"]);
+        let (red, blue) = (GroupId(1), GroupId(2));
+        pane.create_group(red, &[ids[0]], GroupColor::A)
+            .expect("one tab");
+        pane.create_group(blue, &[ids[2]], GroupColor::B)
+            .expect("one tab");
+        assert!(pane.show(ids[0]));
+        assert_eq!(
+            pane.group_mru.front(),
+            Some(&red),
+            "the shown tab's group heads the ring"
+        );
+        assert!(pane.show(ids[2]));
+        assert_eq!(
+            pane.recent_groups(),
+            vec![blue, red],
+            "and follows the shown tab"
+        );
+        // A tab with no group is no group's news: the ring keeps the last one that was.
+        assert!(pane.show(ids[1]));
+        assert_eq!(
+            pane.group_mru.front(),
+            Some(&blue),
+            "an ungrouped tab touches nothing"
+        );
+        pane.debug_assert_invariants();
+    }
+
+    #[test]
+    fn burying_a_group_takes_it_out_of_the_ring_too() {
+        // Invariant 2 is the ring's business as much as the table's: `Alt+Z` must never offer a group
+        // that no tab names any more (design §3).
+        let (mut pane, ids) = strip(&["a", "b", "c"]);
+        let (red, blue) = (GroupId(1), GroupId(2));
+        pane.create_group(red, &[ids[0]], GroupColor::A)
+            .expect("one tab");
+        pane.create_group(blue, &[ids[1], ids[2]], GroupColor::B)
+            .expect("two tabs");
+        pane.activate(ids[1]);
+        assert_eq!(pane.group_mru.front(), Some(&blue));
+        pane.close_tabs(&[ids[1], ids[2]]);
+        assert!(
+            pane.group(blue).is_none(),
+            "the last member went, so the row went"
+        );
+        assert!(
+            !pane.group_mru.contains(&blue),
+            "and the ring does not name a buried group"
+        );
+        assert_eq!(
+            pane.recent_groups(),
+            vec![red],
+            "the surviving group is still listed, untouched as it is"
+        );
+        pane.debug_assert_invariants();
+    }
+
+    #[test]
+    #[should_panic(expected = "mru names")]
+    fn a_tab_ring_that_names_one_tab_twice_is_a_bug_the_check_catches() {
+        let (mut pane, ids) = strip(&["a"]);
+        pane.mru.push_back(ids[0]);
+        pane.mru.push_back(ids[0]);
+        pane.debug_assert_invariants();
+    }
+
+    #[test]
+    #[should_panic(expected = "mru holds the dead tab")]
+    fn a_tab_ring_that_names_a_closed_tab_is_a_bug_the_check_catches() {
+        let (mut pane, _ids) = strip(&["a"]);
+        pane.mru.push_back(TabId(99));
+        pane.debug_assert_invariants();
+    }
+
+    #[test]
+    #[should_panic(expected = "group_mru names")]
+    fn a_group_ring_that_names_one_group_twice_is_a_bug_the_check_catches() {
+        let (mut pane, ids) = strip(&["a"]);
+        let red = GroupId(1);
+        pane.create_group(red, &[ids[0]], GroupColor::A)
+            .expect("one tab");
+        pane.group_mru.push_back(red);
+        pane.group_mru.push_back(red);
+        pane.debug_assert_invariants();
+    }
+
+    #[test]
+    #[should_panic(expected = "group_mru holds the dead group")]
+    fn a_group_ring_that_names_a_buried_group_is_a_bug_the_check_catches() {
+        let (mut pane, ids) = strip(&["a", "b"]);
+        let red = GroupId(1);
+        pane.create_group(red, &[ids[0]], GroupColor::A)
+            .expect("one tab");
+        pane.activate(ids[0]);
+        // The ring keeps an id the table no longer holds — what `prune_groups` exists to prevent.
+        pane.group_mru.push_back(GroupId(99));
+        pane.debug_assert_invariants();
+    }
+
+    #[test]
+    #[should_panic(expected = "the group ring heads")]
+    fn a_group_ring_heading_the_wrong_group_is_a_bug_the_check_catches() {
+        let (mut pane, ids) = strip(&["a", "b"]);
+        let (red, blue) = (GroupId(1), GroupId(2));
+        pane.create_group(red, &[ids[0]], GroupColor::A)
+            .expect("one tab");
+        pane.create_group(blue, &[ids[1]], GroupColor::B)
+            .expect("one tab");
+        pane.activate(ids[0]);
+        // A writer that touched the ring without showing the tab: the head no longer names the screen.
+        pane.touch_group_mru(blue);
         pane.debug_assert_invariants();
     }
 

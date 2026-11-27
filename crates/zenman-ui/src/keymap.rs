@@ -12,9 +12,13 @@
 //! (`keyboard.js:148-253`). Three bindings live outside that table and are enumerated here because
 //! the registry is not the whole truth:
 //!
-//! * `Ctrl+Tab` / `Ctrl+Shift+Tab` — tab cycling (`keyboard.js:203-207`),
-//! * `Shift+Tab` and `Alt+Z` — the *recent-tabs overlay* (`keyboard.js:171-183`, `triggerTabCycling`
-//!   at `:110`), which Go draws as a modifier-held MRU popup,
+//! * `Ctrl+Tab` / `Shift+Tab` (`SwitchTab`) and `Ctrl+Shift+Tab` (`SwitchTabBack`) — the recent-tabs
+//!   panel; `Alt+Z` / `Alt+Shift+Z` (`SwitchGroup`, `SwitchGroupBack`) — the same panel over the pane's
+//!   tab groups. These are Go's *recent-tabs overlay* (`keyboard.js:110-141`, `triggerTabCycling` at
+//!   `:110`, which `Shift+Tab` fired at `:169-183` and `Alt+Z` still does at `:171`) moved onto the
+//!   chord users look for; `docs/tab-switcher-design.md` is the whole story,
+//! * `Ctrl+PageDown` / `Ctrl+PageUp` — Go's positional tab cycling (`keyboard.js:203-207`), which used
+//!   to answer `Ctrl+Tab` / `Ctrl+Shift+Tab` and keeps the walk, just not the chord a switcher wants.
 //! * bare <kbd>H</kbd> — the action-log toggle (`action-log-init.js:16`), and <kbd>Escape</kbd>,
 //!   which Go spends on closing the action log (`action-log.js:231`), the address bar
 //!   (`app.js:276`) and its overlays (`keyboard.js:158,166`, `quick-find.js:353`) but **never** on
@@ -52,8 +56,8 @@
 //! at the cost of `TextEdit`'s own copy/paste). The key *release* is silenced too: the eaten press
 //! leaves a `None` marker in `HeldKeys`, so lifting the key emits nothing either
 //! (`egui-winit/src/held_keys.rs:26-33,83-93`). So the table keeps the chords — they are what the
-//! menus *print*, and what a synthetic press answers — and [`KeyMap::lookup_events`] answers the
-//! clipboard events in their place.
+//! menus *print*, and what a synthetic press answers — and [`KeyMap::lookup_events_flagged`] answers
+//! the clipboard events in their place.
 //!
 //! Two consequences, both handled there:
 //!
@@ -132,12 +136,24 @@ pub enum Command {
     DuplicateTab,
     /// `Ctrl+W` — close the shown tab (Go's `close-tab`).
     CloseTab,
-    /// `Ctrl+Tab` — the next tab (Go's `cycleTabs(1)`, `keyboard.js:205`).
+    /// `Ctrl+PageDown` — the next tab (Go's `cycleTabs(1)`, `keyboard.js:205`, which `Ctrl+Tab` used to
+    /// answer: the switcher took that chord, `docs/tab-switcher-design.md` §2).
     NextTab,
-    /// `Ctrl+Shift+Tab` — the previous tab (Go's `cycleTabs(-1)`, `keyboard.js:205`).
+    /// `Ctrl+PageUp` — the previous tab (Go's `cycleTabs(-1)`, `keyboard.js:205`).
     PrevTab,
-    /// `Shift+Tab` / `Alt+Z` — walk the MRU ring (Go's recent-tabs overlay, `keyboard.js:110-183`).
-    CycleTabsMru,
+    /// `Ctrl+Tab` / `Shift+Tab` — open the recent-tabs panel, or step one row deeper into the past while
+    /// it is open (Go's recent-tabs overlay, `keyboard.js:110-141`, moved onto the chord users press
+    /// for it).
+    SwitchTab,
+    /// `Ctrl+Shift+Tab` — step the open panel backwards, and open it when it is shut
+    /// (`keyboard.js:169-183`, Go's other spelling of the same walk).
+    SwitchTabBack,
+    /// `Alt+Z` — the recent tab-group panel. The same widget as `SwitchTab`, listing groups instead of
+    /// tabs (`docs/tab-switcher-design.md` §1.8); Go's other trigger for its tab overlay
+    /// (`keyboard.js:171`).
+    SwitchGroup,
+    /// `Alt+Shift+Z` — the same group panel, walked backwards.
+    SwitchGroupBack,
     /// `Backspace` — the parent directory (Go's `navigate-up`).
     GoUp,
     /// `Ctrl+A` — every loaded row (Go's `select-all`).
@@ -214,7 +230,10 @@ impl Command {
         Self::CloseTab,
         Self::NextTab,
         Self::PrevTab,
-        Self::CycleTabsMru,
+        Self::SwitchTab,
+        Self::SwitchTabBack,
+        Self::SwitchGroup,
+        Self::SwitchGroupBack,
         Self::GoUp,
         Self::SelectAll,
         Self::SelectNone,
@@ -270,7 +289,10 @@ impl Command {
             Self::CloseTab => "Close tab",
             Self::NextTab => "Next tab",
             Self::PrevTab => "Previous tab",
-            Self::CycleTabsMru => "Recent tabs",
+            Self::SwitchTab => "Recent tabs",
+            Self::SwitchTabBack => "Recent tabs (backwards)",
+            Self::SwitchGroup => "Recent tab groups",
+            Self::SwitchGroupBack => "Recent tab groups (backwards)",
             Self::GoUp => "Go up",
             Self::SelectAll => "Select all",
             Self::SelectNone => "Clear selection",
@@ -535,6 +557,21 @@ fn synthesised(event: &Event) -> bool {
     )
 }
 
+/// `true` for a press the keyboard sent *again* because the chord was held down
+/// (`Event::Key { pressed: true, repeat: true }`) — the difference between one step of a switcher and
+/// the machine-gun rate.
+#[must_use]
+fn repeated(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Key {
+            pressed: true,
+            repeat: true,
+            ..
+        }
+    )
+}
+
 /// The modifier strip in force at each event of a frame. `egui-winit` reports a modifier press as its
 /// own [`Event::ModifiersChanged`] (`egui-winit/src/lib.rs:2367-2387`), and a clipboard event belongs
 /// to the strip held when it was pushed — see the module docs.
@@ -647,18 +684,24 @@ impl KeyMap {
         }
     }
 
-    /// Every command this frame's events ask for, in event order (plan F15's guard lives at the call
-    /// site, [`crate::app::ZenApp::handle_keys`]). Each event is read against the modifier strip it
-    /// was pushed under ([`strips`]).
+    /// Every command this frame's events ask for, in event order, **and** whether the
+    /// [`Event::Key { pressed: true, repeat: true }`] that answered it was the keyboard's auto-repeat
+    /// (plan F15's guard lives at the call site, [`crate::app::ZenApp::handle_keys`]).
+    ///
+    /// A caller that steps a highlight through a held chord needs the flag: one press held is one step,
+    /// not the repeat rate (`docs/tab-switcher-design.md` §5). A synthesised clipboard event is never a
+    /// key press, so its flag is `false`. Each event is read against the modifier strip it was pushed
+    /// under ([`strips`]).
     #[must_use]
-    pub fn lookup_events(&self, events: &[Event]) -> Vec<Command> {
+    pub fn lookup_events_flagged(&self, events: &[Event]) -> Vec<(Command, bool)> {
         let strips = strips(events);
-        let hits: Vec<(Command, bool)> = events
+        // (command, egui's clipboard echo rather than a key press, the key's own `repeat` bit)
+        let hits: Vec<(Command, bool, bool)> = events
             .iter()
             .zip(&strips)
             .filter_map(|(event, modifiers)| {
                 let command = self.lookup_event_with(event, modifiers)?;
-                Some((command, synthesised(event)))
+                Some((command, synthesised(event), repeated(event)))
             })
             .collect();
         // A clipboard event is an *echo* of a chord press whenever that press is also in the frame —
@@ -666,13 +709,13 @@ impl KeyMap {
         // other, so the rule costs a comparison and never fires today; it fires the day egui's
         // clipboard translation is turned off.
         hits.iter()
-            .filter(|(command, is_synthesised)| {
+            .filter(|(command, is_synthesised, _repeat)| {
                 !is_synthesised
                     || !hits
                         .iter()
-                        .any(|(other, pressed)| !pressed && other == command)
+                        .any(|(other, synthesised, _repeat)| !synthesised && other == command)
             })
-            .map(|(command, _)| *command)
+            .map(|(command, _is_synthesised, repeat)| (*command, *repeat))
             .collect()
     }
 
@@ -749,12 +792,15 @@ const TABLE: &[(Command, &[Chord])] = &[
     (Command::GoUp, &[Chord::key(Key::Backspace)]),
     (Command::SelectAll, &[Chord::ctrl(Key::A)]),
     // --- keyboard.js ----------------------------------------------------------------------------
-    (Command::NextTab, &[Chord::ctrl(Key::Tab)]),
-    (Command::PrevTab, &[Chord::ctrl_shift(Key::Tab)]),
+    (Command::NextTab, &[Chord::ctrl(Key::PageDown)]),
+    (Command::PrevTab, &[Chord::ctrl(Key::PageUp)]),
     (
-        Command::CycleTabsMru,
-        &[Chord::shift(Key::Tab), Chord::alt(Key::Z)],
+        Command::SwitchTab,
+        &[Chord::ctrl(Key::Tab), Chord::shift(Key::Tab)],
     ),
+    (Command::SwitchTabBack, &[Chord::ctrl_shift(Key::Tab)]),
+    (Command::SwitchGroup, &[Chord::alt(Key::Z)]),
+    (Command::SwitchGroupBack, &[Chord::alt_shift(Key::Z)]),
     // --- action-log-init.js:16 ------------------------------------------------------------------
     (Command::ActionLog, &[Chord::key(Key::H)]),
     // --- the plan's own additions, each named in the command doc --------------------------------
@@ -785,6 +831,15 @@ const TABLE: &[(Command, &[Chord])] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The commands a frame's events ask for, in event order, with the repeat answer dropped — what a
+    /// caller with no switcher to step wants. [`KeyMap::lookup_events_flagged`] is the whole answer.
+    fn commands(map: &KeyMap, events: &[Event]) -> Vec<Command> {
+        map.lookup_events_flagged(events)
+            .into_iter()
+            .map(|(command, _repeat)| command)
+            .collect()
+    }
 
     #[test]
     fn every_table_row_is_a_command_and_every_command_has_a_row() {
@@ -937,8 +992,9 @@ mod tests {
         };
         assert_eq!(map.lookup_event(&release), None);
         assert_eq!(
-            map.lookup_events(&[chord.event(), release]),
-            vec![Command::Copy]
+            commands(&map, &[chord.event(), release]),
+            vec![Command::Copy],
+            "and a release answers nothing on its own"
         );
     }
 
@@ -1034,12 +1090,12 @@ mod tests {
         let map = KeyMap::default();
         let chord = Chord::ctrl(Key::V).event();
         assert_eq!(
-            map.lookup_events(&[chord.clone(), Event::Paste("x".into())]),
+            commands(&map, &[chord.clone(), Event::Paste("x".into())]),
             vec![Command::Paste],
             "a doubled Paste is a duplicated file batch, not a no-op"
         );
         assert_eq!(
-            map.lookup_events(&[Event::Paste("x".into()), chord]),
+            commands(&map, &[Event::Paste("x".into()), chord]),
             vec![Command::Paste],
             "and the guard does not depend on which of the two arrives first"
         );
@@ -1052,9 +1108,72 @@ mod tests {
         assert!(!map.is_bound(Command::Quit), "Quit is menu-only");
         assert_eq!(map.hint_text(Command::Quit), "—");
         assert_eq!(
-            map.bindings_for(Command::CycleTabsMru),
-            &[Chord::shift(Key::Tab), Chord::alt(Key::Z)],
+            map.bindings_for(Command::SwitchTab),
+            &[Chord::ctrl(Key::Tab), Chord::shift(Key::Tab)],
             "one command may answer two chords, in menu order"
+        );
+    }
+
+    #[test]
+    fn the_switcher_spellings_parse_as_they_display() {
+        // The four chords the panel is driven by, plus the two the positional cycle moved to: each is
+        // written the way `display` spells it, and `display` is what a menu prints.
+        for (text, expected) in [
+            ("Ctrl+Tab", Chord::ctrl(Key::Tab)),
+            ("Shift+Tab", Chord::shift(Key::Tab)),
+            ("Ctrl+Shift+Tab", Chord::ctrl_shift(Key::Tab)),
+            ("Alt+Z", Chord::alt(Key::Z)),
+            ("Alt+Shift+Z", Chord::alt_shift(Key::Z)),
+            ("Ctrl+PageUp", Chord::ctrl(Key::PageUp)),
+            ("Ctrl+PageDown", Chord::ctrl(Key::PageDown)),
+        ] {
+            assert_eq!(Chord::parse(text), Some(expected), "{text}");
+            assert_eq!(
+                expected.display(),
+                text,
+                "{text} is its own canonical spelling"
+            );
+        }
+        // A lowercase key part is the spelling Go's registry does not use but a hand-edited one does.
+        assert_eq!(Chord::parse("alt+shift+z"), Some(Chord::alt_shift(Key::Z)));
+        assert_eq!(Chord::parse("Ctrl+PgDn"), Some(Chord::ctrl(Key::PageDown)));
+    }
+
+    #[test]
+    fn a_held_chord_reports_its_auto_repeats() {
+        let map = KeyMap::default();
+        let fresh = Chord::ctrl(Key::Tab).event();
+        let again = Event::Key {
+            key: Key::Tab,
+            physical_key: None,
+            pressed: true,
+            repeat: true,
+            modifiers: Modifiers {
+                ctrl: true,
+                command: true,
+                ..Modifiers::NONE
+            },
+        };
+        assert_eq!(
+            map.lookup_events_flagged(std::slice::from_ref(&fresh)),
+            vec![(Command::SwitchTab, false)],
+            "a press the keyboard just received is not a repeat"
+        );
+        assert_eq!(
+            map.lookup_events_flagged(std::slice::from_ref(&again)),
+            vec![(Command::SwitchTab, true)],
+            "the same press sent again by a held key is one, and the caller drops it"
+        );
+        // A clipboard event is no key press at all, so it can never be a repeat.
+        assert_eq!(
+            map.lookup_events_flagged(&[Event::Paste("x".into())]),
+            vec![(Command::Paste, false)]
+        );
+        // One frame carrying both: two answers in event order, and the flag is the only difference
+        // between them — dropping the second is the shell's job (§5).
+        assert_eq!(
+            map.lookup_events_flagged(&[fresh, again]),
+            vec![(Command::SwitchTab, false), (Command::SwitchTab, true)]
         );
     }
 }

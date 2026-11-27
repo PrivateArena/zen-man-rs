@@ -537,9 +537,9 @@ mod tests {
         assert!(report.problems.is_empty(), "{:?}", report.problems);
         assert_eq!(report.matched, 13, "one baseline per frozen reference");
         assert_eq!(
-            report.port_only, 4,
-            "the empty-shell frame, the open address field, the sidebar's folder menu and the \
-             navigation bar's parent menu are ours alone"
+            report.port_only, 6,
+            "the empty-shell frame, the open address field, the sidebar's folder menu, the \
+             navigation bar's parent menu and the two switcher panels are ours alone"
         );
         assert_eq!(report.orphans, 0);
         assert_eq!(report.unmatched, 0);

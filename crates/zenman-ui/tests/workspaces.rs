@@ -723,7 +723,7 @@ fn the_tabs_that_were_open_are_the_tabs_that_come_back() {
     );
     assert!(
         !back.model.panes[&PaneSlot::Left].mru.is_empty(),
-        "the MRU ring came back empty, so `Alt+Z` would cycle nothing on a pane full of tabs"
+        "the MRU ring came back empty, so the recent-tabs list would have nothing to walk"
     );
     // The report says what it did, in the words the boot line prints.
     assert!(

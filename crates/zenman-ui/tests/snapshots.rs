@@ -35,7 +35,9 @@ use zenman_core::ops::batch_rename::{Row, Rules};
 use zenman_core::ops::mkdir::MkdirReq;
 use zenman_core::path::{AbsPath, FsPath};
 use zenman_core::session::{Session, SessionPaths};
-use zenman_core::store::config::{LayoutMode, PaneSlot, ThemeMode, ViewMode, ZenConfig};
+use zenman_core::store::config::{
+    GroupColor, LayoutMode, PaneSlot, ThemeMode, ViewMode, ZenConfig,
+};
 use zenman_ui::app::ZenApp;
 use zenman_ui::dialogs::Dialog;
 use zenman_ui::dialogs::batch_rename::BatchRename;
@@ -43,7 +45,8 @@ use zenman_ui::dialogs::search_manager::ManagerRequest;
 use zenman_ui::keymap::{Chord, Command};
 use zenman_ui::menus::MenuTarget;
 use zenman_ui::panels::file_pane::PaneCommand;
-use zenman_ui::state::{Tab, panes_for, quad_slots};
+use zenman_ui::panels::switcher::SwitchKind;
+use zenman_ui::state::{GroupTarget, GroupVerb, Tab, TabId, TabSelKind, panes_for, quad_slots};
 use zenman_ui::theme::Tokens;
 
 const SIZE: egui::Vec2 = egui::vec2(1440.0, 900.0);
@@ -107,6 +110,15 @@ enum Scene {
     Address { tag: &'static str },
     /// The navigation bar's parent menu, open over the pane's listing.
     AppMenu { tag: &'static str },
+    /// The recent-tab switcher panel of `docs/tab-switcher-design.md`, **held open by its chord**
+    /// over a single pane with four tabs — the tabs list (<kbd>Ctrl+Tab</kbd>) or the groups list
+    /// (<kbd>Alt+Z</kbd>).
+    Switcher {
+        /// The `common::session`/`nested_tree` tag — distinct per baseline so the trees never share.
+        tag: &'static str,
+        /// Which list the panel shows; the chord and the rows follow from it.
+        kind: SwitchKind,
+    },
 }
 
 /// Which drawer [`Scene::Drawer`] opens.
@@ -155,6 +167,8 @@ const REFERENCE_MAP: &[(&str, &str, &str)] = &[
     ("15-address-bar.png", "", "the address field open over its own path — ours alone: Go's bar was a native `<input>`, and no reference screenshot shows it open"),
     ("16-folder-menu.png", "", "the folder menu a sidebar row opens — ours alone: the Go reference's is the same popup as its breadcrumb's, and no reference screenshot shows either"),
     ("17-parent-menu.png", "", "the navigation bar's parent menu, open over the listing — ours alone: the reference toolbar has no second level, so nothing shows one"),
+    ("18-recent-tabs.png", "", "the recent-tabs panel held open by Ctrl+Tab — ours alone: Go's overlay was HTML/CSS and its trigger was Shift+Tab, and nothing in docs/parity/ shows a held-modifier panel"),
+    ("19-recent-groups.png", "", "the same panel over the pane's tab groups, held open by Alt+Z — ours alone: no reference screenshot shows the overlay at all, let alone over groups"),
 ];
 
 /// The `REFERENCE_MAP` row of one baseline: its Go reference (empty when it has none) and the note.
@@ -202,6 +216,11 @@ impl Scene {
             Self::QuickFind { .. } => "14-quick-find.png",
             Self::Address { .. } => "15-address-bar.png",
             Self::AppMenu { .. } => "17-parent-menu.png",
+            Self::Switcher {
+                kind: SwitchKind::Tabs,
+                ..
+            } => "18-recent-tabs.png",
+            Self::Switcher { .. } => "19-recent-groups.png",
         }
     }
 
@@ -219,6 +238,7 @@ impl Scene {
             | Self::QuickFind { tag }
             | Self::Address { tag }
             | Self::AppMenu { tag }
+            | Self::Switcher { tag, .. }
             | Self::Index { tag, .. } => tag,
         }
     }
@@ -290,6 +310,21 @@ impl Scene {
                 // (the tree is built above; nothing else to stage)
                 app.set_layout(panes_for(LayoutMode::Single));
                 app.open_tab(PaneSlot::Left, fixture_path(&tree));
+            }
+            Self::Switcher { tag, .. } => {
+                // One pane, four tabs over `common::nested_tree` — the `tests/tab_switcher.rs`
+                // fixture, so the panel's four rows read `nested`, `alpha`, `beta`, `inner`.
+                let tree = common::nested_tree(tag);
+                freeze_mtime(&tree, FIXED_UNIX as u64);
+                app.set_layout(panes_for(LayoutMode::Single));
+                for dir in [
+                    tree.clone(),
+                    tree.join("alpha"),
+                    tree.join("beta"),
+                    tree.join("beta").join("inner"),
+                ] {
+                    app.open_tab(PaneSlot::Left, fixture_path(&dir));
+                }
             }
             Self::BatchRename { tag }
             | Self::QuickFind { tag }
@@ -485,6 +520,7 @@ fn render(scene: &Scene) -> Option<RgbaImage> {
         Scene::QuickFind { .. } => drive_quick_find(&mut harness),
         Scene::Address { .. } => drive_address(&mut harness),
         Scene::AppMenu { .. } => drive_app_menu(&mut harness),
+        Scene::Switcher { kind, .. } => drive_switcher(&mut harness, *kind),
         Scene::Index { running, .. } => drive_index(&mut harness, *running),
     }
 
@@ -499,6 +535,16 @@ fn render(scene: &Scene) -> Option<RgbaImage> {
             );
         }
     };
+    if let Scene::Switcher { kind, .. } = scene {
+        // The frame that was *just painted* still had the panel open: the render pass ran
+        // `tick_switcher` once more, and the chord never came up, so nothing committed (§1.3).
+        // A panel that had closed during the render would make the artefact a picture of a shell.
+        assert!(
+            harness.state().switcher.is_some(),
+            "the rendered frame still shows the {} panel — the chord was never released",
+            kind.title()
+        );
+    }
     if let Scene::ActionLog { .. } = scene {
         // The frame that was *just painted* must still be backed by the frozen stamps: the log panel
         // re-reads itself on its own poll, and a live RFC 3339 stamp would make the baseline differ
@@ -1069,6 +1115,165 @@ fn drive_address(harness: &mut Harness<'static, ZenApp>) {
     );
 }
 
+/// A key event in the shape `Chord::event` produces: the modifiers ride on the **event**, which is
+/// what `KeyMap::lookup_events_flagged` reads through `strips`; `InputState::modifiers` — what `Hold::held`
+/// reads — is fed only by `Event::ModifiersChanged`. `tests/tab_switcher.rs`'s primitive, kept
+/// minimal: a snapshot press is always fresh (`repeat: false`) and is never answered by a release.
+fn key_event(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
+    egui::Event::Key {
+        key,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers,
+    }
+}
+
+/// One frame carrying these events — the suites' batch idiom: everything pushed lands in the
+/// same `run`.
+fn frame(harness: &mut Harness<'static, ZenApp>, events: impl IntoIterator<Item = egui::Event>) {
+    harness.input_mut().events.extend(events);
+    harness.run();
+}
+
+/// Press a chord and **keep it held**: the modifier strip, then the key down under it, one frame.
+/// The release is never sent — the baseline is the panel mid-gesture, and letting the modifier up
+/// would commit the highlighted row (§1.3), closing the very thing being photographed.
+fn press_held(harness: &mut Harness<'static, ZenApp>, key: egui::Key, modifiers: egui::Modifiers) {
+    frame(
+        harness,
+        [
+            egui::Event::ModifiersChanged(modifiers),
+            key_event(key, modifiers),
+        ],
+    );
+}
+
+fn ctrl() -> egui::Modifiers {
+    egui::Modifiers {
+        ctrl: true,
+        ..Default::default()
+    }
+}
+
+fn alt() -> egui::Modifiers {
+    egui::Modifiers {
+        alt: true,
+        ..Default::default()
+    }
+}
+
+/// `18`/`19-switcher`: the panel opened by the very chord the user holds — `tests/tab_switcher.rs`'s
+/// `press` — and then left alone: the settle frames that follow must neither commit the panel nor
+/// walk it (a settle is not a tap), and the highlight stays where the opening put it, on row **1**,
+/// the row you would go back to (§6 — a baseline on row 0 would photograph the tab that is already
+/// on screen). The group scene first stages its two named groups through the shell's own seam.
+fn drive_switcher(harness: &mut Harness<'static, ZenApp>, kind: SwitchKind) {
+    settle(harness);
+    let ids: Vec<TabId> = harness.state().model.panes[&PaneSlot::Left]
+        .tabs
+        .iter()
+        .map(|tab| tab.id)
+        .collect();
+    assert_eq!(ids.len(), 4, "the fixture pane has four tabs");
+    if kind == SwitchKind::Groups {
+        // Two named groups of two tabs each, through `run_command` — the call the menu rows end
+        // up as. `NewColor` starts the run in that colour and, for the second tab, *joins* the one
+        // already wearing it (at most one group per colour per pane); `Name` labels it. Then the
+        // shown tab is re-selected so its group earns the recency touch §3 says a shown tab's
+        // group gets — the panel then leads with the group on screen, like the tab list does.
+        for (pair, color, name) in [
+            ([ids[0], ids[1]], GroupColor::A, "front"),
+            ([ids[2], ids[3]], GroupColor::B, "back"),
+        ] {
+            for id in pair {
+                harness.state_mut().run_command(
+                    PaneSlot::Left,
+                    PaneCommand::TabGroup {
+                        target: GroupTarget::Tab(id),
+                        verb: GroupVerb::NewColor(color),
+                    },
+                );
+            }
+            let gid = harness.state().model.panes[&PaneSlot::Left]
+                .group_of(pair[1])
+                .expect("the pair became a group");
+            harness.state_mut().run_command(
+                PaneSlot::Left,
+                PaneCommand::TabGroup {
+                    target: GroupTarget::Group(gid),
+                    verb: GroupVerb::Name {
+                        id: gid,
+                        name: name.to_string(),
+                    },
+                },
+            );
+        }
+        harness.state_mut().run_command(
+            PaneSlot::Left,
+            PaneCommand::SelectTab {
+                id: ids[3],
+                kind: TabSelKind::Replace,
+            },
+        );
+        settle(harness);
+    }
+    match kind {
+        SwitchKind::Tabs => press_held(harness, egui::Key::Tab, ctrl()),
+        SwitchKind::Groups => press_held(harness, egui::Key::Z, alt()),
+    }
+    settle(harness);
+    let open = harness
+        .state()
+        .switcher
+        .clone()
+        .unwrap_or_else(|| panic!("the chord opened no {} panel", kind.title()));
+    assert_eq!(open.kind, kind, "the panel lists what the chord asked for");
+    let titles: Vec<&str> = open.rows.iter().map(|row| row.title.as_str()).collect();
+    let want: &[&str] = match kind {
+        // The MRU ring read back from the newest tab opened to the oldest — `inner` on screen.
+        SwitchKind::Tabs => &["inner", "beta", "alpha", "nested"],
+        // `back` owns the shown tab, so its touch leads; `front` follows in creation order.
+        SwitchKind::Groups => &["back", "front"],
+    };
+    assert_eq!(titles, want, "the rows are the recency list §6 promises");
+    if kind == SwitchKind::Groups {
+        for row in &open.rows {
+            assert_eq!(
+                row.detail.as_deref(),
+                Some("2 tabs"),
+                "a group row says how many tabs it names"
+            );
+        }
+    }
+    assert_eq!(
+        open.selected, 1,
+        "the highlight is on the row you would go back to, not on the shown one"
+    );
+    assert!(
+        open.row_rect(open.selected).is_some(),
+        "the highlighted row is inside the painted window (§4.1)"
+    );
+    // The same facts as *painted* nodes: a heading naming the list and its length, and the rows —
+    // because a baseline of a panel that silently failed to open would still be a plausible picture.
+    assert_labels(
+        harness,
+        &[&format!(
+            "{} ({})",
+            kind.title().to_uppercase(),
+            open.rows.len()
+        )],
+    );
+    let shown_tab = harness.state().model.panes[&PaneSlot::Left]
+        .active_tab()
+        .expect("the fixture pane shows a tab")
+        .id;
+    assert_eq!(
+        shown_tab, ids[3],
+        "opening the panel switched nothing yet (feature 1)"
+    );
+}
+
 /// Stamp the status block's clock-derived fields, run the frames, stamp again, and assert — the
 /// dialog re-reads `Session::index_status` on its own 1 s poll, so a single patch can be overwritten
 /// by a frame that lands a second later.
@@ -1438,4 +1643,54 @@ fn quick_find_snapshot_renders_or_skips_with_a_reason() {
     let scene = Scene::QuickFind { tag: "snap-find" };
     let Some(image) = render(&scene) else { return };
     assert_covers(&image, 0.2, "the quick-find dialog");
+}
+
+/// The panel is not only *in* the widget tree — its pixels are in the artefact. The layout is
+/// arithmetic (§4.1), so the frame rect is computable from the very `layout` the widget calls, and
+/// a point inside its top padding must carry the panel fill over the backdrop wash: a baseline of a
+/// panel that painted nothing would fail *here*, not in the step-15 human review.
+fn assert_panel_painted(image: &RgbaImage, kind: SwitchKind, rows: usize) {
+    let tokens = Tokens::dark();
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, SIZE);
+    let laid = zenman_ui::panels::switcher::layout(rows, 0, screen, &tokens);
+    // Mid-horizontal, 12 px below the frame's top edge: inside the corner radius, below the
+    // shadow's reach, and above the heading — plain panel fill wherever the rows land.
+    let probe = egui::pos2(laid.frame.center().x, laid.frame.min.y + 12.0);
+    let got = image.get_pixel(probe.x as u32, probe.y as u32).0;
+    let want = [
+        tokens.bg_sidebar[0],
+        tokens.bg_sidebar[1],
+        tokens.bg_sidebar[2],
+        tokens.bg_sidebar[3],
+    ];
+    assert_eq!(
+        got,
+        want,
+        "the {} panel fill is painted at {probe:?}",
+        kind.title()
+    );
+}
+
+#[test]
+fn recent_tabs_switcher_snapshot_renders_or_skips_with_a_reason() {
+    let scene = Scene::Switcher {
+        tag: "snap-switch-tabs",
+        kind: SwitchKind::Tabs,
+    };
+    let Some(image) = render(&scene) else { return };
+    // The backdrop wash covers every pixel, so the "not blank" share is high by construction; the
+    // panel's own fill is the assertion that carries the weight.
+    assert_covers(&image, 0.2, "the recent-tabs panel over a listing");
+    assert_panel_painted(&image, SwitchKind::Tabs, 4);
+}
+
+#[test]
+fn recent_groups_switcher_snapshot_renders_or_skips_with_a_reason() {
+    let scene = Scene::Switcher {
+        tag: "snap-switch-groups",
+        kind: SwitchKind::Groups,
+    };
+    let Some(image) = render(&scene) else { return };
+    assert_covers(&image, 0.2, "the recent-groups panel over a listing");
+    assert_panel_painted(&image, SwitchKind::Groups, 2);
 }

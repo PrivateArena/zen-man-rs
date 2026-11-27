@@ -46,6 +46,7 @@ use crate::panels::{
     self,
     file_pane::{PaneCommand, RowOrder},
     header::HeaderCommand,
+    switcher::{Step, SwitchKind, SwitchPointer, SwitchRow, SwitchTarget, Switcher},
 };
 use crate::persist::Persisted;
 use crate::state::{
@@ -195,6 +196,9 @@ pub struct ZenApp {
     /// The collapsed chip whose tab list is flown out (`docs/tab-groups-design.md` §7). One at a time,
     /// like `menu`, and for the same reason: it is a layer of its own with a keep-alive of its own.
     pub tab_group_hover: Option<TabGroupHover>,
+    /// The switcher panel that is open (`docs/tab-switcher-design.md` §5). One at a time, like `menu`,
+    /// and for the same reason: it is a layer of its own — and while it is up, it owns the keyboard.
+    pub switcher: Option<Switcher>,
     /// The chips the strips reported hovered this frame, consumed by [`Self::logic`].
     pub tab_group_reports: Vec<(PaneSlot, GroupId, egui::Rect)>,
     /// The workspace control of a pane's tab row: the popup, its verbs, the `✓ Saved` chip and the
@@ -280,6 +284,7 @@ impl ZenApp {
             drag: None,
             tab_drag: None,
             tab_group_hover: None,
+            switcher: None,
             tab_group_reports: Vec::new(),
             workspaces: crate::panels::header::WorkspaceBar::default(),
             log: crate::panels::action_log::LogPanel::default(),
@@ -317,6 +322,7 @@ impl ZenApp {
             drag: None,
             tab_drag: None,
             tab_group_hover: None,
+            switcher: None,
             tab_group_reports: Vec::new(),
             workspaces: crate::panels::header::WorkspaceBar::default(),
             log: crate::panels::action_log::LogPanel::default(),
@@ -997,6 +1003,11 @@ impl ZenApp {
     /// correction, see the step-7 §9.2 row).
     pub fn logic(&mut self, ctx: &egui::Context) {
         self.handle_keys(ctx);
+        // The switcher's tick, **immediately after** the keys and before anything else
+        // (`docs/tab-switcher-design.md` §5): a chord press and its release that land in one frame
+        // must still open *and* commit the panel (feature 3's quick tap), so nothing that can prune,
+        // commit or cancel may run later in the pass than this.
+        self.tick_switcher(ctx);
         JobsUi::tick(self, ctx);
         // Step 13b: the two archive polls, once per frame each (`Dialog::show` never touches the
         // engine, so the size answer and the extract progress are collected here).
@@ -1071,8 +1082,13 @@ impl ZenApp {
                 }
             }
         }
-        // A menu, a modal or a tab drag is a different kind of attention: the flyout steps aside.
-        if self.menu.is_some() || self.dialogs.is_open() || self.tab_drag.is_some() {
+        // A menu, a modal, a tab drag or the switcher panel is a different kind of attention: the
+        // flyout steps aside (`docs/tab-switcher-design.md` §5's mutual exclusion).
+        if self.menu.is_some()
+            || self.dialogs.is_open()
+            || self.tab_drag.is_some()
+            || self.switcher.is_some()
+        {
             self.tab_group_hover = None;
             return;
         }
@@ -1288,6 +1304,11 @@ impl ZenApp {
         // Above the menu: the flyout is what the pointer is reaching for, and a hover that opened a
         // menu would have had it stepped aside for anyway (`tick_group_hover`).
         self.show_group_hover(ui.ctx());
+        // Above the flyout, below the modals: the switcher panel (`docs/tab-switcher-design.md` §5).
+        // In this egui fork the last-allocated overlapping rect wins the pointer (plan §9.2 step 8),
+        // so it is drawn after everything it must not lose a click to — and before the modal, which
+        // is the only thing that may answer a key anyway (`handle_keys` has already stood down).
+        self.show_switcher(ui.ctx());
         // **Last**, above the menu: a modal is the only thing on screen that may answer a key, and
         // `handle_keys` has already stood down for it. Its answers run here, after the draw, exactly
         // like the pane commands — a dialog never touches the engine itself.
@@ -1833,9 +1854,56 @@ impl ZenApp {
         }
         // The modifier strip is read out of the events themselves, so the real frame shape is what
         // gets tested: a chord press, then the clipboard event egui-winit pushes in its place.
-        let commands = ctx.input(|input| self.keys.lookup_events(&input.events));
+        // `lookup_events_flagged`, so an auto-repeat press is visible: holding the switcher chord must
+        // step the highlight once, not at the keyboard's repeat rate
+        // (`docs/tab-switcher-design.md` §5). The modifiers handed to `switch_chord` are the live
+        // `InputState` strip — the very one `Hold::held` reads when it decides the chord has gone, so
+        // the chord the panel opens under and the chord it commits on are the same reading. The
+        // keymap's *match* is made against each event's own modifiers field instead, and a stream that
+        // reports no strip at all is `Hold::bare` on both sides: held by its key, committed by its key
+        // (§4).
+        let (commands, modifiers) = ctx.input(|input| {
+            (
+                self.keys.lookup_events_flagged(&input.events),
+                input.modifiers,
+            )
+        });
         let slot = self.model.active_pane;
-        for command in commands {
+        // Once the panel exists **only the panel answers** — a <kbd>D</kbd> held over an open panel
+        // must not delete a file (§5's swallow). Asked per command, not once for the frame: a frame
+        // carrying <kbd>Ctrl+Tab</kbd> *and* a second keypress opens the panel and then, a moment
+        // later in the same batch, used to hand that second key to the file list.
+        for (command, repeat) in commands {
+            // The four switcher chords, in both branches: a repeat never steps the highlight, and
+            // `switch_chord` opens-or-steps by the rules of §5.
+            let switch = match command {
+                Command::SwitchTab => Some((SwitchKind::Tabs, false)),
+                Command::SwitchTabBack => Some((SwitchKind::Tabs, true)),
+                Command::SwitchGroup => Some((SwitchKind::Groups, false)),
+                Command::SwitchGroupBack => Some((SwitchKind::Groups, true)),
+                _ => None,
+            };
+            if let Some((kind, back)) = switch {
+                if !repeat {
+                    self.switch_chord(slot, kind, back, &modifiers);
+                }
+                continue;
+            }
+            if self.switcher.is_some() {
+                // Everything this frame else is swallowed. <kbd>↑</kbd>/<kbd>↓</kbd> walk the list
+                // without wrapping (§1.2); <kbd>Escape</kbd> belongs to the panel (§1.5), and the
+                // head of `escape`'s ladder is where it hands it back.
+                match command {
+                    Command::MoveDown | Command::MoveUp => {
+                        if let Some(switcher) = &mut self.switcher {
+                            switcher.nudge(if command == Command::MoveDown { 1 } else { -1 });
+                        }
+                    }
+                    Command::SelectNone => self.escape(slot),
+                    _ => {}
+                }
+                continue;
+            }
             self.dispatch(slot, command, ctx);
         }
     }
@@ -1896,7 +1964,27 @@ impl ZenApp {
             Command::CloseTab => self.close_shown_tab(slot),
             Command::NextTab => self.cycle_tab(slot, 1),
             Command::PrevTab => self.cycle_tab(slot, -1),
-            Command::CycleTabsMru => self.cycle_mru_tab(slot),
+            // The switcher chords keep a non-keyboard path here on purpose (design §5): a menu row
+            // does not exist — a menu cannot hold a key down — but the tests and any future UI share
+            // this seam. A dispatch is always a **fresh intent**, so the repeat question
+            // `handle_keys` asks does not arise; `switch_chord` opens or steps exactly as the
+            // keyboard would.
+            Command::SwitchTab => {
+                let modifiers = ctx.input(|i| i.modifiers);
+                self.switch_chord(slot, SwitchKind::Tabs, false, &modifiers);
+            }
+            Command::SwitchTabBack => {
+                let modifiers = ctx.input(|i| i.modifiers);
+                self.switch_chord(slot, SwitchKind::Tabs, true, &modifiers);
+            }
+            Command::SwitchGroup => {
+                let modifiers = ctx.input(|i| i.modifiers);
+                self.switch_chord(slot, SwitchKind::Groups, false, &modifiers);
+            }
+            Command::SwitchGroupBack => {
+                let modifiers = ctx.input(|i| i.modifiers);
+                self.switch_chord(slot, SwitchKind::Groups, true, &modifiers);
+            }
             Command::GoUp => self.run_command(slot, PaneCommand::Up),
             Command::SelectAll => self.run_command(slot, PaneCommand::SelectAll),
             Command::SelectNone => self.escape(slot),
@@ -3097,6 +3185,14 @@ impl ZenApp {
     /// selection when nothing is open (`app.js:276` address bar, `action-log.js:231` panel,
     /// `keyboard.js:158,166` overlays).
     fn escape(&mut self, slot: PaneSlot) {
+        // While the switcher panel is up, <kbd>Escape</kbd> belongs to the panel and nothing else
+        // (`docs/tab-switcher-design.md` §5): it cancels and leaves the shown tab exactly where it
+        // was (§1.5), above even the address bar. `handle_keys` routes the chord here while the
+        // panel swallows everything else.
+        if self.switcher.is_some() {
+            self.cancel_switcher();
+            return;
+        }
         if self
             .model
             .panes
@@ -3391,8 +3487,11 @@ impl ZenApp {
         self.run_command(slot, PaneCommand::CloseTab(id));
     }
 
-    /// <kbd>Ctrl+Tab</kbd> / <kbd>Ctrl+Shift+Tab</kbd> — Go's `cycleTabs(dir)` (`keyboard.js:270-277`),
-    /// wrapping, and a no-op when the pane holds one tab (Go's early return at `:272`).
+    /// <kbd>Ctrl+PageDown</kbd> / <kbd>Ctrl+PageUp</kbd> — Go's `cycleTabs(dir)` (`keyboard.js:270-277`),
+    /// wrapping, and a no-op when the pane holds one tab (Go's early return at `:272`). The chords
+    /// that used to live here — <kbd>Ctrl+Tab</kbd> and <kbd>Ctrl+Shift+Tab</kbd> — belong to the
+    /// switcher panel now (`docs/tab-switcher-design.md` §2); this is the positional ring walk,
+    /// which keeps its own spelling.
     fn cycle_tab(&mut self, slot: PaneSlot, dir: i32) {
         let Some(pane) = self.model.panes.get_mut(&slot) else {
             return;
@@ -3410,24 +3509,271 @@ impl ZenApp {
         pane.activate(id);
     }
 
-    /// <kbd>Shift+Tab</kbd> / <kbd>Alt+Z</kbd> — the MRU walk. Go opens a held-modifier overlay
-    /// (`keyboard.js:110-141`); the overlay is not this slice's, so the chord steps to the *second*
-    /// most recent tab — which is where Go's overlay starts too (`selectedIndex = 1`, `:118`).
-    fn cycle_mru_tab(&mut self, slot: PaneSlot) {
-        let Some(pane) = self.model.panes.get_mut(&slot) else {
+    /// The tab rows, in [`crate::state::Pane::recent_tabs`] order (`docs/tab-switcher-design.md` §6):
+    /// the folder mark (Go's folder emoji, `keyboard.js:52`), the tab's own title, the shown path as
+    /// the muted second line (`folder_text`, the same spelling Copy-path copies), and the colour dot
+    /// of the group the tab belongs to. Row 0 is the tab on screen — `recent_tabs` starts there.
+    fn switcher_tab_rows(&self, slot: PaneSlot) -> Vec<SwitchRow> {
+        let Some(pane) = self.model.panes.get(&slot) else {
+            return Vec::new();
+        };
+        pane.recent_tabs()
+            .into_iter()
+            .filter_map(|id| {
+                pane.tabs
+                    .iter()
+                    .find(|tab| tab.id == id)
+                    .map(|tab| (id, tab))
+            })
+            .map(|(id, tab)| SwitchRow {
+                target: SwitchTarget::Tab(id),
+                icon: Some("folder"),
+                title: tab.title.clone(),
+                detail: Some(folder_text(&tab.path, false)),
+                dot: tab
+                    .group
+                    .and_then(|gid| pane.group(gid))
+                    .map(|group| self.tokens.group_color(group.color)),
+            })
+            .collect()
+    }
+
+    /// The group rows, in [`crate::state::Pane::recent_groups`] order (§6): no icon — the colour dot
+    /// *is* the mark — the chip's own words ([`crate::state::TabGroup::label`], so an unnamed group
+    /// follows its colour like the strip's chip does), and the member count as the muted line.
+    fn switcher_group_rows(&self, slot: PaneSlot) -> Vec<SwitchRow> {
+        let Some(pane) = self.model.panes.get(&slot) else {
+            return Vec::new();
+        };
+        pane.recent_groups()
+            .into_iter()
+            .filter_map(|gid| pane.group(gid).map(|group| (gid, group)))
+            .map(|(gid, group)| {
+                let members = pane.member_ids(gid).len();
+                SwitchRow {
+                    target: SwitchTarget::Group(gid),
+                    icon: None,
+                    title: group.label().to_string(),
+                    detail: Some(if members == 1 {
+                        "1 tab".to_owned()
+                    } else {
+                        format!("{members} tabs")
+                    }),
+                    dot: Some(self.tokens.group_color(group.color)),
+                }
+            })
+            .collect()
+    }
+
+    /// One press of a switcher chord (`docs/tab-switcher-design.md` §5): the first press of a kind
+    /// opens the panel listing `slot`'s tabs or groups, the next steps the highlight (a *different*
+    /// kind replaces the panel — the user changed their mind about what to walk). `back` walks the
+    /// list the other way; `modifiers` must come from the same `InputState` `Hold::held` reads,
+    /// which is why open and release can never disagree.
+    ///
+    /// Fewer than two rows answers nothing at all — no panel and no switch (feature 9; Go's
+    /// `if (recentTabs.length <= 1) return;`, `keyboard.js:113`), which is [`Switcher::open`]
+    /// answering `None` and leaving [`ZenApp::switcher`] empty.
+    fn switch_chord(
+        &mut self,
+        slot: PaneSlot,
+        kind: SwitchKind,
+        back: bool,
+        modifiers: &egui::Modifiers,
+    ) {
+        // Same kind **and same pane**: the rows are the pane's, so a panel left open over the left
+        // pane must not be stepped by a chord whose keys now belong to the right one (§5).
+        if let Some(switcher) = &mut self.switcher
+            && switcher.kind == kind
+            && switcher.slot == slot
+        {
+            switcher.step(if back { Step::Back } else { Step::Forward });
+            return;
+        }
+        let rows = match kind {
+            SwitchKind::Tabs => self.switcher_tab_rows(slot),
+            SwitchKind::Groups => self.switcher_group_rows(slot),
+        };
+        let hold = kind.hold(modifiers);
+        let Some(next) = Switcher::open(kind, slot, rows, hold) else {
+            // Feature 9: nothing to list of *this* kind — <kbd>Alt+Z</kbd> in a pane with one group.
+            // Say nothing, and leave a panel that *does* have something to say alone rather than
+            // closing the user's panel out from under a chord they were still holding.
             return;
         };
-        let Some(id) = pane
-            .mru
-            .get(1)
-            .copied()
-            .or_else(|| pane.mru.front().copied())
-        else {
+        // §5's mutual exclusion, in the same breath: the panel is the only thing on its layer now,
+        // so the flyout, the pending menu request and the drawn menu all step aside (the wording is
+        // `tick_group_hover`'s — a different kind of attention).
+        self.tab_group_hover = None;
+        self.context_request = None;
+        self.menu = None;
+        self.switcher = Some(next);
+    }
+
+    /// The switcher's frame tick (`docs/tab-switcher-design.md` §5), run from [`Self::logic`]
+    /// **immediately after** [`Self::handle_keys`]: a chord press and its release that land in one
+    /// frame must still produce a switch (feature 3's quick tap), so this is the first thing after
+    /// the keys that may prune, commit or cancel.
+    ///
+    /// No repaint timer, unlike `tick_group_hover`: every event that can move the panel — a chord
+    /// step, a pointer hover, a release, a focus loss, a row's death reported by the model — is an
+    /// input event, and an input event already buys a frame. An idle panel has nothing left to
+    /// change on its own clock.
+    fn tick_switcher(&mut self, ctx: &egui::Context) {
+        if self.switcher.is_none() {
+            return;
+        }
+        // A modal, a focused text field or a dock float that owns typing has taken the keyboard away
+        // from [`Self::handle_keys`] — and a panel nobody can step is a panel that commits whatever it
+        // is holding the moment its modifier comes up, possibly behind a dialog. Let it go (§5).
+        if self.dialogs.is_open()
+            || ctx.text_edit_focused()
+            || craft_ui::docking::typing_window(ctx).is_some()
+        {
+            self.cancel_switcher();
+            return;
+        }
+        // Losing the window cancels (§1.5). `InputState::focused` is *not* the test — kittest leaves
+        // it false and every behavioural frame would cancel instantly — so this reads the event the
+        // platform sends when focus actually goes away (this fork spells egui's `LostFocus` as
+        // `Event::WindowFocused(false)`).
+        let lost_focus = ctx.input(|i| {
+            i.events
+                .iter()
+                .any(|event| matches!(event, egui::Event::WindowFocused(false)))
+        });
+        if lost_focus {
+            self.cancel_switcher();
+            return;
+        }
+        // Prune rows the model killed between frames (§9.15's `the_panel_dies_with_its_tab`):
+        // the snapshot may name a tab or a group that no longer exists, and the panel must never
+        // promise a dead id.
+        let slot = match &self.switcher {
+            Some(switcher) => switcher.slot,
+            None => return,
+        };
+        // What the user was reaching for, before anything under it moved.
+        let promised = self.switcher.as_ref().and_then(|s| s.target());
+        if let Some(switcher) = &mut self.switcher {
+            switcher.retain(|row| {
+                let Some(pane) = self.model.panes.get(&slot) else {
+                    return false;
+                };
+                match row.target {
+                    SwitchTarget::Tab(id) => pane.tabs.iter().any(|tab| tab.id == id),
+                    SwitchTarget::Group(gid) => pane.group(gid).is_some(),
+                }
+            });
+        }
+        let (rows, target) = match &self.switcher {
+            Some(switcher) => (switcher.rows.len(), switcher.target()),
+            None => return,
+        };
+        if rows == 0 {
+            // Every row died under the panel: no panel, and *nothing* is the answer (§9.15).
+            self.cancel_switcher();
+            return;
+        }
+        if rows < 2 {
+            // One row left is not a choice, so the panel goes either way. It lands on the survivor
+            // **only while that survivor is still the row the user was reaching for** — the row that
+            // fell back into the highlight after the one they chose died is a tab they never asked
+            // for, and a switch nobody requested is worse than a panel that quietly lets go.
+            self.commit_switcher(target.filter(|row| Some(*row) == promised));
+            return;
+        }
+        // The modifier came up (§1.3, Go's `keyupHandler` on `currentModifierKey`,
+        // `keyboard.js:126-129`). The key coming up is not this: that is a tap, and the walk is made of
+        // taps, so a hold that watched the key would land on row 1 and never go deeper (§11.1).
+        let released = ctx.input(|i| {
+            self.switcher
+                .as_ref()
+                .is_some_and(|switcher| switcher.released(i))
+        });
+        if released {
+            self.commit_switcher(target);
+        }
+    }
+
+    /// Land the panel's promise (`docs/tab-switcher-design.md` §5). A tab is shown through the
+    /// flyout row's own command — `SelectTab { kind: Replace }`, `app.rs`'s group-hover path — so
+    /// the selection, the strip and `mru` all follow the same way a click makes them.
+    ///
+    /// A group activates the member tab furthest forward in
+    /// [`crate::state::Pane::recent_tabs`] (§5's group-commit rule), falling back to the first
+    /// member. A collapsed group **stays collapsed**: the strip
+    /// already keeps the shown tab of a folded group visible (`tab_bar.rs:130`), so nothing the
+    /// switch lands can be hidden by it.
+    fn commit_switcher(&mut self, target: Option<SwitchTarget>) {
+        let Some(target) = target else {
+            self.cancel_switcher();
             return;
         };
-        // The same `activate` a strip-order cycle uses ([`Self::cycle_tab`]): a keyboard cycle owns the
-        // selection, so the tab it lands on takes the highlight off the one it left.
-        pane.activate(id);
+        let Some(slot) = self.switcher.as_ref().map(|switcher| switcher.slot) else {
+            return;
+        };
+        let id = match target {
+            SwitchTarget::Tab(id) => Some(id),
+            SwitchTarget::Group(gid) => self.model.panes.get(&slot).and_then(|pane| {
+                let members = pane.member_ids(gid);
+                pane.recent_tabs()
+                    .into_iter()
+                    .find(|id| members.contains(id))
+                    .or_else(|| members.first().copied())
+            }),
+        };
+        // The panel is spent before the switch runs: the command touches `mru`, and a still-open
+        // panel watching its own row move would be a double-take, not a state machine.
+        self.switcher = None;
+        if let Some(id) = id {
+            self.run_command(
+                slot,
+                PaneCommand::SelectTab {
+                    id,
+                    kind: TabSelKind::Replace,
+                },
+            );
+        }
+    }
+
+    /// The panel came up with no answer: <kbd>Escape</kbd>, a click outside, a lost focus (§1.5).
+    /// The shown tab stays exactly where it was — cancelling never switches.
+    fn cancel_switcher(&mut self) {
+        self.switcher = None;
+    }
+
+    /// The open panel, painted (`docs/tab-switcher-design.md` §4.2), and the pointer answered: a
+    /// clicked row commits, a click on the wash cancels. Called from [`Self::ui`] after
+    /// [`Self::show_group_hover`] and before the modals — last-allocated overlapping rect wins the
+    /// pointer in this fork (plan §9.2 step 8), so the panel beats the flyout and the menu, and the
+    /// modal beats the panel.
+    fn show_switcher(&mut self, ctx: &egui::Context) {
+        if self.switcher.is_none() {
+            return;
+        }
+        let tokens = self.tokens;
+        let pointer = self
+            .switcher
+            .as_mut()
+            .map(|switcher| switcher.show(ctx, &tokens));
+        // The target leaves the borrow before the commit: `SwitchTarget` is `Copy`, so the row can
+        // be read out of the snapshot and the snapshot dropped.
+        let picked = match &pointer {
+            Some(Some(SwitchPointer::Picked(ix))) => self
+                .switcher
+                .as_ref()
+                .and_then(|switcher| switcher.rows.get(*ix))
+                .map(|row| row.target),
+            _ => None,
+        };
+        match pointer {
+            Some(Some(SwitchPointer::Picked(_))) => self.commit_switcher(picked),
+            Some(Some(SwitchPointer::Dismissed)) => self.cancel_switcher(),
+            // `None`/nothing: no click answered this frame, or the panel had no rows to show
+            // (`show` says so itself); `tick_switcher` already pruned what died.
+            _ => {}
+        }
     }
 
     /// The arrow / Home / End / Page keys (plan §6.2's "Arrow/Home/End/PageUp/PageDown/Esc added"
