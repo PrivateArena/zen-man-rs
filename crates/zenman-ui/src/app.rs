@@ -360,8 +360,10 @@ impl ZenApp {
         {
             let pane = self.model.pane_mut(slot);
             pane.tabs.push(crate::state::Tab::new(id, path, title));
-            pane.active = pane.tabs.len() - 1;
-            pane.touch_mru(id);
+            // The new tab is shown, and the tab it replaces loses the selection it owned by being
+            // shown: the strip edges a selected tab that is not the shown one, so the residue of the
+            // last activation would read as "this tab is still focused".
+            pane.show_clearing_residue(id);
             id
         };
         self.list(slot, false, false);
@@ -2243,8 +2245,8 @@ impl ZenApp {
         // lost tabs in between cannot be indexed past its own length.
         let inserted_at = (ix + 1).min(pane.tabs.len());
         pane.tabs.insert(inserted_at, copy);
-        pane.active = inserted_at;
-        pane.touch_mru(new_id);
+        // The copy is shown, and the tab it came from drops the highlight it owned by being shown.
+        pane.show_clearing_residue(new_id);
         // The duplicate lists for itself — the same hand-over [`Self::open_tab`] makes for an
         // appended tab, and the reason the new tab is not an empty page forever.
         self.list_at(slot, inserted_at, false, false);
@@ -3423,10 +3425,9 @@ impl ZenApp {
         else {
             return;
         };
-        if let Some(ix) = pane.tabs.iter().position(|tab| tab.id == id) {
-            pane.active = ix;
-            pane.touch_mru(id);
-        }
+        // The same `activate` a strip-order cycle uses ([`Self::cycle_tab`]): a keyboard cycle owns the
+        // selection, so the tab it lands on takes the highlight off the one it left.
+        pane.activate(id);
     }
 
     /// The arrow / Home / End / Page keys (plan §6.2's "Arrow/Home/End/PageUp/PageDown/Esc added"

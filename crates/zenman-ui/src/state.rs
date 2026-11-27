@@ -1135,6 +1135,30 @@ impl Pane {
         true
     }
 
+    /// Show `id` and drop the strip's selection **when it was nothing but the tab being replaced** —
+    /// the residue of the last activation, and not a choice.
+    ///
+    /// The two neighbours each get half of this wrong for a tab the shell opens itself
+    /// (<kbd>Ctrl</kbd>+<kbd>T</kbd>, the `+` button, a duplicate): [`Pane::activate`] would throw away a
+    /// run the user built with <kbd>Ctrl</kbd>/<kbd>Shift</kbd>, and [`Pane::show`] alone leaves the tab
+    /// it replaces inside the set — and the strip edges every *selected-but-not-shown* tab, so the old
+    /// one goes on wearing a highlight that reads "still focused". A selection of one on some **other**
+    /// tab (a right-click's subject) is a choice, and it survives. The new tab gains no membership: the
+    /// shown tab needs none, and <kbd>Ctrl</kbd>-clicking from here still starts a run of one.
+    pub fn show_clearing_residue(&mut self, id: TabId) -> bool {
+        let shown = self.active_id();
+        if !self.show(id) {
+            return false;
+        }
+        // The empty set satisfies `all`, which is right: a pane nobody has clicked has no residue to
+        // lose, and must not gain one either.
+        if self.tab_sel.iter().all(|sel| Some(*sel) == shown) {
+            self.tab_sel.clear();
+            self.tab_sel_anchor = None;
+        }
+        true
+    }
+
     /// The strip's click handling: one tab, toggled, or the run from the anchor (see [`TabSelKind`]).
     /// Selection only — which tab is *shown* is [`Pane::show`]'s question, so a <kbd>Ctrl</kbd>-click can
     /// add to a set without collapsing it back to one.
@@ -2171,6 +2195,54 @@ mod groups {
             "an id this pane does not have is refused, not clamped"
         );
         assert!(!pane.select_tab(TabId(99), TabSelKind::Replace));
+    }
+
+    #[test]
+    fn a_tab_the_shell_opens_takes_the_highlight_off_the_one_it_left() {
+        // What `ZenApp::open_tab` and a duplicate owe the strip: it edges every selected tab that is
+        // *not* the shown one, so the residue of the last activation has to go with the tab it sat on —
+        // while a run the user built with ctrl/shift is a choice the shell must not drop.
+        let (mut pane, ids) = strip(&["a", "b", "c"]);
+        pane.activate(ids[0]);
+        assert!(
+            pane.show_clearing_residue(ids[1]),
+            "the hand-over an open makes"
+        );
+        assert_eq!(pane.active_id(), Some(ids[1]));
+        assert!(
+            pane.selected_tabs().is_empty(),
+            "the tab it left is selected no more, and the new one claims no membership"
+        );
+        // Which is what a ctrl-click after an open needs: a run of the tab it hit, and nothing else.
+        pane.select_tab(ids[2], TabSelKind::Toggle);
+        assert_eq!(pane.selected_tabs(), vec![ids[2]]);
+        // A real multi-selection, taken while `b` was the shown tab, survives the same navigation.
+        pane.select_tab(ids[1], TabSelKind::Toggle);
+        assert_eq!(pane.selected_tabs(), vec![ids[1], ids[2]]);
+        assert!(pane.show_clearing_residue(ids[0]));
+        assert_eq!(
+            pane.selected_tabs(),
+            vec![ids[1], ids[2]],
+            "the run the user made is not the shell's to drop"
+        );
+        assert_eq!(
+            pane.active_id(),
+            Some(ids[0]),
+            "and the tab moved all the same"
+        );
+        // A selection of one on *another* tab is right-click's subject, not an activation's residue.
+        pane.select_tab(ids[1], TabSelKind::Replace);
+        assert!(pane.show_clearing_residue(ids[2]));
+        assert_eq!(pane.selected_tabs(), vec![ids[1]], "so it stays");
+        // A pane nobody has clicked has nothing to clear, and gains nothing.
+        let (mut fresh, fresh_ids) = strip(&["a", "b"]);
+        assert!(fresh.show_clearing_residue(fresh_ids[1]));
+        assert!(fresh.selected_tabs().is_empty());
+        assert!(
+            !pane.show_clearing_residue(TabId(99)),
+            "an id this pane does not have is refused, not clamped"
+        );
+        pane.debug_assert_invariants();
     }
 
     #[test]

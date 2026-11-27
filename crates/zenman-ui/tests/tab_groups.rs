@@ -878,6 +878,81 @@ fn a_right_click_outside_the_selection_acts_on_one_tab_only() {
     pane.debug_assert_invariants();
 }
 
+/// The highlight follows the **shown** tab. A click on the strip leaves the clicked tab inside
+/// `tab_sel`, and a tab the *shell* opens (<kbd>Ctrl</kbd>+<kbd>T</kbd>, the `+` button, a duplicate)
+/// moves the shown tab with no click on the strip — so the residue of that click has to go with the tab
+/// it sat on, or the old tab keeps wearing the accent edge of a selection nobody made.
+#[test]
+fn an_opened_tab_leaves_no_highlight_on_the_tab_it_replaced() {
+    let (mut harness, ids) = four_tab_harness("tgp-opened-highlight");
+    let plain = Modifiers::default();
+    let ctrl = Modifiers {
+        ctrl: true,
+        ..Modifiers::default()
+    };
+
+    // A plain click: the pane shows the tab and selects nothing else.
+    let first = tab_point(&harness, PaneSlot::Left, 0);
+    click_at(&mut harness, first, PointerButton::Primary, plain);
+    assert_eq!(shown(&harness, PaneSlot::Left), Some(ids[0]), "fixture");
+    assert_eq!(
+        harness.state().model.panes[&PaneSlot::Left].selected_tabs(),
+        vec![ids[0]],
+        "fixture: the clicked tab owns the selection"
+    );
+
+    harness
+        .state_mut()
+        .run_command(PaneSlot::Left, PaneCommand::NewTab);
+    settle(&mut harness);
+    let opened = shown(&harness, PaneSlot::Left).expect("the new tab is shown");
+    assert_ne!(opened, ids[0], "the pane moved to the tab it opened");
+    assert!(
+        harness.state().model.panes[&PaneSlot::Left]
+            .selected_tabs()
+            .is_empty(),
+        "the tab the pane stopped showing still owns the selection, so the strip edges it"
+    );
+    // And the new tab claimed no membership of its own, so the next ctrl-click starts a run of one.
+    let fourth = tab_point(&harness, PaneSlot::Left, 3);
+    click_at(&mut harness, fourth, PointerButton::Primary, ctrl);
+    assert_eq!(
+        harness.state().model.panes[&PaneSlot::Left].selected_tabs(),
+        vec![ids[3]],
+        "an opened tab joined the ctrl-click's selection"
+    );
+    click_at(&mut harness, fourth, PointerButton::Primary, ctrl);
+
+    // The other half: a run the *user* built survives the same navigation, because the verbs that act
+    // on it (`New Tab Group`, close) must still find its tabs.
+    let second = tab_point(&harness, PaneSlot::Left, 1);
+    let third = tab_point(&harness, PaneSlot::Left, 2);
+    click_at(&mut harness, second, PointerButton::Primary, plain);
+    click_at(&mut harness, third, PointerButton::Primary, ctrl);
+    assert_eq!(
+        harness.state().model.panes[&PaneSlot::Left].selected_tabs(),
+        vec![ids[1], ids[2]],
+        "fixture: ctrl-click built a two-tab run"
+    );
+    harness
+        .state_mut()
+        .run_command(PaneSlot::Left, PaneCommand::NewTab);
+    settle(&mut harness);
+    let pane = &harness.state().model.panes[&PaneSlot::Left];
+    assert_eq!(
+        pane.selected_tabs(),
+        vec![ids[1], ids[2]],
+        "and opening a tab did not swallow it"
+    );
+    let again = shown(&harness, PaneSlot::Left).expect("the second new tab is shown");
+    assert_ne!(
+        again, opened,
+        "the pane moved to the tab this command opened, not the previous one"
+    );
+    assert_ne!(again, ids[2], "and not onto the run it left behind");
+    pane.debug_assert_invariants();
+}
+
 /// §1.3: the verb groups *the selection* — not the tab under the cursor, and not the whole strip.
 #[test]
 fn the_selection_is_what_new_tab_group_groups() {

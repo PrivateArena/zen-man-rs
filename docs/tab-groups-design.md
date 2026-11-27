@@ -163,6 +163,13 @@ Right-click rule: `PaneCommand::TabContext` folds the selection through `Pane::r
 `context_request`, so `menu_context` never reads a stale selection and a row enabled for three tabs cannot
 fire on one.
 
+Activation rule: the strip edges every selected tab that is **not** the shown one, so a selection left on
+the tab the pane stopped showing reads as "still focused". A tab the shell opens (`Ctrl+T`, the `+`, a
+duplicate) therefore goes through `Pane::show_clearing_residue`, which empties a selection that was nothing
+but the tab being replaced and leaves a run the user built alone: `Pane::activate` would drop that run, and
+`Pane::show` alone is what left the stale edge behind. The keyboard cycles (`Ctrl+Tab`, `Alt+Z`) own the
+selection outright and go through `Pane::activate`.
+
 `MenuTarget::Tab { ix }` gains `group: Option<GroupId>, count: usize`; `MenuContext` gains `in_group` and
 `tab_count`, and they are **not** in `bits()` — that array is the listing's seven plan booleans, which the
 exhaustive 128-row table walks, and multiplying it by four would prove nothing about a listing menu. The
