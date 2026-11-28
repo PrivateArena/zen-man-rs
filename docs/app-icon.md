@@ -4,7 +4,7 @@ One mark, five delivery mechanisms, one generator. How `zenman`'s picture gets o
 Windows — and what each of them will and will not do for you.
 
 ```
-assets/icons/prototype-icon.png        the artwork as drawn: 1024×579, flat white field
+assets/icons/prototype-icon-2.png      the artwork as drawn: 1024², the mark on a painted grid
         │  scripts/make-app-icon.py    matte the field → crop → square canvas → size ladder
         ▼
 assets/app-icon/zenman-master.png      1024² RGBA canonical art (committed, like everything below)

@@ -72,10 +72,10 @@ required beyond this file.
 
 ## `assets/app-icon/` — the application icon
 
-The mark the operating systems draw for zen-man itself: the three-folder/sparkle prototype artwork
-(`assets/icons/prototype-icon.png`, contributed to the project in 2026) matted off its field and
-re-laid out on a square canvas. Like the line icons above, it is original work of the zen-man-rs
-contributors and carries the workspace's **MIT OR Apache-2.0** dual licence.
+The mark the operating systems draw for zen-man itself: the three-folder prototype artwork
+(`assets/icons/prototype-icon-2.png`, contributed to the project in 2026) matted off its painted
+transparency grid and re-laid out on a square canvas. Like the line icons above, it is original work
+of the zen-man-rs contributors and carries the workspace's **MIT OR Apache-2.0** dual licence.
 
 Everything except the prototype row is **generated** — by `scripts/make-app-icon.py`, which is the
 place to edit. Do not hand-edit a derived file: `cargo xtask app-icon` re-derives the master's pixels
@@ -84,7 +84,8 @@ missing from this table.
 
 | File | Licence | Side | Used for |
 |---|---|---|---|
-| `assets/icons/prototype-icon.png` | MIT OR Apache-2.0 | 1024×579 | the source artwork; nothing reads it at runtime |
+| `assets/icons/prototype-icon-2.png` | MIT OR Apache-2.0 | 1024×1024 | the source artwork every artefact below is derived from; nothing reads it at runtime |
+| `assets/icons/prototype-icon.png` | MIT OR Apache-2.0 | 1024×579 | the previous mark, kept for reference; no longer the generator's source |
 | `assets/app-icon/zenman-master.png` | MIT OR Apache-2.0 | 1024 | master art: what `cargo xtask app-icon` re-derives and diffs |
 | `assets/app-icon/zenman.png` | MIT OR Apache-2.0 | 256 | `include_bytes!`-ed window/taskbar/Dock icon (`apps/zenman/src/app_icon.rs`) |
 | `assets/app-icon/zenman.ico` | MIT OR Apache-2.0 | 16–256 | Windows `RT_GROUP_ICON`, compiled in by `apps/zenman/build.rs` |

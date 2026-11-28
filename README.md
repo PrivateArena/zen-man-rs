@@ -63,7 +63,7 @@ tile are right from a bare `cargo run` — no `.desktop` file, no installer, no 
 | Linux / X11 | the embedded PNG via `_NET_WM_ICON` |
 | Linux / Wayland | needs a `.desktop` file — which the compositor, not the process, reads. Opt in: `zenman --install-desktop-entry` writes the entry *and* the hicolor icons into `$XDG_DATA_HOME`, idempotently, and never overwrites a file it did not generate |
 
-The art in `assets/app-icon/` is generated from `assets/icons/prototype-icon.png` by
+The art in `assets/app-icon/` is generated from `assets/icons/prototype-icon-2.png` by
 `scripts/make-app-icon.py`; `cargo xtask app-icon` re-derives it and fails if a committed artefact has
 fallen behind. Details: [`docs/app-icon.md`](docs/app-icon.md).
 

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Derive the shipped application icons from the prototype artwork.
 
-Source of truth: ``assets/icons/prototype-icon.png`` — the three-folder/sparkle mark on a flat
-white field. This script mattes that field away, crops to the mark, re-lays it out on a square
-canvas, and writes every artefact the three desktop platforms want:
+Source of truth: ``assets/icons/prototype-icon-2.png`` — the three-folder mark on a painted
+transparency checkerboard (a neutral two-tone grid with a vignette over it, baked into the RGB).
+This script mattes that field away, crops to the mark, re-lays it out on a square canvas, and
+writes every artefact the three desktop platforms want:
 
   assets/app-icon/zenman-master.png          1024  master, transparent; the gate's pixel source
   assets/app-icon/zenman.png                 256  embedded by the binary (window/dock/taskbar)
@@ -30,40 +31,55 @@ import numpy as np
 from PIL import Image, ImageFilter
 
 ROOT = Path(__file__).resolve().parent.parent
-SOURCE = ROOT / "assets" / "icons" / "prototype-icon.png"
+SOURCE = ROOT / "assets" / "icons" / "prototype-icon-2.png"
 OUT_DIR = ROOT / "assets" / "app-icon"
 
 MASTER_SIZE = 1024
 """Side of the square master canvas."""
 
-FILL = 0.96
+FILL = 0.86
 """Fraction of the master canvas the mark's tight box occupies.
 
 The mark is wider than tall, so this fits its long edge and centres the result. The residual
-margin is what keeps a 16 px taskbar icon from having its corners touch the frame.
+margin is what keeps a 16 px taskbar icon from having its corners touch the frame, and it is what
+the artwork cannot supply on its own: this mark is a chunky near-square folder, and at the old
+0.96 it ran edge to edge of the tile.
 """
 
-FIELD = np.array((255, 255, 255), dtype=np.float64)
-"""The RGB of the field the mark was drawn on."""
+NEUTRAL_CHROMA = 12.0
+"""RGB max-minus-min spread that the border flood-fill treats as field.
 
-FIELD_TOLERANCE = 8.0
-"""RGB distance from `FIELD` that the border flood-fill treats as background.
-
-Kept tight on purpose: it is the only step that must not leak into the mark, and it is what
-protects field-coloured pixels *inside* the mark (the sparkle, the specular bloom) from going
-transparent. Everything beyond it is reached by the two growth steps below.
+The field is a checkerboard, so tone cannot separate it from the art — two greys, one pale and one
+dark, with a vignette over both. Hue can: the grid is neutral (measured chroma p90 = 2, its
+anti-aliased cell borders included) while every stroke of the mark is tinted. Flooding the neutrals
+from the border is therefore the whole matte for the *field*, and a flood can only reach what it
+can walk to: the artwork's accents that float off the silhouette (the small sparkle at the lower
+right, the gloss wisp at the right edge) are neutral, so they go, while a tinted highlight *inside*
+the mark is walled in by saturated body and stays. The exact value barely matters — measured, any
+threshold in 6..24 moves the matte by under 0.1% of the mark — it only has to stay under the
+chroma of the palest paper edge, which is 12.
 """
 
-GLOW_DISTANCE_MAX = 130.0
-GLOW_CHROMA_MAX = 60.0
-"""How far past the field the background region then grows: pale *and* low-chroma.
+SHADOW_CHROMA = 48.0
+SHADOW_SATURATION = 0.40
+"""How far past the grid the background region then grows: low chroma *and* low relative chroma.
 
-The artwork is a sticker: a white halo hugging the mark, and a soft blue-tinted shadow outside
-that. Both are invisible on the mark's own field and read as a light blob on a dark taskbar, so
-both go. They are also pale and desaturated (shadow chroma ~11-40) while the mark's own outline is
-saturated (dark blue border chroma 82, red 110, green 100, light-blue rim 80), so a
-chroma-and-distance growth stops on the silhouette instead of eating into the art. Measured: the
-growth carves zero pixels of the saturated body.
+The artwork is a sticker again: a soft drop shadow hugging the folder, painted *over* the grid, so
+the further it is from the art the more neutral it gets — and a border flood alone stops at the
+first pixel whose chroma clears 12, leaving a grey skirt on the tile. Past the silhouette the
+shadow measures chroma p99 = 34 and chroma/max p99 = 0.34; the mark's own chromatic strokes sit at
+chroma/max p5 = 0.43 and median 0.76. So the two tests together let the growth swallow the shadow
+and stop on the anti-aliased rim, and neither number alone would do it: the shadow's darker core
+clears the chroma test by tone alone, and the rim's own AA pixels pass the saturation test.
+"""
+
+FIELD_SAMPLE = 21
+"""Radius, in pixels, of the box that estimates the field colour an edge pixel sits on.
+
+One checker cell wide either side — the grid's measured period at 1024 px is 20-21 px — so the
+box straddles both tones and returns the mid grey the eye reads rather than whichever square the
+contour happens to cross. That estimate is what the un-matte subtracts, in place of the single
+field RGB a flat field would have supplied.
 """
 
 MEDIAN_KERNEL = 5
@@ -110,17 +126,18 @@ def build_master(source: Path) -> Image.Image:
 
 
 def matte_from_field(source: Path) -> Image.Image:
-    """RGBA art whose alpha is 0 exactly where the field, the halo and the shadow were.
+    """RGBA art whose alpha is 0 exactly where the checkerboard and the shadow were.
 
     The field is flood-filled from the border rather than colour-keyed, so enclosed field-coloured
-    pixels (the sparkle, the specular bloom) stay opaque.
+    pixels (the paper edges, the specular bloom) stay opaque.
     """
     rgb = np.asarray(Image.open(source).convert("RGB"), dtype=np.float64)
-    distance = np.sqrt(((rgb - FIELD) ** 2).sum(axis=2))
     chroma = rgb.max(axis=2) - rgb.min(axis=2)
+    maximum = rgb.max(axis=2)
+    saturation = np.divide(chroma, np.maximum(maximum, 1.0))
 
-    field = grow_from_border(distance <= FIELD_TOLERANCE)
-    outside = grow(field, (distance <= GLOW_DISTANCE_MAX) & (chroma <= GLOW_CHROMA_MAX))
+    field = grow_from_border(chroma <= NEUTRAL_CHROMA)
+    outside = grow(field, (chroma <= SHADOW_CHROMA) & (saturation <= SHADOW_SATURATION))
 
     alpha = blur3(smooth_mask(~outside, MEDIAN_KERNEL))
     alpha[alpha < 0.012] = 0.0  # nothing left of the outer glow, and no colour noise to encode
@@ -130,7 +147,7 @@ def matte_from_field(source: Path) -> Image.Image:
     # The divisor is floored, so a near-transparent pixel keeps its own (field-coloured) value
     # instead of an amplified one.
     divisor = np.maximum(alpha, 0.3)[..., None]
-    core = (rgb - (1.0 - alpha[..., None]) * FIELD) / divisor
+    core = (rgb - (1.0 - alpha[..., None]) * local_field(rgb, field, FIELD_SAMPLE)) / divisor
     colour = np.clip(core, 0, 255).round().astype(np.uint8)
     colour[alpha <= 0] = 0
     rgba = np.dstack([colour, (alpha * 255).round().astype(np.uint8)])
@@ -165,6 +182,35 @@ def adjacent(mask: np.ndarray) -> np.ndarray:
     out[:, 1:] |= mask[:, :-1]
     out[:, :-1] |= mask[:, 1:]
     return out
+
+
+def local_field(rgb: np.ndarray, field: np.ndarray, radius: int) -> np.ndarray:
+    """The mean field colour around every pixel: what the feathered edge is composited over.
+
+    A two-tone checker has no single field RGB to un-matte against, so this averages the field
+    pixels inside a `radius` box — a masked box mean, which ignores the mark's own colour.
+    """
+    weight = field.astype(np.float64)
+    count = box_sum(weight, radius)
+    out = np.zeros_like(rgb)
+    for band in range(3):
+        total = box_sum(rgb[..., band] * weight, radius)
+        out[..., band] = np.where(count > 0, total / np.maximum(count, 1e-9), rgb[..., band].mean())
+    return out
+
+
+def box_sum(channel: np.ndarray, radius: int) -> np.ndarray:
+    """Sum of a (2*radius+1)² window centred on every pixel, by integral image."""
+    padded = np.pad(channel, radius, mode="constant")
+    integral = np.zeros((padded.shape[0] + 1, padded.shape[1] + 1))
+    integral[1:, 1:] = padded.cumsum(axis=0).cumsum(axis=1)
+    side = 2 * radius + 1
+    return (
+        integral[side:, side:]
+        - integral[:-side, side:]
+        - integral[side:, :-side]
+        + integral[:-side, :-side]
+    )
 
 
 def smooth_mask(mask: np.ndarray, kernel: int) -> np.ndarray:

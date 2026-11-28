@@ -14,7 +14,7 @@
 //!   sizes `apps/zenman/src/app_icon.rs` names in its `include_bytes!` paths and the sizes
 //!   `apps/zenman/build.rs` compiles;
 //! * **the master still describes the artwork** — by re-running `scripts/make-app-icon.py --check`,
-//!   which re-derives the master's pixels from `assets/icons/prototype-icon.png` and diffs them.
+//!   which re-derives the master's pixels from `assets/icons/prototype-icon-2.png` and diffs them.
 //!   That rung is a printed **skip** where `python3` or Pillow is absent, exactly like
 //!   [`crate::fixture_tree`]'s skip, because the structural rungs above need no toolchain at all.
 //!
@@ -47,7 +47,7 @@ pub fn app_icon() -> Result<(), Box<dyn Error>> {
             println!("xtask app-icon: master art re-derived from the prototype and identical");
         }
         Ok(false) => problems.push(
-            "assets/app-icon/ no longer matches assets/icons/prototype-icon.png (the diff above is \
+            "assets/app-icon/ no longer matches assets/icons/prototype-icon-2.png (the diff above is \
              the script's own words)"
                 .to_string(),
         ),
