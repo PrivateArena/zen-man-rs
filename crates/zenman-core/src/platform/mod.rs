@@ -26,6 +26,11 @@
 //! [`Env::supports_symlink`] is a lock read and the real write test only ever runs from a job; the
 //! recursion is in [`Env::chmod_all`], which is `async` and yields between items, so cancellation at an
 //! item boundary is the job runner's normal `Cancelled` path.
+//!
+//! The sandbox probe ([`Env::supports_sandbox`]) follows the same shape for the same reason — it *runs*
+//! `unshare` (design §5.4: a refused sandbox is otherwise invisible to its caller), so its verdict gets a
+//! second, equally short-lived cache inside `linux` and the frame path that asks on every menu open is a
+//! PATH scan plus a lock read.
 
 // The three submodules are public because their contents *are* this module's API: `mod.rs`'s own docs
 // point at `platform::stub::Unsupported`, step 6 needs `platform::linux::Linux::probe_symlinks`, and
@@ -251,6 +256,28 @@ pub struct DiskSpace {
     pub total: u64,
 }
 
+/// The program name the sandbox launcher is built around (design §5.1: util-linux `unshare(1)`, and the
+/// only tool this feature needs). Shared so the *menu probe* (`linux::supports_sandbox`) and the *argv
+/// builder* (`ops::launch::unshare_command`) can never disagree about which binary they mean.
+pub const PROGRAM_UNSHARE: &str = "unshare";
+
+/// The `unshare` switches of design §5.1's recipe — the user namespace with a root map, a private mount
+/// table, a private pid namespace with a fresh `/proc`, and **no** `--net`, on purpose.
+///
+/// This is the single source of truth: it is the recipe `ops::launch` *builds* **and** the one
+/// [`Env::supports_sandbox`] *measures* — one list, so the probe can never have tested a command line
+/// other than the one the row runs.
+pub const SANDBOX_UNSHARE_FLAGS: &[&str] = &[
+    "--user",
+    "--map-root-user",
+    "--mount",
+    "--pid",
+    "--fork",
+    "--propagation",
+    "private",
+    "--mount-proc",
+];
+
 /// A program to run: plan F10's single spawn path (argv vector, output cap, cancellation at the process
 /// boundary).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -426,6 +453,20 @@ pub trait Env: Send + Sync {
     /// The symlink answer: the probe's cached result (plan F21) or, before any probe, the static
     /// [`PlatformCaps::SYMLINK`] bit. Never performs file I/O.
     fn supports_symlink(&self) -> Result<bool, CoreError>;
+
+    /// Could this machine run the `Execute (sandbox)` recipe — i.e. would
+    /// [`SANDBOX_UNSHARE_FLAGS`] actually produce a namespace right now?
+    ///
+    /// **Measured, not assumed:** `setsid --fork` hides a refused sandbox launch from the caller (the
+    /// wrapper exits `0` before the launcher has been asked anything), so the only honest answer is the
+    /// one obtained by running the recipe. Implementations that can run it should cache the verdict for
+    /// the session, like the symlink probe; the frame path calls this on every menu open.
+    ///
+    /// Default body [`Ok(false)`]: a platform that has not implemented the probe (or has no `unshare` at
+    /// all) is answered by the row being *absent*, never by the row being offered and doing nothing.
+    fn supports_sandbox(&self) -> Result<bool, CoreError> {
+        Ok(false)
+    }
 
     /// Set the mode of *these* paths, nothing else — Go's bare `os.Chmod` per path (`api/ops.go:929`).
     fn chmod(

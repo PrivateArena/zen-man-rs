@@ -65,8 +65,8 @@
 
 use egui::text::LayoutJob;
 use egui::{
-    Area, Color32, CornerRadius, Frame, Id, LayerId, Margin, Order, Painter, Pos2, Rect, Shadow,
-    Stroke, Ui, Vec2, WidgetInfo,
+    Area, Color32, CornerRadius, Frame, Id, LayerId, Margin, Order, Painter, Pos2, Rect, Response,
+    Shadow, Stroke, Ui, Vec2, WidgetInfo,
 };
 
 use zenman_core::services::actions::{self, ActionContext};
@@ -191,6 +191,12 @@ pub enum MenuTarget {
     Row {
         /// The row is a directory (or the selection is all directories).
         on_dir: bool,
+        /// The row under the cursor is **runnable** — `zenman_core::ops::launch::classify` (design
+        /// `docs/launch-sandbox-design.md` §3) answers anything but `NotRunnable` for it. Like
+        /// `on_dir` this is a fact about the *click*, not about the shell's capabilities, so it
+        /// lives here and not in [`MenuContext::bits`]: the cross product the tests walk is over the
+        /// listing's booleans, and a row is either a script or it is not.
+        on_run: bool,
     },
     /// A folder that is **not** a row of this listing — a breadcrumb chip (Go's
     /// `showFolderContextMenu` from `navigation.js:215`). Which folder is not in the variant: a path
@@ -247,6 +253,12 @@ pub struct MenuContext {
     pub on_archive: bool,
     /// The platform can make symlinks (`platform::Env::supports_symlink`).
     pub can_symlink: bool,
+    /// A sandboxed launch could work here — `Session::can_sandbox`, the *measured* answer of design
+    /// §5.4's probe: util-linux `unshare` on PATH **and** the kernel having granted the very namespace
+    /// recipe the row will run. Gates the *presence* of the row, which is the only honest place for it:
+    /// `setsid --fork` hides a refused launch from the caller, so a greyed row would be the last thing
+    /// the user ever saw.
+    pub can_sandbox: bool,
     /// A batch rename owns the pane: more than one row is selected, which is exactly what sent Go's
     /// [`crate::app::ZenApp::menu_context`]).
     pub in_batch: bool,
@@ -261,14 +273,15 @@ pub struct MenuContext {
 }
 
 impl MenuContext {
-    /// The plan's seven listing booleans, as the cross-product test walks them.
+    /// The plan's seven listing booleans plus design §5.4's `can_sandbox`, as the cross-product test
+    /// walks them.
     ///
     /// [`MenuContext::in_group`] and [`MenuContext::tab_count`] are **not** in it: they belong to the tab
     /// menu, which reads nothing else, and widening this array would multiply every listing menu's
     /// exhaustive walk by four to prove nothing about it. The tab menu's two facts get their own table in
     /// [`crate::app::ZenApp::menu_context`]'s tests instead.
     #[must_use]
-    pub const fn bits(&self) -> [bool; 7] {
+    pub const fn bits(&self) -> [bool; 8] {
         [
             self.has_selection,
             self.all_dirs,
@@ -277,11 +290,12 @@ impl MenuContext {
             self.on_archive,
             self.can_symlink,
             self.in_batch,
+            self.can_sandbox,
         ]
     }
 
     /// A context from [`Self::bits`], leaving [`MenuContext::target`] and the two tab facts alone.
-    pub fn with_bits(&mut self, bits: [bool; 7]) {
+    pub fn with_bits(&mut self, bits: [bool; 8]) {
         let [
             has_selection,
             all_dirs,
@@ -290,6 +304,7 @@ impl MenuContext {
             on_archive,
             can_symlink,
             in_batch,
+            can_sandbox,
         ] = bits;
         self.has_selection = has_selection;
         self.all_dirs = all_dirs;
@@ -298,6 +313,7 @@ impl MenuContext {
         self.on_archive = on_archive;
         self.can_symlink = can_symlink;
         self.in_batch = in_batch;
+        self.can_sandbox = can_sandbox;
     }
 }
 
@@ -316,6 +332,11 @@ pub struct MenuSpec {
     pub danger: bool,
     /// The enabled predicate. `false` greys the row and swallows its click; it never hides it.
     pub when: fn(&MenuContext) -> bool,
+    /// Draw this row **and the one after it** side by side in one line (design §2: the `Execute` pair
+    /// costs the popup one row, not two). Only ever set on the left half — a `paired` spec that is the
+    /// last one in its group is a bug the renderer cannot express, so [`show`] falls back to drawing it
+    /// alone rather than dropping it.
+    pub paired: bool,
 }
 
 impl MenuSpec {
@@ -344,12 +365,25 @@ impl MenuSpec {
     pub fn hint(&self, keys: &KeyMap) -> Option<String> {
         self.chord(keys).map(|chord| chord.display())
     }
+
+    /// Share this row's line with the spec that follows it — the layout half of design §2's pair, set
+    /// at the call site (`file_menu`) so the *builder* says which rows share a line and the renderer
+    /// never has to guess from a label.
+    #[must_use]
+    pub fn paired(mut self) -> Self {
+        self.paired = true;
+        self
+    }
 }
 
 /// Two specs are the same *row* when they look the same. `when` is deliberately not part of it:
 /// comparing function pointers is deprecated (`unpredictable_function_pointer_comparisons`) and
 /// meaningless here — the behaviour a predicate encodes is what [`MenuSpec::enabled`] and the
 /// cross-product test check, in every combination, which is stronger than pointer equality.
+///
+/// `paired` is left out for the same kind of reason: it is *layout*, not text. Two rows that print the
+/// same words are the same offer whether they share a line or not, and the tests that compare menus
+/// shape-for-shape ask about the offer (`tests/menus.rs`'s `labels`), never about the line box.
 impl PartialEq for MenuSpec {
     fn eq(&self, other: &Self) -> bool {
         self.action == other.action
@@ -443,7 +477,7 @@ pub fn file_menu(
             groups.push(custom);
             groups
         }
-        MenuTarget::Row { on_dir } => {
+        MenuTarget::Row { on_dir, on_run } => {
             let rename = if ctx.in_batch {
                 // Go's `triggerRename` sent a >1 selection to `batch-rename.js`
                 // (`context-menu.js:404-410`); the dialog is step 14's, so the row is honest that it
@@ -469,6 +503,23 @@ pub fn file_menu(
                 ]);
             }
             groups.push(vec![item(Command::Open, selection, Some("external-link"))]);
+            // Design §2: the **run** verb beside the **view** verb, in one line. A directory is never
+            // runnable (`classify` says so), which is why this group sits inside the same `on_run` gate
+            // the directory block sits inside its `on_dir` one — and why the pair lives *below* `Open`
+            // rather than in the clipboard ladder, whose rows a script has no use for.
+            if on_run {
+                let plain = item(Command::Execute, selection, Some("terminal"));
+                // Absent, never greyed (§5.4): a refused recipe has no greyed way to succeed either.
+                let sandbox = ctx
+                    .can_sandbox
+                    .then(|| item(Command::ExecuteSandbox, selection, Some("code")));
+                // `paired` is only true when the pair really is two rows: a lone `Execute` on a
+                // sandbox-less platform keeps the whole line rather than half of one.
+                groups.push(match sandbox {
+                    Some(sandbox) => vec![plain.paired(), sandbox],
+                    None => vec![plain],
+                });
+            }
             groups.push(vec![
                 item(Command::Cut, selection_writable, Some("cut")),
                 item(Command::Copy, selection, Some("copy")),
@@ -761,6 +812,7 @@ fn spec(
         icon,
         danger,
         when,
+        paired: false,
     }
 }
 
@@ -899,27 +951,7 @@ pub fn show(
                 .show(ui, |ui| {
                     ui.spacing_mut().item_spacing = Vec2::ZERO;
                     ui.set_min_width(geometry.width);
-                    // A row's top or bottom edge is `FRAME_BORDER + menu_frame_pad_y` inside the frame's
-                    // own edge, which is as deep as the corner arc reaches: today's tokens leave a
-                    // hovered end row exactly `radius - inset = 0` to round.
-                    let inset = FRAME_BORDER + tokens.menu_frame_pad_y;
-                    let total = groups.iter().map(|group| group.len()).sum::<usize>();
-                    let mut drawn = 0;
-                    let mut first = true;
-                    for group in groups.iter().filter(|group| !group.is_empty()) {
-                        // The rule goes *between* two groups: an empty leading group must not buy the
-                        // popup a rule across its own top edge.
-                        if !first {
-                            separator(ui, tokens, geometry.width);
-                        }
-                        first = false;
-                        for spec in group {
-                            let corners =
-                                hover_corners(drawn, total, tokens.menu_corner_radius, inset);
-                            row(ui, spec, menu_ctx, keys, tokens, geometry, corners, out);
-                            drawn += 1;
-                        }
-                    }
+                    draw_lines(ui, groups, menu_ctx, keys, tokens, geometry, out);
                 });
         });
     let rect = area.response.rect;
@@ -931,6 +963,61 @@ pub fn show(
                 .is_none_or(|pos| !rect.contains(pos))
     });
     MenuOutcome { rect, close }
+}
+
+/// `true` when the spec at index `i` of `group` is the **left** half of a pair: it asked to be paired
+/// and there is a spec after it to pair with. The one definition, used by both the measurement and the
+/// draw, so the two can never disagree about what a line is — and the rule that downgrades a `paired`
+/// last-row-in-a-group (a builder bug) to an ordinary row instead of losing it.
+fn is_pair(group: &[MenuSpec], i: usize) -> bool {
+    group[i].paired && i + 1 < group.len()
+}
+
+/// The lines a group list really paints: a pair is **one** line, not two. [`hover_corners`] is indexed
+/// by this, which is what makes both halves light up together and round together.
+fn line_count(groups: &[Vec<MenuSpec>]) -> usize {
+    groups
+        .iter()
+        .map(|group| (0..group.len()).filter(|&i| !is_pair(group, i)).count())
+        .sum()
+}
+
+/// One row's own natural width: the icon column, the label, the hint it will actually print, and the
+/// horizontal padding on **both** of its edges.
+fn natural_width(
+    painter: &Painter,
+    spec: &MenuSpec,
+    menu_ctx: &MenuContext,
+    keys: &KeyMap,
+    tokens: &Tokens,
+    icon_column: f32,
+) -> f32 {
+    let label = painter
+        .layout_job(singleline(
+            &spec.label,
+            tokens.font_size,
+            tokens.text_main,
+            f32::INFINITY,
+        ))
+        .size()
+        .x;
+    let hint = spec
+        .enabled(menu_ctx)
+        .then(|| spec.hint(keys))
+        .flatten()
+        .map_or(0.0, |hint| {
+            painter
+                .layout_job(singleline(
+                    &hint,
+                    tokens.menu_hint_font_size,
+                    tokens.text_muted,
+                    f32::INFINITY,
+                ))
+                .size()
+                .x
+                + tokens.menu_hint_gap
+        });
+    icon_column + label + hint + 2.0 * tokens.menu_item_pad_x
 }
 
 /// Every row of the popup, measured — see [`Geometry`] for why this happens before the draw.
@@ -954,34 +1041,24 @@ fn geometry(
             continue;
         }
         rules += usize::from(rows > 0);
-        rows += group.len();
-        for spec in group {
-            let label = painter
-                .layout_job(singleline(
-                    &spec.label,
-                    tokens.font_size,
-                    tokens.text_main,
-                    f32::INFINITY,
-                ))
-                .size()
-                .x;
-            let hint = spec
-                .enabled(menu_ctx)
-                .then(|| spec.hint(keys))
-                .flatten()
-                .map_or(0.0, |hint| {
-                    painter
-                        .layout_job(singleline(
-                            &hint,
-                            tokens.menu_hint_font_size,
-                            tokens.text_muted,
-                            f32::INFINITY,
-                        ))
-                        .size()
-                        .x
-                        + tokens.menu_hint_gap
-                });
-            width = width.max(icon_column + label + hint + 2.0 * tokens.menu_item_pad_x);
+        let mut i = 0;
+        while i < group.len() {
+            // A pair contributes **one** row to the height and asks for **two** half-rows of width —
+            // each half with its own label + hint budget and its own padding on both of its edges, so
+            // the line is twice the wider half rather than the sum of the two. (One pad per half would
+            // leave the label `menu_item_pad_x` short of what [`paint_row`] then budgets for it, which
+            // is how `Execute (sandbox)` would come to wrap onto a second line inside a 26 pt row.)
+            rows += 1;
+            let left = natural_width(painter, &group[i], menu_ctx, keys, tokens, icon_column);
+            if is_pair(group, i) {
+                let right =
+                    natural_width(painter, &group[i + 1], menu_ctx, keys, tokens, icon_column);
+                width = width.max(2.0 * left.max(right));
+                i += 2;
+            } else {
+                width = width.max(left);
+                i += 1;
+            }
         }
     }
     Geometry {
@@ -1010,6 +1087,217 @@ fn hover_corners(index: usize, total: usize, radius: u8, inset: u8) -> CornerRad
     CornerRadius { nw, ne, sw, se }
 }
 
+/// Which of a row's corners belong to the **left** half of a pair (design §2).
+///
+/// The row's rounding belongs to the two rects that now span its width: the pair is one line, so the
+/// line's own corners are real, but they sit on the *outer* edges — the left rect owns the west pair
+/// and the right rect the east pair. Painting the full set on both halves would round the seam in the
+/// middle of the line, which is where the two hover fills meet.
+#[must_use]
+fn half_corners(full: CornerRadius, left: bool) -> CornerRadius {
+    if left {
+        CornerRadius {
+            ne: 0,
+            se: 0,
+            ..full
+        }
+    } else {
+        CornerRadius {
+            nw: 0,
+            sw: 0,
+            ..full
+        }
+    }
+}
+
+/// Draw every row of the open popup, one **line** at a time: an ordinary row owns its line, and a
+/// `paired` spec shares one with the spec that follows it (design §2's `Execute` pair).
+///
+/// Split out of [`show`] because this loop *is* the popup's vertical layout, and the pair's "one line,
+/// not two" rule has to reach both the corner arithmetic — which line is the first, which is the last
+/// ([`hover_corners`]) — and the drawing. Kept in one function, the two cannot disagree.
+#[allow(clippy::too_many_arguments)]
+fn draw_lines(
+    ui: &mut Ui,
+    groups: &[Vec<MenuSpec>],
+    menu_ctx: &MenuContext,
+    keys: &KeyMap,
+    tokens: &Tokens,
+    geometry: Geometry,
+    out: &mut Vec<MenuAction>,
+) {
+    // A row's top or bottom edge is `FRAME_BORDER + menu_frame_pad_y` inside the frame's own edge,
+    // which is as deep as the corner arc reaches: today's tokens leave a hovered end row exactly
+    // `radius - inset = 0` to round.
+    let inset = FRAME_BORDER + tokens.menu_frame_pad_y;
+    let total = line_count(groups);
+    let mut drawn = 0_usize;
+    let mut first = true;
+    for group in groups.iter().filter(|group| !group.is_empty()) {
+        // The rule goes *between* two groups: an empty leading group must not buy the popup a rule
+        // across its own top edge.
+        if !first {
+            separator(ui, tokens, geometry.width);
+        }
+        first = false;
+        let mut ix = 0_usize;
+        while ix < group.len() {
+            let corners = hover_corners(drawn, total, tokens.menu_corner_radius, inset);
+            if is_pair(group, ix) {
+                row_pair(
+                    ui,
+                    &group[ix],
+                    &group[ix + 1],
+                    menu_ctx,
+                    keys,
+                    tokens,
+                    geometry,
+                    corners,
+                    out,
+                );
+                ix += 2;
+            } else {
+                row(
+                    ui, &group[ix], menu_ctx, keys, tokens, geometry, corners, out,
+                );
+                ix += 1;
+            }
+            // One *line*, which is what `total` counted: both halves of a pair map to the same index.
+            drawn += 1;
+        }
+    }
+}
+
+/// The pixels of one row, inside the rect its caller allocated — the body [`row`] and each half of
+/// [`row_pair`] share, so a paired row cannot drift from a whole one in colour, in the icon column or
+/// in how much of its label it is allowed to print.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn paint_row(
+    ui: &mut Ui,
+    rect: Rect,
+    spec: &MenuSpec,
+    enabled: bool,
+    hovered: bool,
+    keys: &KeyMap,
+    tokens: &Tokens,
+    geometry: Geometry,
+    corners: CornerRadius,
+) {
+    let hint = spec.hint(keys);
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    let hovered = enabled && hovered;
+    if hovered {
+        ui.painter().rect_filled(rect, corners, tokens.bg_hover);
+    }
+    let colour = if !enabled {
+        tokens.disabled_text
+    } else if spec.danger {
+        tokens.danger
+    } else if hovered {
+        tokens.text_active
+    } else {
+        tokens.text_main
+    };
+    let mut x = rect.min.x + tokens.menu_item_pad_x;
+    if let Some(icon) = spec.icon {
+        let side = tokens.row_icon_size;
+        icons::paint(
+            ui,
+            // Centred *on* the row's mid-line: `Rect::from_min_size` at that y hangs the whole
+            // glyph below it, which is what made the icon look like it had sunk out of the text.
+            Rect::from_center_size(
+                Pos2::new(x + side / 2.0, rect.center().y),
+                Vec2::splat(side),
+            ),
+            icon,
+            side,
+            colour,
+        );
+    }
+    // The column is the menu's, not the row's: a glyphless item's label lines up with its
+    // neighbours' instead of starting half an icon early.
+    x += geometry.icon_column;
+    let budget = rect.max.x - x - tokens.menu_item_pad_x;
+    let hint_width = hint.as_ref().map_or(0.0, |hint| {
+        ui.painter()
+            .layout_job(singleline(
+                hint,
+                tokens.menu_hint_font_size,
+                tokens.text_muted,
+                f32::INFINITY,
+            ))
+            .size()
+            .x
+    });
+    // A row with no hint of its own must not be charged the gap: `hint_width` is 0.0 for a custom
+    // action and for a tab-group verb alike, and the old test (`0 + gap <= budget`) was therefore
+    // always true — it squeezed 24 pt out of a label that had nothing to sit against, which is what
+    // wrapped `Select Tabs in Group` onto the row below it.
+    let show_hint = hint.is_some() && enabled && hint_width + tokens.menu_hint_gap <= budget;
+    let label_width = budget
+        - if show_hint {
+            hint_width + tokens.menu_hint_gap
+        } else {
+            0.0
+        };
+    let galley = ui.painter().layout_job(singleline(
+        &spec.label,
+        tokens.font_size,
+        colour,
+        label_width.max(0.0),
+    ));
+    ui.painter().galley(
+        Pos2::new(x, rect.center().y - galley.size().y / 2.0),
+        galley,
+        colour,
+    );
+    if let Some(hint) = hint.as_deref().filter(|_| show_hint) {
+        let galley = ui.painter().layout_job(singleline(
+            hint,
+            tokens.menu_hint_font_size,
+            tokens.text_muted,
+            f32::INFINITY,
+        ));
+        ui.painter().galley(
+            Pos2::new(
+                rect.max.x - tokens.menu_item_pad_x - galley.size().x,
+                rect.center().y - galley.size().y / 2.0,
+            ),
+            galley,
+            tokens.text_muted,
+        );
+    }
+}
+
+/// The accessibility node and the click, reported for a whole row and for a pair's half in the same
+/// words: `Role::Button`, labelled with the menu text, the chord in the `hint_text` slot so a screen
+/// reader reads the shortcut too — and a greyed row that fires nothing.
+///
+/// This is the seam kittest's `get_by_label("Execute")` walks, so both halves of a pair are *their own*
+/// node with their own rect, not one node for the line.
+fn report(
+    response: &Response,
+    spec: &MenuSpec,
+    enabled: bool,
+    keys: &KeyMap,
+    out: &mut Vec<MenuAction>,
+) {
+    let hint = spec.hint(keys);
+    let label = spec.label.clone();
+    response.widget_info(|| {
+        let mut info = WidgetInfo::new(egui::Role::Button);
+        info.label = Some(label.clone());
+        info.enabled = enabled;
+        info.hint_text = hint.clone();
+        info
+    });
+    if enabled && response.clicked() {
+        out.push(spec.action.clone());
+    }
+}
+
 /// One item: the interact rect first (so the row owns its own click), the pixels after.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn row(
@@ -1026,104 +1314,70 @@ fn row(
     // The measured popup width, never `available_width` — see [`Geometry`].
     let size = Vec2::new(geometry.width, tokens.menu_item_height);
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
-    let hint = spec.hint(keys);
-    if ui.is_rect_visible(rect) {
-        let hovered = enabled && response.hovered();
-        if hovered {
-            ui.painter().rect_filled(rect, corners, tokens.bg_hover);
-        }
-        let colour = if !enabled {
-            tokens.disabled_text
-        } else if spec.danger {
-            tokens.danger
-        } else if hovered {
-            tokens.text_active
+    paint_row(
+        ui,
+        rect,
+        spec,
+        enabled,
+        response.hovered(),
+        keys,
+        tokens,
+        geometry,
+        corners,
+    );
+    report(&response, spec, enabled, keys, out);
+}
+
+/// The pair: `left` and `right` in one line of `menu_item_height`, each owning half the popup's width
+/// (design §2 — the two run rows must not cost two lines).
+///
+/// [`Ui::allocate_exact_size`] advances on the **y** axis, so calling `row` twice would be two rows: the
+/// line is allocated once, at the measured popup width, and the two rects are then *placed* inside it
+/// with [`Ui::interact`], which registers each as its own widget — hover, click and the a11y node
+/// ([`report`]) included, which is what `tests/menus.rs` clicks. This is the documented fallback to
+/// [`Ui::put`], whose signature in this egui takes an [`egui::Widget`] rather than an [`egui::Sense`].
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn row_pair(
+    ui: &mut Ui,
+    left: &MenuSpec,
+    right: &MenuSpec,
+    menu_ctx: &MenuContext,
+    keys: &KeyMap,
+    tokens: &Tokens,
+    geometry: Geometry,
+    corners: CornerRadius,
+    out: &mut Vec<MenuAction>,
+) {
+    let height = tokens.menu_item_height;
+    // One line of the vertical layout, and the id both halves are salted from — the same pair of
+    // steps `allocate_exact_size` performs, split so the two rects can sit side by side.
+    let (id, line) = ui.allocate_space(Vec2::new(geometry.width, height));
+    let half = geometry.width / 2.0;
+    for (ix, spec) in [(0_usize, left), (1, right)] {
+        let enabled = spec.enabled(menu_ctx);
+        // The two halves tile the line *exactly*: the right one ends on the line's own edge rather
+        // than on `min.x + 2 * (width / 2)`, which a float can land a hair short of, and a half a
+        // point of bare frame between the two hover fills is exactly the kind of seam a user sees.
+        let min = Pos2::new(line.min.x + ix as f32 * half, line.min.y);
+        let max = if ix == 0 {
+            Pos2::new(min.x + half, line.max.y)
         } else {
-            tokens.text_main
+            line.max
         };
-        let mut x = rect.min.x + tokens.menu_item_pad_x;
-        if let Some(icon) = spec.icon {
-            let side = tokens.row_icon_size;
-            icons::paint(
-                ui,
-                // Centred *on* the row's mid-line: `Rect::from_min_size` at that y hangs the whole
-                // glyph below it, which is what made the icon look like it had sunk out of the text.
-                Rect::from_center_size(
-                    Pos2::new(x + side / 2.0, rect.center().y),
-                    Vec2::splat(side),
-                ),
-                icon,
-                side,
-                colour,
-            );
-        }
-        // The column is the menu's, not the row's: a glyphless item's label lines up with its
-        // neighbours' instead of starting half an icon early.
-        x += geometry.icon_column;
-        let budget = rect.max.x - x - tokens.menu_item_pad_x;
-        let hint_width = hint.as_ref().map_or(0.0, |hint| {
-            ui.painter()
-                .layout_job(singleline(
-                    hint,
-                    tokens.menu_hint_font_size,
-                    tokens.text_muted,
-                    f32::INFINITY,
-                ))
-                .size()
-                .x
-        });
-        // A row with no hint of its own must not be charged the gap: `hint_width` is 0.0 for a custom
-        // action and for a tab-group verb alike, and the old test (`0 + gap <= budget`) was therefore
-        // always true — it squeezed 24 pt out of a label that had nothing to sit against, which is what
-        // wrapped `Select Tabs in Group` onto the row below it.
-        let show_hint = hint.is_some() && enabled && hint_width + tokens.menu_hint_gap <= budget;
-        let label_width = budget
-            - if show_hint {
-                hint_width + tokens.menu_hint_gap
-            } else {
-                0.0
-            };
-        let galley = ui.painter().layout_job(singleline(
-            &spec.label,
-            tokens.font_size,
-            colour,
-            label_width.max(0.0),
-        ));
-        ui.painter().galley(
-            Pos2::new(x, rect.center().y - galley.size().y / 2.0),
-            galley,
-            colour,
+        let rect = Rect::from_min_max(min, max);
+        let response = ui.interact(rect, id.with(ix), egui::Sense::click());
+        paint_row(
+            ui,
+            rect,
+            spec,
+            enabled,
+            response.hovered(),
+            keys,
+            tokens,
+            geometry,
+            half_corners(corners, ix == 0),
         );
-        if let Some(hint) = hint.as_deref().filter(|_| show_hint) {
-            let galley = ui.painter().layout_job(singleline(
-                hint,
-                tokens.menu_hint_font_size,
-                tokens.text_muted,
-                f32::INFINITY,
-            ));
-            ui.painter().galley(
-                Pos2::new(
-                    rect.max.x - tokens.menu_item_pad_x - galley.size().x,
-                    rect.center().y - galley.size().y / 2.0,
-                ),
-                galley,
-                tokens.text_muted,
-            );
-        }
-    }
-    // One node per row for the accessibility tree and for kittest (`Role::Button`, labelled with the
-    // menu text) — the same seam `panels::file_pane` uses for its rows, with the chord in the
-    // `hint_text` slot so a screen reader reads the shortcut too.
-    let label = spec.label.clone();
-    response.widget_info(|| {
-        let mut info = WidgetInfo::new(egui::Role::Button);
-        info.label = Some(label.clone());
-        info.enabled = enabled;
-        info.hint_text = hint.clone();
-        info
-    });
-    if enabled && response.clicked() {
-        out.push(spec.action.clone());
+        report(&response, spec, enabled, keys, out);
     }
 }
 
@@ -1158,9 +1412,10 @@ mod tests {
     use crate::keymap::KeyMap;
     use zenman_core::path::AbsPath;
 
-    /// The seven plan booleans in every combination, `bit 0` = `has_selection` … `bit 6` = `in_batch`.
-    fn all_bits() -> impl Iterator<Item = [bool; 7]> {
-        (0..128u16).map(|n| {
+    /// The eight listing booleans in every combination, `bit 0` = `has_selection` … `bit 7` =
+    /// `can_sandbox`.
+    fn all_bits() -> impl Iterator<Item = [bool; 8]> {
+        (0..256u16).map(|n| {
             [
                 n & 1 != 0,
                 n & 2 != 0,
@@ -1169,6 +1424,7 @@ mod tests {
                 n & 16 != 0,
                 n & 32 != 0,
                 n & 64 != 0,
+                n & 128 != 0,
             ]
         })
     }
@@ -1177,18 +1433,31 @@ mod tests {
         at_bits(into_bits(bits), target)
     }
 
-    fn at_bits(bits: [bool; 7], target: MenuTarget) -> MenuContext {
+    fn at_bits(bits: [bool; 8], target: MenuTarget) -> MenuContext {
         let mut ctx = MenuContext::default();
         ctx.with_bits(bits);
         ctx.target = target;
         ctx
     }
 
-    /// Every target shape the file menu answers, so one walk covers `3 × 128` contexts.
-    const TARGETS: [MenuTarget; 3] = [
+    /// Every target shape the file menu answers, so one walk covers `4 × 256` contexts. The two
+    /// `on_run` rows are design §2's: a runnable file is the only shape the `Execute` pair appears on,
+    /// and a directory never is ([`crate::app::ZenApp::open_requested_menu`] will not even ask
+    /// `classify` for one).
+    const TARGETS: [MenuTarget; 4] = [
         MenuTarget::Background,
-        MenuTarget::Row { on_dir: true },
-        MenuTarget::Row { on_dir: false },
+        MenuTarget::Row {
+            on_dir: true,
+            on_run: false,
+        },
+        MenuTarget::Row {
+            on_dir: false,
+            on_run: false,
+        },
+        MenuTarget::Row {
+            on_dir: false,
+            on_run: true,
+        },
     ];
 
     /// An **independent** answer for one command in one context: `None` = the row is not in this
@@ -1197,10 +1466,19 @@ mod tests {
     /// `trigger*`), never by calling a builder.
     fn expect(command: Command, ctx: &MenuContext) -> Option<bool> {
         let background = ctx.target == MenuTarget::Background;
-        let on_dir = ctx.target == MenuTarget::Row { on_dir: true };
+        let on_dir = matches!(ctx.target, MenuTarget::Row { on_dir: true, .. });
+        // Design §2: a fact about the clicked row, spelled here the same independent way `on_dir` is
+        // — read off the *target*, never off a builder.
+        let on_run = matches!(ctx.target, MenuTarget::Row { on_run: true, .. });
         let writable = !ctx.on_archive;
         match command {
             Command::Open => (!background).then_some(ctx.has_selection),
+            // Design §2's pair, re-derived from the prose rather than from `file_menu`: `Execute` is
+            // over a runnable row and nothing else, and both rows obey Go's `selectedPaths.size > 0`
+            // guard because both act on the whole selection. The sandbox twin additionally needs the
+            // measured sandbox probe (§5.4) — and is *absent*, never greyed, without it.
+            Command::Execute => on_run.then_some(ctx.has_selection),
+            Command::ExecuteSandbox => (on_run && ctx.can_sandbox).then_some(ctx.has_selection),
             Command::OpenInNewTab => (!background && on_dir).then_some(ctx.has_selection),
             Command::CopyInside | Command::CutInside => {
                 (!background && on_dir).then_some(ctx.has_selection && ctx.all_dirs && writable)
@@ -1337,7 +1615,7 @@ mod tests {
                 );
                 assert_eq!(
                     enabled(Command::PasteInside),
-                    ctx.target == MenuTarget::Row { on_dir: true }
+                    matches!(ctx.target, MenuTarget::Row { on_dir: true, .. })
                         && ctx.has_clipboard
                         && !ctx.on_archive
                 );
@@ -1372,17 +1650,18 @@ mod tests {
                 // Contents-level clipboard work is a directory thing.
                 assert_eq!(
                     enabled(Command::CopyInside),
-                    ctx.target == MenuTarget::Row { on_dir: true }
+                    matches!(ctx.target, MenuTarget::Row { on_dir: true, .. })
                         && ctx.has_selection
                         && ctx.all_dirs
                         && !ctx.on_archive
                 );
-                // Nothing is *hidden* because it is disabled: a greyed row keeps its place.
+                // A greyed row is still drawn: nothing vanishes because it is disabled.
                 for command in [Command::Delete, Command::Paste, Command::NewFolder] {
                     if expect(command, &ctx).is_some() {
                         assert!(present(command), "{command:?} vanished from {ctx:?}");
                     }
                 }
+                run_pair(&groups, &ctx);
                 // No command outside the file menu's vocabulary crept in.
                 for spec in groups.iter().flatten() {
                     let command = spec.command().expect("built with no custom actions");
@@ -1395,18 +1674,57 @@ mod tests {
         }
     }
 
+    /// Design §2's run pair, as its own invariant so the walk above keeps its complexity budget:
+    /// `Execute` belongs to a **runnable** row and to nothing else, `Execute (sandbox)` additionally to
+    /// a platform whose measured probe says the `unshare` recipe works — and it is *absent* without one,
+    /// never greyed, because a refused recipe has no greyed way to succeed (§5.4). Both are enabled by
+    /// the selection, like every other row that acts on the selection.
+    fn run_pair(groups: &[Vec<MenuSpec>], ctx: &MenuContext) {
+        let present = |command: Command| {
+            groups
+                .iter()
+                .flatten()
+                .any(|spec| spec.command() == Some(command))
+        };
+        let enabled = |command: Command| {
+            groups
+                .iter()
+                .flatten()
+                .any(|spec| spec.command() == Some(command) && spec.enabled(ctx))
+        };
+        let on_run = matches!(ctx.target, MenuTarget::Row { on_run: true, .. });
+        assert_eq!(
+            present(Command::Execute),
+            on_run,
+            "the run row is not the row under the cursor: {ctx:?}"
+        );
+        assert_eq!(
+            present(Command::ExecuteSandbox),
+            on_run && ctx.can_sandbox,
+            "the sandbox row is greyed instead of absent, or the reverse: {ctx:?}"
+        );
+        assert_eq!(
+            enabled(Command::Execute),
+            on_run && ctx.has_selection,
+            "`Execute` does not obey Go's `selectedPaths.size > 0` guard: {ctx:?}"
+        );
+        assert_eq!(
+            enabled(Command::ExecuteSandbox),
+            on_run && ctx.can_sandbox && ctx.has_selection,
+            "`Execute (sandbox)` does not obey the same guard: {ctx:?}"
+        );
+    }
+
     /// One literal row per **distinct menu shape** — the human-readable half of the cross-product.
-    /// The combination is named by its bits (`0x1` = `has_selection` … `0x40` = `in_batch`).
+    /// The combination is named by its bits (`0x1` = `has_selection` … `0x40` = `in_batch`,
+    /// `0x80` = `can_sandbox`).
     #[test]
     fn the_menu_shapes_are_this_table() {
-        let row = |bits: u16, on_dir: bool| {
+        let row = |bits: u16, on_dir: bool, on_run: bool| {
+            let target = MenuTarget::Row { on_dir, on_run };
             shape(
-                &file_menu(
-                    &at(bits, MenuTarget::Row { on_dir }),
-                    &ActionContext::background(None),
-                    &[],
-                ),
-                &at(bits, MenuTarget::Row { on_dir }),
+                &file_menu(&at(bits, target), &ActionContext::background(None), &[]),
+                &at(bits, target),
             )
         };
         let background = |bits: u16| {
@@ -1420,13 +1738,26 @@ mod tests {
             // nothing selected, empty clipboard, plain filesystem
             (
                 "0x00 row(dir)",
-                row(0x00, true),
+                row(0x00, true, false),
                 "Open in new tab-, Copy inside-, Cut inside-, Paste inside- | Open- | Cut-, Copy-, Copy path-, Copy name- | Rename-, Change permissions- | Properties-, Extract here- | Move to trash-, Delete permanently-",
             ),
             (
                 "0x00 row(file)",
-                row(0x00, false),
+                row(0x00, false, false),
                 "Open- | Cut-, Copy-, Copy path-, Copy name- | Rename-, Change permissions- | Properties-, Extract here- | Move to trash-, Delete permanently-",
+            ),
+            // a script with nothing selected, on a platform that cannot sandbox: one greyed run row and
+            // no sandbox twin to grey
+            (
+                "0x00 row(script)",
+                row(0x00, false, true),
+                "Open- | Execute- | Cut-, Copy-, Copy path-, Copy name- | Rename-, Change permissions- | Properties-, Extract here- | Move to trash-, Delete permanently-",
+            ),
+            // …and the same row with `unshare` on PATH: both halves, both greyed
+            (
+                "0x80 row(script)",
+                row(0x80, false, true),
+                "Open- | Execute-, Execute (sandbox)- | Cut-, Copy-, Copy path-, Copy name- | Rename-, Change permissions- | Properties-, Extract here- | Move to trash-, Delete permanently-",
             ),
             (
                 "0x00 background",
@@ -1442,19 +1773,32 @@ mod tests {
             // one file selected: the whole write ladder is live
             (
                 "0x01 row(file)",
-                row(0x01, false),
+                row(0x01, false, false),
                 "Open+ | Cut+, Copy+, Copy path+, Copy name+ | Rename+, Change permissions+ | Properties+, Extract here- | Move to trash+, Delete permanently+",
+            ),
+            // the same file when it is a script and the platform can sandbox: design §2's pair, one
+            // group between `Open` and the clipboard ladder
+            (
+                "0x01+0x80 row(script)",
+                row(0x01 | 0x80, false, true),
+                "Open+ | Execute+, Execute (sandbox)+ | Cut+, Copy+, Copy path+, Copy name+ | Rename+, Change permissions+ | Properties+, Extract here- | Move to trash+, Delete permanently+",
+            ),
+            // …and the same row where `unshare` is not on PATH: the sandbox row is *absent*, not greyed
+            (
+                "0x01 row(script), no unshare",
+                row(0x01, false, true),
+                "Open+ | Execute+ | Cut+, Copy+, Copy path+, Copy name+ | Rename+, Change permissions+ | Properties+, Extract here- | Move to trash+, Delete permanently+",
             ),
             // the same row when it is a directory: Go's top block appears above Open
             (
                 "0x01+0x02 row(dir)",
-                row(0x01 | 0x02, true),
+                row(0x01 | 0x02, true, false),
                 "Open in new tab+, Copy inside+, Cut inside+, Paste inside- | Open+ | Cut+, Copy+, Copy path+, Copy name+ | Rename+, Change permissions+ | Properties+, Extract here- | Move to trash+, Delete permanently+",
             ),
             // a read-only store: every write is greyed, every read is not (Go offered Delete here)
             (
                 "0x01+0x10 row(file)",
-                row(0x01 | 0x10, false),
+                row(0x01 | 0x10, false, false),
                 "Open+ | Cut-, Copy+, Copy path+, Copy name+ | Rename-, Change permissions- | Properties+, Extract here+ | Move to trash-, Delete permanently-",
             ),
             (
@@ -1465,7 +1809,7 @@ mod tests {
             // the batch state: the rename row says what it is and cannot yet run
             (
                 "0x01+0x40 row(file)",
-                row(0x01 | 0x40, false),
+                row(0x01 | 0x40, false, false),
                 "Open+ | Cut+, Copy+, Copy path+, Copy name+ | Rename batch+, Change permissions+ | Properties+, Extract here- | Move to trash+, Delete permanently+",
             ),
             // everything true at once
@@ -1473,7 +1817,7 @@ mod tests {
             // the rename row — which is why this shape is the interesting one.
             (
                 "0x7f row(dir)",
-                row(0x7f, true),
+                row(0x7f, true, false),
                 "Open in new tab+, Copy inside-, Cut inside-, Paste inside- | Open+ | Cut-, Copy+, Copy path+, Copy name+ | Rename batch-, Change permissions- | Properties+, Extract here+ | Move to trash-, Delete permanently-",
             ),
             (
@@ -1484,8 +1828,15 @@ mod tests {
             // everything except the read-only store: the fully live menu
             (
                 "0x6f row(dir)",
-                row(0x6f, true),
+                row(0x6f, true, false),
                 "Open in new tab+, Copy inside+, Cut inside+, Paste inside+ | Open+ | Cut+, Copy+, Copy path+, Copy name+ | Rename batch+, Change permissions+ | Properties+, Extract here- | Move to trash+, Delete permanently+",
+            ),
+            // the fully live *script* row: every flag on, and the pair is the only two-in-a-line the
+            // menu has
+            (
+                "0xef row(script)",
+                row(0x6f | 0x80, false, true),
+                "Open+ | Execute+, Execute (sandbox)+ | Cut+, Copy+, Copy path+, Copy name+ | Rename batch+, Change permissions+ | Properties+, Extract here- | Move to trash+, Delete permanently+",
             ),
             (
                 "0x6f background",
@@ -1498,7 +1849,7 @@ mod tests {
         }
     }
 
-    fn into_bits(n: u16) -> [bool; 7] {
+    fn into_bits(n: u16) -> [bool; 8] {
         [
             n & 1 != 0,
             n & 2 != 0,
@@ -1507,31 +1858,43 @@ mod tests {
             n & 16 != 0,
             n & 32 != 0,
             n & 64 != 0,
+            n & 128 != 0,
         ]
     }
 
     #[test]
     fn the_danger_group_is_last_and_holds_the_delete_pair() {
         for bits in all_bits() {
-            let ctx = at_bits(bits, MenuTarget::Row { on_dir: false });
-            let groups = file_menu(&ctx, &ActionContext::background(None), &[]);
-            let last = groups.last().expect("the row menu always has a group");
-            let commands: Vec<Command> = last.iter().filter_map(|spec| spec.command()).collect();
-            assert_eq!(
-                commands,
-                vec![Command::Delete, Command::PermanentDelete],
-                "{ctx:?}"
-            );
-            assert!(
-                last.iter().all(|spec| spec.danger),
-                "the delete group is the danger group: {ctx:?}"
-            );
-            // …and it is the only one: Go coloured nothing else red (`context-menu.js:99`).
-            for group in &groups[..groups.len() - 1] {
-                assert!(
-                    group.iter().all(|spec| !spec.danger),
-                    "a non-final group is red in {ctx:?}"
+            // …and for the **runnable** row too: design §2's `Execute` group goes between `Open` and
+            // the clipboard ladder, never after Delete, so the pair must not become the last group.
+            for on_run in [false, true] {
+                let ctx = at_bits(
+                    bits,
+                    MenuTarget::Row {
+                        on_dir: false,
+                        on_run,
+                    },
                 );
+                let groups = file_menu(&ctx, &ActionContext::background(None), &[]);
+                let last = groups.last().expect("the row menu always has a group");
+                let commands: Vec<Command> =
+                    last.iter().filter_map(|spec| spec.command()).collect();
+                assert_eq!(
+                    commands,
+                    vec![Command::Delete, Command::PermanentDelete],
+                    "the run pair pushed the delete pair out of the last group: {ctx:?}"
+                );
+                assert!(
+                    last.iter().all(|spec| spec.danger),
+                    "the delete group is the danger group: {ctx:?}"
+                );
+                // …and it is the only one: Go coloured nothing else red (`context-menu.js:99`).
+                for group in &groups[..groups.len() - 1] {
+                    assert!(
+                        group.iter().all(|spec| !spec.danger),
+                        "a non-final group is red in {ctx:?}"
+                    );
+                }
             }
         }
     }
@@ -1552,7 +1915,13 @@ mod tests {
             action("everywhere", "files|dirs|background"),
             action("bg-only", "background"),
         ];
-        let ctx = at(0x01, MenuTarget::Row { on_dir: false });
+        let ctx = at(
+            0x01,
+            MenuTarget::Row {
+                on_dir: false,
+                on_run: false,
+            },
+        );
         let groups = file_menu(&ctx, &file_row(), &actions);
         let names: Vec<&str> = groups
             .iter()
@@ -1575,7 +1944,10 @@ mod tests {
             "{order:?}"
         );
 
-        let dir_ctx = at_(MenuTarget::Row { on_dir: true });
+        let dir_ctx = at_(MenuTarget::Row {
+            on_dir: true,
+            on_run: false,
+        });
         let dir_names: Vec<String> = file_menu(&dir_ctx, &dir_row(), &actions)
             .iter()
             .flatten()
@@ -1607,7 +1979,13 @@ mod tests {
     #[test]
     fn every_hint_is_the_keymaps_own_chord_and_menu_only_rows_print_none() {
         let keys = KeyMap::default();
-        let ctx = at(0x7f, MenuTarget::Row { on_dir: true });
+        let ctx = at(
+            0x7f,
+            MenuTarget::Row {
+                on_dir: true,
+                on_run: false,
+            },
+        );
         for spec in file_menu(&ctx, &ActionContext::background(None), &[])
             .iter()
             .flatten()
@@ -1751,7 +2129,13 @@ mod tests {
             "a folder target must answer with `showFolderContextMenu`'s rows"
         );
         for listing in [
-            at(0x01, MenuTarget::Row { on_dir: false }),
+            at(
+                0x01,
+                MenuTarget::Row {
+                    on_dir: false,
+                    on_run: false,
+                },
+            ),
             at(0x00, MenuTarget::Background),
         ] {
             let got = labels(&menu_for(&listing, &sel, &[]));
@@ -1794,7 +2178,7 @@ mod tests {
     /// and fails if anyone later "fixes" parity by adding one.
     #[test]
     fn background_menu_is_go_three_rows_and_carries_no_selection_block() {
-        let ctx = at_bits([false; 7], MenuTarget::Background);
+        let ctx = at_bits([false; 8], MenuTarget::Background);
         let menu = background_menu(&ctx, &ActionContext::background(None), &[]);
         let rows: Vec<String> = menu
             .iter()
@@ -1849,12 +2233,38 @@ mod tests {
             0,
             "a frame rounder than the inset it sits in has nothing left to round"
         );
+        // A pair's line keeps the same rounding, split: the left rect owns the west corners and the
+        // right rect the east ones, so the seam in the middle of the line stays square (`half_corners`).
+        let (left, right) = (half_corners(alone, true), half_corners(alone, false));
+        assert_eq!(
+            (left.nw, left.ne, left.sw, left.se),
+            (shallow, 0, shallow, 0)
+        );
+        assert_eq!(
+            (right.nw, right.ne, right.sw, right.se),
+            (0, shallow, 0, shallow)
+        );
+        // A middle line has nothing to give either way.
+        let middle = hover_corners(1, 3, radius, 4);
+        assert_eq!(
+            (
+                half_corners(middle, true).nw,
+                half_corners(middle, false).se
+            ),
+            (0, 0)
+        );
     }
 
     #[test]
     fn background_menu_is_the_file_menus_background_half() {
         for bits in all_bits() {
-            let ctx = at_bits(bits, MenuTarget::Row { on_dir: true });
+            let ctx = at_bits(
+                bits,
+                MenuTarget::Row {
+                    on_dir: true,
+                    on_run: false,
+                },
+            );
             assert_eq!(
                 background_menu(&ctx, &ActionContext::background(None), &[]),
                 file_menu(

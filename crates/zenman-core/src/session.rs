@@ -44,6 +44,7 @@ use crate::limits::Limits;
 use crate::ops::chmod::{self, ChmodReport, ChmodReq};
 use crate::ops::clipboard::{self, Clipboard, ClipboardStore};
 use crate::ops::delete::{self, DeleteReport, DeleteReq};
+use crate::ops::launch::{self, LaunchReport, RunKind};
 use crate::ops::mkdir::{self, MkdirReq};
 use crate::ops::r#move::{MoveFs, OsMoveFs};
 use crate::ops::open::{self, OpenReport};
@@ -1546,6 +1547,42 @@ impl Session {
     /// As [`Self::open_paths`] for the parent directory.
     pub fn reveal(&self, path: &AbsPath) -> Result<(), CoreError> {
         open::reveal(self.inner.env.as_ref(), path)
+    }
+
+    /// What one path could do with the *run* verb (design §3 `ops/launch.rs`): the answer the
+    /// `Execute` menu row gates on. One `stat` plus one ≤8-byte read, never a spawn, never an error —
+    /// an unreadable path is simply [`RunKind::NotRunnable`].
+    #[must_use]
+    pub fn run_kind(&self, path: &AbsPath) -> RunKind {
+        launch::classify(path)
+    }
+
+    /// `true` when a sandboxed launch could actually work here — unix plus the platform's **measured**
+    /// answer to "do these `unshare` flags give us a namespace" (design §5.4). The measurement is one
+    /// spawn of the real recipe, made once per session and cached inside the platform implementation
+    /// (`crate::platform::linux::Linux::sandbox_supported`), so calling this on every frame is a lock read.
+    /// It gates the *presence* of the `Execute (sandbox)` row, and `launch` refuses on the same answer —
+    /// a kernel that denies a userns cannot be caught afterwards, because `setsid --fork` hides the
+    /// refusal from the launch report (design §5.3).
+    #[must_use]
+    pub fn can_sandbox(&self) -> bool {
+        launch::can_sandbox(self.inner.env.as_ref())
+    }
+
+    /// Run each path, plainly or in the `unshare` sandbox (design §4/§5, the `Execute` rows).
+    ///
+    /// No log record and no invalidation for the launch itself — a process starting is not a
+    /// filesystem change the pane must re-read (the sandbox mask writes land in a tmpfs that vanishes
+    /// with the child). A launcher that exits non-zero is a per-path [`CoreError::Shell`] in
+    /// [`LaunchReport::failed`] whose stderr the toast shows via [`CoreError::detail`], never a panic
+    /// and never a silent success.
+    ///
+    /// # Errors
+    /// [`CoreError::Empty`] for an empty selection and [`CoreError::Cancelled`]. Per-path failures are
+    /// in the report.
+    pub fn launch(&self, paths: &[AbsPath], sandbox: bool) -> Result<LaunchReport, CoreError> {
+        let cancel = CancelToken::new();
+        launch::launch(self.inner.env.as_ref(), paths, sandbox, &cancel)
     }
 
     // ------------------------------------------------------------------------------------ revert

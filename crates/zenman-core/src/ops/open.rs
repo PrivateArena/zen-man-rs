@@ -24,11 +24,24 @@
 //!
 //! The spawn is **detached** (plan §9.1's measured fact about `xclip`: a waiting spawn parks a job until the
 //! external application exits, and `xdg-open` does not exit until its application does).
+//!
+//! # An executable with no handler is the file the user meant to run
+//!
+//! The `Launch` arm's one deviation from Go: when the desktop opener **fails** and
+//! [`launch::classify`](crate::ops::launch::classify) says [`crate::ops::launch::RunKind::Binary`], the
+//! path is retried through [`crate::ops::launch::launch`] (design §7.1 — the measured `zen-dragon`
+//! case: `xdg-open` exits 4 because nothing is registered for an ELF file, and the file is sitting
+//! there with its exec bit set). Scripts keep the editor (the ask was a *new row* for them, not a
+//! surprise exec) and their error; directories are never classified at all (the [`route`] arm runs
+//! first, keeping §3's one-`stat` budget honest). When the fallback fails too, the report keeps the
+//! **opener's** error, not the exec's: the user asked for the desktop handler, and a second failure
+//! must not overwrite the message that explains the first.
 
 use std::sync::Arc;
 
 use crate::error::CoreError;
 use crate::jobs::CancelToken;
+use crate::ops::launch::{self, RunKind};
 use crate::path::AbsPath;
 use crate::platform::Env;
 
@@ -131,8 +144,21 @@ pub fn open_paths(
             OpenRoute::Navigate(dir) => report.navigated.push(dir),
             OpenRoute::Launch(file) => match crate::jobs::block_on(env.open_with(&file)) {
                 Ok(Ok(())) => report.launched.push(file),
-                Ok(Err(e)) => report.failed.push((file, Arc::new(e))),
-                Err(e) => report.failed.push((file, Arc::new(e))),
+                Ok(Err(e)) | Err(e) => {
+                    // design §7.1: a binary the desktop refuses is the file the user meant to *run*.
+                    // Directories never reach here (the `Navigate` arm above took them, so `classify`
+                    // keeps its single-stat budget), and scripts keep their error (module docs).
+                    if launch::classify(&file) == RunKind::Binary
+                        && launch::launch(env, std::slice::from_ref(&file), false, cancel)
+                            .is_ok_and(|r| r.launched.iter().any(|p| p == &file))
+                    {
+                        report.launched.push(file);
+                    } else {
+                        // The opener's error survives: the exec fallback failing secondarily must not
+                        // hide the message that explains the refusal the user actually asked about.
+                        report.failed.push((file, Arc::new(e)));
+                    }
+                }
             },
         }
     }

@@ -46,6 +46,12 @@ pub enum PathReject {
     /// [`platform::windows::name_reject`](crate::platform::windows::name_reject), which keeps the precise
     /// rule in its own `NameReject` type and maps here for the 400-class error channel.
     WindowsName,
+    /// The text contains a newline. Not an input-shape rule of `path.rs` in general — it is the
+    /// launch sandbox's transport rule (`ops::launch` passes the target, the inner argv and the mask
+    /// directories through newline-separated environment variables, docs/launch-sandbox-design.md
+    /// §5.2): a path with a `\n` would arrive as *two* entries, so it is refused before the spawn
+    /// rather than encoded. Legal filename byte otherwise (Linux and macOS both accept it).
+    Newline,
 }
 
 impl std::fmt::Display for PathReject {
@@ -58,6 +64,7 @@ impl std::fmt::Display for PathReject {
             Self::Wildcard => "path contains a wildcard",
             Self::NoHome => "home directory is unknown (HOME is unset)",
             Self::WindowsName => "illegal Windows file name",
+            Self::Newline => "path contains a newline",
         };
         f.write_str(s)
     }
@@ -300,6 +307,33 @@ impl CoreError {
     pub fn user_message(&self) -> String {
         match self {
             Self::Nested(inner) => inner.user_message(),
+            other => other.to_string(),
+        }
+    }
+
+    /// The text a toast shows; [`Display`](std::fmt::Display) alone names only the program.
+    ///
+    /// `Display` plus the free text a launcher's failure carries but its `#[error]` string drops:
+    /// [`CoreError::Shell`]'s captured `stderr` and exit `code` (design §7.2 — the user reads
+    /// `no method available for opening zen-dragon`, not a bare `xdg-open`). Every other variant's
+    /// `Display` already includes its own `reason`/`msg` free text, so for those this is that string;
+    /// [`CoreError::Nested`] unwraps to the inner error's detail, like [`CoreError::user_message`].
+    #[must_use]
+    pub fn detail(&self) -> String {
+        match self {
+            Self::Nested(inner) => inner.detail(),
+            Self::Shell { code, stderr, .. } => {
+                let mut text = self.to_string();
+                if let Some(code) = code {
+                    text.push_str(&format!(" (exit {code})"));
+                }
+                let stderr = stderr.trim();
+                if !stderr.is_empty() {
+                    text.push_str(": ");
+                    text.push_str(stderr);
+                }
+                text
+            }
             other => other.to_string(),
         }
     }
@@ -643,6 +677,42 @@ mod tests {
         };
         assert_eq!(e.status_code(), 500);
         assert_eq!(e.kind(), "shell_error");
+    }
+
+    #[test]
+    fn detail_adds_the_launcher_s_own_words_to_display() {
+        // design §7.2: `Display` names only the program; the toast shows what the program said.
+        let e = CoreError::Shell {
+            cmd: "xdg-open".into(),
+            code: Some(4),
+            stderr: "  no method available for opening zen-dragon  ".into(),
+        };
+        assert_eq!(e.to_string(), "command failed: xdg-open");
+        assert_eq!(
+            e.detail(),
+            "command failed: xdg-open (exit 4): no method available for opening zen-dragon"
+        );
+        // Absent code and blank stderr add nothing (a spawn that died before forking, say).
+        let e = CoreError::Shell {
+            cmd: "xdg-open".into(),
+            code: None,
+            stderr: "   ".into(),
+        };
+        assert_eq!(e.detail(), "command failed: xdg-open");
+        // Every other variant's Display already carries its free text, and Nested unwraps.
+        let e = CoreError::Sql {
+            msg: "no such table: x".into(),
+        };
+        assert_eq!(e.detail(), e.to_string());
+        let inner = Arc::new(CoreError::Shell {
+            cmd: "xdg-open".into(),
+            code: None,
+            stderr: "not found".into(),
+        });
+        assert_eq!(
+            CoreError::Nested(inner).detail(),
+            "command failed: xdg-open: not found"
+        );
     }
 
     #[test]

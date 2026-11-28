@@ -37,6 +37,7 @@ use zenman_core::limits::Limits;
 use zenman_core::ops::clipboard::{ClipOp, ClipScope, ClipboardStore};
 use zenman_core::ops::copy::{copy_file, copy_item};
 use zenman_core::ops::guard::{self, SourceReject};
+use zenman_core::ops::launch;
 use zenman_core::ops::r#move as move_ops;
 use zenman_core::ops::r#move::{MoveFs, OsMoveFs};
 use zenman_core::ops::paste::{
@@ -1048,12 +1049,14 @@ use zenman_core::platform::{
     PlatformCaps, PlatformFuture, Shortcut, ready,
 };
 
-/// An [`Env`] whose three answers a test decides: is there a trash bin, does it accept this path, and
-/// what did the launcher get asked to open.
+/// An [`Env`] whose answers a test decides: is there a trash bin, does it accept this path, what did
+/// the launcher get asked to open, and what would a spawn have been asked to run.
 ///
 /// The remaining methods are the minimum that keeps `Session::open` honest: `supports_symlink` yes (the
-/// link tests need it), `copy_paths`/`exec_program` refused (nothing here should reach them, and a call
-/// that does becomes a loud typed error rather than a spawn).
+/// link tests need it), `copy_paths` refused (nothing here should reach it, and a call that does
+/// becomes a loud typed error rather than a spawn). `exec_program` **records** every request and then
+/// refuses unless the test set [`OpEnv::exec_ok`] — the launch tests (design §3/§4) assert the argv
+/// that would have been spawned, and no test ever spawns anything.
 struct OpEnv {
     /// Where this fake bin puts what it "trashes" — a real directory in the test's own temp tree.
     bin: PathBuf,
@@ -1069,8 +1072,23 @@ struct OpEnv {
     /// `true` makes the platform report "no opener configured" (`CoreError::Shell`, as
     /// `platform::linux::open_with` does when `open::commands()` is empty).
     no_opener: bool,
+    /// `true` makes the recorded `exec_program` calls answer exit 0 instead of the refusal (the
+    /// launch tests; the recording happens either way).
+    exec_ok: bool,
+    /// Names [`Env::has_program`] answers `true` for (`setsid`, whose presence decides the wrapper of
+    /// design §4.3; the `unshare` question is the [`Env::supports_sandbox`] field below, since the real
+    /// PATH scan for it lives in `platform::linux`). Every other name keeps the trait's default `Unsupported` answer, so no flow
+    /// that used to see "lookup unknown" silently sees "absent".
+    probes: Vec<String>,
+    /// What [`Env::supports_sandbox`] answers — design §5.4's *measured* kernel question. `true` by
+    /// default, because the alternative is that `launch` refuses every sandboxed request this file
+    /// builds and the argv assertions below silently stop testing anything; `false` models the kernel
+    /// that denies a userns (the refusal lane).
+    sandbox: bool,
     opened: Mutex<Vec<String>>,
     trashed: Mutex<Vec<String>>,
+    /// Every [`ExecRequest`] handed to `exec_program`, in order — the launch tests' argv assertions.
+    execs: Mutex<Vec<ExecRequest>>,
 }
 
 impl OpEnv {
@@ -1082,8 +1100,12 @@ impl OpEnv {
             broken: false,
             chmod_refused: false,
             no_opener: false,
+            exec_ok: false,
+            probes: Vec::new(),
+            sandbox: true,
             opened: Mutex::new(Vec::new()),
             trashed: Mutex::new(Vec::new()),
+            execs: Mutex::new(Vec::new()),
         }
     }
 
@@ -1093,6 +1115,10 @@ impl OpEnv {
 
     fn trashed(&self) -> Vec<String> {
         self.trashed.lock().expect("not poisoned").clone()
+    }
+
+    fn execs(&self) -> Vec<ExecRequest> {
+        self.execs.lock().expect("not poisoned").clone()
     }
 }
 
@@ -1152,6 +1178,14 @@ impl Env for OpEnv {
 
     fn supports_symlink(&self) -> Result<bool, PubError> {
         Ok(true)
+    }
+
+    /// This fake's job is argv inspection; the kernel question is `platform::linux`'s. It answers the
+    /// probe as `true` (unless a test asks for the refusal lane via [`OpEnv::sandbox`]) so the sandboxed
+    /// launch below really reaches the sandbox path — `setsid --fork` means a refused sandbox could never
+    /// be observed through `exec_program` anyway (design §5.3).
+    fn supports_sandbox(&self) -> Result<bool, PubError> {
+        Ok(self.sandbox)
     }
 
     fn chmod(
@@ -1230,10 +1264,32 @@ impl Env for OpEnv {
     }
 
     fn exec_program(&self, req: ExecRequest) -> PlatformFuture<'_, Result<ExecOutput, PubError>> {
-        let _ = req;
+        // Record either way; only answer success when the test opted in. Nothing is ever spawned —
+        // the launch tests assert the argv this fake *would* have run.
+        self.execs.lock().expect("not poisoned").push(req.clone());
+        if self.exec_ok {
+            return ready(Ok(ExecOutput {
+                code: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+                truncated: false,
+            }));
+        }
         ready(Err(PubError::Unsupported {
             what: "spawns (the test env never starts a process)",
         }))
+    }
+
+    fn has_program(&self, name: &str) -> Result<bool, PubError> {
+        if self.probes.iter().any(|p| p == name) {
+            return Ok(true);
+        }
+        // Not on the allow-list: the trait's default "this platform has no lookup", *not* a `false`
+        // that would silently change the answer for flows (the clipboard, plan §5.3) that branch on
+        // unknown-vs-absent.
+        Err(PubError::Unsupported {
+            what: "program lookup (the test env does not probe PATH)",
+        })
     }
 }
 
@@ -2125,7 +2181,7 @@ fn open_launches_files_routes_directories_and_reports_a_missing_opener() {
         no_opener: true,
         ..OpEnv::new(&bin)
     });
-    let session2 = open_session_env(&root, no_opener as Arc<dyn Env>);
+    let session2 = open_session_env(&root, Arc::clone(&no_opener) as Arc<dyn Env>);
     let report = session2
         .open_paths(std::slice::from_ref(&file))
         .expect("a per-path failure is not the call's error");
@@ -2140,11 +2196,308 @@ fn open_launches_files_routes_directories_and_reports_a_missing_opener() {
         "and it says something usable"
     );
     assert!(report.launched.is_empty());
+    assert!(
+        no_opener.execs().is_empty(),
+        "a .txt is not a binary: design §7.1's exec fallback must not touch it"
+    );
+
+    // design §7.1: an executable binary the desktop refuses *is* the file the user meant to run.
+    // `xdg-open` exits 4 on a bare ELF (the measured `zen-dragon` case), and the retry through
+    // `ops::launch` turns the failure into a launch — with the exec fallback's own request visible.
+    let exe_path = root.join("tree/app.bin");
+    write(&exe_path, b"\x7fELF\x02\x01\x01\x00");
+    set_mode(&exe_path, 0o755);
+    let exe = abs(&exe_path);
+    let fallback = Arc::new(OpEnv {
+        no_opener: true,
+        exec_ok: true,
+        ..OpEnv::new(&bin)
+    });
+    let session3 = open_session_env(&root, Arc::clone(&fallback) as Arc<dyn Env>);
+    let report = session3
+        .open_paths(std::slice::from_ref(&exe))
+        .expect("the fallback launches");
+    assert_eq!(
+        report.launched,
+        vec![exe.clone()],
+        "failed open became a run"
+    );
+    assert!(report.failed.is_empty(), "{report:?}");
+    let execs = fallback.execs();
+    assert_eq!(execs.len(), 1, "one exec_program request, recorded not run");
+    assert_eq!(execs[0].program, exe.to_string_lossy());
+    assert_eq!(
+        execs[0].cwd,
+        exe.parent(),
+        "cwd is the app's folder, not zenman's (design §4.2)"
+    );
+    assert!(execs[0].detached && !execs[0].shell);
 
     assert_eq!(
         session.open_paths(&[]).expect_err("nothing to open").kind(),
         "empty",
         "Go's `No files specified to open` (`api/ops.go:124`)"
+    );
+    let _ = remove_tree(&root);
+}
+
+// ── launch (`docs/launch-sandbox-design.md` §3-§5) ────────────────────────────────────────────
+
+/// The write helper the launch tests want: bytes, exec bit, [`AbsPath`].
+fn write_exec(path: &Path, bytes: &[u8]) -> AbsPath {
+    write(path, bytes);
+    set_mode(path, 0o755);
+    abs(path)
+}
+
+/// `launch` reaches `exec_program` with exactly the argv design §4 promises — recorded, never run:
+/// the fake answers with a synthetic exit 0 and the test asserts the request shape.
+#[test]
+fn launch_sends_the_expected_argv_through_exec_program() {
+    let root = temp_dir("launch-argv");
+    let bin = root.join("bin");
+    fs::create_dir_all(&bin).expect("bin dir");
+    let env = Arc::new(OpEnv {
+        exec_ok: true,
+        ..OpEnv::new(&bin)
+    });
+    let tree = mkdir(&root.join("tree"));
+    let exe = write_exec(&root.join("tree/app.bin"), b"\x7fELF\x02\x01\x01\x00");
+    let she = write_exec(&root.join("tree/AppRun"), b"#!/bin/sh\necho hi\n");
+    let py = write_exec(&root.join("tree/tool.py"), b"print()\n");
+    let txt = write_exec(&root.join("tree/notes.txt"), b"hi\n");
+    let cancel = CancelToken::new();
+
+    // The session wiring: `run_kind` is the menu answer, `launch` the verb, `can_sandbox` the probe.
+    let session = open_session_env(&root, Arc::clone(&env) as Arc<dyn Env>);
+    assert_eq!(session.run_kind(&exe), launch::RunKind::Binary);
+    assert_eq!(session.run_kind(&txt), launch::RunKind::NotRunnable);
+    assert!(
+        session.can_sandbox(),
+        "the fake answers the sandbox probe `true` so the sandboxed argv test reaches `launch`'s sandbox \
+         lane (design §5.4: the measurement is the platform's, and this host's real answer is tested in \
+         `platform::linux`)"
+    );
+    assert_eq!(
+        session
+            .launch(&[], false)
+            .expect_err("nothing to run")
+            .kind(),
+        "empty",
+        "the same empty-selection rule as `open_paths`"
+    );
+    let report = session
+        .launch(std::slice::from_ref(&exe), false)
+        .expect("one launch");
+    assert_eq!(report.launched, vec![exe.clone()]);
+    assert_eq!(report.summary(), "1 launched, 0 failed");
+    assert!(!report.is_empty());
+
+    // The batch: a shebang script runs directly, a shebang-less `.py` through /bin/sh, and an
+    // executable `.txt` is refused before the spawn.
+    let report = launch::launch(
+        env.as_ref(),
+        &[she.clone(), py.clone(), txt.clone()],
+        false,
+        &cancel,
+    )
+    .expect("batch accepted; the .txt failure is per-path");
+    assert_eq!(report.launched, vec![she.clone(), py.clone()]);
+    assert_eq!(report.failed.len(), 1, "{report:?}");
+    assert_eq!(report.failed[0].1.kind(), "unsupported");
+    assert_eq!(report.summary(), "2 launched, 1 failed");
+
+    let execs = env.execs();
+    assert_eq!(
+        execs.len(),
+        3,
+        "session exe, script, py — the refused txt never spawned"
+    );
+    assert_eq!(execs[0].program, exe.to_string_lossy());
+    assert_eq!(
+        execs[1].program,
+        she.to_string_lossy(),
+        "#! is the kernel's job"
+    );
+    assert_eq!(execs[1].args, Vec::<String>::new());
+    assert_eq!(
+        execs[2].program, "/bin/sh",
+        "a shebang-less script runs through sh (design §3)"
+    );
+    assert_eq!(execs[2].args, vec![py.to_string_lossy()]);
+    for e in &execs {
+        assert!(
+            !e.shell,
+            "never a command line, whatever the file name says"
+        );
+        assert!(
+            e.detached,
+            "the app must outlive the launcher (design §4.4)"
+        );
+        assert_eq!(
+            e.cwd.as_ref(),
+            Some(&tree),
+            "cwd = the target's parent (design §4.2)"
+        );
+    }
+    let _ = remove_tree(&root);
+}
+
+/// The sandboxed shape (design §5): `setsid --fork unshare … -- /bin/sh -c SANDBOX_SCRIPT`, with the
+/// target, the inner argv and the mask roots travelling through the **environment** only — and the
+/// up-front, typed refusal when the platform's sandbox probe says no.
+#[test]
+fn launch_sandbox_wraps_unshare_and_passes_paths_by_environment() {
+    let root = temp_dir("launch-sandbox");
+    let bin = root.join("bin");
+    fs::create_dir_all(&bin).expect("bin dir");
+    let exe = write_exec(&root.join("app.bin"), b"\x7fELF\x02\x01\x01\x00");
+    let cancel = CancelToken::new();
+
+    // The probe says "this kernel refuses it": per-path refusal, nothing reaches exec_program. (§5.3 —
+    // this is the *only* place a refused sandbox can still be caught, because `setsid --fork` hides the
+    // launcher's own status from the report.)
+    let plain = Arc::new(OpEnv {
+        exec_ok: true,
+        sandbox: false,
+        ..OpEnv::new(&bin)
+    });
+    let report = launch::launch(plain.as_ref(), std::slice::from_ref(&exe), true, &cancel)
+        .expect("the refusal is per-path, not the call's error");
+    assert!(
+        report.launched.is_empty() && report.failed.len() == 1,
+        "{report:?}"
+    );
+    assert_eq!(report.failed[0].1.kind(), "unsupported");
+    assert!(plain.execs().is_empty(), "a refused sandbox never spawns");
+
+    // The probes answer: the full launcher pipeline is what exec_program would have run.
+    let env = Arc::new(OpEnv {
+        exec_ok: true,
+        probes: vec!["unshare".into(), "setsid".into()],
+        ..OpEnv::new(&bin)
+    });
+    assert!(launch::can_sandbox(env.as_ref()));
+    let report = launch::launch(env.as_ref(), std::slice::from_ref(&exe), true, &cancel)
+        .expect("sandboxed launch");
+    assert_eq!(report.launched, vec![exe.clone()]);
+    let execs = env.execs();
+    assert_eq!(execs.len(), 1);
+    let r = &execs[0];
+    assert_eq!(
+        r.program, "setsid",
+        "setsid wraps the *launcher*, not the app"
+    );
+    assert_eq!(r.args.first().map(String::as_str), Some("--fork"));
+    assert_eq!(r.args.get(1).map(String::as_str), Some("unshare"));
+    assert_eq!(
+        r.args[r.args.len() - 3..],
+        [
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            launch::SANDBOX_SCRIPT.to_string()
+        ],
+        "the validated wrapper, quoted by its own script, passed as one argv entry"
+    );
+    assert!(r.detached && !r.shell);
+    let get = |key: &str| {
+        r.env
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_else(|| panic!("env is missing {key}"))
+    };
+    assert_eq!(get("ZENMAN_SANDBOX_TARGET"), exe.to_string_lossy());
+    assert_eq!(
+        get("ZENMAN_SANDBOX_ARGV"),
+        exe.to_string_lossy(),
+        "program first, one per line"
+    );
+    let masks = get("ZENMAN_SANDBOX_MASKS");
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = home.to_string_lossy().into_owned();
+        assert!(
+            masks.lines().any(|l| l == home),
+            "$HOME is masked (design §5.2): {masks:?}"
+        );
+    }
+    let _ = remove_tree(&root);
+}
+
+/// design §7.1's edges: scripts keep their error (no surprise exec), a binary the desktop *accepted*
+/// is never re-run, both failures name the **opener**, and a directory is never classified at all
+/// (the `Navigate` arm runs first, keeping §3's one-`stat` budget honest).
+#[test]
+fn open_exec_fallback_is_binaries_only() {
+    let root = temp_dir("open-fallback");
+    let bin = root.join("bin");
+    fs::create_dir_all(&bin).expect("bin dir");
+    let exe = write_exec(&root.join("app.bin"), b"\x7fELF\x02\x01\x01\x00");
+    let script = write_exec(&root.join("AppRun"), b"#!/bin/sh\necho hi\n");
+    let dir = mkdir(&root.join("sub"));
+
+    // Script + no opener: the opener's error stands, and no exec is even attempted.
+    let env = Arc::new(OpEnv {
+        no_opener: true,
+        exec_ok: true,
+        ..OpEnv::new(&bin)
+    });
+    let session = open_session_env(&root, Arc::clone(&env) as Arc<dyn Env>);
+    let report = session
+        .open_paths(&[script.clone(), dir.clone()])
+        .expect("per-path failures are not the call's error");
+    assert_eq!(report.failed.len(), 1, "{report:?}");
+    assert_eq!(report.failed[0].0, script);
+    assert_eq!(
+        report.failed[0].1.kind(),
+        "shell_error",
+        "the opener's message, not the exec's"
+    );
+    assert_eq!(
+        report.navigated,
+        vec![dir],
+        "the directory was routed, never classified"
+    );
+    assert!(
+        env.execs().is_empty(),
+        "a script is not exec'd behind the user's back"
+    );
+
+    // Binary + working opener: the desktop answer wins outright, no exec attempt.
+    let env2 = Arc::new(OpEnv {
+        exec_ok: true,
+        ..OpEnv::new(&bin)
+    });
+    let session2 = open_session_env(&root, Arc::clone(&env2) as Arc<dyn Env>);
+    let report = session2
+        .open_paths(std::slice::from_ref(&exe))
+        .expect("opened by the desktop");
+    assert_eq!(report.launched, vec![exe.clone()]);
+    assert!(
+        env2.execs().is_empty(),
+        "the opener worked; nothing to fall back from"
+    );
+
+    // Binary + no opener + the exec *also* fails: the report keeps the opener's error, so the
+    // second failure never hides the message that explains the refusal the user asked about.
+    let env3 = Arc::new(OpEnv {
+        no_opener: true,
+        ..OpEnv::new(&bin)
+    }); // exec_ok stays false: the fallback fails too
+    let session3 = open_session_env(&root, Arc::clone(&env3) as Arc<dyn Env>);
+    let report = session3
+        .open_paths(std::slice::from_ref(&exe))
+        .expect("per-path failure");
+    assert_eq!(report.failed.len(), 1, "{report:?}");
+    assert_eq!(
+        report.failed[0].1.kind(),
+        "shell_error",
+        "the opener's error survived the failed fallback"
+    );
+    assert_eq!(
+        env3.execs().len(),
+        1,
+        "and the fallback was genuinely attempted"
     );
     let _ = remove_tree(&root);
 }

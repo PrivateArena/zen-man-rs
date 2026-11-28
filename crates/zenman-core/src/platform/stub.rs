@@ -222,7 +222,10 @@ mod tests {
         let path = AbsPath::from_path(std::env::temp_dir()).expect("the temp dir is absolute");
         let rows = outcomes(&env, &path);
 
-        // The trait has exactly these fourteen methods; a fifteenth would have to be added here to compile.
+        // One row per trait method the stub answers *itself*. A method with a default body —
+        // `supports_sandbox`, whose default is the honest `false` for a platform with no `unshare` —
+        // is not the stub's answer to give and is deliberately not here; `mod.rs`'s own trait list and
+        // `windows.rs`'s table are the two places that would notice a new required method.
         let names: Vec<&str> = rows.iter().map(|(name, _)| *name).collect();
         assert_eq!(
             names,

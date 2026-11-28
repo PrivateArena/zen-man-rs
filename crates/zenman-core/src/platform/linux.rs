@@ -29,7 +29,8 @@ use std::sync::{Arc, RwLock};
 use super::env_probe::{self, ProbeReport};
 use super::{
     CopyFailure, CopyItem, CopyReport, DiskSpace, Env, ExecOutput, ExecRequest, LinkItem,
-    MountEntry, MountTable, Os, PlatformCaps, PlatformFuture, Shortcut, ready,
+    MountEntry, MountTable, Os, PROGRAM_UNSHARE, PlatformCaps, PlatformFuture,
+    SANDBOX_UNSHARE_FLAGS, Shortcut, ready,
 };
 use crate::error::CoreError;
 use crate::mode::ModeBits;
@@ -49,10 +50,11 @@ pub type ProbeCache = Arc<RwLock<Option<bool>>>;
 /// Linux (and, through the `unix` gates, macOS/BSD) platform actions.
 ///
 /// Cheap to construct and free of I/O: `default_env()` is allowed to build one on every startup, and the
-/// only state is the probe cache.
+/// only state is the two probe caches (symlink, sandbox), each `None` until its own measurement.
 #[derive(Clone)]
 pub struct Linux {
     probe_cache: ProbeCache,
+    sandbox_cache: ProbeCache,
 }
 
 impl Linux {
@@ -63,14 +65,19 @@ impl Linux {
     pub fn new() -> Self {
         Self {
             probe_cache: Arc::new(RwLock::new(None)),
+            sandbox_cache: Arc::new(RwLock::new(None)),
         }
     }
 
     /// Share a probe cache with somebody else — step 6's `Session` owns the cache so the probe result
     /// survives a `Linux` handle being cloned, and so the `Session` can re-probe after a settings change.
+    /// The sandbox cache is this instance's own (design §5.4: one measured spawn per session).
     #[must_use]
     pub fn with_probe_cache(probe_cache: ProbeCache) -> Self {
-        Self { probe_cache }
+        Self {
+            probe_cache,
+            sandbox_cache: Arc::new(RwLock::new(None)),
+        }
     }
 
     /// The cache this implementation reads. Cloning the `Arc` is how a caller (or a test recorder)
@@ -110,6 +117,39 @@ impl Linux {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+
+    /// Publish a sandbox verdict into the shared cache (the `unshare` probe's counterpart of
+    /// [`Linux::set_symlink_supported`]).
+    pub fn set_sandbox_supported(&self, supported: bool) {
+        let mut guard = self
+            .sandbox_cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = Some(supported);
+    }
+
+    /// The cached sandbox verdict, if any — the frame-path read, the same shape as
+    /// [`Linux::cached_symlink_support`].
+    #[must_use]
+    pub fn cached_sandbox_support(&self) -> Option<bool> {
+        *self
+            .sandbox_cache
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The measured sandbox answer, run **at most once per session**: the cache decides when it already
+    /// knows, and only the first call pays for the [`probe_sandbox_recipe`] spawn (measured ~1 ms;
+    /// design §5.4), while every later call — including the menu-open path that asks on every frame — is
+    /// a lock read.
+    pub fn sandbox_supported(&self) -> Result<bool, CoreError> {
+        if let Some(cached) = self.cached_sandbox_support() {
+            return Ok(cached);
+        }
+        let supported = probe_sandbox_recipe(SANDBOX_UNSHARE_FLAGS)?;
+        self.set_sandbox_supported(supported);
+        Ok(supported)
+    }
 }
 
 impl Default for Linux {
@@ -144,6 +184,15 @@ impl Env for Linux {
             Some(cached) => cached,
             None => self.caps().contains(PlatformCaps::SYMLINK),
         })
+    }
+
+    /// Design §5.4's probe, measured (see [`Linux::sandbox_supported`]). The PATH scan comes first so a
+    /// machine without util-linux never spawns at all.
+    fn supports_sandbox(&self) -> Result<bool, CoreError> {
+        if !self::has_program(PROGRAM_UNSHARE)? {
+            return Ok(false);
+        }
+        self.sandbox_supported()
     }
 
     fn chmod(
@@ -872,6 +921,52 @@ pub fn supports_symlink(scratch_root: &Path) -> Result<bool, CoreError> {
     env_probe::probe_symlink_support(scratch_root, env_probe::ProbeFlags::detect())
 }
 
+/// Run the sandbox recipe once and report whether the kernel allowed it: `unshare <flags> -- /bin/sh -c
+/// true` (design §5.4). `Ok(true)` only for a **zero exit**, which is the only answer that means "a
+/// namespace with these flags exists here".
+///
+/// Every refusal is `Ok(false)`, and the *reason* is deliberately dropped: a missing `unshare`, an
+/// `EPERM`/`ENOSPC` from `clone(2)`, `kernel.unprivileged_userns_clone=0` and a `--propagation` this
+/// util-linux does not know all look the same from here, because the question the row asks is a boolean
+/// ("is the `Execute (sandbox)` row real?") and not a diagnosis — the sentence that would explain one
+/// refusal would mislead about the next. Nothing here can report a launch failure either: this is a
+/// capability probe, and the launch path is `ops::launch::launch`.
+///
+/// The spawn is the crate's second and last non-`exec_program` one, and it is deliberately *not* routed
+/// through [`exec_program`]: the probe needs the exit status of the *launcher* alone, with no `setsid`
+/// wrapper in front of it (design §5.3 — that wrapper is exactly what hides a refused sandbox from a
+/// caller). `Command::output` stays banned (`clippy.toml`), so this is `spawn` + `wait_with_output`, the
+/// same shape `exec_program` uses.
+#[cfg(unix)]
+fn probe_sandbox_recipe(flags: &[&str]) -> Result<bool, CoreError> {
+    let child = Command::new(PROGRAM_UNSHARE)
+        .args(flags)
+        .arg("--")
+        .arg("/bin/sh")
+        .args(["-c", "true"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
+    let child = match child {
+        Ok(child) => child,
+        // No `unshare`, or `exec` refused it: the answer to "could we sandbox here" is no, and a
+        // capability question has no failure lane.
+        Err(_) => return Ok(false),
+    };
+    let output = child
+        .wait_with_output()
+        .map_err(|e| CoreError::io(PROGRAM_UNSHARE.to_string(), e))?;
+    Ok(output.status.success())
+}
+
+/// No `unshare(1)` recipe to measure on a non-unix host: the answer is the same `false` the [`Env`]
+/// default gives, without a spawn.
+#[cfg(not(unix))]
+fn probe_sandbox_recipe(_flags: &[&str]) -> Result<bool, CoreError> {
+    Ok(false)
+}
+
 /// The measured `/api/props` payload: the write test's verdict, paired with the OS string Go published.
 /// Step 6 caches this in [`Linux::probe_symlinks`]; the frame path uses [`env_probe::probe`].
 pub fn probe(scratch_root: &Path) -> Result<ProbeReport, CoreError> {
@@ -1099,6 +1194,45 @@ mod tests {
             "the probe must clean its scratch dir"
         );
         remove_probe_root(&scratch);
+    }
+
+    /// The refusal lane of design §5.3/§5.4: a flag list the machine will not accept must answer
+    /// `Ok(false)` — that is the very exit `setsid --fork` swallows on a real launch, so the probe is the
+    /// only place it can still be seen. A bogus long option is accepted by no `unshare`, whichever
+    /// util-linux is installed.
+    #[cfg(unix)]
+    #[test]
+    fn sandbox_probe_reads_a_refused_recipe_as_not_supported() {
+        assert!(
+            !probe_sandbox_recipe(&["--definitely-not-an-unshare-option"])
+                .expect("a capability probe does not fail; it answers"),
+            "a refused recipe must read as 'no sandbox here', not as 'yes'"
+        );
+    }
+
+    /// The sandbox probe is measured **once**: the second answer comes from the cache. No assertion on
+    /// the verdict itself — a CI box with `kernel.unprivileged_userns_clone=0` (or a seccomp filter that
+    /// denies `clone(CLONE_NEWUSER)`) must stay green, and both answers are legal here.
+    #[test]
+    fn sandbox_probe_measures_once_and_caches() {
+        let linux = Linux::new();
+        assert_eq!(linux.cached_sandbox_support(), None, "no measurement yet");
+        let first = linux.sandbox_supported().expect("the probe answers");
+        assert_eq!(
+            linux.cached_sandbox_support(),
+            Some(first),
+            "the measurement is stored for the session"
+        );
+        let second = linux.sandbox_supported().expect("the cached answer");
+        assert_eq!(first, second, "the cached answer is the measured one");
+        // `Env::supports_sandbox` is the same measurement through the PATH scan, and it may not change
+        // the verdict (a machine without `unshare` answers false without ever spawning).
+        let via_env = linux.supports_sandbox().expect("the trait method answers");
+        assert_eq!(
+            via_env,
+            first && has_program(PROGRAM_UNSHARE).unwrap_or(false),
+            "the PATH scan may only *remove* a capability, never invent one"
+        );
     }
 
     #[test]

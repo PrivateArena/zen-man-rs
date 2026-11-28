@@ -82,6 +82,14 @@ use egui::{Event, Key, Modifiers, Ui};
 pub enum Command {
     /// Enter: open the selection (`Session::open_paths`, dirs navigate — Go's `open`).
     Open,
+    /// Run the selection instead of viewing it (`Session::launch`, design
+    /// `docs/launch-sandbox-design.md` §4) — **no chord**: Go's registry (`shortcuts.js:7-31`) never
+    /// had a `run` verb at all (`api/ops.go:122`'s `handleOpen` was the only activation), so there is
+    /// no Go binding to inherit and none has been agreed; the menu row is the entry point.
+    Execute,
+    /// The same run inside the `unshare` sandbox (design §5) — **no chord**, the same reason as
+    /// [`Self::Execute`], and the row is present only when the platform can sandbox at all (§5.4).
+    ExecuteSandbox,
     /// `Ctrl+C` — `Session::clipboard_store` with `ClipOp::Copy` (Go's `copy`).
     Copy,
     /// `Ctrl+X` — the same with `ClipOp::Cut` (Go's `cut`).
@@ -202,6 +210,8 @@ impl Command {
     /// Every command, in table order — the iteration the "every chord tested" test walks.
     pub const ALL: &'static [Self] = &[
         Self::Open,
+        Self::Execute,
+        Self::ExecuteSandbox,
         Self::Copy,
         Self::Cut,
         Self::OpenInNewTab,
@@ -261,6 +271,8 @@ impl Command {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Open => "Open",
+            Self::Execute => "Execute",
+            Self::ExecuteSandbox => "Execute (sandbox)",
             Self::OpenInNewTab => "Open in new tab",
             Self::Copy => "Copy",
             Self::Cut => "Cut",
@@ -768,6 +780,9 @@ impl KeyMap {
 const TABLE: &[(Command, &[Chord])] = &[
     // --- shortcuts.js:7-31, verbatim -----------------------------------------------------------
     (Command::Open, &[Chord::key(Key::Enter)]),
+    // --- design §2: the run pair, menu-only (Go gave `run` no key, because Go had no run verb) -----
+    (Command::Execute, &[]),
+    (Command::ExecuteSandbox, &[]),
     (Command::Cut, &[Chord::ctrl(Key::X)]),
     (Command::Copy, &[Chord::ctrl(Key::C)]),
     (Command::CopyPath, &[Chord::alt_shift(Key::C)]),

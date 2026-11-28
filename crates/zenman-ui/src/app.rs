@@ -1579,14 +1579,29 @@ impl ZenApp {
         let (target, folder) = match subject {
             MenuSubject::Listing(ix) => match ix {
                 Some(ix) => {
-                    let on_dir = self
+                    let tab = self
                         .model
                         .panes
                         .get(&slot)
-                        .and_then(|pane| pane.active_tab())
-                        .and_then(|tab| tab.entries.entries.get(ix))
-                        .is_some_and(|entry| entry.is_dir);
-                    (MenuTarget::Row { on_dir }, None)
+                        .and_then(|pane| pane.active_tab());
+                    let entry = tab.and_then(|tab| tab.entries.entries.get(ix));
+                    let on_dir = entry.is_some_and(|entry| entry.is_dir);
+                    // Design §3: the row is what `classify` answers for, and a directory is never
+                    // runnable — so the `stat` + 8-byte read is only paid for a file row, which keeps
+                    // `classify`'s one-`stat` budget honest. An archive listing is skipped for the same
+                    // reason `run_open` names: `Tab::row_abs` answers the **container** for a member, so
+                    // the question would be about the `.zip`, not the row. No path at all (a row that
+                    // vanished between the click and the draw) is "not runnable", the safe answer: the
+                    // row is absent, not greyed.
+                    let on_run = !on_dir
+                        && tab.is_some_and(|tab| {
+                            !matches!(tab.path.store, zenman_core::path::VfsKind::Archive { .. })
+                        })
+                        && entry
+                            .zip(tab)
+                            .and_then(|(entry, tab)| tab.row_abs(entry))
+                            .is_some_and(|path| self.session.run_kind(&path).is_runnable());
+                    (MenuTarget::Row { on_dir, on_run }, None)
                 }
                 None => (MenuTarget::Background, None),
             },
@@ -1705,6 +1720,10 @@ impl ZenApp {
             // is called while a menu is open and never per frame). An unprobed environment is `false`:
             // no capability we cannot confirm is one we will not offer.
             can_symlink: self.session.env().supports_symlink().is_ok_and(|ok| ok),
+            // …and design §5.4's, the same kind of *measured* probe — a PATH scan plus one spawn of the
+            // real recipe, ~1 ms the first time and a lock read (~7 µs) afterwards — folded in beside it
+            // for the same reason: the menu asks the platform, not a constant.
+            can_sandbox: self.session.can_sandbox(),
             // 14b: the real source. Go's `triggerRename` sent a selection of more than one row to
             // `batch-rename.js`, so "mid-batch" *is* "more than one row is selected".
             in_batch: tab.is_some_and(|tab| tab.sel.len() > 1),
@@ -1930,6 +1949,11 @@ impl ZenApp {
             Command::PermanentDelete,
             Command::Rename,
             Command::Chmod,
+            // Design §2's run pair: a VFS member is not a file on disk — `Tab::row_abs` answers the
+            // *container* for a row of an archive listing, so `Execute` here would run the `.zip`, not
+            // the thing the user right-clicked. Refused with the reason, like every other write.
+            Command::Execute,
+            Command::ExecuteSandbox,
         ];
         if READ_ONLY_REFUSED.contains(&command) && self.in_archive(slot) {
             self.notices.post(
@@ -2054,6 +2078,9 @@ impl ZenApp {
             Command::Rename if self.selection_abs(slot).len() > 1 => self.open_batch_rename(slot),
             Command::Rename => self.start_rename(slot),
             Command::Open => self.open_selection(slot),
+            // The run pair, through the same seam the menu rows and (one day) a chord would use.
+            Command::Execute => self.run_launch(slot, false),
+            Command::ExecuteSandbox => self.run_launch(slot, true),
             Command::NewFolder => self.open_new_folder_prompt(slot),
             Command::QuickFind => match self.shown_dir_abs(slot) {
                 // Step 11b: the live search dialog, scoped to the pane's directory (Go's
@@ -3909,11 +3936,60 @@ impl ZenApp {
                 for (path, e) in &report.failed {
                     self.notices.post(
                         toast::Level::Error,
-                        format!("open {}: {}", path.as_path().display(), e.user_message()),
+                        // `detail`, not `user_message`/`Display`: `CoreError::Shell`'s own string names
+                        // the program (`command failed: xdg-open`) and drops the launcher's stderr, which
+                        // is the only thing that says *why* (design §7.2 — `no method available for
+                        // opening zen-dragon`, not a bare `xdg-open`).
+                        format!("open {}: {}", path.as_path().display(), e.detail()),
                     );
                 }
             }
             Err(e) => self.toast_error("open", e),
+        }
+    }
+
+    /// The `Execute` pair's own front end: run the selection, plainly or inside the `unshare` sandbox
+    /// (design §4/§5). The sibling of [`Self::run_open`] on purpose — same path collection, same
+    /// per-path failure notice, same silence on success (a launch that works is nothing to report).
+    ///
+    /// The notice carries [`CoreError::detail`]: a sandbox the kernel refuses and a `sh` that cannot
+    /// read the script are both *said* by the child's stderr, and the design's §5.3 rule is that a
+    /// failure is named, never guessed. `sandbox` reaches [`Session::launch`] as the bool it is there
+    /// (design §8 step A: one verb, not an `execute`/`execute_sandboxed` pair).
+    ///
+    /// Only ever reached with host paths, for the same reason [`Self::run_open`] gives: a member of an
+    /// archive is not a file on disk, and [`Tab::row_abs`] answers the *container* for one — running it
+    /// would run the `.zip`.
+    fn run_launch(&mut self, slot: PaneSlot, sandbox: bool) {
+        let verb = if sandbox {
+            "execute (sandbox)"
+        } else {
+            "execute"
+        };
+        if self.in_archive(slot) {
+            self.notices.post(
+                toast::Level::Warning,
+                "execute: an archive member is not a local file — extract it first",
+            );
+            return;
+        }
+        let paths = self.selection_abs(slot);
+        if paths.is_empty() {
+            self.nothing_selected(verb);
+            return;
+        }
+        match self.session.launch(&paths, sandbox) {
+            Ok(report) => {
+                // Success is silent (design §4: a launched app tells the user it started); a path the
+                // launcher refused gets its own toast, like every other batch verb here.
+                for (path, e) in &report.failed {
+                    self.notices.post(
+                        toast::Level::Error,
+                        format!("{verb} {}: {}", path.as_path().display(), e.detail()),
+                    );
+                }
+            }
+            Err(e) => self.toast_error(verb, e),
         }
     }
 

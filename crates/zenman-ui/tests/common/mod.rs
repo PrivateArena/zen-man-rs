@@ -93,9 +93,19 @@ pub fn session_with_launcher(tag: &str) -> (Session, std::sync::Arc<NoDesktopEnv
 /// Every other method forwards to [`zenman_core::platform::default_env`], because the disk meter, the
 /// mount table, the trash predicate and the writable probe are exactly what the shell renders and must
 /// see for real.
+///
+/// `exec_program` is recorded for the same reason `open_with` is: it is the *other* spawn the shell can
+/// reach from a menu row — design §4's `Execute` — and a test that clicks it would otherwise really
+/// start the fixture script (and, sandboxed, really try to make namespaces). The core suite's `OpEnv`
+/// set the pattern (`zenman-core/tests/contract_ops.rs:1060`): record the whole [`ExecRequest`], answer
+/// a successful [`ExecOutput`], spawn nothing.
 pub struct NoDesktopEnv {
     inner: std::sync::Arc<dyn zenman_core::platform::Env>,
     opened: std::sync::Mutex<Vec<String>>,
+    /// Every [`ExecRequest`] handed to `exec_program`, in order — argv, environment, cwd and `detached`
+    /// and all, because for `Execute` the request *is* the behaviour (design §4: one argv vector, no
+    /// shell string).
+    execs: std::sync::Mutex<Vec<zenman_core::platform::ExecRequest>>,
 }
 
 impl NoDesktopEnv {
@@ -105,6 +115,7 @@ impl NoDesktopEnv {
         Self {
             inner: zenman_core::platform::default_env(),
             opened: std::sync::Mutex::new(Vec::new()),
+            execs: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -112,6 +123,13 @@ impl NoDesktopEnv {
     #[must_use]
     pub fn opened(&self) -> Vec<String> {
         self.opened.lock().expect("not poisoned").clone()
+    }
+
+    /// The requests handed to `exec_program`, in order — the launch tests' argv assertions, read the
+    /// same way [`Self::opened`] reads the launcher's.
+    #[must_use]
+    pub fn execs(&self) -> Vec<zenman_core::platform::ExecRequest> {
+        self.execs.lock().expect("not poisoned").clone()
     }
 }
 
@@ -165,6 +183,18 @@ impl zenman_core::platform::Env for NoDesktopEnv {
         self.inner.supports_symlink()
     }
 
+    /// Design §5.4's sandbox capability, answered by the **real PATH scan** and deliberately *not*
+    /// forwarded to `self.inner.supports_sandbox()`: that probe is the measured one, and forwarding would
+    /// spawn `unshare` from a test process — exactly what this fake exists to prevent (see the type's
+    /// docs on `exec_program`). The kernel half of the answer is measured once, for real, in
+    /// `zenman-core`'s `platform::linux` tests; here only the row's *presence* is under test.
+    fn supports_sandbox(&self) -> Result<bool, zenman_core::error::CoreError> {
+        Ok(self
+            .inner
+            .has_program(zenman_core::platform::PROGRAM_UNSHARE)
+            .unwrap_or(false))
+    }
+
     fn chmod(
         &self,
         targets: &[zenman_core::path::AbsPath],
@@ -211,7 +241,16 @@ impl zenman_core::platform::Env for NoDesktopEnv {
         '_,
         Result<zenman_core::platform::ExecOutput, zenman_core::error::CoreError>,
     > {
-        self.inner.exec_program(req)
+        // Recorded, never forwarded (module docs): the exit status the launcher *would* have had is not
+        // what a UI test asserts, and the one that is (`Execute` ran, `Execute (sandbox)` passed the
+        // wrapper's variables) is fully decided by the request the shell built.
+        self.execs.lock().expect("not poisoned").push(req.clone());
+        zenman_core::platform::ready(Ok(zenman_core::platform::ExecOutput {
+            code: Some(0),
+            stdout: String::new(),
+            stderr: String::new(),
+            truncated: false,
+        }))
     }
 
     fn has_program(&self, name: &str) -> Result<bool, zenman_core::error::CoreError> {

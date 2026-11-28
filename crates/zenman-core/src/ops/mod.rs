@@ -29,6 +29,10 @@
 //! * [`chmod`] — the octal text in, the mode bits out, with the record keeping the text the user typed;
 //! * [`open`] — the desktop launcher, with a directory routed as navigation instead.
 //!
+//! The launch/sandbox step (docs/launch-sandbox-design.md) added [`launch`] next to [`open`]: the *run*
+//! verb Go never had, as an argv vector that is never a command line, with a `unshare`-based sandbox
+//! whose wrapper script takes every path through the environment rather than through the shell source.
+//!
 //! [`crate::history::revert`] completes the pair: it drives *these* functions backwards, so an undo can
 //! never disagree with what the forward operation did.
 //!
@@ -48,6 +52,7 @@ pub mod clipboard;
 pub mod copy;
 pub mod delete;
 pub mod guard;
+pub mod launch;
 pub mod mkdir;
 pub mod r#move;
 pub mod open;

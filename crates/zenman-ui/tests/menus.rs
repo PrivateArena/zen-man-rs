@@ -683,7 +683,10 @@ fn the_open_menu_context_is_read_from_the_engine_not_invented() {
     let mut harness = pane_harness("menus-ctx", &listing);
     let ctx = harness.state().menu_context(
         PaneSlot::Left,
-        zenman_ui::menus::MenuTarget::Row { on_dir: false },
+        zenman_ui::menus::MenuTarget::Row {
+            on_dir: false,
+            on_run: false,
+        },
     );
     assert!(!ctx.has_selection, "nothing has been clicked yet");
     assert!(!ctx.on_archive, "a plain directory is writable");
@@ -770,9 +773,13 @@ fn custom_actions_come_from_the_real_service_including_the_glob_half() {
 fn a_batch_selection_labels_the_rename_row_and_the_menu_says_so() {
     let dir = tree("menus-batch14", &["a.txt", "b.txt", "c.md"]);
     let mut harness = pane_harness("menus-batch14", &dir);
-    let ctx = harness
-        .state()
-        .menu_context(PaneSlot::Left, MenuTarget::Row { on_dir: false });
+    let ctx = harness.state().menu_context(
+        PaneSlot::Left,
+        MenuTarget::Row {
+            on_dir: false,
+            on_run: false,
+        },
+    );
     assert!(
         !ctx.in_batch,
         "nothing is selected, so no batch owns the pane"
@@ -783,9 +790,13 @@ fn a_batch_selection_labels_the_rename_row_and_the_menu_says_so() {
     right_click(&mut harness, "a.txt");
     select_two(&mut harness);
     harness.run();
-    let ctx = harness
-        .state()
-        .menu_context(PaneSlot::Left, MenuTarget::Row { on_dir: false });
+    let ctx = harness.state().menu_context(
+        PaneSlot::Left,
+        MenuTarget::Row {
+            on_dir: false,
+            on_run: false,
+        },
+    );
     assert!(
         ctx.in_batch,
         "`in_batch` still has no source (step 14b gave it one)"
@@ -1568,5 +1579,331 @@ fn the_next_popup_measures_its_own_rows_instead_of_inheriting_the_last_ones_widt
     assert!(
         background_menu < row_menu,
         "the {background_menu:.1} pt background menu kept the {row_menu:.1} pt row menu's frame",
+    );
+}
+
+// --------------------------------------------------------------------- design §2: the run pair
+
+/// [`tree`], plus one row `classify` calls a script: a `#!` first line and mode `0755` (design §3).
+/// Test code may use `std::fs` — `xtask`'s `io_guard` inspects `crates/zenman-ui/src` only.
+fn script_tree(tag: &str, files: &[&str], script: &str) -> PathBuf {
+    let root = tree(tag, files);
+    let path = root.join(script);
+    std::fs::write(&path, b"#!/bin/sh\necho zenman-ui-fixture\n").expect("fixture script");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod the fixture script");
+    }
+    root
+}
+
+/// A single-pane shell listing `dir`, **and** the [`common::NoDesktopEnv`] its session records into —
+/// the launch tests read the argv back out of it.
+fn pane_harness_env(
+    tag: &str,
+    dir: &Path,
+) -> (
+    Harness<'static, ZenApp>,
+    std::sync::Arc<common::NoDesktopEnv>,
+) {
+    let (session, env) = common::session_with_launcher(tag);
+    let mut app = ZenApp::new(session, Vec::new());
+    app.set_layout(panes_for(LayoutMode::Single));
+    app.open_tab(PaneSlot::Left, fixture_path(dir));
+    (build_harness(app, egui::vec2(1200.0, 800.0)), env)
+}
+
+/// Empty the shown tab's selection with the menu still open — the rows are rebuilt from live state
+/// every frame, which is what lets a greyed row be *made* by a test rather than by a click.
+fn clear_selection(harness: &mut Harness<'static, ZenApp>) {
+    harness
+        .state_mut()
+        .model
+        .panes
+        .get_mut(&PaneSlot::Left)
+        .and_then(|pane| pane.active_tab_mut())
+        .expect("the pane has a tab")
+        .sel
+        .clear();
+}
+
+/// `true` when this session's platform could sandbox a launch — design §5.4's probe as the *test*
+/// environment answers it: `NoDesktopEnv` asks the host's PATH and never spawns, so the branches below
+/// run identically on a kernel with user namespaces switched off.
+fn can_sandbox(harness: &Harness<'static, ZenApp>) -> bool {
+    harness.state().session.can_sandbox()
+}
+
+#[test]
+fn right_clicking_a_script_offers_the_run_rows_and_a_text_row_offers_none() {
+    let dir = script_tree("menus-run-shape", &["a.txt"], "run.sh");
+    let mut harness = pane_harness("menus-run-shape", &dir);
+
+    // A plain text file with no exec bit is `NotRunnable` (design §3), so the pair is *absent* — the
+    // same rule that keeps the directory block off a file row.
+    right_click(&mut harness, "a.txt");
+    assert!(
+        !labels(&harness)
+            .iter()
+            .any(|label| label.starts_with("Execute")),
+        "a text row grew a run row: {:?}",
+        labels(&harness)
+    );
+    close_menu(&mut harness);
+
+    right_click(&mut harness, "run.sh");
+    let rows = rows(&harness);
+    let run: Vec<(&str, bool)> = rows
+        .iter()
+        .map(|(label, on, _)| (label.as_str(), *on))
+        .filter(|(label, _)| label.starts_with("Execute"))
+        .collect();
+    assert!(
+        run.iter().any(|(label, _)| *label == "Execute"),
+        "a script row grew no run row: {:?}",
+        labels(&harness)
+    );
+    assert_eq!(
+        run.iter().any(|(label, _)| *label == "Execute (sandbox)"),
+        can_sandbox(&harness),
+        "the sandbox row does not follow the platform probe: {run:?}"
+    );
+    // Both sit directly under `Open` — the view verb first, the run verb next (design §2's shape).
+    let labels = labels(&harness);
+    let open = labels
+        .iter()
+        .position(|label| label == "Open")
+        .expect("the row menu has an Open row");
+    assert_eq!(
+        labels.get(open + 1).map(String::as_str),
+        Some("Execute"),
+        "the run pair is not below Open: {labels:?}"
+    );
+}
+
+#[test]
+fn the_run_rows_are_greyed_without_a_selection_and_fire_nothing() {
+    let dir = script_tree("menus-run-grey", &["a.txt"], "run.sh");
+    let (mut harness, env) = pane_harness_env("menus-run-grey", &dir);
+    right_click(&mut harness, "run.sh");
+    // The right-click selected the row, so Go's `selectedPaths.size > 0` guard is satisfied.
+    assert!(
+        rows(&harness)
+            .iter()
+            .any(|(label, on, _)| label == "Execute" && *on),
+        "a selected script row greyed its run row: {:?}",
+        rows(&harness)
+    );
+    // Take the selection away with the menu still open: the row keeps its place and loses its power.
+    clear_selection(&mut harness);
+    harness.run();
+    let run: Vec<(String, bool)> = rows(&harness)
+        .into_iter()
+        .filter(|(label, _, _)| label.starts_with("Execute"))
+        .map(|(label, on, _)| (label, on))
+        .collect();
+    assert!(
+        !run.is_empty() && run.iter().all(|(_, on)| !on),
+        "a run row stayed live with nothing selected: {run:?}"
+    );
+    harness.get_by_label("Execute").click();
+    harness.run();
+    assert!(
+        is_open(&harness),
+        "a greyed run row dismissed the menu: {:?}",
+        notices(&harness)
+    );
+    assert!(
+        env.execs().is_empty(),
+        "a greyed run row reached the platform: {:?}",
+        env.execs()
+    );
+}
+
+/// Design §2's whole point: two rows, **one** line. Asserted off the painted a11y rects, because a
+/// pair that stacked would still give the right labels and the right enabled states.
+#[test]
+fn the_run_pair_is_one_line_of_the_popup() {
+    let dir = script_tree("menus-run-line", &["a.txt"], "run.sh");
+    let mut harness = pane_harness("menus-run-line", &dir);
+    right_click(&mut harness, "run.sh");
+    if !can_sandbox(&harness) {
+        println!("SKIP: this platform has no `unshare`, so there is no pair to measure");
+        return;
+    }
+    let left = menu_row_point(&harness, "Execute");
+    let right = menu_row_point(&harness, "Execute (sandbox)");
+    // Two nodes, one per half — not one node for the line, which is what would leave the second verb
+    // unclickable for kittest, a screen reader and the pointer.
+    assert_eq!(
+        drawn_nodes(&harness, "Execute"),
+        1,
+        "the left half drew no node"
+    );
+    assert_eq!(
+        drawn_nodes(&harness, "Execute (sandbox)"),
+        1,
+        "the right half drew no node"
+    );
+    assert_eq!(left.y, right.y, "the pair is stacked, not side by side");
+    assert!(
+        right.x > left.x,
+        "the sandbox half is not to the right of its twin: {left} then {right}"
+    );
+    // The line sits between the two neighbours the group order promises.
+    assert!(
+        menu_row_point(&harness, "Open").y < left.y,
+        "`Open` is not above the pair"
+    );
+    assert!(
+        menu_row_point(&harness, "Cut").y > right.y,
+        "the clipboard ladder is not below the pair"
+    );
+}
+
+#[test]
+fn the_run_pair_does_not_push_the_popup_past_its_clamp() {
+    let dir = script_tree("menus-run-width", &["a.txt"], "run.sh");
+    let mut harness = pane_harness("menus-run-width", &dir);
+    right_click(&mut harness, "run.sh");
+    if !can_sandbox(&harness) {
+        println!("SKIP: this platform has no `unshare`, so there is no pair to measure");
+        return;
+    }
+    let tokens = harness.state().tokens;
+    let left = width_of(&harness, "Execute");
+    let right = width_of(&harness, "Execute (sandbox)");
+    let line = width_of(&harness, "Open");
+    // The two halves are equal and together are exactly the popup's line — the pair widened the
+    // frame, it did not become a frame of its own.
+    assert!(
+        (left - right).abs() < 0.5,
+        "the pair's halves disagree: {left} and {right}"
+    );
+    assert!(
+        (left + right - line).abs() < 1.0,
+        "the pair spans {left} + {right} of a {line} pt line"
+    );
+    assert!(
+        line <= tokens.menu_max_width + 0.5,
+        "the pair pushed the frame to {line:.1} pt, past the {} pt clamp",
+        tokens.menu_max_width
+    );
+    assert!(
+        line > tokens.menu_min_width,
+        "the popup is {line:.1} pt, at or under the {} pt floor it grew past",
+        tokens.menu_min_width
+    );
+}
+
+/// The builder's rule, driven directly: what §5.4's probe is worth to the shell is its effect on the
+/// *menu*, and the fake's bool is the whole input for that question.
+#[test]
+fn the_sandbox_row_follows_the_capability_probe_and_not_a_constant() {
+    let labels = |can_sandbox: bool| -> Vec<String> {
+        let ctx = zenman_ui::menus::MenuContext {
+            has_selection: true,
+            can_sandbox,
+            target: MenuTarget::Row {
+                on_dir: false,
+                on_run: true,
+            },
+            ..zenman_ui::menus::MenuContext::default()
+        };
+        zenman_ui::menus::menu_for(
+            &ctx,
+            &zenman_core::services::actions::ActionContext::background(None),
+            &[],
+        )
+        .into_iter()
+        .flatten()
+        .map(|spec| spec.label)
+        .collect()
+    };
+    let with = labels(true);
+    let without = labels(false);
+    assert!(
+        with.iter().any(|label| label == "Execute (sandbox)"),
+        "a sandboxing platform got no sandbox row: {with:?}"
+    );
+    assert!(
+        !without.iter().any(|label| label == "Execute (sandbox)"),
+        "the sandbox row survived a platform that cannot do it: {without:?}"
+    );
+    assert!(
+        without.iter().any(|label| label == "Execute"),
+        "the plain run row went away with the probe: {without:?}"
+    );
+}
+
+/// The dispatch half: the row's click ends in one recorded [`ExecRequest`], and `open_with` — the
+/// launcher the `Open` row uses — is never touched.
+#[test]
+fn clicking_a_run_row_launches_the_script_and_not_the_desktop() {
+    let dir = script_tree("menus-run-exec", &["a.txt"], "run.sh");
+    let (mut harness, env) = pane_harness_env("menus-run-exec", &dir);
+    let script = dir.join("run.sh");
+    let want = script.to_string_lossy().into_owned();
+
+    right_click(&mut harness, "run.sh");
+    harness.get_by_label("Execute").click();
+    common::settle_until(&mut harness, "the launch to be recorded", |_| {
+        !env.execs().is_empty()
+    });
+
+    let execs = env.execs();
+    assert_eq!(execs.len(), 1, "one row, one request: {execs:?}");
+    let plain = &execs[0];
+    assert!(
+        plain.detached,
+        "design §4.3: an attached launch parks the pane until the app exits"
+    );
+    assert!(
+        plain.args.last().is_some_and(|arg| arg == &want) || plain.program == want,
+        "the script is not the last thing the launcher runs: {plain:?}"
+    );
+    assert_eq!(
+        plain.cwd.as_ref().map(|cwd| cwd.to_string_lossy().clone()),
+        script.parent().map(|p| p.to_string_lossy().into_owned()),
+        "design §4.2: the cwd is the app's own folder"
+    );
+    assert!(
+        env.opened().is_empty(),
+        "a run was handed to the desktop launcher: {:?}",
+        env.opened()
+    );
+
+    // …and the sandboxed twin, which is the same launch with the wrapper's environment (§5.2).
+    right_click(&mut harness, "run.sh");
+    if !can_sandbox(&harness) {
+        println!("SKIP: this platform has no `unshare`, so the sandbox row is not on offer");
+        return;
+    }
+    harness.get_by_label("Execute (sandbox)").click();
+    common::settle_until(&mut harness, "the sandboxed launch", |_| {
+        env.execs().len() > 1
+    });
+    let execs = env.execs();
+    let sandboxed = execs.last().expect("two requests by now");
+    assert!(
+        sandboxed
+            .env
+            .iter()
+            .any(|(key, value)| key == "ZENMAN_SANDBOX_TARGET" && value == &want),
+        "the wrapper was not told what to sandbox: {:?}",
+        sandboxed.env
+    );
+    assert_eq!(
+        execs.len(),
+        2,
+        "a run reached the launcher as well: {:?}",
+        env.opened()
+    );
+    assert!(
+        env.opened().is_empty(),
+        "a run was handed to the desktop launcher: {:?}",
+        env.opened()
     );
 }
