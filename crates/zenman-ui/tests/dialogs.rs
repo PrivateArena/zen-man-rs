@@ -31,6 +31,7 @@ use zenman_ui::dialogs::{Dialog, Prompt};
 use zenman_ui::keymap::{Chord, Command};
 use zenman_ui::state::{Tab, panes_for};
 use zenman_ui::widgets::toast;
+use zenman_ui::widgets::virtual_list::RowColumns;
 
 const SETTLE: usize = 6;
 
@@ -221,6 +222,165 @@ fn f2_rename_is_in_the_row_and_enter_commits_it() {
     assert!(
         names(shown(&harness, PaneSlot::Left)).contains(&"gamma-renamed.txt".to_string()),
         "the listing reloaded onto the new name"
+    );
+}
+
+/// The two bugs the in-cell editor had, measured off the field's own rect in the a11y tree: it was
+/// laid out from the row's left padding, so egui's frame filled an opaque box over the row's
+/// **icon** (it vanished on F2), and its text began a padding-width left of where the name's glyphs
+/// had been (the word jumped). Both are one geometry mistake — the field must be the name *text*,
+/// not the name *cell* — and the fix is [`zenman_ui::widgets::entry_row::rename_rects`], whose
+/// arithmetic this test spells out again so a wrong helper cannot hide behind itself.
+#[test]
+fn the_rename_field_takes_the_name_text_and_leaves_the_icon() {
+    let dir = tree("dlg-rename-rect", &["gamma-source.txt"]);
+    let mut harness = pane_harness("dlg-rename-rect", &dir);
+    harness.get_by_label("gamma-source.txt").click();
+    settle(&mut harness);
+    let row = harness.get_by_label("gamma-source.txt").rect();
+    let tokens = harness.state().tokens;
+    press(&mut harness, Chord::key(Key::F2));
+    settle(&mut harness);
+
+    // The pane is in the plain list's flex table, so this is the row's name cell.
+    let inner = row.width() - 2.0 * tokens.row_pad_x;
+    let name_width = RowColumns::LIST.widths(inner)[0];
+    let name_left = row.min.x + tokens.row_pad_x;
+    let icon_right = name_left + tokens.row_icon_size;
+    let glyph_x = icon_right + tokens.row_icon_gap;
+
+    let fields: Vec<egui_kittest::Node<'_>> =
+        harness.query_all_by_role(egui::Role::TextInput).collect();
+    assert_eq!(fields.len(), 1, "F2 opened exactly the in-cell field");
+    let field = fields.first().expect("just asserted one").rect();
+    assert!(
+        (field.min.x - glyph_x).abs() < 0.01,
+        "the field's text must start on the name's first glyph, not a padding-width left of it: \
+         {field:?} vs {glyph_x}"
+    );
+    assert!(
+        field.min.x >= icon_right,
+        "the field must never reach into the row's icon column (it ends at {icon_right}): {field:?}"
+    );
+    assert!(
+        (field.max.x - (name_left + name_width)).abs() < 0.01,
+        "and it owns the rest of the name cell: {field:?}"
+    );
+    // The baseline claim's other half: the field is centred on the row, which is the one rule
+    // `entry_row::paint_text` uses, so the two agree without anyone naming the font's row height.
+    assert!(
+        (field.center().y - row.center().y).abs() < 0.01,
+        "the field sits on the row's mid-line: {field:?} in {row:?}"
+    );
+}
+
+/// The same claim as [`the_rename_field_takes_the_name_text_and_leaves_the_icon`], off the rendered
+/// frame rather than off the a11y tree: opening the editor must not repaint a single pixel of the
+/// row's icon, and must not move the name's glyphs.
+///
+/// Both frames are compared with the buffer *untouched*, over two windows:
+///
+/// * the icon column, which the old editor filled with egui's opaque text-edit background;
+/// * the tail of the name. The editor selects the base name, and a selection paints an accent
+///   rectangle behind its glyphs, so the selected part of the word cannot be compared pixel for
+///   pixel — but `.txt` is not selected, and it is drawn on the bare row in both frames, which makes
+///   it a pure glyph comparison in both axes.
+///
+/// The vertical band is the glyph band (`+/- 6` of the row's mid-line), not the whole row: the
+/// accent frame's top and bottom strokes are new pixels by design, at `+/- 10`.
+#[test]
+fn entering_rename_mode_moves_no_pixel_of_the_row() {
+    let name = "gamma-source.txt";
+    let dir = tree("dlg-rename-pixels", &[name]);
+    let mut harness = pane_harness("dlg-rename-pixels", &dir);
+    harness.get_by_label(name).click();
+    settle(&mut harness);
+    let row = harness.get_by_label(name).rect();
+    let before = match harness.render() {
+        Ok(image) => image,
+        Err(_) => {
+            println!("SKIP: no raster adapter, and this test measures painted pixels");
+            return;
+        }
+    };
+    press(&mut harness, Chord::key(Key::F2));
+    settle(&mut harness);
+    let after = harness.render().expect("the first render had an adapter");
+
+    let scale = harness.ctx.pixels_per_point();
+    let tokens = harness.state().tokens;
+    let name_cell = zenman_ui::widgets::entry_row::column_rects(row, &RowColumns::LIST, &tokens)[0];
+    let col = |x: f32| (x * scale).floor().max(0.0) as u32;
+    let icon_right = col(name_cell.min.x + tokens.row_icon_size);
+    let glyph_x = col(name_cell.min.x + tokens.row_icon_size + tokens.row_icon_gap);
+    let glyph_band = col(row.center().y - 6.0)..col(row.center().y + 6.0);
+    let ink = |img: &image::RgbaImage, x: u32, y: u32| {
+        let p = img.get_pixel(x, y);
+        (u32::from(p[0]) + u32::from(p[1]) + u32::from(p[2])) / 3 > 60
+    };
+    let same = |x: u32, y: u32| before.get_pixel(x, y).0 == after.get_pixel(x, y).0;
+
+    // The icon column, from the name cell's left edge to the icon's right edge: the old editor
+    // filled exactly this with egui's opaque text-edit background.
+    let mut repainted = Vec::new();
+    for x in col(name_cell.min.x)..icon_right {
+        for y in glyph_band.clone() {
+            if !same(x, y) {
+                repainted.push((x, y));
+            }
+        }
+    }
+    assert!(
+        repainted.is_empty(),
+        "F2 repainted {} pixels of the row's icon: {repainted:?}",
+        repainted.len()
+    );
+
+    // The name's ink run: its first inked column to the last one before its first gap of three
+    // blank columns. The walk stops at that gap because the pane paints other ink further right
+    // inside the same cell, and that ink is not the name.
+    let run = |img: &image::RgbaImage| {
+        let inked = |x: u32| glyph_band.clone().any(|y| ink(img, x, y));
+        let first = (glyph_x..col(name_cell.max.x)).find(|x| inked(*x))?;
+        let mut last = first;
+        let mut blank = 0;
+        for x in first..col(name_cell.max.x) {
+            if inked(x) {
+                blank = 0;
+                last = x;
+            } else {
+                blank += 1;
+                if blank >= 3 {
+                    break;
+                }
+            }
+        }
+        Some(first..last)
+    };
+    let was = run(&before).expect("the row painted a name to compare");
+    let now = run(&after).expect("and so does the editor, on the same string");
+    assert_eq!(
+        was, now,
+        "the word occupies different columns once the editor owns it"
+    );
+
+    // And inside it, the tail: the unselected `.txt`, drawn on the bare row in both frames. The same
+    // pixels in the same places is the claim about the baseline as much as about the x.
+    let tail = was.end.saturating_sub(13)..=was.end;
+    let mut moved = Vec::new();
+    for x in tail.clone() {
+        for y in glyph_band.clone() {
+            if !same(x, y) {
+                moved.push((x, y));
+            }
+        }
+    }
+    assert!(
+        moved.is_empty(),
+        "F2 moved the name's glyphs: {} pixels of the unselected tail {tail:?} came out different, \
+         the first at {:?}",
+        moved.len(),
+        moved.first()
     );
 }
 

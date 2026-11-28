@@ -241,6 +241,69 @@ pub fn column_rects(rect: Rect, columns: &RowColumns, tokens: &Tokens) -> [Rect;
     out
 }
 
+/// The name cell's two boxes: the row's icon square and the text box the name is painted in.
+///
+/// The split is the design's: the icon and the label share one flex cell with the gap between them
+/// (`file-list.css:20-22`), so the label starts one icon-width and one gap from the cell's left
+/// edge. [`paint_list_row`] and [`rename_rects`] both come through here — that is the whole point:
+/// the in-cell editor has to put its caret on the pixel this function's glyph started on.
+fn name_cells(name: Rect, tokens: &Tokens) -> (Rect, Rect) {
+    let side = tokens.row_icon_size;
+    let icon = Rect::from_min_size(
+        egui::pos2(name.min.x, name.center().y - side / 2.0),
+        egui::vec2(side, side),
+    );
+    let text_x = icon.max.x + tokens.row_icon_gap;
+    let text = Rect::from_min_size(
+        egui::pos2(text_x, name.min.y),
+        egui::vec2((name.max.x - text_x).max(0.0), name.height()),
+    );
+    (icon, text)
+}
+
+/// The breathing room the rename frame leaves between its stroke and the glyph it wraps, in px.
+///
+/// The frame hugs the text, so the gap must be small enough that the box still reads as *this name,
+/// being edited* and large enough that the stroke never touches a letter. It is the frame's own
+/// inset, not one of the design's measurements, so there is no token for it.
+const RENAME_FRAME_INSET: f32 = 2.0;
+
+/// Where the in-cell rename editor goes in one list row ([`rename_rects`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RenameCells {
+    /// The rect the accent stroke is painted on. It starts to the right of the icon, so the icon of
+    /// the row being renamed stays visible the whole time.
+    pub frame: Rect,
+    /// The rect to hand the `TextEdit` — with [`egui::Frame::NONE`] (no inset, no background over
+    /// the row's selection fill) and [`egui::Align2::LEFT_CENTER`] — whose first glyph then lands on
+    /// the pixel the static name's first glyph occupied.
+    pub edit: Rect,
+}
+
+/// The geometry of the in-cell rename editor over one list row.
+///
+/// The editor *replaces* the name text, so it has to be the name text: [`RenameCells::edit`] is
+/// exactly the rect [`paint_list_row`] paints the name into, and [`RenameCells::frame`] is that
+/// box's line height — the row's icon square is the design's measure of one line
+/// (`file-list.css:110-112`) — plus [`RENAME_FRAME_INSET`], with the icon left outside.
+///
+/// The vertical claim is not arithmetic on font metrics but a shared construction: egui centres a
+/// `LEFT_CENTER` text edit's galley in the rect it is given (the atom block in the frame's inner
+/// rect, the galley in the block — centring twice is centring once), and [`paint_text`] centres the
+/// static galley in the same rect. Same font, same rect, same baseline.
+pub fn rename_rects(row: Rect, columns: &RowColumns, tokens: &Tokens) -> RenameCells {
+    let (_, text) = name_cells(column_rects(row, columns, tokens)[0], tokens);
+    let height = tokens.row_icon_size + 2.0 * RENAME_FRAME_INSET;
+    let frame = Rect::from_min_max(
+        egui::pos2(
+            text.min.x - RENAME_FRAME_INSET,
+            text.center().y - height / 2.0,
+        ),
+        egui::pos2(text.max.x, text.center().y + height / 2.0),
+    );
+    RenameCells { frame, edit: text }
+}
+
 /// One row's content: the wire entry, its absolute path when it has one (the size key), and how
 /// it should paint.
 #[derive(Clone, Copy, Debug)]
@@ -251,6 +314,11 @@ pub struct RowSpec<'a> {
     pub path: Option<&'a AbsPath>,
     /// Selection/cut state.
     pub sel: SelectionState,
+    /// `true` while the in-cell rename editor owns the name cell. The icon and the other cells still
+    /// paint; the *name* does not, because the editor draws it over this very rect
+    /// ([`rename_rects`]) and a second copy behind it would read as the old name bleeding through
+    /// every keystroke.
+    pub renaming: bool,
 }
 
 /// Paint one list row into `hit.rect`.
@@ -267,34 +335,35 @@ pub fn paint_list_row(
     sizes: &SizeLookup<'_>,
     tokens: &Tokens,
 ) {
-    let RowSpec { entry, path, sel } = row;
+    let RowSpec {
+        entry,
+        path,
+        sel,
+        renaming,
+    } = row;
     let rect = hit.rect;
     paint_row_background(ui, rect, sel, hit.response.hovered(), tokens);
     let [name, rel, size, date] = column_rects(rect, columns, tokens);
-    let icon_side = tokens.row_icon_size;
-    let icon_rect = Rect::from_min_size(
-        egui::pos2(name.min.x, name.center().y - icon_side / 2.0),
-        egui::vec2(icon_side, icon_side),
-    );
+    let (icon_rect, name_text) = name_cells(name, tokens);
+    // The icon of a row that is being renamed keeps painting: the editor's frame is laid out to
+    // start right of it, so there is nothing to hide (`rename_rects`).
     icons::paint(
         ui,
         icon_rect,
         icons::icon_for(entry),
-        icon_side,
+        tokens.row_icon_size,
         sel.icon(entry, tokens),
     );
-    let text_x = icon_rect.max.x + tokens.row_icon_gap;
-    cell(
-        ui,
-        Rect::from_min_size(
-            egui::pos2(text_x, name.min.y),
-            egui::vec2((name.max.x - text_x).max(0.0), name.height()),
-        ),
-        &entry.name,
-        sel.text(tokens),
-        Align::LEFT,
-        tokens,
-    );
+    if !renaming {
+        cell(
+            ui,
+            name_text,
+            &entry.name,
+            sel.text(tokens),
+            Align::LEFT,
+            tokens,
+        );
+    }
     if rel.width() > 0.0 {
         cell(
             ui,
@@ -725,6 +794,110 @@ mod tests {
         assert!(
             flat[1].width() > 0.0,
             "the flat listing shows the rel column"
+        );
+    }
+
+    #[test]
+    fn the_rename_frame_hugs_the_name_and_leaves_the_icon_alone() {
+        let tokens = Tokens::dark();
+        let row = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(620.0, tokens.row_height));
+        // Both flex tables, because the editor opens in the flat listing too.
+        for columns in [RowColumns::LIST, RowColumns::FLAT] {
+            let [name, ..] = column_rects(row, &columns, &tokens);
+            let icon_right = name.min.x + tokens.row_icon_size;
+            let cells = rename_rects(row, &columns, &tokens);
+            // The glyph box is the text box `name_cells` hands the static name, so the first letter
+            // cannot jump when F2 opens the editor.
+            assert_eq!(
+                cells.edit.min.x,
+                icon_right + tokens.row_icon_gap,
+                "the editor's text starts one icon and one gap into the name cell"
+            );
+            assert_eq!(cells.edit.max.x, name.max.x, "and owns the rest of it");
+            assert_eq!(cells.edit.min.y, name.min.y, "the full row height");
+            assert_eq!(cells.edit.max.y, name.max.y);
+            // The frame hugs the glyph box, and its stroke stops short of the first letter by the
+            // inset — never further left than the icon's right edge, which is the bug this rect is.
+            assert_eq!(cells.frame.min.x, cells.edit.min.x - RENAME_FRAME_INSET);
+            assert!(
+                cells.frame.min.x >= icon_right,
+                "the frame must not cover the icon: {:?} vs the icon ending at {icon_right}",
+                cells.frame
+            );
+            assert_eq!(
+                cells.frame.max.x, name.max.x,
+                "the frame ends at the name cell's right edge"
+            );
+            assert!(
+                cells.frame.height() <= row.height(),
+                "a frame taller than the row would paint over its neighbours: {:?}",
+                cells.frame
+            );
+        }
+    }
+
+    /// The row's name painted the way [`paint_list_row`] paints it, and the same string in the
+    /// editor laid out the way [`crate::panels::file_pane`] adds it, in one frame — and then the two
+    /// text shapes must agree on every pixel, because a transition into rename mode that moves the
+    /// glyphs by a point is a transition the user sees.
+    ///
+    /// This is the test that makes the geometry claim in [`rename_rects`] a fact rather than a
+    /// reading of egui's layout code: the font's row height, the frame's inset and the atom layout's
+    /// centring are all egui's, and here they are measured rather than assumed.
+    #[test]
+    fn entering_rename_mode_does_not_move_a_single_glyph() {
+        let tokens = Tokens::dark();
+        let name = "report.pdf";
+        let row = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(620.0, tokens.row_height));
+        let cells = rename_rects(row, &RowColumns::LIST, &tokens);
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx, zenman_core::store::config::ThemeMode::Dark);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            ..Default::default()
+        };
+        let out = ctx.run_ui(input, |ui| {
+            cell(ui, cells.edit, name, tokens.text_main, Align::LEFT, &tokens);
+            let mut buf = name.to_owned();
+            ui.put(
+                cells.edit,
+                egui::TextEdit::singleline(&mut buf)
+                    .font(tokens.font())
+                    .align(egui::Align2::LEFT_CENTER)
+                    .frame(egui::Frame::NONE)
+                    .desired_width(cells.edit.width()),
+            );
+        });
+        let painted: Vec<(egui::Pos2, Rect)> = out
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) if text.galley.text() == name => {
+                    Some((text.pos, text.galley.rect))
+                }
+                _ => None,
+            })
+            .collect();
+        out.drop_without_applying_deltas();
+        assert_eq!(painted.len(), 2, "the row's name and the editor's text");
+        // Same font, same rect, one line: the two galleys are one box, so agreeing on the origin
+        // means agreeing on the baseline.
+        assert_eq!(
+            painted[0].1, painted[1].1,
+            "the editor laid the same text out at a different height"
+        );
+        assert_eq!(
+            painted[0].0, painted[1].0,
+            "the glyphs jumped on entering rename mode"
+        );
+        // And where that is, spelled out: the name cell's text x, one icon and one gap in.
+        assert_eq!(
+            painted[0].0.x,
+            tokens.row_pad_x + tokens.row_icon_size + tokens.row_icon_gap,
+            "the first glyph must sit where the row painted it"
         );
     }
 }

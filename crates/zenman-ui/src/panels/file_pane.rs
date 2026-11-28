@@ -694,11 +694,15 @@ pub struct ListOut {
 fn list(ui: &mut Ui, model: &mut PaneModel<'_>, tokens: &Tokens) -> ListOut {
     let metrics = row_metrics(tokens, model.tab.flat);
     let mut scroll = take_scroll(model.tab);
-    let order = RowOrder::build(model.tab);
-    let drag = model.drag.clone();
     // The editor comes *out* of the tab: the scroller borrows the tab immutably to paint rows, and the
     // editor is the one piece of pane state that a draw mutates.
     let mut editor = model.tab.rename_editor.take();
+    // And it is seeded *here*, before a single row is painted: the row a fresh `rename_target` names
+    // has already given its name text up to the field ([`is_renaming`]), so an editor that only
+    // appeared once the rows were drawn would blink the name out for a frame.
+    finish_editor(model.tab, &mut editor);
+    let order = RowOrder::build(model.tab);
+    let drag = model.drag.clone();
     let mut commands = Vec::new();
     let tab: &Tab = model.tab;
     let sizes = model.sizes;
@@ -724,6 +728,7 @@ fn list(ui: &mut Ui, model: &mut PaneModel<'_>, tokens: &Tokens) -> ListOut {
                 ix,
                 &order,
                 tab,
+                &facts,
                 tokens,
                 &drag,
                 &mut editor,
@@ -734,6 +739,8 @@ fn list(ui: &mut Ui, model: &mut PaneModel<'_>, tokens: &Tokens) -> ListOut {
         &mut scroll,
     );
     model.tab.scroll = scroll;
+    // Back in the tab it came from, in step with the arming (a commit or a cancel that the shell has
+    // since applied leaves `rename_target` empty, and the editor goes with it).
     finish_editor(model.tab, &mut editor);
     model.tab.rename_editor = editor;
     ListOut { events, commands }
@@ -834,6 +841,10 @@ fn paint_row(
                 entry,
                 path: path.as_ref(),
                 sel,
+                // The editor owns this row's name from here on: `rename_rects` puts its glyph box on
+                // the rect this call would otherwise paint the name into, so painting both would show
+                // the old name behind the new one. The icon is *not* part of that deal.
+                renaming: is_renaming(tab, entry),
             },
             &hit.metrics.columns,
             &SizeLookup(facts.sizes),
@@ -850,6 +861,17 @@ fn paint_row(
     });
     let _ = key;
     row_event(hit, entry_ix)
+}
+
+/// `true` when the rename editor is armed on this row.
+///
+/// It reads [`Tab::rename_target`] and not [`Tab::rename_editor`] on purpose: [`list`] takes the editor
+/// out of the tab for the duration of the draw (the scroller borrows the tab immutably, and the field is
+/// the one piece of pane state a draw mutates), so while the rows are being painted the editor lives
+/// only in the closure's local. `rename_target` is the arming, and [`finish_editor`] keeps the two in
+/// step, so it is the answer that cannot disagree with the field once the editor is back.
+fn is_renaming(tab: &Tab, entry: &zenman_core::entry::FileEntry) -> bool {
+    tab.rename_target.as_deref() == Some(Tab::row_key(entry))
 }
 
 /// The row's own click, before the pane interprets it.
@@ -1059,6 +1081,7 @@ fn rename_field(
     hit: &RowHit<'_>,
     entry_ix: usize,
     editor: &mut RenameEditor,
+    sel: SelectionState,
     tokens: &Tokens,
     out: &mut Vec<PaneCommand>,
 ) {
@@ -1067,14 +1090,30 @@ fn rename_field(
     // is the only thing on screen that may answer them.
     let enter = consume_key(ui, egui::Key::Enter);
     let escape = consume_key(ui, egui::Key::Escape);
+    // The error line is painted in the size cell, which is a `column_rects` answer.
     let cells = entry_row::column_rects(hit.rect, &hit.metrics.columns, tokens);
-    let cell = cells[0];
+    // The editor *is* the name text: the glyph box is the rect [`entry_row::paint_list_row`] painted
+    // the name into, and the frame is that box's line height, starting right of the icon the row keeps
+    // drawing (`entry_row::rename_rects`, and the test that measures it there).
+    let rects = entry_row::rename_rects(hit.rect, &hit.metrics.columns, tokens);
     let field = ui
         .put(
-            cell,
+            rects.edit,
             egui::TextEdit::singleline(&mut editor.buf)
-                .desired_width((cell.width() - tokens.cell_padding).max(1.0))
-                .font(tokens.font()),
+                .desired_width(rects.edit.width().max(1.0))
+                .font(tokens.font())
+                // The two knobs the seamless transition rests on. `LEFT_CENTER` is what makes the
+                // baseline match: egui centres the edit's galley in the rect it is given, exactly as
+                // `entry_row::paint_text` centres the static galley in the same rect, so the two land
+                // on one line without this file knowing the font's row height. And egui's own frame
+                // would inset the text by `button_padding` *and* fill an opaque background over the
+                // row's selection tint, so the field has none — the accent stroke below is paint.
+                .align(egui::Align2::LEFT_CENTER)
+                .frame(egui::Frame::NONE)
+                // The name's own colour, from the row's own state: the theme sets
+                // `Visuals::override_text_color` to the *unselected* row text, and the row being
+                // renamed is the selected one.
+                .text_color(sel.text(tokens)),
         )
         .on_hover_text("New name: Enter commits, Escape cancels");
     if editor.fresh {
@@ -1085,14 +1124,14 @@ fn rename_field(
         select_prefix(ui.ctx(), field.id, len);
         editor.fresh = false;
     }
-    // The frame around the cell is paint, so it cannot compete with the field for the pointer.
+    // The frame around the text is paint, so it cannot compete with the field for the pointer.
     let stroke = if editor.error.is_some() {
         egui::Stroke::new(1.0, tokens.danger)
     } else {
         egui::Stroke::new(1.0, tokens.accent)
     };
     ui.painter().rect_stroke(
-        cell,
+        rects.frame,
         egui::CornerRadius::same(tokens.corner_radius),
         stroke,
         egui::StrokeKind::Inside,
@@ -1127,7 +1166,8 @@ fn paint_row_overlay(
     hit: &RowHit<'_>,
     visual: usize,
     order: &RowOrder,
-    _tab: &Tab,
+    tab: &Tab,
+    facts: &RowFacts<'_>,
     tokens: &Tokens,
     drag: &Option<crate::drag_drop::DragPayload>,
     editor: &mut Option<RenameEditor>,
@@ -1145,8 +1185,17 @@ fn paint_row_overlay(
     if editor.key != Tab::row_key(entry) {
         return;
     }
+    // The row's own state, because the field draws the name the row used to draw: same colour, same
+    // dimming, or F2 repaints the word. This is why the overlay is handed [`RowFacts`] at all — the
+    // cut queue is part of the answer.
+    let path = tab.row_abs(entry);
+    let sel = row_state(
+        path.as_ref(),
+        tab.sel.contains(Tab::row_key(entry)),
+        facts.cut,
+    );
     if let Some(ix) = order.entry_ix(visual) {
-        rename_field(ui, hit, ix, editor, tokens, out);
+        rename_field(ui, hit, ix, editor, sel, tokens, out);
     }
 }
 
@@ -1274,5 +1323,33 @@ mod tests {
             "an archive row keeps the selection colour and no dimming"
         );
         assert_eq!(row_state(None, false, Some(&rows)), SelectionState::Normal);
+    }
+
+    #[test]
+    fn only_the_armed_row_gives_up_its_name_text() {
+        // The row that is being renamed stops painting its name, because the in-cell editor paints it
+        // over the same rect (`entry_row::rename_rects`) — and only that row.
+        let row = |name: &str| zenman_core::entry::FileEntry {
+            name: name.into(),
+            is_dir: false,
+            is_symlink: false,
+            size: 1,
+            mod_time: zenman_core::entry::unix_to_datetime(0),
+            mode: "-rw-r--r--".into(),
+            rel_path: String::new(),
+            depth: 0,
+            files_count: None,
+        };
+        let mut tab = Tab::new(TabId(1), FsPath::ROOT, "/");
+        assert!(!is_renaming(&tab, &row("a.txt")), "no arming, no editor");
+        tab.rename_target = Some("a.txt".into());
+        assert!(
+            is_renaming(&tab, &row("a.txt")),
+            "the armed row yields its name text to the field"
+        );
+        assert!(
+            !is_renaming(&tab, &row("b.txt")),
+            "every other row keeps painting its name"
+        );
     }
 }
